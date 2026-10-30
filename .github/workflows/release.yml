@@ -38,8 +38,21 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          for leaf in protocol core conformance codex claude acp ahp; do
-            tarball=$(ls artifacts/anureo-$leaf-*.tgz)
-            echo "Publishing $tarball"
-            npm publish "$tarball" --access public --provenance
-          done
+          publish() {
+            name="$1"; tarball="$2"
+            version=$(basename "$tarball" | sed -E 's/.*-v?([0-9]+\.[0-9]+\.[0-9]+[^/]*)\.tgz$/\1/')
+            published=$(npm view "$name@$version" version 2>/dev/null || true)
+            if [ "$published" = "$version" ]; then
+              echo "skip $name@$version (already published)"
+            else
+              echo "Publishing $tarball"
+              npm publish "$tarball" --access public --provenance
+            fi
+          }
+          publish @anureo/protocol      artifacts/anureo-protocol-*.tgz
+          publish @anureo/sdk           artifacts/anureo-sdk-*.tgz
+          publish @anureo/conformance   artifacts/anureo-conformance-*.tgz
+          publish @anureo/adapter-codex artifacts/anureo-adapter-codex-*.tgz
+          publish @anureo/adapter-claude artifacts/anureo-adapter-claude-*.tgz
+          publish @anureo/adapter-acp   artifacts/anureo-adapter-acp-*.tgz
+          publish @anureo/adapter-ahp   artifacts/anureo-adapter-ahp-*.tgz
