@@ -65,5 +65,5 @@ The generator rejects unsupported type vocabulary rather than emitting `any`. Sc
 
 ## Documentation
 
-- [AHP v1 protocol](../../spec/ahp-v1.md) — the protocol contract (currently in Chinese)
+- [AHP v1 protocol](../../spec/ahp-v1.md) — the authoritative protocol contract (English; a Chinese reference translation is available)
 - [Architecture](../../docs/architecture.md) — how protocol, core, and adapters relate

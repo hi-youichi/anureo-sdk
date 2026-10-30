@@ -1,19 +1,52 @@
-# Anureo Harness Protocol v1
+# Anureo Harness Protocol (AHP) v1
 
-> 状态：本仓 AHP v1 合同的中文迁入稿，尚未作为正式规范发布。
-> 当前实现与迁移边界见[开发记录](../docs/development.md)。
+> Status: Published. This document specifies AHP v1 as shipped in
+> `@anureo/protocol` 0.2.0. The normative source of truth is the JSON Schema
+> at `packages/protocol/schema/v1/ahp.schema.json` (`$id:
+> urn:anureo:ahp:v1`); TypeScript types, the method table, and runtime
+> validation are generated from that schema. This document describes the
+> contract as implemented; it does not imply that every backend supports
+> every optional capability. A [Chinese reference translation](ahp-v1.zh.md)
+> is available; if the two disagree, this English document is authoritative.
 
-会话元数据使用 `SessionState.metadata?: SessionMetadata` 和 `session/metadata` 事件；`title` 缺省表示无更新，字符串替换，null 清除，不携带 turn 生命周期语义。外部 AHP v1 经 `x-anureo/session-metadata@1` 扩展协商后发送。
+## Scope
 
-AHP 是 harness 一侧的独立协议。调用者为 Harness SDK / Host，不是浏览器。浏览器到 Host 使用独立的 `hx.*` 产品协议。规范来源是 `packages/protocol/schema/v1/ahp.schema.json`；TypeScript、方法表和运行校验从它生成或编译。这里描述已实现的合同，不表示所有后端都支持全部可选能力。
+AHP is a harness-side protocol. The caller is a Harness SDK / Host, not a
+browser; browser-to-host communication uses a separate `hx.*` product
+protocol and is out of scope here. AHP's position among neighboring
+protocols (MCP, ACP, AG-UI) is summarized in the repository
+[README](../README.md).
 
-## 版本、传输与握手
+Session-level metadata uses `SessionState.metadata?: SessionMetadata` and
+the `session/metadata` event: an absent `title` means no update, a string
+replaces, `null` clears, and no turn lifecycle semantics are attached.
+External AHP v1 peers send it after negotiating the
+`x-anureo/session-metadata@1` extension (see
+[GOVERNANCE](../GOVERNANCE.md) for the extension registry).
 
-AHP v1 使用标准 JSON-RPC 2.0。stdio 每行一个 UTF-8 JSON 对象；WebSocket 每个文本帧一个对象。请求 id 为非空字符串或整数，应答复用该 id。`initialize` 请求双方能力并选择共同支持的最高主版本；没有共同版本在业务操作前报 `PROTOCOL_VERSION_UNSUPPORTED`。调用者收到成功结果后发送 `initialized`。未声明能力即不支持；新增可选字段不升级主版本，破坏性语义变动必须升级主版本。
+## Versioning, transport, and handshake
 
-AHP 线通知采用 `method = event.type`、`params = 完整 AhpEvent`。params 保留 type/payload 与会话源序号；method 与 params.type 必须相等。交互通过 `interaction/requested` 通知发起，只能由独立的 `interaction/respond` 或 `interaction/cancel` 请求应答，不同时要求对同一通知发送 JSON-RPC response。
+AHP v1 uses standard JSON-RPC 2.0. Over stdio, each line is one UTF-8 JSON
+object; over WebSocket, each text frame is one object. Request ids are
+non-empty strings or integers, and responses must reuse the id.
 
-以下 JSONL 消息通过包内文档样例测试校验：
+`initialize` exchanges both parties' capabilities and selects the highest
+commonly supported major version. If no common version exists, the peer
+reports `PROTOCOL_VERSION_UNSUPPORTED` before any business operation. After
+the caller receives a successful result, it sends `initialized`.
+Capabilities that are not declared are not supported: adding an optional
+field does not bump the major version, while breaking semantic changes
+must bump it.
+
+Wire notifications use `method = event.type` and `params = the full
+AhpEvent`. `params` retains `type`, `payload`, and the session source
+sequence number; `method` and `params.type` must be equal. Interactions
+are initiated by the `interaction/requested` notification and may only be
+answered by the separate `interaction/respond` or `interaction/cancel`
+requests; no JSON-RPC response is required for the notification itself.
+
+The following JSONL messages are validated by the package's documentation
+example tests:
 
 ```jsonl
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersions":[1],"clientInfo":{"name":"example-host","version":"0.1.0"},"clientCapabilities":{"interactions":["approval"]}}}
@@ -28,54 +61,118 @@ AHP 线通知采用 `method = event.type`、`params = 完整 AhpEvent`。params 
 {"jsonrpc":"2.0","method":"turn/completed","params":{"sessionId":"s1","streamId":"stream-1","seq":4,"timestamp":"2026-10-26T00:00:03Z","turnId":"t1","type":"turn/completed","payload":{"turnId":"t1","status":"completed"}}}
 ```
 
-## 能力与方法
+## Capabilities and methods
 
-能力声明是 `Capabilities`，包含 session resume/fork/revert/history、turn steer/interrupt/outputSchema/输入模态、goal actions、review、compact、嵌套子代理、MCP、交互类型、配置选项 schema 和显式扩展。上层按能力选择，不按提供方名称猜测。`supportsCapability` 对缺省和空列表返回 false。
+Capability declaration is `Capabilities`. It covers session
+resume/fork/revert/history, turn steer/interrupt/outputSchema and input
+modalities, goal actions, review, compaction, nested subagents, MCP,
+interaction kinds, configuration option schemas, and explicit extensions.
+Upper layers select by capability; they must not guess from provider
+names. `supportsCapability` returns `false` for absent and empty lists.
 
-| 方法 | 参数类型 | 结果类型与限制 |
+| Method | Params | Result and constraints |
 | --- | --- | --- |
-| initialize | InitializeParams | InitializeResult；协议主版本协商 |
-| session/open | SessionOpenParams | SessionOpenResult；new/resume/fork，binding 不可变 |
-| session/close | SessionCloseParams | SessionCloseResult；只释放 idle 会话 |
-| session/config/set | SessionConfigParams | SessionState；patch 按选项 schema 校验 |
-| session/revert | SessionRevertParams | RevertResult；请求 scope 必须全部可用，实际效果如实返回 |
-| history/read | HistoryReadParams | HistoryPage；权威 item 快照，无原始 delta 序号 |
-| turn/start | TurnStartParams | TurnStartResult；调用方先分配 turnId，无默认排队 |
-| turn/steer | TurnSteerParams | TurnSteerResult；expectedTurnId 精确匹配当前 turn |
-| turn/interrupt | TurnInterruptParams | TurnInterruptResult；受理不代表已结束 |
-| interaction/respond | InteractionRespondParams | InteractionResult；审批只允许提供的 optionId |
-| interaction/cancel | InteractionCancelParams | InteractionResult；明确非授权取消 |
-| goal/set、goal/clear | GoalSetParams、GoalClearParams | GoalState；缺省不支持，不模拟目标 |
-| compact/start | CompactStartParams | MaintenanceResult；maintenance 期间不启动 turn |
-| review/start | ReviewStartParams | TurnStartResult；与普通 turn 共用互斥与生命周期 |
+| initialize | InitializeParams | InitializeResult; major-version negotiation |
+| session/open | SessionOpenParams | SessionOpenResult; new/resume/fork; binding is immutable |
+| session/close | SessionCloseParams | SessionCloseResult; only idle sessions may be released |
+| session/config/set | SessionConfigParams | SessionState; patches validated against the option schema |
+| session/revert | SessionRevertParams | RevertResult; every requested scope must be available; the actual effect is reported faithfully |
+| history/read | HistoryReadParams | HistoryPage; authoritative item snapshots, no raw delta sequence numbers |
+| turn/start | TurnStartParams | TurnStartResult; the caller allocates turnId first; no implicit queuing |
+| turn/steer | TurnSteerParams | TurnSteerResult; expectedTurnId must match the current turn exactly |
+| turn/interrupt | TurnInterruptParams | TurnInterruptResult; acceptance does not mean the turn has ended |
+| interaction/respond | InteractionRespondParams | InteractionResult; approvals only accept offered optionIds |
+| interaction/cancel | InteractionCancelParams | InteractionResult; explicit non-authoritative cancellation |
+| goal/set, goal/clear | GoalSetParams, GoalClearParams | GoalState; unsupported by default; goals are never simulated |
+| compact/start | CompactStartParams | MaintenanceResult; no turn may start during maintenance |
+| review/start | ReviewStartParams | TurnStartResult; shares mutual exclusion and lifecycle with normal turns |
 
-业务请求的 requestId 只关联本次原生会话操作，不承诺跨进程幂等；持久幂等由 Host 操作账本提供。resume 必须有 binding.nativeRef；fork 必须有 fork.sourceSessionId 与 boundary。boundary 区分 before/through。revert scope 为 conversation/files/both，不支持完整 scope 时必须在执行前拒绝。部分执行后失败携带实际影响和 outcomeUnknown，不声称原子回退。
+The `requestId` of a business request correlates only with that native
+session operation; cross-process idempotency is not promised — durable
+idempotency is provided by the host's operation ledger. `resume` requires
+`binding.nativeRef`; `fork` requires `fork.sourceSessionId` and
+`boundary` (before/through). Revert scope is conversation/files/both; a
+peer that cannot honor the full scope must reject before executing. A
+failure after partial execution reports the actual effect and
+`outcomeUnknown`; atomic rollback is not claimed.
 
-## 内容和事件
+## Content and events
 
-输入为 text/image/file；文件引用是显式 URI，不把任意文本推断为文件操作。Item 包含 userMessage、agentMessage、reasoning、plan、toolCall、subagent、review、compaction、hook、notice 十类。agentMessage.phase 区分 commentary/final；工具 kind/input/output、子代理 subagentId/state 由结构字段表达，title 只展示。
+Input is text/image/file; file references are explicit URIs — arbitrary
+text is never inferred as a file operation. Items are one of ten kinds:
+userMessage, agentMessage, reasoning, plan, toolCall, subagent, review,
+compaction, hook, notice. `agentMessage.phase` distinguishes
+commentary/final; tool kind/input/output and subagent subagentId/state
+are expressed structurally; titles are display-only.
 
-每个 session 最多一个活动 turn。每个已开始的 turn 只有一个 completed 终态（completed/interrupted/failed）。item/completed 是完整权威内容，替换流式内容而不是再拼一次。身份使用 `(sessionId,turnId,itemId)`，不能仅按提供方 itemId 建索引。
+Each session has at most one active turn. Each started turn has exactly
+one terminal `turn/completed` state (completed/interrupted/failed).
+`item/completed` carries the full authoritative content and replaces
+streamed content rather than being appended again. Identity is
+`(sessionId, turnId, itemId)`; indexing by provider itemId alone is not
+valid.
 
-每次 open 生成 streamId，源 seq 从 1 连续递增；再次 open 使用新 streamId。Host 的持久 hostSeq 是另一套序号，不与源 seq 混用。只有明确声明 replay 的源才可回放；history 快照不能伪装成原始实时事件。usage 必须标明 provider/scope/source=native，不提供的计数字段缺省，不记零或用累计差值假装精确值。
+Each `session/open` allocates a `streamId`, and the source `seq`
+increments consecutively from 1; opening again allocates a new
+`streamId`. The host's durable `hostSeq` is a separate sequence and is
+never mixed with source seq. Only sources that explicitly declare replay
+may be replayed; history snapshots must not masquerade as original
+real-time events. Usage must state provider/scope/source=native;
+unavailable counters are omitted rather than reported as zero or faked
+via cumulative deltas.
 
-标准事件包括 session/state、turn/started/completed、item/started/delta/completed、usage/updated、interaction/requested/resolved、notice。未知原生通知转 notice，未知 item 以 toolCall.kind=other 保存可安全公开的 nativeType/raw。未知请求返回 method-not-found，不能默认批准。协议层 schema 校验不替代 SDK 的有状态生命周期检查。
+Standard events are session/state, turn/started, turn/completed,
+item/started, item/delta, item/completed, usage/updated,
+interaction/requested, interaction/resolved, and notice. Unknown native
+notifications are converted to notice; unknown items are preserved as
+`toolCall.kind = other` with safely publishable nativeType/raw. Unknown
+requests return method-not-found and must never default to approval.
+Schema validation at the protocol layer does not replace the SDK's
+stateful lifecycle checks.
 
-## 交互与隐私
+## Interactions and privacy
 
-四类交互：approval（options）、userInput（questions 与可选答案 schema）、elicitation（form/url 与 schema）、dynamicTool（toolName/arguments 与输出 schema）。`validateInteractionResponse` 验证 kind、optionId、问题必答/选择范围及附带 JSON Schema。响应的竞争、超时和唯一解决由 SDK 的交互管理器负责。
+There are four interaction kinds: approval (options), userInput
+(questions with optional answer schemas), elicitation (form/url with
+schema), and dynamicTool (toolName/arguments with an output schema).
+`validateInteractionResponse` validates kind, optionId, required
+questions and choice ranges, and any attached JSON Schema. Racy
+responses, timeouts, and single resolution are handled by the SDK's
+interaction manager.
 
-resolved.outcome 为 responded/cancelled/expired/unknown。responded 表示已提交原生应答；unknown 表示本地不能再安全应答，不能解释为原生已批准或取消。超时、断线和 turn 终止不能默认授权。
+`resolved.outcome` is responded/cancelled/expired/unknown. `responded`
+means the native answer was submitted; `unknown` means the local side
+can no longer answer safely and must not be interpreted as native
+approval or cancellation. Timeouts, disconnects, and turn termination
+never imply authorization.
 
-privatePayload 只在内存使用，publicEvent/publicInteraction 产生不修改原对象的公开投影，删除整个 privatePayload 并设置 privatePayloadAvailable。secret 答案、认证字段、headers/env 不得持久化。授权 URL 的 query/fragment 不进入公开文本；完整地址仅通过 Host 的授权私有读取返回。日志/错误只保留校验路径和错误关键词，不复制参数值。
+`privatePayload` exists only in memory. `publicEvent`/`publicInteraction`
+produce a public projection without modifying the original object:
+`privatePayload` is removed entirely (replaced by
+`privatePayloadAvailable`). Secret-marked answers, authentication
+fields, and headers/env must never be persisted. Query and fragment are
+stripped from authorization URLs in public text; the full address is
+returned only through the host's private authorization read. Logs and
+errors keep only validation paths and error keywords, never parameter
+values.
 
-## 错误与扩展
+## Errors and extensions
 
-HarnessError 包含稳定 code/message/retryable/outcomeUnknown 和可选 details。发送后断线不确定是否执行时 outcomeUnknown=true，禁止自动重新发送。仅明确未执行的 method-not-found 可用于已验证的别名降级；不能用破坏性方法探测能力。
+`HarnessError` carries a stable code/message/retryable/outcomeUnknown
+and optional details. If a disconnect after sending leaves execution
+uncertain, `outcomeUnknown` is true and automatic resending is
+forbidden. Only an explicitly not-executed method-not-found may be used
+for verified alias fallback; destructive methods must not be used to
+probe capabilities.
 
-扩展使用 `x-<vendor>/<feature>` 与独立 version，必须在双方能力中声明。AHP 的 extension 事件以 payload.name 指向协商命名空间，payload.version 指定扩展版本。未知可选字段可保留，但不能让旧实现承担新必填语义；未知必需功能按不支持处理。
+Extensions use `x-<vendor>/<feature>` with an independent version and
+must be declared in both parties' capabilities. AHP's extension event
+points `payload.name` at the negotiated namespace and `payload.version`
+at the extension version. Unknown optional fields may be preserved, but
+must not impose new required semantics on older implementations; unknown
+required features are treated as unsupported.
 
-## 开发与一致性
+## Development and conformance
 
 ```sh
 cd packages/protocol
@@ -85,10 +182,29 @@ bun run typecheck
 bun test tests
 ```
 
-生成器拒绝不支持的类型词汇，不能静默发出 any。Schema 的结构校验用固定 Ajv 8.20.0 draft 2020-12；业务强类型和方法映射由相同 Schema 生成。核心和各适配器还必须通过生命周期/恢复一致性套件，Schema 测试本身不证明运行时正确。
+The generator rejects unsupported type vocabulary and never silently
+emits `any`. Structural validation of the schema uses a pinned Ajv
+8.20.0 with JSON Schema draft 2020-12; business types and method
+mappings are generated from the same schema. The core and every adapter
+must additionally pass the lifecycle/recovery conformance suite — schema
+tests alone do not prove runtime correctness. See
+[CONTRIBUTING](../CONTRIBUTING.md) for the full validation entry points.
 
-## 文件变更材料
+## File-change materials
 
-`toolCall.fileChanges?: FileChange[]` 是 AHP v1 的可选扩展，旧事件仍有效。每个文件包含 `path`、可选 `oldPath`、`operation`、`materials` 与 `completeness`；材料是 `unified` 原文、带 `scope: file|fragment` 的旧新文本，或带原因的 `unavailable`。片段只有原生提供定位时才有 1-based `oldStartLine/newStartLine`。`oldText: null` 表示有证据的新建，空字符串表示已有空内容。`stats.accuracy` 与 `completeness` 描述材料，执行是否成功仍以原生 item.status 为准。
+`toolCall.fileChanges?: FileChange[]` is an optional AHP v1 extension;
+older events remain valid. Each entry carries `path`, optional
+`oldPath`, `operation`, `materials`, and `completeness`. Materials are
+either the original `unified` text, old/new text with
+`scope: file|fragment`, or `unavailable` with a reason. Fragments carry
+1-based `oldStartLine`/`newStartLine` only when the native side supplies
+locations. `oldText: null` denotes evidenced creation; an empty string
+denotes pre-existing empty content. `stats.accuracy` and `completeness`
+describe the materials; whether execution succeeded is still determined
+by the native `item.status`.
 
-`item/delta` 的 `kind: patch, value` 保存完整 Item 快照；消费者校验 Item、ID 与当前 turn 中已有类型后整体替换。`patch.text` 仅兼容旧 fileChange 执行日志，不是 unified patch。Codex 的 `item/fileChange/outputDelta` 使用 `kind: output`。
+`item/delta` with `kind: patch` carries a full item snapshot in `value`;
+consumers validate the item, its id, and the existing kinds in the
+current turn, then replace wholesale. `patch.text` exists only for
+legacy fileChange execution logs and is not a unified patch. Codex's
+`item/fileChange/outputDelta` uses `kind: output`.

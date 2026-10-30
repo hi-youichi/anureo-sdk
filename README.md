@@ -75,6 +75,18 @@ The example prints `Hello from Anureo SDK`. Here, `createScriptedAdapter()` prov
 | `@anureo/adapter-ahp` | Adapter for external AHP harnesses over stdio or WebSocket |
 | `@anureo/conformance` | Shared conformance tests and scripted fixtures |
 
+## Why AHP?
+
+AHP sits at the harness layer: one host, many agent backends, uniform
+approvals, history, fork/revert, and steering. It interoperates with —
+instead of competing against — the neighboring protocols:
+
+| Protocol | Layer | Relationship to AHP |
+|---|---|---|
+| [MCP](https://modelcontextprotocol.io) | Tools & resources | MCP tool calls ride inside AHP `toolCall` items; the host may proxy MCP servers while turns stay AHP-shaped |
+| [ACP](https://agentclientprotocol.com) | Editor ↔ agent | `@anureo/adapter-acp` brings any ACP agent behind AHP — an interop proof, not a fork |
+| AG-UI and UI event streams | UI rendering | AHP adds approvals, goals, fork/revert, steering, and replayable history with source sequence numbers |
+
 ## Development and validation
 
 ```sh
@@ -93,11 +105,16 @@ CI validates Windows, macOS, and Linux on every push; all three platforms are gr
 
 ## Documentation
 
+- [AHP v1 specification](spec/ahp-v1.md) — the published protocol contract (English, authoritative); a [Chinese reference translation](spec/ahp-v1.zh.md) is available.
+- [Governance](GOVERNANCE.md) — versioning, the extension registry, and conformance policy.
+- [Contributing](CONTRIBUTING.md) — setup, validation commands, and the adapter checklist.
+- [Security](SECURITY.md) — the reporting channel and the redaction/secret-handling invariants.
+- [Changelog](CHANGELOG.md) — release history with BREAKING markers for the 0.x line.
+
 The following prose documents are currently in Chinese:
 
 - [Architecture](docs/architecture.md): layers, interfaces, event flow, and approval sequences.
 - [Development and migration notes](docs/development.md): implementation scope, naming changes, and validation records.
-- [AHP v1 protocol](spec/ahp-v1.md): the protocol contract migrated from upstream.
 - [Extraction plan](extraction-plan.md): the original migration sequence, public release goals, and pending decisions.
 
 The [upstream provenance manifest](docs/upstream-provenance.json) records the source revision, source file SHA-256 hashes, and destination paths.

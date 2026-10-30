@@ -60,5 +60,5 @@ The workspace's `bun run verify:pack` runs real stdio conversations against the 
 
 ## Documentation
 
-- [AHP v1 protocol](../../spec/ahp-v1.md) — the wire contract (currently in Chinese)
+- [AHP v1 protocol](../../spec/ahp-v1.md) — the wire contract
 - [Architecture](../../docs/architecture.md)
