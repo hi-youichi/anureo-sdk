@@ -19,7 +19,7 @@ const answer: InteractionResponse = { kind: "approval", optionId: "allow" };
 
 test("pending reports only actionable requests and empties after resolution", async () => {
   const { registry, published } = harness();
-  const observed = registry.begin(approval("i1"), async () => ({ interactionId: "i1", outcome: "responded" }));
+  const observed = registry.begin(approval("i1"), async () => {});
   expect(registry.pending().map((request) => request.interactionId)).toEqual(["i1"]);
   expect(registry.pendingCount).toBe(1);
   await expect(registry.respond("i1", "r1", answer)).resolves.toMatchObject({ outcome: "responded" });
@@ -31,7 +31,7 @@ test("pending reports only actionable requests and empties after resolution", as
 
 test("an expired interaction cancels itself through its timer", async () => {
   const { registry, published } = harness({ timeoutMs: 15 });
-  const observed = registry.begin(approval("i1"), async () => ({ interactionId: "i1", outcome: "responded" }));
+  const observed = registry.begin(approval("i1"), async () => {});
   await expect(observed).rejects.toMatchObject({ code: "INTERACTION_CANCELLED" });
   expect(published.at(-1)).toMatchObject({ interactionId: "i1", outcome: "expired" });
 });
@@ -40,7 +40,7 @@ test("resolved records are evicted only past the bounded replay guard", async ()
   const { registry } = harness({ maxPending: 1, timeoutMs: 60_000 });
   for (let index = 0; index < 1_026; index++) {
     const interactionId = `i${index}`;
-    const observed = registry.begin(approval(interactionId), async () => ({ interactionId, outcome: "responded" }));
+    const observed = registry.begin(approval(interactionId), async () => {});
     await registry.respond(interactionId, `r${index}`, answer);
     await observed.catch(() => {});
   }
@@ -49,7 +49,7 @@ test("resolved records are evicted only past the bounded replay guard", async ()
 
 test("external resolution settles waiters without a published outcome", async () => {
   const { registry, published } = harness();
-  const observed = registry.begin(approval("i1"), async () => ({ interactionId: "i1", outcome: "responded" }));
+  const observed = registry.begin(approval("i1"), async () => {});
   await registry.resolveExternally({ interactionId: "unknown", outcome: "responded" });
   await registry.resolveExternally({ interactionId: "i1", outcome: "responded" });
   await expect(observed).rejects.toThrow("Interaction was resolved by the native peer");

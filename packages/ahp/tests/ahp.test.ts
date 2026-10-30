@@ -105,7 +105,7 @@ test("wire send failures reject the caller once with an unknown outcome", async 
   const frames = new BoundedEventQueue<string>();
   const transport: AhpTransport = { messages: frames, send: () => Promise.reject(new Error("pipe gone")), close: async () => { frames.end(); } };
   const wire = new AhpWire(transport, { timeoutMs: 100 });
-  await expect(wire.request("doomed")).rejects.toMatchObject({ code: "RPC_CONNECTION_CLOSED", outcomeUnknown: true });
+  await expect(wire.request("doomed", {})).rejects.toMatchObject({ code: "RPC_CONNECTION_CLOSED", outcomeUnknown: true });
   await expect(wire.notify("ignored")).rejects.toMatchObject({ message: "pipe gone" });
   await wire.close();
 });
