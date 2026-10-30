@@ -1,7 +1,28 @@
 {
   "name": "@anureo/adapter-acp",
-  "private": true,
+  "description": "Anureo SDK adapter for standard Agent Client Protocol (ACP) agents",
   "version": "0.2.0",
+  "license": "Apache-2.0",
+  "keywords": [
+    "anureo",
+    "ahp",
+    "harness",
+    "agent",
+    "acp",
+    "agent-client-protocol"
+  ],
+  "homepage": "https://github.com/hi-youichi/anureo-sdk#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
+    "directory": "packages/acp"
+  },
+  "bugs": {
+    "url": "https://github.com/hi-youichi/anureo-sdk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "exports": {
     ".": "./src/index.ts"

@@ -1,7 +1,28 @@
 {
   "name": "@anureo/adapter-claude",
-  "private": true,
+  "description": "Anureo SDK adapter for the official Claude Agent SDK",
   "version": "0.2.0",
+  "license": "Apache-2.0",
+  "keywords": [
+    "anureo",
+    "ahp",
+    "harness",
+    "agent",
+    "claude",
+    "anthropic"
+  ],
+  "homepage": "https://github.com/hi-youichi/anureo-sdk#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
+    "directory": "packages/claude"
+  },
+  "bugs": {
+    "url": "https://github.com/hi-youichi/anureo-sdk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "exports": {
     ".": "./src/index.ts",

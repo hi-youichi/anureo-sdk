@@ -1,7 +1,29 @@
 {
   "name": "@anureo/protocol",
-  "private": true,
+  "description": "Anureo Harness Protocol (AHP) v1: JSON Schema, generated TypeScript types, runtime validation, and version/capability negotiation",
   "version": "0.2.0",
+  "license": "Apache-2.0",
+  "keywords": [
+    "anureo",
+    "ahp",
+    "harness",
+    "agent",
+    "protocol",
+    "json-rpc",
+    "json-schema"
+  ],
+  "homepage": "https://github.com/hi-youichi/anureo-sdk#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
+    "directory": "packages/protocol"
+  },
+  "bugs": {
+    "url": "https://github.com/hi-youichi/anureo-sdk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "exports": {
     ".": "./src/index.ts",

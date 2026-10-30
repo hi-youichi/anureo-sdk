@@ -1,7 +1,28 @@
 {
   "name": "@anureo/conformance",
-  "private": true,
+  "description": "Shared conformance suite and scripted fixtures for Anureo SDK adapters and AHP implementations",
   "version": "0.2.0",
+  "license": "Apache-2.0",
+  "keywords": [
+    "anureo",
+    "ahp",
+    "harness",
+    "agent",
+    "conformance",
+    "testing"
+  ],
+  "homepage": "https://github.com/hi-youichi/anureo-sdk#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
+    "directory": "packages/conformance"
+  },
+  "bugs": {
+    "url": "https://github.com/hi-youichi/anureo-sdk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "exports": {
     ".": "./src/index.ts",

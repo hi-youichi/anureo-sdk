@@ -17,7 +17,7 @@ const npmCommand = resolveNpmCommand()
 const output = path.resolve(option('--out') ?? await mkdtemp(path.join(tmpdir(), 'anureo-harness-pack-')))
 await mkdir(output, { recursive: true })
 const work = await mkdtemp(path.join(tmpdir(), 'anureo-harness-stage-'))
-type Manifest = { name: string; version: string; exports: Record<string, string>; dependencies?: Record<string, string>; peerDependencies?: Record<string, string>; optionalDependencies?: Record<string, string>; engines?: Record<string, string> }
+type Manifest = { name: string; version: string; description: string; license: string; keywords?: string[]; homepage?: string; repository?: Record<string, string>; bugs?: Record<string, string>; publishConfig?: Record<string, string>; exports: Record<string, string>; dependencies?: Record<string, string>; peerDependencies?: Record<string, string>; optionalDependencies?: Record<string, string>; engines?: Record<string, string> }
 const manifests = new Map<string, Manifest>()
 for (const leaf of leaves) manifests.set(leaf, JSON.parse(await readFile(path.join(repository, 'packages', leaf, 'package.json'), 'utf8')) as Manifest)
 const internalVersions = new Map([...manifests.values()].map(manifest => [manifest.name, manifest.version]))
@@ -72,12 +72,14 @@ try {
       await mkdir(path.join(stage,'examples'),{recursive:true})
       await cp(path.join(repository,'scripts/harness-sdk/independent-examples/smoke.mjs'),path.join(stage,'examples/standalone.mjs'))
     }
-    const packed = { name: manifest.name, version: manifest.version, private: true, type: 'module', description: 'Anureo independent Harness SDK internal preview', exports, files: ['dist','schema','protocol','examples','README.md'],
+    for (const field of ['description','license','repository'] as const) if (!manifest[field]) throw new Error(`Missing npm metadata field ${field} in ${leaf}/package.json`)
+    const packed = { name: manifest.name, version: manifest.version, description: manifest.description, license: manifest.license, keywords: manifest.keywords, homepage: manifest.homepage, repository: manifest.repository, bugs: manifest.bugs, publishConfig: manifest.publishConfig, type: 'module', exports, files: ['dist','schema','protocol','examples','README.md','LICENSE'],
       dependencies: safeDependencyField(manifest.dependencies), peerDependencies: safeDependencyField(manifest.peerDependencies), optionalDependencies: safeDependencyField(manifest.optionalDependencies), engines: manifest.engines ?? { node: '>=22' } }
     const manifestText = JSON.stringify(packed,null,2)+'\n'
     if (/workspace:|file:\/\/|\/Users\/|[A-Z]:\\\\/.test(manifestText)) throw new Error(`Distributable manifest leaks local/workspace references: ${leaf}`)
     await writeFile(path.join(stage,'package.json'),manifestText)
-    await writeFile(path.join(stage,'README.md'),'# '+manifest.name+'\n\nInternal preview. See AHP v1 and the independent conformance examples. This tarball is not a public npm release.\n')
+    await cp(path.join(packageRoot,'README.md'),path.join(stage,'README.md'))
+    await cp(path.join(repository,'LICENSE'),path.join(stage,'LICENSE'))
     for (const filename of await walk(stage)) {
       const text = await readFile(filename,'utf8')
       if (text.includes(repository)) throw new Error(`Local source path leaked into ${leaf}/${path.relative(stage, filename)}`)

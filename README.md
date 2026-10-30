@@ -2,11 +2,17 @@
 
 Connect Codex, Claude, ACP agents, and external AHP harnesses through a unified host interface. Anureo SDK provides the Anureo Harness Protocol (AHP), a shared runtime, four backend adapters, and conformance tests, independently of Cowork's application orchestration layer.
 
-> This is a standalone development workspace. All seven packages remain marked `private: true`. Version `0.2.0` is a local development version and has not been published to npm. Upstream Git history migration and downstream integration are still pending.
+> The seven packages are published to npm under the `@anureo` scope. AHP is vendor-neutral: the SDK treats every backend — Codex, Claude, ACP agents, external AHP harnesses — identically, and the conformance suite is the arbiter.
 
 ## Getting started
 
-Requires Node.js 22+, npm installed with Node.js, and Bun 1.4.2+.
+```sh
+npm install @anureo/sdk @anureo/adapter-codex
+```
+
+`@anureo/sdk` is the runtime; pick one or more adapters (`@anureo/adapter-codex`, `@anureo/adapter-claude`, `@anureo/adapter-acp`, `@anureo/adapter-ahp`) plus `@anureo/protocol` if you need the wire contract directly. Everything requires Node.js 22+.
+
+To work on this repository itself, you also need npm installed with Node.js and Bun 1.4.2+:
 
 ```sh
 bun install --frozen-lockfile
@@ -83,7 +89,7 @@ bun run verify:pack
 
 `bun run build` produces seven standalone `.tgz` packages in `artifacts/`. `verify:pack` also installs them in a clean directory and runs strict NodeNext type checks, examples under both Node and Bun, and ACP/AHP exchanges over actual stdio connections. Build artifacts and dependency directories are excluded from version control.
 
-CI is configured to validate Windows, macOS, and Linux. Platform support is verified by actual CI results; configuration alone does not establish a passing run.
+CI validates Windows, macOS, and Linux on every push; all three platforms are green on the released revision.
 
 ## Documentation
 

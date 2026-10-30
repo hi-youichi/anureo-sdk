@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.20.0'
+          registry-url: https://registry.npmjs.org
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - run: bun install --frozen-lockfile
+      - run: bun run check:boundaries
+      - run: bun run generate:check
+      - run: bun run protocol:check
+      - run: bun run typecheck
+      - run: bun run typecheck:tooling
+      - run: bun test --timeout 15000 packages scripts/harness-sdk
+      - run: bun run example
+      - run: bun run verify:pack
+      - name: Publish packages in dependency order
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for leaf in protocol core conformance codex claude acp ahp; do
+            tarball=$(ls artifacts/anureo-$leaf-*.tgz)
+            echo "Publishing $tarball"
+            npm publish "$tarball" --access public --provenance
+          done

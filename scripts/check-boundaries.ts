@@ -5,12 +5,14 @@ import { distributableDependencies } from './harness-sdk/dependencies'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const leaves = ['protocol', 'core', 'conformance', 'codex', 'claude', 'acp', 'ahp']
-type Manifest = { name: string; version: string; private: boolean; dependencies?: Record<string, string>; devDependencies?: Record<string, string>; peerDependencies?: Record<string, string>; optionalDependencies?: Record<string, string> }
+type Manifest = { name: string; version: string; private?: boolean; description?: string; license?: string; repository?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string>; peerDependencies?: Record<string, string>; optionalDependencies?: Record<string, string> }
 const manifests = await Promise.all(leaves.map(async leaf => JSON.parse(await readFile(path.join(root, 'packages', leaf, 'package.json'), 'utf8')) as Manifest))
 const versions = new Map(manifests.map(manifest => [manifest.name, manifest.version]))
 if (versions.size !== leaves.length) throw new Error('SDK package names must be unique')
 for (const manifest of manifests) {
-  if (!manifest.name.startsWith('@anureo/') || manifest.private !== true) throw new Error(`Unexpected package boundary or publication state: ${manifest.name}`)
+  if (!manifest.name.startsWith('@anureo/')) throw new Error(`Unexpected package boundary: ${manifest.name}`)
+  if (manifest.private === true) throw new Error(`Package must not be private for publication: ${manifest.name}`)
+  for (const field of ['description', 'license', 'repository'] as const) if (!manifest[field]) throw new Error(`Missing npm metadata field ${field} on ${manifest.name}`)
   for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'] as const) {
     distributableDependencies(manifest[field], versions)
   }
