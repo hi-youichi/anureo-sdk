@@ -1,0 +1,23 @@
+{
+  "name": "@anureo/sdk",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./process": "./src/process.ts",
+    "./queue": "./src/queue.ts",
+    "./diagnostics": "./src/diagnostics.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --pretty false",
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@anureo/protocol": "workspace:*"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

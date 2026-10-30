@@ -1,0 +1,9 @@
+.anureo/
+node_modules/
+artifacts/
+dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example

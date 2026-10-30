@@ -1,0 +1,489 @@
+{
+  "revision": "5ecfe8305b2e3fc92763768e6dc460f344c475f3",
+  "importedAt": "2026-10-29",
+  "upstream": "cowork",
+  "mode": "working-tree snapshot; Git history migration pending",
+  "files": [
+    {
+      "source": "packages/harness-sdk/protocol/tsconfig.json",
+      "sha256": "3a09226d4b3556d8a0df4a6c93418870c03133c481ce2afdc402a92ece3833b4",
+      "target": "packages/protocol/tsconfig.json"
+    },
+    {
+      "source": "packages/harness-sdk/protocol/tests/protocol.test.ts",
+      "sha256": "4957fc9f544434929a138b2717cbf574791450118ad09fe4de3a19c76220ca01",
+      "target": "packages/protocol/tests/protocol.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/protocol/src/index.ts",
+      "sha256": "d0b7e5770960d8ebbbf50a034ca692aa4468cdf732b49369219c1553dd525334",
+      "target": "packages/protocol/src/index.ts"
+    },
+    {
+      "source": "packages/harness-sdk/chp/tsconfig.json",
+      "sha256": "04f86cb22748e0f2eb6fe450dfcbf825046cbc8f8051f5581bfb535c90a28a2e",
+      "target": "packages/ahp/tsconfig.json"
+    },
+    {
+      "source": "packages/harness-sdk/acp/tsconfig.json",
+      "sha256": "ff291c8aed6174ff7348b98a54549027ea1924cd5254c397bf557ba62a435967",
+      "target": "packages/acp/tsconfig.json"
+    },
+    {
+      "source": "packages/harness-sdk/chp/tests/chp.test.ts",
+      "sha256": "1d3e8cadebc2fdec5e4b4a5e3816130e5624ccdd45786d921a048a4fd49dc624",
+      "target": "packages/ahp/tests/ahp.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/protocol/src/generated/types.ts",
+      "sha256": "304d58be465246ce105a8539e27225914fc504ee0d38e481e7fc2e6ee15d6898",
+      "target": "packages/protocol/src/generated/types.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/tsconfig.json",
+      "sha256": "9f7c5a762ee0ac631db22f5265b639f2a3a5f1caa62119797d22086e6f6c1bea",
+      "target": "packages/conformance/tsconfig.json"
+    },
+    {
+      "source": "packages/harness-sdk/acp/package.json",
+      "sha256": "b3b134dda8be4c8e995a7467d35c175b3bcd23de61280ff75f750210ec7620db",
+      "target": "packages/acp/package.json"
+    },
+    {
+      "source": "packages/harness-sdk/protocol/package.json",
+      "sha256": "61b3269025359390b1d7ad23142ff5eee6227a18d6388a9e9b1208da313f8270",
+      "target": "packages/protocol/package.json"
+    },
+    {
+      "source": "packages/harness-sdk/chp/package.json",
+      "sha256": "ff324aaa917ebd67f912e024cfa70c3c3f02468ce23ebf1e20a0fb060830905d",
+      "target": "packages/ahp/package.json"
+    },
+    {
+      "source": "packages/harness-sdk/acp/tests/metadata.test.ts",
+      "sha256": "7c7901b7a49ff748fb2d6b8f7fdd652e4c6fbfff86e40416910f934171c07a65",
+      "target": "packages/acp/tests/metadata.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/acp/tests/file-changes.test.ts",
+      "sha256": "37a4badf3ca99c9d408eccd6faee9fd3f1b52f9e8646e6d7fa6f10ec0d6f9f6d",
+      "target": "packages/acp/tests/file-changes.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/acp/tests/conformance.test.ts",
+      "sha256": "1616bdd628b2d191e6a8746e60fdeb269d7a1a5d534004e68a326b88578700a8",
+      "target": "packages/acp/tests/conformance.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/acp/tests/adapter.test.ts",
+      "sha256": "d9784536c31e73ed890ff5305c1d6fd5f2eb31d88b5230be5fa3ff3e22a46f97",
+      "target": "packages/acp/tests/adapter.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/chp/src/index.ts",
+      "sha256": "8d14c1930b27c38a6bf4211e4a9998b2e33fd05ee3378fbbed9e0eb30c393ab3",
+      "target": "packages/ahp/src/index.ts"
+    },
+    {
+      "source": "packages/harness-sdk/protocol/scripts/generate.ts",
+      "sha256": "e4213f4c4d2672a8eeec06cafee3d1c42185411aef4c4581a3a691ee33d3a14b",
+      "target": "packages/protocol/scripts/generate.ts"
+    },
+    {
+      "source": "packages/harness-sdk/chp/src/wire.ts",
+      "sha256": "543da18ea51f369c9583cb5a9729414477a53d030246a1194c0cc0f5663cfc03",
+      "target": "packages/ahp/src/wire.ts"
+    },
+    {
+      "source": "packages/harness-sdk/chp/src/websocket.ts",
+      "sha256": "c90112ad2b99c5a899b9833cbbbb19dab78e9e636a2a77182aea592ecbe54959",
+      "target": "packages/ahp/src/websocket.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/package.json",
+      "sha256": "b16ed7034b919f560cd9c8a459c041a3c49608d143af7fcf073dcd5fc4710cf8",
+      "target": "packages/conformance/package.json"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/src/suite.ts",
+      "sha256": "bb72d9cf1f1b8e9ee9dd224df9d8245e832033de06ced14cf0a3356cf70dfe24",
+      "target": "packages/conformance/src/suite.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/src/suite.test.ts",
+      "sha256": "4d59c2e4f35964e02e8a69dd686953e081169976fde9a5c6a548e417d055ceb3",
+      "target": "packages/conformance/src/suite.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/src/runtime.test.ts",
+      "sha256": "c164c31ad3b9593df17ac70f13423e3fb35368ebfee62a8c0b0f9693eec9dade",
+      "target": "packages/conformance/src/runtime.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/src/index.ts",
+      "sha256": "f5ba069ec55569c79049af1c5475e05dac72123b08c06071957d938a6f6ee1c8",
+      "target": "packages/conformance/src/index.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/src/fixtures.ts",
+      "sha256": "107cb4dd39ea881fb8f53ada56eedc3c70167d94a18e2206adac89c0a511bbc0",
+      "target": "packages/conformance/src/fixtures.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/src/fake.ts",
+      "sha256": "8bb6317594f249d9108d1e3156abd66aeaa195a3ebc4117a151d9feb4af6f777",
+      "target": "packages/conformance/src/fake.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/src/fake-wire.test.ts",
+      "sha256": "62a456b2166127af6404b0263d21418a2f3353f2b0789c7250291e7038d69678",
+      "target": "packages/conformance/src/fake-wire.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/src/fake-claude.ts",
+      "sha256": "b4da9df39147a3ba0f8a5383447147fd59cd9880a9e48282c97337f5d6314ffc",
+      "target": "packages/conformance/src/fake-claude.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/examples/standalone.ts",
+      "sha256": "049559d2c27f403379edb205d7a6ecde439dab46fbe18761e89cc16fcca31210",
+      "target": "packages/conformance/examples/standalone.ts"
+    },
+    {
+      "source": "packages/harness-sdk/acp/src/mapping.ts",
+      "sha256": "15f9fcdedaad8c84059a39b71bc6a22c05bdf08b9f87ab5ebb48668956dc79e3",
+      "target": "packages/acp/src/mapping.ts"
+    },
+    {
+      "source": "packages/harness-sdk/acp/src/index.ts",
+      "sha256": "15e8dc5bfb719ff7c8f6fdd5918d7732494a5c1d0edbed52abf5d8042271b50a",
+      "target": "packages/acp/src/index.ts"
+    },
+    {
+      "source": "packages/harness-sdk/acp/src/file-changes.ts",
+      "sha256": "15866adf22a5257e407cc40200242e84c8ae5aeeb2afb184d33ef7cd7f360592",
+      "target": "packages/acp/src/file-changes.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/package.json",
+      "sha256": "c7fc7153016b62e4ca27c378de113608a754891639ed83222ca704aab7f17044",
+      "target": "packages/codex/package.json"
+    },
+    {
+      "source": "packages/harness-sdk/codex/tsconfig.json",
+      "sha256": "074225281d7a7f671a5a0777e0688dccd59de7cd26aa9dccb78779e669ead679",
+      "target": "packages/codex/tsconfig.json"
+    },
+    {
+      "source": "packages/harness-sdk/core/tsconfig.json",
+      "sha256": "8d35d13682fcaa3c9ab4c73f4f7414991c466b12a947f454a4c4f59c5ba417fd",
+      "target": "packages/core/tsconfig.json"
+    },
+    {
+      "source": "packages/harness-sdk/chp/examples/reference.ts",
+      "sha256": "5444ee551eb02740fe0fc91ca1b7d932615072807d091736012cf0345459dc50",
+      "target": "packages/ahp/examples/reference.ts"
+    },
+    {
+      "source": "packages/harness-sdk/claude/package.json",
+      "sha256": "4cc5b8e82b8df4995cb9454af9c909b289476e110158e6d05c75a3665190f61d",
+      "target": "packages/claude/package.json"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/scripts/fake-acp.ts",
+      "sha256": "e033d06eb62586d35626966502f924ea7bb443fc1c60b4dc35a7ef2132aa1e33",
+      "target": "packages/conformance/scripts/fake-acp.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/scripts/fake-acp.d.ts",
+      "sha256": "f761c91419d0a89422a0004ef1a92929dd4d2d5e5c16758654d8b0467d1998c6",
+      "target": "packages/conformance/scripts/fake-acp.d.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/scripts/fake-chp.d.ts",
+      "sha256": "f761c91419d0a89422a0004ef1a92929dd4d2d5e5c16758654d8b0467d1998c6",
+      "target": "packages/conformance/scripts/fake-ahp.d.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/package.json",
+      "sha256": "eabb810d17a7dd26a1c53d5f3103fdc20b689abd5b74fa444e1afdeab784ab65",
+      "target": "packages/core/package.json"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/scripts/fake-wire.ts",
+      "sha256": "8a6990f3ec293f868228615b78a08c1c36bbc56fbe8084c515bc11096fdb5370",
+      "target": "packages/conformance/scripts/fake-wire.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/scripts/fake-wire.d.ts",
+      "sha256": "8fe4a899c0b76907d8f8aed1fdab5f5d75a34ba6e0d1a13bf4bc6263e0d0d4c4",
+      "target": "packages/conformance/scripts/fake-wire.d.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/scripts/fake-codex.ts",
+      "sha256": "b397d5f1e899a97f007d326ea50f138f779f94a1ac091e367a4673e96455c9a4",
+      "target": "packages/conformance/scripts/fake-codex.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/scripts/fake-codex.d.ts",
+      "sha256": "f761c91419d0a89422a0004ef1a92929dd4d2d5e5c16758654d8b0467d1998c6",
+      "target": "packages/conformance/scripts/fake-codex.d.ts"
+    },
+    {
+      "source": "packages/harness-sdk/conformance/scripts/fake-chp.ts",
+      "sha256": "467a570ac8b969482ee627216fcab0603416ccaa6a6e09c3c72ee0c91adcde58",
+      "target": "packages/conformance/scripts/fake-ahp.ts"
+    },
+    {
+      "source": "packages/harness-sdk/claude/tsconfig.json",
+      "sha256": "dd89671804d2220af15442b2e2d12247f8740159611c1bd511ecbca15aead5a1",
+      "target": "packages/claude/tsconfig.json"
+    },
+    {
+      "source": "packages/harness-sdk/protocol/schema/v1/chp.schema.json",
+      "sha256": "fac2f083df83de9830873b0c1c2563c398e5a2e726f8887963305dfc3b969915",
+      "target": "packages/protocol/schema/v1/ahp.schema.json"
+    },
+    {
+      "source": "packages/harness-sdk/codex/tests/catalog.test.ts",
+      "sha256": "a971d203924e65c730541a8443101428d5bd621b1393aa97b6dca7e84d9112d4",
+      "target": "packages/codex/tests/catalog.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/tests/adapter.test.ts",
+      "sha256": "b2b23956458b72af31e52e8646fce062b1df36f58f3a1b1abb87eec9901e0b16",
+      "target": "packages/codex/tests/adapter.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/tests/conformance.test.ts",
+      "sha256": "4dafa3f9c0f7a4a0357d402ba34b9577371f78a95bbcbd336e73a7f5f57cc1f4",
+      "target": "packages/codex/tests/conformance.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/tests/fake-app-server.mjs",
+      "sha256": "5b7d8bae313c03737ae51a38682d494a1b90697f2f17f99d66f352c8e79896bc",
+      "target": "packages/codex/tests/fake-app-server.mjs"
+    },
+    {
+      "source": "packages/harness-sdk/codex/tests/jsonl.test.ts",
+      "sha256": "46ecb916cc555e1c57fac7426e4a79546d462169eac7a214f6d3bccc0e4dcee2",
+      "target": "packages/codex/tests/jsonl.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/tests/file-changes.test.ts",
+      "sha256": "1544383618cd47eb69f755920f1cba6728394a30ce17a33d9162e34fa6b18986",
+      "target": "packages/codex/tests/file-changes.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/scripts/smoke.ts",
+      "sha256": "864c57c4110c2cfe7f64fad56668b9e1ae2e6e34512c4e375586a5913dd894d8",
+      "target": "packages/codex/scripts/smoke.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/scripts/protocol-check.ts",
+      "sha256": "a8f86e531eb8188a1bd93e079749723314baa3e4daa0f130d76b44a643e91c14",
+      "target": "packages/codex/scripts/protocol-check.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/diagnostics.test.ts",
+      "sha256": "34218bc242dfad6b0763f6cfce0a00dcd4d37ffea1b8be812d72ed8242be0628",
+      "target": "packages/core/src/diagnostics.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/src/mapping.ts",
+      "sha256": "636bed10e44b75b1e18777aa6cd2404c7a434f8aff56cd03a418a2806bc5273a",
+      "target": "packages/codex/src/mapping.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/src/jsonl.ts",
+      "sha256": "d3eba9f4b79ff32bf45e9e83bf00ac81bd586689e7171331e1a90a0645bc997b",
+      "target": "packages/codex/src/jsonl.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/src/index.ts",
+      "sha256": "521de36d223af7cf754f7bf38340bd97b2757d168925d173a14e5b66addfef94",
+      "target": "packages/codex/src/index.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/src/file-changes.ts",
+      "sha256": "4b88230440c2f1485d4c0a00ef9dea36eb38f5f3c4d0d13da3bbf3613eeae0aa",
+      "target": "packages/codex/src/file-changes.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/src/catalog.ts",
+      "sha256": "d3e7cd8cb2b24abbe0a6f404d6677c43ca04d718b50648cbb3ecc7c74acab17f",
+      "target": "packages/codex/src/catalog.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/file-change-limits.test.ts",
+      "sha256": "ee49423fa00381d56d046b8aba5b55f886712ed211f05eeab927377f6cd51ed3",
+      "target": "packages/core/src/file-change-limits.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/errors.ts",
+      "sha256": "82f110d05004f31f9ff11725926f368d7fd4dbe7189f7b6cb0cff12844bbb5df",
+      "target": "packages/core/src/errors.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/diagnostics.ts",
+      "sha256": "d33d07e992908d6e2dba9d332b3efd2cef340fcb3875094038c7f717c8c1bab6",
+      "target": "packages/core/src/diagnostics.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/identity.test.ts",
+      "sha256": "501be3baa760fbaa50f3a7083ed626136dddf4dfa3ee784672ff311f08054088",
+      "target": "packages/core/src/identity.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/file-change-limits.ts",
+      "sha256": "d462ca0788733c2841a12d072051dbf81eff49a4e0e11d5d546307f8ce19e78e",
+      "target": "packages/core/src/file-change-limits.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/identity.ts",
+      "sha256": "b2491f4aeea66bd92576ffb520985cd9977b0d7f37e2e676962e98fdbbf5c1ed",
+      "target": "packages/core/src/identity.ts"
+    },
+    {
+      "source": "packages/harness-sdk/claude/src/catalog.test.ts",
+      "sha256": "ed78f495f3bacf08e97cdd4130a0f853137fe3832642bd721f5e765c4a4dbbb1",
+      "target": "packages/claude/src/catalog.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/claude/src/catalog.ts",
+      "sha256": "e792e9c32191416e6d1a602c48282edf9e0ba551e2ba037e2ac8092d0f9e7a4f",
+      "target": "packages/claude/src/catalog.ts"
+    },
+    {
+      "source": "packages/harness-sdk/claude/src/store.ts",
+      "sha256": "3846499d718cefd8b859a7da0a4c10bf5201e42b641a6b7dd4af571dfd77a98e",
+      "target": "packages/claude/src/store.ts"
+    },
+    {
+      "source": "packages/harness-sdk/claude/src/index.ts",
+      "sha256": "85ace5ad69ae735dce0b364d1a041677b5fb70a2ddb2130a1022fdc9273997d3",
+      "target": "packages/claude/src/index.ts"
+    },
+    {
+      "source": "packages/harness-sdk/claude/src/file-changes.ts",
+      "sha256": "997c12a6646ca8ba6e039999b8a8678b531c5b74ca63f71478f55e7e2db5bf26",
+      "target": "packages/claude/src/file-changes.ts"
+    },
+    {
+      "source": "packages/harness-sdk/claude/src/file-changes.test.ts",
+      "sha256": "098f9e3fd929bcc4a945c6edca567abcfa1890522350033dbbc0098bc516a1d8",
+      "target": "packages/claude/src/file-changes.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/claude/src/claude.test.ts",
+      "sha256": "4577f8e1b6fd38824154c260615b64611ff5887181b5f76c9ea811b8d3ba0351",
+      "target": "packages/claude/src/claude.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/ports.ts",
+      "sha256": "44d8bf18bdfcd42c6e2c8fdcb44572950a306dfbe9a00647ac4b956996b7f778",
+      "target": "packages/core/src/ports.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/interactions.ts",
+      "sha256": "2db923e69c70d83c52e59bedd1a484dad9c5d3d2a87c5cce6e1af71f64aa8a91",
+      "target": "packages/core/src/interactions.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/index.ts",
+      "sha256": "53448f0f2b78dc6d33ff07c5094b920ae48510a4a84480279e3a4bdac61756f4",
+      "target": "packages/core/src/index.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/process.test.ts",
+      "sha256": "90eb48f8d77147941b9b6f29d271c82e2f250e1c9cd00a80639b7306d72be8f9",
+      "target": "packages/core/src/process.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/process.ts",
+      "sha256": "6d0025ea06dcfde45135b2fd2361548cbd0ee798482c1a13fcca1fd2e8bf0bca",
+      "target": "packages/core/src/process.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/secrets.ts",
+      "sha256": "63b1b904b0b3349952bd01dc5072d6d061766025ab79536dc12b58004041b64d",
+      "target": "packages/core/src/secrets.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/runtime.ts",
+      "sha256": "53f59d65cb718fe4d6159214eb17d1e111b71d59517363ce11d94d0d80038d6f",
+      "target": "packages/core/src/runtime.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/queue.ts",
+      "sha256": "f338994e67f8d428ba4f7539fe42d2dfafdaa32ba6326cdf12535d70ede8e121",
+      "target": "packages/core/src/queue.ts"
+    },
+    {
+      "source": "packages/harness-sdk/core/src/queue.test.ts",
+      "sha256": "579e3f35fe053a47464543ff5f17dde037b11e1980a6b2cc98f04428e4eff931",
+      "target": "packages/core/src/queue.test.ts"
+    },
+    {
+      "source": "packages/harness-sdk/codex/protocol/0.164.0/provenance.json",
+      "sha256": "1f4f397431773971ad75d2135544ed655c9adc0878f3ce2be1d0d0c768c0df15",
+      "target": "packages/codex/protocol/0.164.0/provenance.json"
+    },
+    {
+      "source": "packages/harness-sdk/codex/protocol/0.164.0/native.schema.json",
+      "sha256": "a53a1030fc5729dfd6752bfef49d24b44b123ad017d77273e12f1c20b3550d72",
+      "target": "packages/codex/protocol/0.164.0/native.schema.json"
+    },
+    {
+      "source": "packages/harness-sdk/codex/protocol/0.148.0/provenance.json",
+      "sha256": "d91ff3dc49c8d0c64bf48707c2aff3bb22128fddf68133de27d4c23f2f81c0cf",
+      "target": "packages/codex/protocol/0.148.0/provenance.json"
+    },
+    {
+      "source": "packages/harness-sdk/codex/protocol/0.148.0/native.schema.json",
+      "sha256": "0341246a94f0632d9128af94afd4e978311dd9a406c607feae2489182fec622d",
+      "target": "packages/codex/protocol/0.148.0/native.schema.json"
+    },
+    {
+      "source": "scripts/harness-sdk/independent-examples/acp-agent.mjs",
+      "sha256": "60a15ab53e6793d7d5e141b5c184f9cded8c2c5601927a45fc73980b7ce9a816",
+      "target": "scripts/harness-sdk/independent-examples/acp-agent.mjs"
+    },
+    {
+      "source": "scripts/harness-sdk/independent-examples/smoke.mjs",
+      "sha256": "1d7c41c8fdbece2fedf8dd06b3dcf569a2e027138cd171992a319979ab9c0272",
+      "target": "scripts/harness-sdk/independent-examples/smoke.mjs"
+    },
+    {
+      "source": "scripts/harness-sdk/pack.ts",
+      "sha256": "e2cb0f0aa2efce40072223ea84fceef3eb6262fc8f1c3aad43c69aec6fd0ec66",
+      "target": "scripts/harness-sdk/pack.ts"
+    },
+    {
+      "source": "scripts/harness-sdk/npm-runner.ts",
+      "sha256": "b286754bd303e2059aee679afbe49b20ff0db0951dd712d6369d93b1ae76c0c3",
+      "target": "scripts/harness-sdk/npm-runner.ts"
+    },
+    {
+      "source": "scripts/harness-sdk/npm-runner.test.ts",
+      "sha256": "359d4dff73fc15ab73655209a6db76488c0f8c5c993b9b1848c28adae8e6b694",
+      "target": "scripts/harness-sdk/npm-runner.test.ts"
+    },
+    {
+      "source": "scripts/harness-sdk/fixtures/fake-acp.mjs",
+      "sha256": "70bd7d621f26b6214479d77abfe451d64da787ad172d56d0107712e26fe196ce",
+      "target": "scripts/harness-sdk/fixtures/fake-acp.mjs"
+    },
+    {
+      "source": "scripts/harness-sdk/fixtures/fake-claude.mjs",
+      "sha256": "de2961d936b2ff652d9c37722dc748b67c685554e24b22bda0f642ddf753593a",
+      "target": "scripts/harness-sdk/fixtures/fake-claude.mjs"
+    },
+    {
+      "source": "docs/harness-protocol.md",
+      "sha256": "c1e84cfc8b62825474e3dc880c2c685718be320393a22a11f543b53c6c3668de",
+      "target": "spec/ahp-v1.md"
+    }
+  ],
+  "scopedWorkingTreeClean": true
+}

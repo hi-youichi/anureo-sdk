@@ -1,0 +1,29 @@
+{
+  "name": "anureo-sdk-workspace",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.2",
+  "engines": { "node": ">=22", "bun": ">=1.4.2" },
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "check:boundaries": "bun scripts/check-boundaries.ts",
+    "generate": "bun run --filter @anureo/protocol generate",
+    "generate:check": "bun run --filter @anureo/protocol generate:check",
+    "protocol:check": "bun run --filter @anureo/adapter-codex protocol:check",
+    "typecheck": "bun run --filter '@anureo/*' typecheck",
+    "typecheck:tooling": "tsc --noEmit",
+    "test": "bun test --timeout 15000 packages scripts/harness-sdk",
+    "build": "bun scripts/harness-sdk/pack.ts --out artifacts",
+    "verify:pack": "bun scripts/harness-sdk/pack.ts --verify --out artifacts",
+    "example": "bun examples/standalone.ts"
+  },
+  "devDependencies": {
+    "@anureo/sdk": "workspace:*",
+    "@anureo/conformance": "workspace:*",
+    "@anureo/adapter-codex": "workspace:*",
+    "@types/bun": "1.4.0",
+    "@types/node": "22.15.3",
+    "typescript": "5.8.3"
+  }
+}

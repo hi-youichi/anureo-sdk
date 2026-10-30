@@ -1,0 +1,3983 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:anureo:ahp:v1",
+  "title": "AHP v1",
+  "description": "Anureo Harness Protocol v1: JSON Schema is the single source of protocol types.",
+  "$defs": {
+    "JsonValue": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JsonValue"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          }
+        }
+      ]
+    },
+    "JsonObject": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/JsonValue"
+      }
+    },
+    "JsonSchema": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/JsonObject"
+        }
+      ]
+    },
+    "InteractionKind": {
+      "enum": [
+        "approval",
+        "userInput",
+        "elicitation",
+        "dynamicTool"
+      ]
+    },
+    "RevertScope": {
+      "enum": [
+        "conversation",
+        "files",
+        "both"
+      ]
+    },
+    "Boundary": {
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "relation": {
+          "enum": [
+            "before",
+            "through"
+          ]
+        },
+        "nativeTurnId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "turnId",
+        "relation"
+      ],
+      "additionalProperties": true
+    },
+    "ExtensionDescriptor": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^x-[a-z0-9][a-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_/-]*$"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "additionalProperties": true
+    },
+    "ConfigOption": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "schema": {
+          "$ref": "#/$defs/JsonSchema"
+        },
+        "scope": {
+          "enum": [
+            "session",
+            "turn"
+          ]
+        },
+        "value": {
+          "$ref": "#/$defs/JsonValue"
+        }
+      },
+      "required": [
+        "id",
+        "schema",
+        "scope"
+      ],
+      "additionalProperties": true
+    },
+    "Capabilities": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": "object",
+          "properties": {
+            "resume": {
+              "type": "boolean"
+            },
+            "fork": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "before",
+                  "through"
+                ]
+              },
+              "uniqueItems": true
+            },
+            "revert": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/RevertScope"
+              },
+              "uniqueItems": true
+            },
+            "history": {
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "additionalProperties": true
+        },
+        "turn": {
+          "type": "object",
+          "properties": {
+            "steer": {
+              "type": "boolean"
+            },
+            "interrupt": {
+              "type": "boolean"
+            },
+            "outputSchema": {
+              "type": "boolean"
+            },
+            "overrides": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "inputModalities": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "text",
+                  "image",
+                  "file"
+                ]
+              }
+            }
+          },
+          "required": [],
+          "additionalProperties": true
+        },
+        "goal": {
+          "type": "object",
+          "properties": {
+            "actions": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "set",
+                  "clear"
+                ]
+              },
+              "uniqueItems": true
+            }
+          },
+          "required": [],
+          "additionalProperties": true
+        },
+        "review": {
+          "type": "boolean"
+        },
+        "compact": {
+          "type": "boolean"
+        },
+        "subagents": {
+          "type": "object",
+          "properties": {
+            "events": {
+              "enum": [
+                "nested",
+                "none"
+              ]
+            }
+          },
+          "required": [
+            "events"
+          ],
+          "additionalProperties": true
+        },
+        "mcp": {
+          "type": "object",
+          "properties": {
+            "stdio": {
+              "type": "boolean"
+            },
+            "http": {
+              "type": "boolean"
+            },
+            "elicitation": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "form",
+                  "url"
+                ]
+              }
+            }
+          },
+          "required": [],
+          "additionalProperties": true
+        },
+        "interactions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InteractionKind"
+          },
+          "uniqueItems": true
+        },
+        "config": {
+          "type": "object",
+          "properties": {
+            "options": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ConfigOption"
+              }
+            }
+          },
+          "required": [
+            "options"
+          ],
+          "additionalProperties": true
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExtensionDescriptor"
+          }
+        }
+      },
+      "required": [],
+      "additionalProperties": true
+    },
+    "ClientInfo": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "additionalProperties": true
+    },
+    "RuntimeInfo": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "adapter": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "adapter"
+      ],
+      "additionalProperties": true
+    },
+    "InitializeParams": {
+      "type": "object",
+      "properties": {
+        "protocolVersions": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "clientInfo": {
+          "$ref": "#/$defs/ClientInfo"
+        },
+        "clientCapabilities": {
+          "$ref": "#/$defs/Capabilities"
+        }
+      },
+      "required": [
+        "protocolVersions",
+        "clientInfo"
+      ],
+      "additionalProperties": true
+    },
+    "InitializeResult": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "runtime": {
+          "$ref": "#/$defs/RuntimeInfo"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/Capabilities"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "runtime",
+        "capabilities"
+      ],
+      "additionalProperties": true
+    },
+    "NativeRef": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "provider",
+        "value"
+      ],
+      "additionalProperties": true
+    },
+    "SessionBinding": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "adapterId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runtimeConfigId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nativeRef": {
+          "$ref": "#/$defs/NativeRef"
+        }
+      },
+      "required": [
+        "sessionId",
+        "adapterId",
+        "runtimeConfigId"
+      ],
+      "additionalProperties": true
+    },
+    "HarnessError": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "outcomeUnknown": {
+          "type": "boolean"
+        },
+        "details": {
+          "$ref": "#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable",
+        "outcomeUnknown"
+      ],
+      "additionalProperties": true
+    },
+    "Usage": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "enum": [
+            "turn",
+            "session"
+          ]
+        },
+        "source": {
+          "const": "native"
+        },
+        "input": {
+          "type": "number",
+          "minimum": 0
+        },
+        "output": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cacheRead": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cacheWrite": {
+          "type": "number",
+          "minimum": 0
+        },
+        "total": {
+          "type": "number",
+          "minimum": 0
+        },
+        "contextWindow": {
+          "type": "number",
+          "minimum": 0
+        },
+        "contextUsed": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "provider",
+        "scope",
+        "source"
+      ],
+      "additionalProperties": true
+    },
+    "TextBlock": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "text"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "text"
+      ],
+      "additionalProperties": true
+    },
+    "ImageBlock": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "image"
+        },
+        "url": {
+          "type": "string"
+        },
+        "data": {
+          "type": "string"
+        },
+        "mimeType": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": true,
+      "anyOf": [
+        {
+          "required": [
+            "url"
+          ]
+        },
+        {
+          "required": [
+            "data",
+            "mimeType"
+          ]
+        }
+      ]
+    },
+    "FileBlock": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "file"
+        },
+        "uri": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string"
+        },
+        "mimeType": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "uri"
+      ],
+      "additionalProperties": true
+    },
+    "InputBlock": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TextBlock"
+        },
+        {
+          "$ref": "#/$defs/ImageBlock"
+        },
+        {
+          "$ref": "#/$defs/FileBlock"
+        }
+      ]
+    },
+    "McpServer": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "stdio"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "command": {
+              "type": "string",
+              "minLength": 1
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "env": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "command"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "http"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "url"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "SessionState": {
+      "type": "object",
+      "properties": {
+        "binding": {
+          "$ref": "#/$defs/SessionBinding"
+        },
+        "status": {
+          "enum": [
+            "opening",
+            "ready",
+            "running",
+            "closed",
+            "recoveryRequired"
+          ]
+        },
+        "config": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/Capabilities"
+        },
+        "capabilityRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "activeTurnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string"
+        },
+        "goal": {
+          "$ref": "#/$defs/GoalState"
+        },
+        "fastMode": {
+          "type": "object",
+          "description": "Native fast-mode outcome: the requested setting may be on while the runtime reports it off, with a reason.",
+          "properties": {
+            "state": {
+              "type": "string",
+              "enum": [
+                "off",
+                "cooldown",
+                "on"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "additionalProperties": false
+        },
+        "metadata": {
+          "$ref": "#/$defs/SessionMetadata"
+        }
+      },
+      "required": [
+        "binding",
+        "status",
+        "config",
+        "capabilities",
+        "capabilityRevision"
+      ],
+      "additionalProperties": true
+    },
+    "SessionOpenParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mode": {
+          "enum": [
+            "new",
+            "resume",
+            "fork"
+          ]
+        },
+        "binding": {
+          "$ref": "#/$defs/SessionBinding"
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string"
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "mcpServers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/McpServer"
+          }
+        },
+        "permissionMode": {
+          "type": "string"
+        },
+        "config": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "fork": {
+          "type": "object",
+          "properties": {
+            "sourceSessionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "nativeRef": {
+              "$ref": "#/$defs/NativeRef"
+            },
+            "boundary": {
+              "$ref": "#/$defs/Boundary"
+            }
+          },
+          "required": [
+            "sourceSessionId",
+            "boundary"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "requestId",
+        "mode",
+        "binding",
+        "cwd"
+      ],
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "resume"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "binding": {
+                "required": [
+                  "nativeRef"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "fork"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "fork"
+            ]
+          }
+        }
+      ]
+    },
+    "SessionOpenResult": {
+      "type": "object",
+      "properties": {
+        "binding": {
+          "$ref": "#/$defs/SessionBinding"
+        },
+        "streamId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "$ref": "#/$defs/SessionState"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/Capabilities"
+        }
+      },
+      "required": [
+        "binding",
+        "streamId",
+        "state",
+        "capabilities"
+      ],
+      "additionalProperties": true
+    },
+    "SessionCloseParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId"
+      ],
+      "additionalProperties": true
+    },
+    "SessionCloseResult": {
+      "type": "object",
+      "properties": {
+        "closed": {
+          "const": true
+        }
+      },
+      "required": [
+        "closed"
+      ],
+      "additionalProperties": true
+    },
+    "SessionConfigParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "patch": {
+          "$ref": "#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId",
+        "patch"
+      ],
+      "additionalProperties": true
+    },
+    "SessionRevertParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "boundary": {
+          "$ref": "#/$defs/Boundary"
+        },
+        "scope": {
+          "$ref": "#/$defs/RevertScope"
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId",
+        "boundary",
+        "scope"
+      ],
+      "additionalProperties": true
+    },
+    "RevertResult": {
+      "type": "object",
+      "properties": {
+        "appliedScope": {
+          "$ref": "#/$defs/RevertScope"
+        },
+        "boundary": {
+          "$ref": "#/$defs/Boundary"
+        },
+        "nativeRef": {
+          "$ref": "#/$defs/NativeRef"
+        }
+      },
+      "required": [
+        "appliedScope",
+        "boundary"
+      ],
+      "additionalProperties": true
+    },
+    "HistoryReadParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "snapshotToken": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId"
+      ],
+      "additionalProperties": true
+    },
+    "HistoryItem": {
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "item": {
+          "$ref": "#/$defs/Item"
+        },
+        "nativeTurnId": {
+          "type": "string"
+        },
+        "nativeItemId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turnId",
+        "item"
+      ],
+      "additionalProperties": true
+    },
+    "HistoryPage": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HistoryItem"
+          }
+        },
+        "nextCursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "snapshotToken": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/NativeRef"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "additionalProperties": true
+    },
+    "TurnStartParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InputBlock"
+          },
+          "minItems": 1
+        },
+        "overrides": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "outputSchema": {
+          "$ref": "#/$defs/JsonSchema"
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId",
+        "turnId",
+        "input"
+      ],
+      "additionalProperties": true
+    },
+    "TurnStartResult": {
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "accepted": {
+          "const": true
+        }
+      },
+      "required": [
+        "turnId",
+        "accepted"
+      ],
+      "additionalProperties": true
+    },
+    "TurnSteerParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedTurnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InputBlock"
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId",
+        "expectedTurnId",
+        "input"
+      ],
+      "additionalProperties": true
+    },
+    "TurnSteerResult": {
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "accepted": {
+          "const": true
+        }
+      },
+      "required": [
+        "turnId"
+      ],
+      "additionalProperties": true
+    },
+    "TurnInterruptParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId",
+        "turnId"
+      ],
+      "additionalProperties": true
+    },
+    "TurnInterruptResult": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "const": true
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "additionalProperties": true
+    },
+    "GoalState": {
+      "type": "object",
+      "properties": {
+        "goal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonObject"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "enum": [
+            "active",
+            "cleared"
+          ]
+        }
+      },
+      "required": [
+        "goal"
+      ],
+      "additionalProperties": true
+    },
+    "GoalSetParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "goal": {
+          "$ref": "#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId",
+        "goal"
+      ],
+      "additionalProperties": true
+    },
+    "GoalClearParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId"
+      ],
+      "additionalProperties": true
+    },
+    "CompactStartParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId"
+      ],
+      "additionalProperties": true
+    },
+    "MaintenanceResult": {
+      "type": "object",
+      "properties": {
+        "maintenanceId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "accepted",
+            "completed"
+          ]
+        }
+      },
+      "required": [
+        "maintenanceId",
+        "status"
+      ],
+      "additionalProperties": true
+    },
+    "ReviewStartParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "$ref": "#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId",
+        "turnId",
+        "target"
+      ],
+      "additionalProperties": true
+    },
+    "UserMessageItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "declined",
+            "interrupted"
+          ]
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "durationMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "parentItemId": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "type": {
+          "const": "userMessage"
+        },
+        "content": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InputBlock"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "content"
+      ],
+      "additionalProperties": true
+    },
+    "AgentMessageItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "declined",
+            "interrupted"
+          ]
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "durationMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "parentItemId": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "type": {
+          "const": "agentMessage"
+        },
+        "text": {
+          "type": "string"
+        },
+        "phase": {
+          "enum": [
+            "commentary",
+            "final"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "text"
+      ],
+      "additionalProperties": true
+    },
+    "ReasoningItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "declined",
+            "interrupted"
+          ]
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "durationMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "parentItemId": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "type": {
+          "const": "reasoning"
+        },
+        "text": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type"
+      ],
+      "additionalProperties": true
+    },
+    "PlanItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "declined",
+            "interrupted"
+          ]
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "durationMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "parentItemId": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "type": {
+          "const": "plan"
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "text": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "inProgress",
+                  "completed"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "text",
+              "status"
+            ],
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "steps"
+      ],
+      "additionalProperties": true
+    },
+    "ToolCallItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "declined",
+            "interrupted"
+          ]
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "durationMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "parentItemId": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "type": {
+          "const": "toolCall"
+        },
+        "kind": {
+          "enum": [
+            "command",
+            "fileChange",
+            "mcp",
+            "dynamic",
+            "web",
+            "image",
+            "other"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "input": {
+          "$ref": "#/$defs/JsonValue"
+        },
+        "output": {
+          "$ref": "#/$defs/JsonValue"
+        },
+        "locations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "nativeType": {
+          "type": "string"
+        },
+        "raw": {
+          "$ref": "#/$defs/JsonValue"
+        },
+        "fileChanges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FileChange"
+          }
+        },
+        "image": {
+          "$ref": "#/$defs/ToolImageOutput"
+        },
+        "mcp": {
+          "type": "object",
+          "properties": {
+            "server": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "server",
+            "tool"
+          ],
+          "additionalProperties": false
+        },
+        "toolName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "kind",
+        "title"
+      ],
+      "additionalProperties": true
+    },
+    "SubagentItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "declined",
+            "interrupted"
+          ]
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "durationMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "parentItemId": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "type": {
+          "const": "subagent"
+        },
+        "subagentId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "running",
+            "completed",
+            "failed",
+            "interrupted"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        },
+        "nativeRef": {
+          "$ref": "#/$defs/NativeRef"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "subagentId",
+        "state"
+      ],
+      "additionalProperties": true
+    },
+    "ReviewItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "declined",
+            "interrupted"
+          ]
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "durationMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "parentItemId": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "type": {
+          "const": "review"
+        },
+        "state": {
+          "enum": [
+            "entered",
+            "exited"
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "state"
+      ],
+      "additionalProperties": true
+    },
+    "CompactionItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "declined",
+            "interrupted"
+          ]
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "durationMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "parentItemId": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "type": {
+          "const": "compaction"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "trigger": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type"
+      ],
+      "additionalProperties": true
+    },
+    "HookItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "declined",
+            "interrupted"
+          ]
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "durationMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "parentItemId": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "type": {
+          "const": "hook"
+        },
+        "name": {
+          "type": "string"
+        },
+        "input": {
+          "$ref": "#/$defs/JsonValue"
+        },
+        "output": {
+          "$ref": "#/$defs/JsonValue"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "name"
+      ],
+      "additionalProperties": true
+    },
+    "NoticeItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "declined",
+            "interrupted"
+          ]
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "durationMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "parentItemId": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "type": {
+          "const": "notice"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "warning",
+            "error"
+          ]
+        },
+        "code": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "severity",
+        "text"
+      ],
+      "additionalProperties": true
+    },
+    "Item": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/UserMessageItem"
+        },
+        {
+          "$ref": "#/$defs/AgentMessageItem"
+        },
+        {
+          "$ref": "#/$defs/ReasoningItem"
+        },
+        {
+          "$ref": "#/$defs/PlanItem"
+        },
+        {
+          "$ref": "#/$defs/ToolCallItem"
+        },
+        {
+          "$ref": "#/$defs/SubagentItem"
+        },
+        {
+          "$ref": "#/$defs/ReviewItem"
+        },
+        {
+          "$ref": "#/$defs/CompactionItem"
+        },
+        {
+          "$ref": "#/$defs/HookItem"
+        },
+        {
+          "$ref": "#/$defs/NoticeItem"
+        }
+      ]
+    },
+    "ApprovalOption": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string"
+        },
+        "semantic": {
+          "enum": [
+            "allowOnce",
+            "allowSession",
+            "deny",
+            "allowWithRule",
+            "cancel"
+          ]
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ],
+      "additionalProperties": true
+    },
+    "UserQuestion": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "label": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "label"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "secret": {
+          "type": "boolean"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "prompt"
+      ],
+      "additionalProperties": true
+    },
+    "ApprovalInteraction": {
+      "type": "object",
+      "properties": {
+        "interactionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "privatePayload": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "privatePayloadAvailable": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "approval"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ApprovalOption"
+          },
+          "minItems": 1
+        },
+        "input": {
+          "$ref": "#/$defs/JsonValue"
+        }
+      },
+      "required": [
+        "interactionId",
+        "kind",
+        "options"
+      ],
+      "additionalProperties": true
+    },
+    "UserInputInteraction": {
+      "type": "object",
+      "properties": {
+        "interactionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "privatePayload": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "privatePayloadAvailable": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "userInput"
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UserQuestion"
+          },
+          "minItems": 1
+        },
+        "schema": {
+          "$ref": "#/$defs/JsonSchema"
+        }
+      },
+      "required": [
+        "interactionId",
+        "kind",
+        "questions"
+      ],
+      "additionalProperties": true
+    },
+    "ElicitationInteraction": {
+      "type": "object",
+      "properties": {
+        "interactionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "privatePayload": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "privatePayloadAvailable": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "elicitation"
+        },
+        "mode": {
+          "enum": [
+            "form",
+            "url"
+          ]
+        },
+        "schema": {
+          "$ref": "#/$defs/JsonSchema"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "interactionId",
+        "kind",
+        "mode"
+      ],
+      "additionalProperties": true
+    },
+    "DynamicToolInteraction": {
+      "type": "object",
+      "properties": {
+        "interactionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "privatePayload": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "privatePayloadAvailable": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "dynamicTool"
+        },
+        "toolName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "arguments": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "schema": {
+          "$ref": "#/$defs/JsonSchema"
+        }
+      },
+      "required": [
+        "interactionId",
+        "kind",
+        "toolName",
+        "arguments"
+      ],
+      "additionalProperties": true
+    },
+    "InteractionRequested": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ApprovalInteraction"
+        },
+        {
+          "$ref": "#/$defs/UserInputInteraction"
+        },
+        {
+          "$ref": "#/$defs/ElicitationInteraction"
+        },
+        {
+          "$ref": "#/$defs/DynamicToolInteraction"
+        }
+      ]
+    },
+    "InteractionResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "approval"
+            },
+            "optionId": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "kind",
+            "optionId"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "userInput"
+            },
+            "answers": {
+              "$ref": "#/$defs/JsonObject"
+            }
+          },
+          "required": [
+            "kind",
+            "answers"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "elicitation"
+            },
+            "action": {
+              "enum": [
+                "accept",
+                "decline",
+                "cancel"
+              ]
+            },
+            "content": {
+              "$ref": "#/$defs/JsonObject"
+            }
+          },
+          "required": [
+            "kind",
+            "action"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "dynamicTool"
+            },
+            "content": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/InputBlock"
+              }
+            },
+            "isError": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "content"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "InteractionRespondParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "interactionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "response": {
+          "$ref": "#/$defs/InteractionResponse"
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId",
+        "interactionId",
+        "response"
+      ],
+      "additionalProperties": true
+    },
+    "InteractionCancelParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "interactionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId",
+        "interactionId"
+      ],
+      "additionalProperties": true
+    },
+    "InteractionOutcome": {
+      "enum": [
+        "responded",
+        "cancelled",
+        "expired",
+        "unknown"
+      ]
+    },
+    "InteractionResult": {
+      "type": "object",
+      "properties": {
+        "interactionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "$ref": "#/$defs/InteractionOutcome"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "interactionId",
+        "outcome"
+      ],
+      "additionalProperties": true
+    },
+    "SessionStateEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "session/state"
+        },
+        "payload": {
+          "$ref": "#/$defs/SessionState"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "TurnStartedEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "turn/started"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "turnId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "nativeTurnId": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "turnId"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "TurnCompletedEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "turn/completed"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "turnId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "status": {
+              "enum": [
+                "completed",
+                "interrupted",
+                "failed"
+              ]
+            },
+            "error": {
+              "$ref": "#/$defs/HarnessError"
+            },
+            "usage": {
+              "$ref": "#/$defs/Usage"
+            }
+          },
+          "required": [
+            "turnId",
+            "status"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "ItemStartedEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "item/started"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "$ref": "#/$defs/Item"
+            }
+          },
+          "required": [
+            "item"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "ItemDeltaEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "item/delta"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "itemId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "kind": {
+              "enum": [
+                "text",
+                "reasoningSummary",
+                "output",
+                "patch"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/JsonValue"
+            }
+          },
+          "required": [
+            "itemId",
+            "kind"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "ItemCompletedEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "item/completed"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "$ref": "#/$defs/Item"
+            }
+          },
+          "required": [
+            "item"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "UsageUpdatedEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "usage/updated"
+        },
+        "payload": {
+          "$ref": "#/$defs/Usage"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "InteractionRequestedEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "interaction/requested"
+        },
+        "payload": {
+          "$ref": "#/$defs/InteractionRequested"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "InteractionResolvedEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "interaction/resolved"
+        },
+        "payload": {
+          "$ref": "#/$defs/InteractionResult"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "NoticeEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "notice"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "severity": {
+              "enum": [
+                "info",
+                "warning",
+                "error"
+              ]
+            },
+            "code": {
+              "type": "string",
+              "minLength": 1
+            },
+            "message": {
+              "type": "string"
+            },
+            "raw": {
+              "$ref": "#/$defs/JsonValue"
+            }
+          },
+          "required": [
+            "severity",
+            "code",
+            "message"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "ExtensionEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "extension"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^x-[a-z0-9][a-z0-9-]*/.+$"
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1
+            },
+            "method": {
+              "type": "string"
+            },
+            "data": {
+              "$ref": "#/$defs/JsonValue"
+            }
+          },
+          "required": [
+            "name",
+            "version",
+            "data"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "AhpEventPayload": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SessionStateEvent"
+        },
+        {
+          "$ref": "#/$defs/SessionMetadataEvent"
+        },
+        {
+          "$ref": "#/$defs/TurnStartedEvent"
+        },
+        {
+          "$ref": "#/$defs/TurnCompletedEvent"
+        },
+        {
+          "$ref": "#/$defs/ItemStartedEvent"
+        },
+        {
+          "$ref": "#/$defs/ItemDeltaEvent"
+        },
+        {
+          "$ref": "#/$defs/ItemCompletedEvent"
+        },
+        {
+          "$ref": "#/$defs/UsageUpdatedEvent"
+        },
+        {
+          "$ref": "#/$defs/InteractionRequestedEvent"
+        },
+        {
+          "$ref": "#/$defs/InteractionResolvedEvent"
+        },
+        {
+          "$ref": "#/$defs/NoticeEvent"
+        },
+        {
+          "$ref": "#/$defs/ExtensionEvent"
+        }
+      ]
+    },
+    "SourceEnvelope": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "streamId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "timestamp": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "itemId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId",
+        "streamId",
+        "seq",
+        "timestamp"
+      ],
+      "additionalProperties": true
+    },
+    "AhpEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/SourceEnvelope"
+        },
+        {
+          "$ref": "#/$defs/AhpEventPayload"
+        }
+      ]
+    },
+    "RpcId": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "integer"
+        }
+      ]
+    },
+    "RpcError": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer"
+        },
+        "message": {
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/HarnessError"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "InitializeRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "initialize"
+        },
+        "params": {
+          "$ref": "#/$defs/InitializeParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "SessionOpenRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "session/open"
+        },
+        "params": {
+          "$ref": "#/$defs/SessionOpenParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "SessionCloseRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "session/close"
+        },
+        "params": {
+          "$ref": "#/$defs/SessionCloseParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "SessionConfigRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "session/config/set"
+        },
+        "params": {
+          "$ref": "#/$defs/SessionConfigParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "SessionRevertRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "session/revert"
+        },
+        "params": {
+          "$ref": "#/$defs/SessionRevertParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "HistoryReadRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "history/read"
+        },
+        "params": {
+          "$ref": "#/$defs/HistoryReadParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "TurnStartRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "turn/start"
+        },
+        "params": {
+          "$ref": "#/$defs/TurnStartParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "TurnSteerRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "turn/steer"
+        },
+        "params": {
+          "$ref": "#/$defs/TurnSteerParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "TurnInterruptRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "turn/interrupt"
+        },
+        "params": {
+          "$ref": "#/$defs/TurnInterruptParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "InteractionRespondRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "interaction/respond"
+        },
+        "params": {
+          "$ref": "#/$defs/InteractionRespondParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "InteractionCancelRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "interaction/cancel"
+        },
+        "params": {
+          "$ref": "#/$defs/InteractionCancelParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "GoalSetRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "goal/set"
+        },
+        "params": {
+          "$ref": "#/$defs/GoalSetParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "GoalClearRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "goal/clear"
+        },
+        "params": {
+          "$ref": "#/$defs/GoalClearParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "CompactStartRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "compact/start"
+        },
+        "params": {
+          "$ref": "#/$defs/CompactStartParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "ReviewStartRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "review/start"
+        },
+        "params": {
+          "$ref": "#/$defs/ReviewStartParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "AhpRpcRequest": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/InitializeRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/SessionOpenRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/SessionCloseRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/SessionConfigRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/SessionRevertRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/HistoryReadRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/TurnStartRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/TurnSteerRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/TurnInterruptRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/InteractionRespondRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/InteractionCancelRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/GoalSetRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/GoalClearRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/CompactStartRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/ReviewStartRpcRequest"
+        }
+      ]
+    },
+    "AhpRpcSuccess": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GoalState"
+            },
+            {
+              "$ref": "#/$defs/HistoryPage"
+            },
+            {
+              "$ref": "#/$defs/InitializeResult"
+            },
+            {
+              "$ref": "#/$defs/InteractionResult"
+            },
+            {
+              "$ref": "#/$defs/MaintenanceResult"
+            },
+            {
+              "$ref": "#/$defs/RevertResult"
+            },
+            {
+              "$ref": "#/$defs/SessionCloseResult"
+            },
+            {
+              "$ref": "#/$defs/SessionOpenResult"
+            },
+            {
+              "$ref": "#/$defs/SessionState"
+            },
+            {
+              "$ref": "#/$defs/TurnInterruptResult"
+            },
+            {
+              "$ref": "#/$defs/TurnStartResult"
+            },
+            {
+              "$ref": "#/$defs/TurnSteerResult"
+            }
+          ]
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "AhpRpcFailure": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RpcId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    "AhpRpcResponse": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/AhpRpcSuccess"
+        },
+        {
+          "$ref": "#/$defs/AhpRpcFailure"
+        }
+      ]
+    },
+    "InitializedNotification": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "initialized"
+        },
+        "params": {
+          "type": "object",
+          "properties": {},
+          "required": [],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method"
+      ],
+      "additionalProperties": false
+    },
+    "AhpEventNotification": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "session/state"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/SessionStateEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "session/metadata"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/SessionMetadataEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "turn/started"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/TurnStartedEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "turn/completed"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/TurnCompletedEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "item/started"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/ItemStartedEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "item/delta"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/ItemDeltaEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "item/completed"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/ItemCompletedEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "usage/updated"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/UsageUpdatedEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "interaction/requested"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/InteractionRequestedEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "interaction/resolved"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/InteractionResolvedEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "notice"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/NoticeEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "extension"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/ExtensionEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "AhpRpcNotification": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/InitializedNotification"
+        },
+        {
+          "$ref": "#/$defs/AhpEventNotification"
+        }
+      ]
+    },
+    "AhpRpcMessage": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/AhpRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/AhpRpcResponse"
+        },
+        {
+          "$ref": "#/$defs/AhpRpcNotification"
+        }
+      ]
+    },
+    "FileChangeMaterial": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "format": {
+              "const": "unified"
+            },
+            "patch": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "format",
+            "patch"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "format": {
+              "const": "text"
+            },
+            "scope": {
+              "enum": [
+                "file",
+                "fragment"
+              ]
+            },
+            "oldText": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "newText": {
+              "type": "string"
+            },
+            "oldStartLine": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "newStartLine": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "format",
+            "scope",
+            "oldText",
+            "newText"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "format": {
+              "const": "unavailable"
+            },
+            "reason": {
+              "enum": [
+                "notProvided",
+                "binary",
+                "tooLarge",
+                "unsupported"
+              ]
+            }
+          },
+          "required": [
+            "format",
+            "reason"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FileChange": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "oldPath": {
+          "type": "string"
+        },
+        "operation": {
+          "enum": [
+            "add",
+            "modify",
+            "delete",
+            "rename",
+            "unknown"
+          ]
+        },
+        "materials": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FileChangeMaterial"
+          }
+        },
+        "completeness": {
+          "enum": [
+            "complete",
+            "partial"
+          ]
+        },
+        "stats": {
+          "type": "object",
+          "properties": {
+            "added": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "removed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "accuracy": {
+              "enum": [
+                "exact",
+                "partial"
+              ]
+            }
+          },
+          "required": [
+            "added",
+            "removed",
+            "accuracy"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "materials",
+        "completeness"
+      ],
+      "additionalProperties": false
+    },
+    "ToolImageOutput": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "generated",
+            "view"
+          ]
+        },
+        "data": {
+          "type": "string",
+          "maxLength": 29360128
+        },
+        "mimeType": {
+          "enum": [
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "fileId": {
+          "type": "string"
+        },
+        "revisedPrompt": {
+          "type": "string"
+        },
+        "blob": {
+          "type": "object",
+          "properties": {
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "mimeType": {
+              "enum": [
+                "image/png",
+                "image/jpeg",
+                "image/webp",
+                "image/gif"
+              ]
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "sha256",
+            "mimeType",
+            "bytes"
+          ],
+          "additionalProperties": false
+        },
+        "unavailable": {
+          "enum": [
+            "notProvided",
+            "unsupportedType",
+            "storageFailed",
+            "pathForbidden"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false
+    },
+    "SessionMetadata": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "SessionMetadataEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "session/metadata"
+        },
+        "payload": {
+          "$ref": "#/$defs/SessionMetadata"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "x-methods": {
+    "initialize": [
+      "InitializeParams",
+      "InitializeResult"
+    ],
+    "session/open": [
+      "SessionOpenParams",
+      "SessionOpenResult"
+    ],
+    "session/close": [
+      "SessionCloseParams",
+      "SessionCloseResult"
+    ],
+    "session/config/set": [
+      "SessionConfigParams",
+      "SessionState"
+    ],
+    "session/revert": [
+      "SessionRevertParams",
+      "RevertResult"
+    ],
+    "history/read": [
+      "HistoryReadParams",
+      "HistoryPage"
+    ],
+    "turn/start": [
+      "TurnStartParams",
+      "TurnStartResult"
+    ],
+    "turn/steer": [
+      "TurnSteerParams",
+      "TurnSteerResult"
+    ],
+    "turn/interrupt": [
+      "TurnInterruptParams",
+      "TurnInterruptResult"
+    ],
+    "interaction/respond": [
+      "InteractionRespondParams",
+      "InteractionResult"
+    ],
+    "interaction/cancel": [
+      "InteractionCancelParams",
+      "InteractionResult"
+    ],
+    "goal/set": [
+      "GoalSetParams",
+      "GoalState"
+    ],
+    "goal/clear": [
+      "GoalClearParams",
+      "GoalState"
+    ],
+    "compact/start": [
+      "CompactStartParams",
+      "MaintenanceResult"
+    ],
+    "review/start": [
+      "ReviewStartParams",
+      "TurnStartResult"
+    ]
+  }
+}

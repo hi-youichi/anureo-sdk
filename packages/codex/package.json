@@ -1,0 +1,29 @@
+{
+  "name": "@anureo/adapter-codex",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./jsonl": "./src/jsonl.ts",
+    "./mapping": "./src/mapping.ts",
+    "./catalog": "./src/catalog.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --pretty false",
+    "test": "bun test tests",
+    "protocol:check": "bun scripts/protocol-check.ts",
+    "smoke": "bun scripts/smoke.ts"
+  },
+  "dependencies": {
+    "@anureo/sdk": "workspace:*",
+    "@anureo/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@anureo/conformance": "workspace:*"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

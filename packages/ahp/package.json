@@ -1,0 +1,24 @@
+{
+  "name": "@anureo/adapter-ahp",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --pretty false",
+    "test": "bun test tests"
+  },
+  "dependencies": {
+    "@anureo/protocol": "workspace:*",
+    "@anureo/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@anureo/conformance": "workspace:*"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

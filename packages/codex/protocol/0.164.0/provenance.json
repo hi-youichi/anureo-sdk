@@ -1,0 +1,31 @@
+{
+  "version": "0.164.0",
+  "source": "docs/codex-app-server-schemas/json-schema/codex_app_server_protocol.v2.schemas.json (VERSION: codex-cli 0.164.0)",
+  "sourceSha256": "72b1afcdb14b4880cff9faccdfca1f73f7288ff3a0cb80b7a4bd400a5c4e574c",
+  "subsetSha256": "eb22740f8e39cf6e3e45a50224b1615c2509e7da4c820e9c39101f141ce58e90",
+  "generator": "codex app-server generate-json-schema",
+  "selectedDefinitions": [
+    "ThreadStartParams",
+    "ThreadResumeParams",
+    "ThreadForkParams",
+    "ThreadRevertParams",
+    "ThreadRollbackParams",
+    "ThreadReadParams",
+    "ThreadTurnsListParams",
+    "ThreadItemsListParams",
+    "TurnStartParams",
+    "TurnSteerParams",
+    "TurnInterruptParams",
+    "ThreadSettingsUpdateParams",
+    "ThreadGoalSetParams",
+    "ThreadGoalClearParams",
+    "ThreadCompactStartParams",
+    "ReviewStartParams",
+    "ThreadItem",
+    "ThreadItemEntry",
+    "ThreadTokenUsage",
+    "Turn"
+  ],
+  "includedDefinitions": 105,
+  "license": "Apache-2.0 (OpenAI Codex protocol schemas)"
+}

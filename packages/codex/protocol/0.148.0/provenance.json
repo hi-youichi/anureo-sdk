@@ -1,0 +1,31 @@
+{
+  "version": "0.148.0",
+  "source": "@openai/codex@0.148.0-darwin-arm64; codex app-server generate-json-schema --out <temporary>",
+  "sourceSha256": "e5a20eb7211c21540a2d4e0106479285e13778e9c53d5837cfc735a71316a51e",
+  "subsetSha256": "5a312cc01bd18caad82aa4a274432d0a59b0c2e03e10faa31baf42297e38b624",
+  "generator": "codex app-server generate-json-schema",
+  "selectedDefinitions": [
+    "ThreadStartParams",
+    "ThreadResumeParams",
+    "ThreadForkParams",
+    "ThreadRevertParams",
+    "ThreadRollbackParams",
+    "ThreadReadParams",
+    "ThreadTurnsListParams",
+    "ThreadItemsListParams",
+    "TurnStartParams",
+    "TurnSteerParams",
+    "TurnInterruptParams",
+    "ThreadSettingsUpdateParams",
+    "ThreadGoalSetParams",
+    "ThreadGoalClearParams",
+    "ThreadCompactStartParams",
+    "ReviewStartParams",
+    "ThreadItem",
+    "ThreadItemEntry",
+    "ThreadTokenUsage",
+    "Turn"
+  ],
+  "includedDefinitions": 64,
+  "license": "Apache-2.0 (OpenAI Codex protocol schemas)"
+}

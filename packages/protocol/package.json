@@ -1,0 +1,23 @@
+{
+  "name": "@anureo/protocol",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schema": "./schema/v1/ahp.schema.json"
+  },
+  "scripts": {
+    "generate": "bun scripts/generate.ts",
+    "generate:check": "bun scripts/generate.ts --check",
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --pretty false",
+    "test": "bun test tests"
+  },
+  "dependencies": {
+    "ajv": "8.20.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

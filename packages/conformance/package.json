@@ -1,0 +1,23 @@
+{
+  "name": "@anureo/conformance",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./fake": "./src/fake.ts",
+    "./fixtures": "./src/fixtures.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --pretty false",
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@anureo/protocol": "workspace:*",
+    "@anureo/sdk": "workspace:*"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
