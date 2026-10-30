@@ -17,7 +17,7 @@ test('Windows npm.cmd is never executed and literal argv with spaces is preserve
     await writeFile(path.join(directory,'npm.cmd'),'@echo This shim must never execute\r\n')
     await writeFile(cli,"console.log(JSON.stringify(process.argv.slice(2)))\n")
     const actual=resolveNpmCommand();const resolved=resolveNpmCommand({platform:'win32',environment:{},searchDirectories:[directory],nodeExecutable:actual.executable})
-    expect(resolved.args[0]).toBe(await realpath(cli))
+    expect(await realpath(resolved.args[0])).toBe(await realpath(cli))
     const result=spawnSync(resolved.executable,[...resolved.args,'pack','a b','$(never-execute)'],{shell:false,encoding:'utf8'})
     expect(result.status).toBe(0);expect(JSON.parse(result.stdout)).toEqual(['pack','a b','$(never-execute)'])
   } finally {await rm(root,{recursive:true,force:true})}

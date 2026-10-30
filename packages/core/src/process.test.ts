@@ -43,7 +43,7 @@ test('argument arrays preserve executable/cwd spaces and literal shell metachara
     const exit = await child.exited;
     assert.equal(exit.code, 0);
     const data = JSON.parse((await output).trim());
-    assert.equal(data.cwd, await realpath(cwd)); assert.deepEqual(data.argv, [literal]); assert.equal(data.env, 'injected');
+    assert.equal(await realpath(data.cwd), await realpath(cwd)); assert.deepEqual(data.argv, [literal]); assert.equal(data.env, 'injected');
     assert.notEqual(process.env.HARNESS_PROCESS_TEST, 'injected');
     await child.dispose();
   } finally { await rm(root, { recursive: true, force: true }); }
