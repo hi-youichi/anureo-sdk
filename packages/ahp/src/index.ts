@@ -1,5 +1,5 @@
 import { HarnessSdkError,type HarnessAdapter,type BackendSession,type SessionEventSink,type SessionMethod } from "@anureo/sdk";
-import { assertDefinition,assertEvent,assertResult,negotiateVersion,supportsExtension,publicValue,type JsonValue,type AhpEvent,type AhpRequestMap,type AhpResultMap,type InitializeParams,type InitializeResult,type SessionOpenParams,type InteractionResult,type InteractionResponse } from "@anureo/protocol";
+import { assertRequest,assertDefinition,assertEvent,assertResult,negotiateVersion,supportsExtension,publicValue,type JsonValue,type AhpEvent,type AhpRequestMap,type AhpResultMap,type InitializeParams,type InitializeResult,type SessionOpenParams,type InteractionResult,type InteractionResponse } from "@anureo/protocol";
 import { AhpWire,createStdioTransport,type AhpTransport,type WireOptions } from "./wire";
 import type { HarnessProcessOptions } from "@anureo/sdk/process";
 export { AhpWire,createStdioTransport,type AhpTransport } from "./wire";
@@ -16,16 +16,20 @@ const METADATA_EXTENSION = {name:"x-anureo/session-metadata",version:"1"};
 export class AhpAdapter implements HarnessAdapter {
   private wire?:AhpWire;private initialized?:Promise<InitializeResult>;private result?:InitializeResult;
   private readonly sessions=new Map<string,SessionRecord>();
+  private readonly retiredStreams=new Set<string>();
   private readonly responding=new Map<string,Responding>();
   private disposed=false;
   constructor(private readonly options:AhpAdapterOptions){}
   initialize(params:InitializeParams):Promise<InitializeResult>{
+    if(this.disposed)return Promise.reject(new HarnessSdkError('RUNTIME_DISPOSED'));
+    assertRequest("initialize",params);
     negotiateVersion(params.protocolVersions);
     return this.initialized??=(async()=>{
       let transport:AhpTransport;
       if(this.options.transport)transport=typeof this.options.transport==="function"?await this.options.transport():this.options.transport;
       else if(this.options.url){if(!this.options.connect)throw new HarnessSdkError("WEBSOCKET_FACTORY_REQUIRED");transport=await this.options.connect(this.options.url);}
       else {if(!this.options.command)throw new HarnessSdkError("HARNESS_UNAVAILABLE");transport=await createStdioTransport({...this.options,command:this.options.command});}
+      if(this.disposed){await transport.close();throw new HarnessSdkError('RUNTIME_DISPOSED');}
       const wire=this.wire=new AhpWire(transport,this.options);
       wire.onNotification=(method,event)=>this.notification(method,event);
       wire.onClose=async cause=>{for(const session of this.sessions.values())await session.sink.fail(cause);for(const pending of this.responding.values())pending.reject(cause);this.responding.clear();};
@@ -34,13 +38,14 @@ export class AhpAdapter implements HarnessAdapter {
     })();
   }
   private async notification(method:string,value:unknown):Promise<void>{
-    const known=["session/metadata","session/state","turn/started","turn/completed","item/started","item/delta","item/completed","usage/updated","interaction/requested","interaction/resolved","notice","extension"];
+    const known=["submission/bound","submission/status","session/metadata","session/state","turn/started","turn/completed","item/started","item/delta","item/completed","usage/updated","interaction/requested","interaction/resolved","notice","extension"];
     if(!known.includes(method)){
       const raw=publicValue(JSON.parse(JSON.stringify(value??null)) as JsonValue);
       for(const session of this.sessions.values())await session.sink.emit({type:"notice",payload:{severity:"info",code:"UNKNOWN_NOTIFICATION",message:"Unknown AHP notification",raw}});
       return;
     }
     assertEvent(value);if(value.type!==method)throw new HarnessSdkError("PROTOCOL_ERROR");
+    if(this.retiredStreams.has(JSON.stringify([value.sessionId,value.streamId])))return;
     const session=this.sessions.get(value.sessionId);if(!session)throw new HarnessSdkError("SOURCE_SESSION_MISMATCH");
     const last=session.lastByStream.get(value.streamId)??0;if(value.seq<=last)return;
     if(session.streamId&&session.streamId!==value.streamId)throw new HarnessSdkError("SOURCE_STREAM_UNAVAILABLE");session.streamId=value.streamId;
@@ -97,13 +102,22 @@ export class AhpAdapter implements HarnessAdapter {
     try{
       const opened=await this.wire.request("session/open",params);assertResult("session/open",opened);
       if(opened.binding.sessionId!==params.binding.sessionId||opened.binding.adapterId!==params.binding.adapterId||opened.binding.runtimeConfigId!==params.binding.runtimeConfigId)throw new HarnessSdkError("SESSION_BINDING_MISMATCH");
+      if(this.retiredStreams.has(JSON.stringify([params.binding.sessionId,opened.streamId])))throw new HarnessSdkError("SOURCE_STREAM_UNAVAILABLE");
       record.streamId=opened.streamId;
       if(!record.metadataObserved&&opened.state?.metadata)await sink.emit({type:"session/metadata",payload:opened.state.metadata});
       const adapter=this;
-      return {binding:opened.binding,capabilities:opened.capabilities,async execute<M extends SessionMethod>(method:M,p:AhpRequestMap[M]):Promise<AhpResultMap[M]>{
+      return {binding:opened.binding,capabilities:opened.capabilities,state:opened.state,async execute<M extends SessionMethod>(method:M,p:AhpRequestMap[M]):Promise<AhpResultMap[M]>{
         const result=await adapter.wire!.request(method,p);assertResult(method,result);return result;
-      },async dispose(){adapter.sessions.delete(params.binding.sessionId);}};
+      },async dispose(){adapter.retire(params.binding.sessionId,record);}};
     }catch(cause){this.sessions.delete(params.binding.sessionId);throw cause;}
+  }
+  private retire(sessionId:string,record:SessionRecord):void{
+    if(this.sessions.get(sessionId)!==record)return;
+    this.sessions.delete(sessionId);
+    if(record.streamId){
+      this.retiredStreams.add(JSON.stringify([sessionId,record.streamId]));
+      if(this.retiredStreams.size>128)this.retiredStreams.delete(this.retiredStreams.values().next().value!);
+    }
   }
   async dispose():Promise<void>{if(this.disposed)return;this.disposed=true;await this.wire?.close();this.sessions.clear();}
 }

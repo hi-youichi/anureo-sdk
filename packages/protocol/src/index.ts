@@ -10,6 +10,7 @@ import type {
 export * from './generated/types'
 export { default as ahpSchema } from '../schema/v1/ahp.schema.json'
 export const AHP_PROTOCOL_VERSION = 1 as const
+export const AHP_PROTOCOL_CONTRACT = 'native-lifecycle' as const
 
 const ajv = new Ajv2020({ strict: false, allErrors: true, validateFormats: false })
 ajv.addSchema(schema)
@@ -52,8 +53,8 @@ export function validateResult<M extends AhpMethod>(method: M, value: unknown): 
 export function assertResult<M extends AhpMethod>(method: M, value: unknown): asserts value is AhpResultMap[M] {
   assertDefinition<AhpResultMap[M]>(AHP_METHOD_DEFINITIONS[method][1], value)
 }
-export function validateEvent(value: unknown): value is AhpEvent { return validateDefinition<AhpEvent>('AhpEvent', value) }
-export function assertEvent(value: unknown): asserts value is AhpEvent { assertDefinition<AhpEvent>('AhpEvent', value) }
+export function validateEvent(value: unknown): value is AhpEvent { return validateDefinition<AhpEvent>('AhpEvent', value) && (!value.type.startsWith('item/') || !!value.turnId) }
+export function assertEvent(value: unknown): asserts value is AhpEvent { if (!validateEvent(value)) throw new ProtocolValidationError('Invalid AHP event') }
 export function isAhpMethod(value: string): value is AhpMethod { return Object.hasOwn(AHP_METHOD_DEFINITIONS, value) }
 
 export function negotiateVersion(versions: readonly number[], supported: readonly number[] = [AHP_PROTOCOL_VERSION]): number {

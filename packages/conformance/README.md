@@ -1,5 +1,10 @@
 # @anureo/conformance
 
+The root conformance suite drives the revised AHP v1 client.
+`runConformance` covers shared operations; `runNativeConformance` covers overlap,
+active close and independent observations. Adapter fixtures must supply native
+evidence. Passing a subset does not establish full adapter conformance. See the [acceptance plan](../../docs/native-harness-lifecycle.md#9-实施顺序与验收).
+
 The shared conformance suite for the Anureo SDK. It drives any `HarnessAdapter` through the public runtime API and verifies the behavioral contract that AHP implies — so "implements AHP" has a concrete, repeatable meaning: pass the suite, and every host built on the SDK can use your backend.
 
 > Part of the [Anureo SDK workspace](../../README.md). Install with `npm install @anureo/conformance`.
@@ -28,7 +33,7 @@ if (!report.passed) {
 
 Each case returns `passed`, `failed`, or `not-applicable`:
 
-- A scenario is **not-applicable** when its capability was not declared at initialization (e.g. `steer` for a backend without `turn.steer`).
+- A scenario is **not-applicable** when its capability was not declared at initialization (e.g. `steer` for a backend without `input.steer.atomicMatch`).
 - A **declared** capability must actually pass its scenario — a missing fixture is a failure, not a skip. Declaring fork without a working fork is exactly the bug this suite exists to catch.
 
 ## Scenarios

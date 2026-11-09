@@ -6,15 +6,22 @@ Adapter connecting the Anureo SDK to the [Codex](https://github.com/openai/codex
 
 ## Usage
 
+This shows the revised workspace API, not the published 0.2.0 API. Root migration and local
+validation are complete.
+
 ```typescript
-import { createHarnessRuntime } from '@anureo/sdk'
+import { createClient } from '@anureo/sdk'
 import { createCodexAdapter } from '@anureo/adapter-codex'
 
-const runtime = createHarnessRuntime(createCodexAdapter({
-  command: 'codex',        // required; args default to ['app-server']
-  cwd: '/workspace',
-  env: { OPENAI_API_KEY: '...' },
-}))
+const client = await createClient({
+  adapter: createCodexAdapter({
+    command: 'codex',        // required; args default to ['app-server']
+    cwd: '/workspace',
+    env: { OPENAI_API_KEY: '...' },
+  }),
+  identity: { adapterId: 'codex', runtimeConfigId: 'local' },
+})
+// Use client.sessions.create(...) and session.submit(...); dispose in finally.
 ```
 
 The adapter probes the binary's version during initialization (or trusts an explicit `options.version` from a host probe) and derives its capabilities from a native behavior profile.
@@ -63,3 +70,14 @@ bun run smoke            # optional live smoke against a local binary
 
 - [Architecture](../../docs/architecture.md) — adapters' role in the SDK (currently in Chinese)
 - [AHP v1 protocol](../../spec/ahp-v1.md)
+
+## AHP v1 lifecycle revision
+
+The lifecycle design updates AHP v1 and package root entries in place.
+The root implementation and tests use the revised lifecycle; parallel versioned
+entries have been removed. Local conformance and clean-install checks have passed. Preserve native expectedTurnId validation for exact steering; do not treat an input receipt as proof of a new execution.
+See the [design and implementation plan](../../docs/native-harness-lifecycle.md).
+
+Use `await turn.steer({ input })` before `await turn.result()` for exact guidance.
+The adapter maps the target to native expectedTurnId; a stale target rejects.
+See the [complete example](../../README.md#usage-example).

@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import {
-  AHP_METHODS, AHP_METHOD_DEFINITIONS, assertInteractionResponse, assertRequest, assertResult, itemIdentity,
+  AHP_PROTOCOL_CONTRACT, AHP_METHODS, AHP_METHOD_DEFINITIONS, assertInteractionResponse, assertRequest, assertResult, itemIdentity,
   negotiateVersion, publicEvent, publicInteraction, publicValue, supportsCapability, supportsExtension,
   validateDefinition, validateEvent, validateInteractionResponse, validateJsonSchema, validateRequest, validateResult,
   type AhpEvent, type AhpMethod, type AhpRequestMap, type AhpResultMap, type InteractionRequested, type Item,
@@ -18,34 +18,35 @@ test('structured image outputs validate blob identity and distinguish generated 
   expect(validateDefinition('Item', { ...item, image: { ...item.image, blob: { ...item.image.blob, sha256: '../../bad' } } })).toBe(false)
   expect(validateDefinition('Item', { ...item, image: { ...item.image, blob: { ...item.image.blob, mimeType: 'text/html' } } })).toBe(false)
 })
-const state = { binding, status: 'ready' as const, config: {}, capabilities: {}, capabilityRevision: 0 }
+const state = { binding, status: 'ready' as const, activeTurnIds: [], config: {}, capabilities: {}, capabilityRevision: 0 }
 const base = { sessionId: 's', requestId: 'r' }
 const boundary = { turnId: 't', relation: 'before' as const }
 const requests: AhpRequestMap = {
-  initialize: { protocolVersions: [1], clientInfo: { name: 'test', version: '1' }, clientCapabilities: {} },
+  initialize: { protocolVersions: [1], protocolContract: AHP_PROTOCOL_CONTRACT, clientInfo: { name: 'test', version: '1' }, clientCapabilities: {} },
   'session/open': { requestId: 'r', mode: 'new', binding, cwd: '/workspace' },
   'session/close': base,
   'session/config/set': { ...base, patch: { model: 'fake' } },
   'session/revert': { ...base, boundary, scope: 'conversation' },
   'history/read': { ...base, limit: 25 },
-  'turn/start': { ...base, turnId: 't', input: [{ type: 'text', text: 'hello' }] },
-  'turn/steer': { ...base, expectedTurnId: 't', input: [{ type: 'text', text: 'adjust' }] },
+  'input/submit': { ...base, submissionId: 'input', delivery: 'native', input: [{ type: 'text', text: 'hello' }] },
+  'turn/steer': { ...base, submissionId: 'guide', expectedTurnId: 't', input: [{ type: 'text', text: 'adjust' }] },
   'turn/interrupt': { ...base, turnId: 't' },
+  'session/interrupt': { ...base },
   'interaction/respond': { ...base, interactionId: 'i', response: { kind: 'approval', optionId: 'deny' } },
   'interaction/cancel': { ...base, interactionId: 'i' },
   'goal/set': { ...base, goal: { text: 'goal' } }, 'goal/clear': base,
-  'compact/start': base, 'review/start': { ...base, turnId: 't-review', target: { type: 'uncommitted' } },
+  'compact/start': base, 'review/start': { ...base, submissionId: 'review', target: { type: 'uncommitted' } },
 }
 const results: AhpResultMap = {
-  initialize: { protocolVersion: 1, runtime: { name: 'fake', version: '1', adapter: 'fake/1' }, capabilities: {} },
-  'session/open': { binding, streamId: 'stream', state, capabilities: {} }, 'session/close': { closed: true },
+  initialize: { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: 'fake', version: '1', adapter: 'fake/1' }, capabilities: {} },
+  'session/open': { binding, streamId: 'stream', state, capabilities: {} }, 'session/close': { closed: true, observationClosed: true, executionStopped: 'unconfirmed' },
   'session/config/set': state, 'session/revert': { appliedScope: 'conversation', boundary },
   'history/read': { items: [], snapshotToken: 'snapshot', nextCursor: null },
-  'turn/start': { turnId: 't', accepted: true }, 'turn/steer': { turnId: 't' },
-  'turn/interrupt': { accepted: true }, 'interaction/respond': { interactionId: 'i', outcome: 'responded' },
+  'input/submit': { submissionId: 'input', disposition: 'dispatched' }, 'turn/steer': { submissionId: 'guide', turnId: 't', accepted: true },
+  'turn/interrupt': { accepted: true }, 'session/interrupt': { accepted: true, stillQueued: [] }, 'interaction/respond': { interactionId: 'i', outcome: 'responded' },
   'interaction/cancel': { interactionId: 'i', outcome: 'cancelled' }, 'goal/set': { goal: { text: 'goal' }, status: 'active' },
   'goal/clear': { goal: null, status: 'cleared' }, 'compact/start': { maintenanceId: 'm', status: 'completed' },
-  'review/start': { turnId: 't-review', accepted: true },
+  'review/start': { submissionId: 'review', turnId: 't-review', accepted: true, disposition: 'started' },
 }
 const envelope = { sessionId: 's', streamId: 'stream', seq: 1, timestamp: '2026-10-26T00:00:00.000Z', turnId: 't' }
 
@@ -68,15 +69,15 @@ describe('schema and generation', () => {
   })
   test('rejects missing target, empty identifiers, invalid scope and implicit resume', () => {
     expect(validateRequest('turn/steer', { ...base, input: [{ type: 'text', text: 'x' }] })).toBe(false)
-    expect(validateRequest('turn/start', { ...requests['turn/start'], turnId: '' })).toBe(false)
+    expect(validateRequest('input/submit', { ...requests['input/submit'], turnId: '' })).toBe(false)
     expect(validateRequest('session/revert', { ...requests['session/revert'], scope: 'everything' })).toBe(false)
     expect(validateRequest('session/open', { ...requests['session/open'], mode: 'resume' })).toBe(false)
     expect(validateRequest('session/open', { ...requests['session/open'], mode: 'fork' })).toBe(false)
-    expect(() => assertRequest('turn/start', { secret: 'do-not-copy' })).toThrow('Invalid AHP TurnStartParams')
+    expect(() => assertRequest('input/submit', { secret: 'do-not-copy' })).toThrow('Invalid AHP InputSubmitParams')
   })
-  test('unknown optional fields survive validation without becoming required', () => {
-    const params = { ...requests['turn/start'], futureOptional: { x: true } }
-    expect(validateRequest('turn/start', params)).toBe(true)
+  test('session-open optional extensions survive validation without becoming required', () => {
+    const params = { ...requests['session/open'], futureOptional: { x: true } }
+    expect(validateRequest('session/open', params)).toBe(true)
     expect(params.futureOptional).toEqual({ x: true })
   })
 })
@@ -193,7 +194,7 @@ test('public interaction preserves secret classification booleans without exposi
 })
 
 test('result assertions, public values and broken schemas fail closed', () => {
-  expect(() => assertResult('turn/start', { bad: true })).toThrow('Invalid AHP TurnStartResult')
+  expect(() => assertResult('input/submit', { bad: true })).toThrow('Invalid AHP InputSubmitResult')
   expect(validateJsonSchema({ $ref: '#/definitions/nonexistent' }, {})).toBe(false)
   expect(publicValue({ token: 'credential', nested: [{ apiKey: 'k', url: 'https://x.test/a?token=SECRET' }] })).toEqual({ token: '[redacted]', nested: [{ apiKey: '[redacted]', url: 'https://x.test/a' }] })
 })

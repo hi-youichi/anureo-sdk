@@ -12,7 +12,7 @@ import {
   type BackendSession, type HarnessAdapter, type SessionEventSink, type SessionMethod,
 } from "@anureo/sdk";
 import {
-  negotiateVersion, publicValue, validateJsonSchema,
+  AHP_PROTOCOL_CONTRACT, assertRequest, negotiateVersion, publicValue, validateJsonSchema,
   type Capabilities, type AhpRequestMap, type AhpResultMap, type HistoryItem, type HistoryPage,
   type InitializeParams, type InitializeResult, type InputBlock, type InteractionRequested, type InteractionResponse,
   type Item, type JsonObject, type JsonValue, type SessionBinding, type SessionOpenParams, type SessionState, type Boundary,
@@ -59,7 +59,8 @@ function permission(value: unknown): PermissionMode { if (typeof value !== "stri
 function capabilities(store: boolean, checkpoints: boolean): Capabilities {
   return {
     session: { resume: store, fork: store ? ["before", "through"] : [], revert: [...(store ? ["conversation" as const] : []), ...(checkpoints ? ["files" as const] : []), ...(store && checkpoints ? ["both" as const] : [])], history: store },
-    turn: { steer: false, interrupt: true, outputSchema: false, overrides: [], inputModalities: ["text", "image"] },
+    input: { delivery: ['native', 'afterTurn'], interrupt: { targets: ['session'], reportsPendingInputs: true } },
+    turn: { outputSchema: false, overrides: [], inputModalities: ["text", "image"] },
     interactions: ["approval", "userInput", "elicitation"], subagents: { events: "nested" },
     mcp: { stdio: true, http: true, elicitation: ["form", "url"] },
     config: { options: [{ id: "model", scope: "session", schema: { type: "string", minLength: 1 } }, { id: "permissionMode", title: "Permissions", scope: "session", schema: { type: "string", enum: PERMISSION_MODES, default: "default" } }, { id: "effort", title: "Effort", scope: "session", schema: { type: "string", enum: [...EFFORT_LEVELS], default: "high" } }, { id: "fastMode", title: "Fast mode", scope: "session", schema: { type: "boolean", default: false } }, { id: "maxThinkingTokens", scope: "session", schema: { type: ["integer", "null"], minimum: 0 } }] },
@@ -101,10 +102,11 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
   }
   get capabilities(): Capabilities { return capabilities(!!this.sessionStore, !!this.options.enableFileCheckpointing); }
   async initialize(params: InitializeParams): Promise<InitializeResult> {
+    assertRequest("initialize", params);
     negotiateVersion(params.protocolVersions);
     if (this.disposed) throw new HarnessSdkError("RUNTIME_DISPOSED");
     if (!this.env.CLAUDE_CONFIG_DIR && !this.options.defaultHome && !this.options.queryFactory) throw new HarnessSdkError("HARNESS_CONFIG_INVALID", "Claude requires an explicit isolated CLAUDE_CONFIG_DIR");
-    return { protocolVersion: 1, runtime: { name: "claude", version: "0.3.257", adapter: "claude-native/0.1.0" }, capabilities: this.capabilities };
+    return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: "claude", version: "0.3.265", adapter: "claude-native/0.1.0" }, capabilities: this.capabilities };
   }
   async openSession(params: SessionOpenParams, sink: SessionEventSink): Promise<BackendSession> {
     if (this.disposed) throw new HarnessSdkError("RUNTIME_DISPOSED");
@@ -128,11 +130,18 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
       enableFileCheckpointing: this.options.enableFileCheckpointing ?? false,
     };
   }
-  async dispose(): Promise<void> { if (this.disposed) return; this.disposed = true; await Promise.allSettled([...this.sessions].map((session) => session.dispose())); this.sessions.clear(); }
+  async dispose(): Promise<void> {
+    if (this.disposed) return; this.disposed = true;
+    const results = await Promise.allSettled([...this.sessions].map(session => session.dispose())); this.sessions.clear();
+    const failed = results.find((value): value is PromiseRejectedResult => value.status === 'rejected');
+    if (failed) throw failed.reason;
+  }
 }
 
-interface ActiveTurn { id: string; userUuid: string; interrupted: boolean; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageId?: string; blockIndex: number }
+interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageId?: string; blockIndex: number }
 export class ClaudeBackendSession implements BackendSession {
+  private release?: Promise<void>;
+  private readonly nativeInputs = new Map<string, { submissionId: string; turnId?: string }>();
   binding: SessionBinding;
   readonly capabilities: Capabilities;
   private query?: ClaudeQuery;
@@ -228,10 +237,10 @@ export class ClaudeBackendSession implements BackendSession {
     this.fastMode = next;
     return changed;
   }
-  private snapshot(): SessionState { return { ...(this.sessionTitle !== undefined ? { metadata: { title: this.sessionTitle } } : {}), binding: structuredClone(this.binding), status: this.active ? "running" : "ready", config: structuredClone(this.config), capabilities: this.capabilities, capabilityRevision: this.capabilityRevision, ...(this.model ? { model: this.model } : {}), ...(this.fastMode ? { fastMode: this.fastMode } : {}), ...(this.active ? { activeTurnId: this.active.id } : {}) }; }
+  private snapshot(): SessionState { return { ...(this.sessionTitle !== undefined ? { metadata: { title: this.sessionTitle } } : {}), binding: structuredClone(this.binding), status: this.active ? "running" : "ready", config: structuredClone(this.config), capabilities: this.capabilities, capabilityRevision: this.capabilityRevision, ...(this.model ? { model: this.model } : {}), ...(this.fastMode ? { fastMode: this.fastMode } : {}), activeTurnIds: this.active ? [this.active.id] : [] }; }
   private async startQuery(fresh: boolean, resumeAt?: string): Promise<void> {
     const generation = ++this.generation;
-    this.input = new BoundedEventQueue<SDKUserMessage>({ maxEvents: 1 });
+    this.input = new BoundedEventQueue<SDKUserMessage>({ maxEvents: 64 });
     const mcpServers: NonNullable<Options["mcpServers"]> = {};
     for (const server of this.params.mcpServers ?? []) mcpServers[server.name] = server.type === "stdio" ? { type: "stdio", command: server.command, args: server.args, env: server.env } : { type: "http", url: server.url, headers: server.headers };
     const options: Options = {
@@ -258,11 +267,48 @@ export class ClaudeBackendSession implements BackendSession {
   private async pump(stream: ClaudeQuery, generation: number): Promise<void> {
     try {
       for await (const message of stream) { if (this.closed || generation !== this.generation) return; await this.mapMessage(message); }
-      if (!this.closed && generation === this.generation && this.active) await this.sink.fail(new HarnessSdkError("CONNECTION_CLOSED", "Claude query ended before a result", false, true));
+      if (!this.closed && generation === this.generation && (this.active || this.nativeInputs.size)) await this.sink.fail(new HarnessSdkError("CONNECTION_CLOSED", "Claude query ended before a result", false, true));
     } catch (cause) { if (!this.closed && generation === this.generation) await this.sink.fail(sdkError(cause, "CLAUDE_QUERY_FAILED", true)); }
+  }
+  private async beginExecution(userUuid: string = randomUUID()): Promise<ActiveTurn> {
+    if (!this.active) {
+      this.active = { id: randomUUID(), userUuid, consumed: new Set(), output: new Map(), stoppedTools: new Map(), blockIndex: 0 };
+      await this.sink.emit({ type: 'turn/started', payload: { turnId: this.active.id } });
+    }
+    return this.active;
   }
   private async mapMessage(message: SDKMessage): Promise<void> {
     const value = record(message);
+    const refused = str(value.refused_user_message_uuid);
+    if (refused && this.nativeInputs.has(refused)) {
+      const pending = this.nativeInputs.get(refused)!;
+      await this.sink.emit({ type: 'submission/status', payload: { submissionId: pending.submissionId, status: 'rejected', error: { code: 'NATIVE_INPUT_REJECTED', message: 'Native input rejected', retryable: false, outcomeUnknown: false } } });
+      this.nativeInputs.delete(refused); return;
+    }
+    const mainReply = !value.parent_tool_use_id && (message.type === 'assistant' || message.type === 'stream_event' || message.type === 'result');
+    const uuids = Array.isArray(value.user_message_uuids) ? value.user_message_uuids.filter((id): id is string => typeof id === 'string') : str(value.user_message_uuid) ? [String(value.user_message_uuid)] : [];
+    // A message UUID is input identity. New UUID echoes inside an active native
+    // loop bind additional inputs to that loop; they never create another turn.
+    if (mainReply && (this.active || uuids.some(id => this.nativeInputs.has(id)) || this.nativeInputs.size && message.type !== 'result')) {
+      if (message.type === 'result' && value.num_turns === 0 && !this.active) {
+        for (const id of uuids) {
+          const pending = this.nativeInputs.get(id); if (!pending) continue;
+          await this.sink.emit({ type: 'submission/status', payload: { submissionId: pending.submissionId, status: 'rejected', error: { code: 'NATIVE_INPUT_NOT_EXECUTED', message: 'Input ended without an execution', retryable: false, outcomeUnknown: false } } });
+          this.nativeInputs.delete(id);
+        }
+        return;
+      }
+      const execution = await this.beginExecution(uuids[0]);
+      for (const id of uuids) {
+        const pending = this.nativeInputs.get(id); if (!pending) continue;
+        if (pending.turnId && pending.turnId !== execution.id) throw new HarnessSdkError('PROTOCOL_ERROR', 'Native input changed executions');
+        if (!pending.turnId) {
+          pending.turnId = execution.id; execution.consumed.add(id); this.turns[id] = execution.id;
+          await this.sink.bindSubmission(pending.submissionId, execution.id);
+        }
+      }
+      this.adapter.turnMaps.set(this.nativeId, this.turns); await this.fileStore?.saveTurnMap(this.nativeId, this.turns);
+    }
     const active = this.active;
     if (message.type === "system" && message.subtype === "init") {
       this.trackFastMode(value);
@@ -273,7 +319,6 @@ export class ClaudeBackendSession implements BackendSession {
       await this.sink.emit({ type: "session/state", payload: this.snapshot() }); return;
     }
     if (!active) { await this.notice(value); return; }
-    if (value.user_message_uuid && value.user_message_uuid !== active.userUuid && !value.parent_tool_use_id) throw new HarnessSdkError("TURN_MISMATCH", "Claude replied to a different input UUID");
     if (message.type === "assistant") {
       for (const block of message.message.content) await this.completeBlock(record(block), message.message.id, message.parent_tool_use_id !== null);
       return;
@@ -304,7 +349,7 @@ export class ClaudeBackendSession implements BackendSession {
       const nativeUsage = record(message.usage);
       const usage = { provider: "claude", scope: "turn" as const, source: "native" as const, ...(typeof nativeUsage.input_tokens === "number" ? { input: nativeUsage.input_tokens } : {}), ...(typeof nativeUsage.output_tokens === "number" ? { output: nativeUsage.output_tokens } : {}), ...(typeof nativeUsage.cache_read_input_tokens === "number" ? { cacheRead: nativeUsage.cache_read_input_tokens } : {}), ...(typeof nativeUsage.cache_creation_input_tokens === "number" ? { cacheWrite: nativeUsage.cache_creation_input_tokens } : {}) };
       await this.sink.emit({ type: "usage/updated", payload: usage }, { turnId: active.id });
-      const interrupted = active.interrupted || str(message.stop_reason) === "interrupted" || str(value.terminal_reason) === "interrupted";
+      const interrupted = str(message.stop_reason) === "interrupted" || str(value.terminal_reason) === "interrupted";
       const failed = message.subtype !== "success" || message.is_error;
       for (const pending of active.output.values()) {
         if (pending.type !== "toolCall" || pending.kind !== "fileChange" || pending.status === "completed" || pending.status === "failed") continue;
@@ -313,6 +358,7 @@ export class ClaudeBackendSession implements BackendSession {
         await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
       }
       this.active = undefined;
+      for (const id of active.consumed) this.nativeInputs.delete(id);
       this.trackFastMode(value);
       await this.sink.emit({ type: "turn/completed", payload: { turnId: active.id, status: interrupted ? "interrupted" : failed ? "failed" : "completed", usage, ...(failed && !interrupted ? { error: { code: "CLAUDE_TURN_FAILED", message: "Claude turn failed", retryable: false, outcomeUnknown: false } } : {}) } });
       void this.refreshMetadata();
@@ -389,6 +435,9 @@ export class ClaudeBackendSession implements BackendSession {
     await this.sink.emit({ type: "notice", payload: { severity: /error|denied|retry|rate_limit/.test(subtype) ? "warning" : "info", code: `CLAUDE_${subtype.toUpperCase().replace(/[^A-Z0-9_]/g, "_")}`, message: str(value.content) ?? str(value.message) ?? subtype, raw: safe(value) } }, this.active ? { turnId: this.active.id } : {});
   }
   private async permissionRequest(toolName: string, input: Record<string, unknown>, details: Parameters<NonNullable<Options["canUseTool"]>>[2]): Promise<PermissionResult> {
+    // A native tool permission request is execution evidence even when the SDK
+    // callback arrives before its assistant message. Binding still waits for UUID evidence.
+    if (!this.active && this.nativeInputs.size) await this.beginExecution();
     const turnId = this.active?.id;
     if (!turnId) return { behavior: "deny", message: "No active AHP turn" };
     const interactionId = details.toolUseID;
@@ -472,21 +521,13 @@ export class ClaudeBackendSession implements BackendSession {
     if (this.closed || !this.query) throw new HarnessSdkError("SESSION_CLOSED");
     let result: AhpResultMap[SessionMethod];
     switch (method) {
-      case "turn/start": {
-        const start = params as AhpRequestMap["turn/start"];
-        if (this.active) throw new HarnessSdkError("SESSION_BUSY");
-        const userUuid = randomUUID(); const message: SDKUserMessage = { type: "user", uuid: userUuid, session_id: this.nativeId, message: { role: "user", content: content(start.input) }, parent_tool_use_id: null };
-        this.active = { id: start.turnId, userUuid, interrupted: false, output: new Map(), stoppedTools: new Map(), blockIndex: 0 }; this.turns[userUuid] = start.turnId;
-        this.adapter.turnMaps.set(this.nativeId, this.turns); await this.fileStore?.saveTurnMap(this.nativeId, this.turns);
-        await this.sink.emit({ type: "turn/started", payload: { turnId: start.turnId, nativeTurnId: userUuid } });
-        this.input!.push(message); result = { accepted: true, turnId: start.turnId }; break;
+      case 'input/submit': return await this.submitInput(params as AhpRequestMap['input/submit']) as AhpResultMap[M];
+      case 'session/interrupt': {
+        const receipt = await this.query.interrupt();
+        const stillQueued = receipt?.still_queued?.flatMap(id => { const pending = this.nativeInputs.get(id); return pending ? [pending.submissionId] : []; });
+        result = { accepted: true, ...(stillQueued ? { stillQueued } : {}) }; break;
       }
-      case "turn/interrupt": {
-        const request = params as AhpRequestMap["turn/interrupt"];
-        if (this.active?.id !== request.turnId) throw new HarnessSdkError("TURN_MISMATCH");
-        this.active.interrupted = true; await this.query.interrupt(); result = { accepted: true, turnId: request.turnId }; break;
-      }
-      case "turn/steer": throw new HarnessSdkError("CAPABILITY_UNSUPPORTED", "Claude queued input is not current-turn steering");
+      case 'turn/interrupt': case 'turn/steer': throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Claude controls target the session, not an atomically matched Turn');
       case "session/config/set": {
         const patch = (params as AhpRequestMap["session/config/set"]).patch;
         try {
@@ -522,10 +563,24 @@ export class ClaudeBackendSession implements BackendSession {
         }
         result = { appliedScope: request.scope, boundary: request.boundary, nativeRef: this.binding.nativeRef }; break;
       }
-      case "session/close": await this.dispose(); result = { closed: true }; break;
+      case "session/close": await this.dispose(); result = { closed: true, observationClosed: true, executionStopped: "unconfirmed" }; break;
       default: throw new HarnessSdkError("CAPABILITY_UNSUPPORTED");
     }
     return result as AhpResultMap[M];
+  }
+  private async submitInput(start: AhpRequestMap['input/submit']): Promise<AhpResultMap['input/submit']> {
+    if (this.closed || !this.input) throw new HarnessSdkError('SESSION_CLOSED');
+    // Native association echoes are bounded to 64 UUIDs. Do not admit more
+    // unresolved inputs than we can correlate without guessing.
+    if (this.nativeInputs.size >= 64) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED');
+    const userUuid = randomUUID();
+    this.nativeInputs.set(userUuid, { submissionId: start.submissionId });
+    try {
+      this.input.push({ type: 'user', uuid: userUuid, session_id: this.nativeId,
+        message: { role: 'user', content: content(start.input) }, parent_tool_use_id: null,
+        priority: start.delivery === 'afterTurn' ? 'later' : 'next' });
+      return { submissionId: start.submissionId, disposition: 'dispatched' };
+    } catch (cause) { this.nativeInputs.delete(userUuid); throw cause; }
   }
   private async readHistory(request: AhpRequestMap["history/read"]): Promise<HistoryPage> {
     let snapshotToken = request.snapshotToken;
@@ -561,7 +616,16 @@ export class ClaudeBackendSession implements BackendSession {
     const limit = Math.min(request.limit ?? 200, 1000); const page = snapshot.slice(offset, offset + limit);
     return { items: structuredClone(page), ...(offset + page.length < snapshot.length ? { nextCursor: String(offset + page.length) } : {}), snapshotToken, source: this.binding.nativeRef };
   }
-  async dispose(): Promise<void> { if (this.closed) return; this.closed = true; this.generation++; this.input?.end(); this.query?.close(); await (this.query as (ClaudeQuery & Partial<Pick<Query, "return">>) | undefined)?.return?.(); }
+  async dispose(): Promise<void> {
+    return this.release ??= (async () => {
+      this.closed = true; this.generation++;
+      this.nativeInputs.clear(); this.input?.end();
+      const errors: Array<{ code: string }> = [];
+      try { this.query?.close(); } catch { errors.push({ code: 'CLAUDE_CLOSE_FAILED' }); }
+      try { await (this.query as (ClaudeQuery & Partial<Pick<Query, 'return'>>) | undefined)?.return?.(); } catch { errors.push({ code: 'CLAUDE_RETURN_FAILED' }); }
+      if (errors.length) throw new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'Claude resources were not fully released', false, true, { errors });
+    })();
+  }
 }
 export function createClaudeAdapter(options?: ClaudeAdapterOptions): ClaudeNativeAdapter { return new ClaudeNativeAdapter(options); }
 export { FileSessionStore } from "./store";

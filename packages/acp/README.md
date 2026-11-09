@@ -6,15 +6,22 @@ Adapter connecting the Anureo SDK to agents implementing the [Agent Client Proto
 
 ## Usage
 
+This shows the revised workspace API, not the published 0.2.0 API. Root migration and local
+validation are complete.
+
 ```typescript
-import { createHarnessRuntime } from '@anureo/sdk'
+import { createClient } from '@anureo/sdk'
 import { createAcpAdapter } from '@anureo/adapter-acp'
 
-const runtime = createHarnessRuntime(createAcpAdapter({
-  command: 'my-acp-agent',        // spawn over stdio; or use connect() below
-  args: ['--stdio'],
-  cwd: '/workspace',
-}))
+const client = await createClient({
+  adapter: createAcpAdapter({
+    command: 'my-acp-agent',        // spawn over stdio; or use connect() below
+    args: ['--stdio'],
+    cwd: '/workspace',
+  }),
+  identity: { adapterId: 'acp', runtimeConfigId: 'local' },
+})
+// Use client.sessions.create(...) and session.submit(...); dispose in finally.
 
 // Remote or custom transports inject an official v1 message stream:
 // createAcpAdapter({ connect: () => openMyStream() })
@@ -28,7 +35,7 @@ ACP's core protocol covers sessions, turns, messages, and permission requests. A
 - **Client requests** — `userInput` (`_ahp/user_input`) and `dynamicTool` (`_ahp/dynamic_tool`) interactions
 - **Features** — nested subagent events and custom instructions
 
-Agents that do not advertise the extension still work: the adapter publishes only the standard ACP baseline (interrupt, approval interactions, text/image/file input). fs and terminal capabilities are announced **only** when the host injects the corresponding ports — connecting an adapter never grants filesystem or terminal permission by itself.
+Agents that do not advertise the extension still work: the adapter publishes only the standard ACP baseline (session-scoped interrupt, approval interactions, text/image/file input). fs and terminal capabilities are announced **only** when the host injects the corresponding ports — connecting an adapter never grants filesystem or terminal permission by itself.
 
 Session snapshots loaded via ACP `session/load` have no turn boundaries; they are handed to the host through `onLoadSnapshot` instead of being replayed as realtime events.
 
@@ -59,3 +66,10 @@ The conformance tests spawn a scripted ACP agent (implementing the standard wire
 
 - [Architecture](../../docs/architecture.md) — adapters' role in the SDK (currently in Chinese)
 - [AHP v1 protocol](../../spec/ahp-v1.md)
+
+## AHP v1 lifecycle revision
+
+The lifecycle design updates AHP v1 and package root entries in place.
+The root implementation and tests use the revised lifecycle; parallel versioned
+entries have been removed. Local conformance and clean-install checks have passed. Standard ACP remains limited to guarantees it can prove; overlapping input requires an explicit correlation extension, and session cancellation must not masquerade as exact-turn interrupt.
+See the [design and implementation plan](../../docs/native-harness-lifecycle.md).

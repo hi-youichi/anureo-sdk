@@ -140,13 +140,14 @@ export class SecretRedactor {
     }
     return this.json(value);
   }
-  event(event: AhpEventPayload): AhpEventPayload {
+  event(event: AhpEventPayload, turnId?: string): AhpEventPayload {
+    const stream = (itemId: string): string => turnId === undefined ? itemId : JSON.stringify([turnId, itemId]);
     switch (event.type) {
       case "item/started": case "item/completed": {
-        if (event.type === "item/completed") this.streams.delete(event.payload.item.id);
+        if (event.type === "item/completed") this.streams.delete(stream(event.payload.item.id));
         return { ...event, payload: { item: this.item(event.payload.item) } };
       }
-      case "item/delta": return { ...event, payload: { ...event.payload, ...(event.payload.text !== undefined ? { text: this.delta(event.payload.itemId, event.payload.text) } : {}), ...(event.payload.value !== undefined ? { value: this.deltaValue(event.payload.kind, event.payload.value) } : {}) } };
+      case "item/delta": return { ...event, payload: { ...event.payload, ...(event.payload.text !== undefined ? { text: this.delta(stream(event.payload.itemId), event.payload.text) } : {}), ...(event.payload.value !== undefined ? { value: this.deltaValue(event.payload.kind, event.payload.value) } : {}) } };
       case "notice": return { ...event, payload: { ...event.payload, message: this.text(event.payload.message), ...(event.payload.raw !== undefined ? { raw: this.json(event.payload.raw) } : {}) } };
       case "extension": return { ...event, payload: { ...event.payload, data: this.json(event.payload.data) } };
       case "session/metadata": return { ...event, payload: this.json(event.payload as JsonObject) as typeof event.payload };

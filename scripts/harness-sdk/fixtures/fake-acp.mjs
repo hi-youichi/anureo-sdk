@@ -1,6 +1,8 @@
 // Vanilla ACP JSON-RPC wire fixture. No Anureo runtime, SDK patches or credentials.
 import { createInterface } from 'node:readline';
 const extensions = process.argv.includes('--extensions');
+const nativeLifecycle = process.argv.includes('--native-lifecycle');
+const nativeHeld = new Map();
 const badVersion = process.argv.includes('--bad-version');
 const noResume = process.argv.includes('--load-only');
 const missingSteer = process.argv.includes('--missing-steer');
@@ -17,6 +19,7 @@ async function handle(frame) {
   if (!frame.method && pending.has(frame.id)) { const wait = pending.get(frame.id); pending.delete(frame.id); frame.error ? wait.reject(frame.error) : wait.resolve(frame.result); return; }
   const p = frame.params ?? {}; const respond = (result) => { if ('id' in frame) send({ id: frame.id, result }); };
   if (frame.method === 'initialize') {
+    if (nativeLifecycle) { respond({ protocolVersion: 1, agentInfo: { name: 'correlated-agent', version: '1' }, agentCapabilities: { promptCapabilities: {}, sessionCapabilities: { close: {} } }, _meta: { ahp: { version: 2, turnCorrelation: true } } }); return; }
     clientCapabilities = p.clientCapabilities ?? {};
     respond({ protocolVersion: badVersion ? 99 : 1, agentInfo: { name: 'vanilla-fake-acp', version: '1.0.0' }, agentCapabilities: { loadSession: true, promptCapabilities: { image: true, embeddedContext: true }, mcpCapabilities: { http: true }, sessionCapabilities: { ...(noResume ? {} : { resume: {} }), close: {} } }, ...(extensions ? { _meta: { ahp: { version: invalidExtension ? 2 : 1, methods: { fork: '_ahp/session/fork', revert: '_ahp/session/revert', steer: missingSteer ? '_ahp/missing/steer' : '_ahp/turn/steer', history: '_ahp/history/read', goalSet: '_ahp/goal/set', goalClear: '_ahp/goal/clear', compact: '_ahp/compact/start', review: '_ahp/review/start' }, fork: ['before', 'through'], revert: ['conversation', 'files', 'both'], subagents: true, clientRequests: { userInput: '_ahp/user_input', dynamicTool: '_ahp/dynamic_tool' } } } } : {}) }); return;
   }
@@ -32,6 +35,18 @@ async function handle(frame) {
   if (frame.method === 'session/set_config_option') { const data = configFor(p.sessionId); const option = data.configOptions.find((option) => option.id === p.configId); if (option) option.currentValue = p.value; respond({ configOptions: data.configOptions }); return; }
   if (frame.method === 'session/cancel') { const promptId = prompts.get(p.sessionId); if (promptId !== undefined) { send({ id: promptId, result: { stopReason: 'cancelled' } }); prompts.delete(p.sessionId); } return; }
   if (frame.method === 'session/prompt') {
+    if (nativeLifecycle) {
+      const submissionId = p._meta?.ahp?.submissionId, joined = nativeHeld.has(p.sessionId);
+      const event = (type, payload) => send({ method: '_ahp/event', params: { sessionId: p.sessionId, turnId: 'actual-acp', event: { type, payload } } });
+      if (!joined) event('turn/started', { turnId: 'actual-acp' });
+      event('submission/bound', { submissionId, turnId: 'actual-acp' });
+      if (!joined) { nativeHeld.set(p.sessionId, { id: frame.id, submissionId }); return; }
+      update(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'correlated ACP result' }, _meta: { ahp: { turnId: 'actual-acp' } } });
+      event('turn/completed', { turnId: 'actual-acp', status: 'completed' });
+      const first = nativeHeld.get(p.sessionId); nativeHeld.delete(p.sessionId);
+      send({ id: first.id, result: { stopReason: 'end_turn', _meta: { ahp: { acceptance: { accepted: true, submissionId: first.submissionId, disposition: 'started', turnId: 'actual-acp' } } } } });
+      respond({ stopReason: 'end_turn', _meta: { ahp: { acceptance: { accepted: true, submissionId, disposition: 'joined', turnId: 'actual-acp' } } } }); return;
+    }
     let command = p.prompt.filter((block) => block.type === 'text').map((block) => block.text).join('');
     if (scenario) command = { approval: 'permission', userInput: 'userInput', dynamicTool: 'dynamicTool', elicitation: 'elicitation', interrupt: 'wait', steer: 'wait', disconnect: 'disconnect' }[scenario] ?? command;
     if (scenario === 'backpressure') { update(p.sessionId, { sessionUpdate: 'future_update', content: 'x'.repeat(4096) }); respond({ stopReason: 'end_turn' }); return; }

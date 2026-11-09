@@ -6,36 +6,35 @@ Adapter connecting the Anureo SDK to **external harnesses that speak AHP themsel
 
 ## Usage
 
+This is the revised workspace API, not the published 0.2.0 API. Root migration and local
+validation are complete.
+
 ```typescript
-import { createHarnessRuntime } from '@anureo/sdk'
-import { createAhpAdapter, createWebSocketTransport } from '@anureo/adapter-ahp'
+import { createClient } from '@anureo/sdk'
+import { createAhpAdapter } from '@anureo/adapter-ahp'
 
-// Over stdio:
-const stdioRuntime = createHarnessRuntime(createAhpAdapter({
-  command: 'my-harness',           // spawned; speaks nd-JSON AHP on stdio
-  args: ['serve'],
-}))
-
-// Over WebSocket (loopback-only by default):
-const wsRuntime = createHarnessRuntime(createAhpAdapter({
-  url: 'ws://127.0.0.1:9210',
-  connect: url => createWebSocketTransport(url),
-}))
-
-// Or inject any transport you already own:
-const customRuntime = createHarnessRuntime(createAhpAdapter({
-  transport: () => Promise.resolve(myTransport),
-}))
+const client = await createClient({
+  adapter: createAhpAdapter({ command: 'my-harness', args: ['serve'] }),
+  identity: { adapterId: 'ahp', runtimeConfigId: 'local' },
+})
+try {
+  const session = await client.sessions.create({ cwd: process.cwd() })
+  const turn = await session.submit({ input: 'Inspect the workspace.' })
+  console.log(await turn.result())
+  await session.close()
+} finally {
+  await client.dispose()
+}
 ```
 
-A minimal, dependency-free reference harness lives in [examples/reference.ts](examples/reference.ts); it implements the AHP wire contract on top of the SDK itself and can serve as the template for third-party harnesses.
+A standalone revised-v1 reference harness lives in [examples/reference.ts](examples/reference.ts); its stdio and WebSocket paths are exercised by the adapter tests.
 
 ## Behavior the adapter enforces
 
-- **Version handshake.** `initialize` negotiates the AHP major version; every request and result is validated against the protocol schema before use.
+- **Version handshake.** `initialize` negotiates major 1 and requires `protocolContract: "native-lifecycle"` in both directions; every request and result is validated against the protocol schema before use.
 - **Sequence integrity.** Events carry `(sessionId, streamId, seq)`. A gap in the sequence is repaired only when the harness negotiated `x-anureo/event-replay@1` (via `x-anureo/events/read`); otherwise the stream fails with `SOURCE_SEQUENCE_GAP` instead of presenting a hole as complete history.
 - **Session metadata.** Delivered through the negotiated `x-anureo/session-metadata@1` extension; the adapter always requests it and ignores duplicated metadata from other channels.
-- **Interactions.** `interaction/requested` is answered through the session's `respond()`/`cancelInteraction()`; the adapter forwards the answer over the wire and surfaces remote resolutions (`interaction/resolved`) without double-answering.
+- **Interactions.** `interaction/requested` is answered through `interaction/respond` / `interaction/cancel`; the adapter forwards the answer over the wire and surfaces remote resolutions (`interaction/resolved`) without double-answering.
 - **Unknown notifications.** Native notifications outside the AHP event set are converted to safe `notice` events with the raw (redacted) payload attached — a future-proofing harness cannot crash the host.
 - **Connection loss.** A closed transport fails every open session sink and rejects pending responses with `outcomeUnknown`-carrying errors; no session continues silently on a dead wire.
 
@@ -62,3 +61,10 @@ The workspace's `bun run verify:pack` runs real stdio conversations against the 
 
 - [AHP v1 protocol](../../spec/ahp-v1.md) — the wire contract
 - [Architecture](../../docs/architecture.md)
+
+## AHP v1 lifecycle revision
+
+The lifecycle design updates AHP v1 and package root entries in place.
+The root implementation and tests use the revised lifecycle; parallel versioned
+entries have been removed. Local conformance and clean-install checks have passed. External peers must upgrade together and reject mismatched lifecycle capabilities during initialization, even though the protocol major remains 1.
+See the [design and implementation plan](../../docs/native-harness-lifecycle.md).

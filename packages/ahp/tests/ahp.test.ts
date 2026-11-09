@@ -1,70 +1,67 @@
 import { expect,test } from "bun:test";
 import path from "node:path";
-import { createHarnessRuntime,BoundedEventQueue,type HarnessRuntime,type HarnessSession } from "@anureo/sdk";
+import { createClient,BoundedEventQueue,type Client,type Session } from "@anureo/sdk";
 import type { AhpEvent } from "@anureo/protocol";
 import { createAhpAdapter,createWebSocketTransport,AhpWire,createStdioTransport,type AhpTransport } from "../src/index";
 import { createReferenceHarness } from "../examples/reference";
 
 async function fixture(options:{dropSeq?:number;replay?:boolean;duplicate?:boolean}={}){
-  const queue=new BoundedEventQueue<string>();let dropped=false;
+  const queue=new BoundedEventQueue<string>();const sent: Array<{method?:string;params?:AhpEvent}>=[];let dropped=false;
   const reference=createReferenceHarness(frame=>{
     const m=JSON.parse(frame) as {method?:string;params?:AhpEvent;result?:{capabilities?:{extensions?:unknown}}};
     if(options.replay===false&&m.result?.capabilities)delete m.result.capabilities.extensions;
     if(options.dropSeq!==undefined&&m.params?.seq===options.dropSeq&&!dropped){dropped=true;return;}
-    const projected=JSON.stringify(m);queue.push(projected);if(options.duplicate&&m.params?.seq===1)queue.push(projected);
+    sent.push(m);const projected=JSON.stringify(m);queue.push(projected);if(options.duplicate&&m.params?.seq===1)queue.push(projected);
   });
   const transport:AhpTransport={messages:queue,send:frame=>reference.receive(frame),close:async()=>{await reference.close();queue.end();}};
-  const runtime=createHarnessRuntime(createAhpAdapter({transport,timeoutMs:500}));
-  await runtime.initialize({protocolVersions:[1],clientInfo:{name:"test",version:"1"},clientCapabilities:{interactions:["approval"]}});
+  const runtime=await createClient({identity:{adapterId:"ahp",runtimeConfigId:"ref"},interactions:{approval:undefined},adapter:createAhpAdapter({transport,timeoutMs:500})});
   const session=await runtime.openSession({requestId:"open",mode:"new",binding:{sessionId:"session",adapterId:"ahp",runtimeConfigId:"ref"},cwd:process.cwd()});
-  return {runtime,session,queue};
+  return {runtime,session,queue,sent};
 }
-async function collect(session:HarnessSession,turnId:string,answer=false):Promise<AhpEvent[]>{
+async function collect(session:Session,turnId:string,answer=false):Promise<AhpEvent[]>{
   const events:AhpEvent[]=[],reader=session.events()[Symbol.asyncIterator]();
   const timer=setTimeout(()=>{void reader.return?.();},1500);
   try{for(;;){const next=await reader.next();if(next.done)throw new Error("Missing terminal");events.push(next.value);
-    if(answer&&next.value.type==="interaction/requested")await session.respond({requestId:"respond",sessionId:session.binding.sessionId,interactionId:next.value.payload.interactionId,response:{kind:"approval",optionId:"deny"}});
-    if(next.value.type==="turn/completed"&&next.value.payload.turnId===turnId)return events;
+    if(answer&&next.value.type==="interaction/requested")await session.request("interaction/respond",{requestId:"respond",sessionId:session.binding.sessionId,interactionId:next.value.payload.interactionId,response:{kind:"approval",optionId:"deny"}});
+    if(next.value.type==="turn/completed")return events;
   }}finally{clearTimeout(timer);await reader.return?.();}
 }
 test("external AHP preserves immediate lifecycle over stdio",async()=>{
-  const runtime=createHarnessRuntime(createAhpAdapter({command:process.execPath,args:[path.resolve(import.meta.dir,"../examples/reference.ts")],timeoutMs:1500}));
+  const runtime=await createClient({identity:{adapterId:"ahp",runtimeConfigId:"ref"},interactions:{approval:undefined},adapter:createAhpAdapter({command:process.execPath,args:[path.resolve(import.meta.dir,"../examples/reference.ts")],timeoutMs:1500})});
   try{
-    await runtime.initialize({protocolVersions:[1],clientInfo:{name:"stdio",version:"1"},clientCapabilities:{interactions:["approval"]}});
     const session=await runtime.openSession({requestId:"open",mode:"new",binding:{sessionId:"s",adapterId:"ahp",runtimeConfigId:"ref"},cwd:process.cwd()});
-    const collecting=collect(session,"turn");await session.startTurn({requestId:"start",sessionId:"s",turnId:"turn",input:[{type:"text",text:"stdio"}]});
+    const collecting=collect(session,"turn");await session.submit({ input:[{type:"text",text:"stdio"}] });
     const events=await collecting;expect(events.some(e=>e.type==="item/completed"&&e.payload.item.type==="agentMessage"&&e.payload.item.text==="stdio")).toBe(true);
   }finally{await runtime.dispose();}
 });
 test("remote interaction responds once, with no duplicate local resolution",async()=>{
   const f=await fixture();try{
-    const reading=collect(f.session,"turn",true);await f.session.startTurn({requestId:"start",sessionId:"session",turnId:"turn",input:[{type:"text",text:"/approval"}]});
+    const reading=collect(f.session,"turn",true);await f.session.submit({ input:[{type:"text",text:"/approval"}] });
     const events=await reading;expect(events.filter(e=>e.type==="interaction/resolved")).toHaveLength(1);expect(events.filter(e=>e.type==="interaction/requested")).toHaveLength(1);
   }finally{await f.runtime.dispose();}
 });
 test("advertised source replay fills remote gaps and dedupes source notifications",async()=>{
   const f=await fixture({dropSeq:3,duplicate:true});try{
-    const reading=collect(f.session,"turn");await f.session.startTurn({requestId:"start",sessionId:"session",turnId:"turn",input:[{type:"text",text:"replayed"}]});
+    const reading=collect(f.session,"turn");await f.session.submit({ input:[{type:"text",text:"replayed"}] });
     const events=await reading;expect(events.filter(e=>e.type==="item/started")).toHaveLength(1);expect(events.at(-1)?.type).toBe("turn/completed");
-    expect(events.every((e,i)=>e.seq===i+1)).toBe(true);
+    expect(events.every((e,i)=>e.seq===events[0]!.seq+i)).toBe(true);
   }finally{await f.runtime.dispose();}
 });
 test("source without replay fails a missing sequence instead of silently continuing",async()=>{
   const f=await fixture({dropSeq:3,replay:false});try{
-    const reading=collect(f.session,"turn");const start=f.session.startTurn({requestId:"start",sessionId:"session",turnId:"turn",input:[{type:"text",text:"gap"}]});void start.catch(()=>{});
-    const events=await reading;await start.catch(()=>{});expect(events.at(-1)).toMatchObject({type:"turn/completed",payload:{status:"failed"}});
+    const reading=collect(f.session,"turn");const start=f.session.submit({ input:[{type:"text",text:"gap"}] });void start.catch(()=>{});
+    await expect(reading).rejects.toMatchObject({code:"SOURCE_SEQUENCE_GAP"});await start.catch(()=>{});
   }finally{await f.runtime.dispose();}
 });
 test("WebSocket factory uses identical lifecycle and closes only its connection",async()=>{
   const sessions=new Map<string,ReturnType<typeof createReferenceHarness>>();
   const server=Bun.serve<{id:string}>({hostname:"127.0.0.1",port:0,fetch(req,s){if(s.upgrade(req,{data:{id:crypto.randomUUID()}}))return;return new Response("no",{status:400});},websocket:{open(socket){sessions.set(socket.data.id,createReferenceHarness(frame=>{socket.send(frame);}));},message(socket,frame){void sessions.get(socket.data.id)?.receive(String(frame));},close(socket){void sessions.get(socket.data.id)?.close();sessions.delete(socket.data.id);}}});
-  const runtime=createHarnessRuntime(createAhpAdapter({url:`ws://127.0.0.1:${server.port}/`,connect:url=>createWebSocketTransport(url)}));
+  const runtime=await createClient({identity:{adapterId:"ahp",runtimeConfigId:"ref"},interactions:{approval:undefined},adapter:createAhpAdapter({url:`ws://127.0.0.1:${server.port}/`,connect:url=>createWebSocketTransport(url)})});
   try{
-    await runtime.initialize({protocolVersions:[1],clientInfo:{name:"ws",version:"1"},clientCapabilities:{interactions:["approval"]}});
     const session=await runtime.openSession({requestId:"open",mode:"new",binding:{sessionId:"ws",adapterId:"ahp",runtimeConfigId:"ref"},cwd:process.cwd()});
-    const text=collect(session,"text");await session.startTurn({requestId:"text",sessionId:"ws",turnId:"text",input:[{type:"text",text:"stdio"}]});expect((await text).some(e=>e.type==="item/completed"&&e.payload.item.type==="agentMessage"&&e.payload.item.text==="stdio")).toBe(true);
-    const approval=collect(session,"approval",true);await session.startTurn({requestId:"approval",sessionId:"ws",turnId:"approval",input:[{type:"text",text:"/approval"}]});expect((await approval).filter(e=>e.type==="interaction/resolved")).toHaveLength(1);
-    const reading=collect(session,"turn");await session.startTurn({requestId:"start",sessionId:"ws",turnId:"turn",input:[{type:"text",text:"/wait"}]});await session.interrupt({requestId:"stop",sessionId:"ws",turnId:"turn"});expect((await reading).at(-1)).toMatchObject({payload:{status:"interrupted"}});
+    const text=collect(session,"text");await session.submit({ input:[{type:"text",text:"stdio"}] });expect((await text).some(e=>e.type==="item/completed"&&e.payload.item.type==="agentMessage"&&e.payload.item.text==="stdio")).toBe(true);
+    const approval=collect(session,"approval",true);await session.submit({ input:[{type:"text",text:"/approval"}] });expect((await approval).filter(e=>e.type==="interaction/resolved")).toHaveLength(1);
+    const reading=collect(session,"turn");const active=await session.submit({ input:"/wait" });await active.interrupt();expect((await reading).at(-1)).toMatchObject({payload:{status:"interrupted"}});
     await runtime.dispose();expect(server.port).toBeGreaterThan(0);
   }finally{await runtime.dispose();await server.stop(true);}
 });
@@ -74,7 +71,7 @@ test("negotiated metadata extensions map to standard title events through replay
   const f = await fixture({ dropSeq: 3, replay: true });
   try {
     const pending = collect(f.session, 'title');
-    await f.session.startTurn({ requestId: 'title', sessionId: 'session', turnId: 'title', input: [{ type: 'text', text: '/title Native title' }] });
+    await f.session.submit({ input: [{ type: 'text', text: '/title Native title' }] });
     const events = await pending;
     expect(events.filter(e => e.type === 'session/metadata').map(e => e.payload)).toEqual([{ title: 'Native title' }]);
     expect(events.filter(e => e.type === 'turn/completed')).toHaveLength(1);
@@ -95,7 +92,7 @@ test("unknown remote notifications surface as neutral notices", async () => {
   try {
     const reading = collect(f.session, "turn");
     f.queue.push(JSON.stringify({ jsonrpc: "2.0", method: "custom/ping", params: { hello: "world" } }));
-    await f.session.startTurn({ requestId: "start", sessionId: "session", turnId: "turn", input: [{ type: "text", text: "x" }] });
+    await f.session.submit({ input: [{ type: "text", text: "x" }] });
     const events = await reading;
     expect(events.some(e => e.type === "notice" && e.payload.code === "UNKNOWN_NOTIFICATION")).toBe(true);
   } finally { await f.runtime.dispose(); }
@@ -162,4 +159,18 @@ test("webSocket transport rejects non-text frames and closes", async () => {
   await expect(reader.next()).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
   expect(socket.object.readyState).toBe(3);
   await transport.close();
+});
+
+for(const reopen of [false,true])test(`late notifications from a closed source do not fail ${reopen?'a reopened':'another live'} session`,async()=>{
+  const f=await fixture();
+  try{
+    const old=f.sent.find(frame=>frame.params?.sessionId==='session')!.params!;
+    await f.session.close();
+    const live=await f.runtime.openSession({requestId:'other',mode:'new',binding:{sessionId:reopen?'session':'other',adapterId:'ahp',runtimeConfigId:'ref'},cwd:process.cwd()});
+    const late={...old,seq:50,type:'notice',payload:{severity:'info',code:'LATE',message:'closed source'}};
+    f.queue.push(JSON.stringify({jsonrpc:'2.0',method:'notice',params:late}));
+    const turn=await live.submit({input:'still connected'},{timeoutMs:1000});
+    expect((await turn.result({timeoutMs:1000})).text).toBe('still connected');
+    await live.close();
+  }finally{await f.runtime.dispose();}
 });

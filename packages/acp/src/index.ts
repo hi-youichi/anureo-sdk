@@ -1,11 +1,12 @@
 import { acpFileChanges } from './file-changes';
+import { randomUUID } from 'node:crypto';
 import * as acp from '@agentclientprotocol/sdk';
 import {
-  spawnHarnessProcess, HarnessSdkError, waitForRequest,
+  spawnHarnessProcess, HarnessSdkError, sdkError, waitForRequest,
   type HarnessAdapter, type BackendSession, type SessionEventSink, type SessionMethod, type HarnessProcess,
 } from '@anureo/sdk';
 import {
-  negotiateVersion, assertResult, assertDefinition,
+  AHP_PROTOCOL_CONTRACT, assertRequest, negotiateVersion, assertResult, assertDefinition,
   type Capabilities, type SessionBinding, type SessionOpenParams, type SessionState, type InitializeParams,
   type InitializeResult, type AhpRequestMap, type AhpResultMap, type JsonObject, type InteractionRequested,
   type InteractionResponse, type AhpEventPayload,
@@ -47,12 +48,13 @@ function errorFromNative(error: unknown, fallback = 'ACP_REQUEST_FAILED'): Harne
   return new HarnessSdkError('ACP_CONNECTION_CLOSED', 'ACP connection closed', false, true);
 }
 type ExtensionKey = 'fork' | 'revert' | 'steer' | 'history' | 'goalSet' | 'goalClear' | 'compact' | 'review';
-interface Extensions { methods: Partial<Record<ExtensionKey, string>>; fork: Array<'before' | 'through'>; revert: Array<'conversation' | 'files' | 'both'>; subagents: boolean; instructions: boolean; userInput: boolean; dynamicTool: boolean }
+interface Extensions { methods: Partial<Record<ExtensionKey, string>>; fork: Array<'before' | 'through'>; revert: Array<'conversation' | 'files' | 'both'>; subagents: boolean; instructions: boolean; userInput: boolean; dynamicTool: boolean; nativeLifecycle?: boolean }
 function extensions(response: unknown): Extensions {
   const extension = record(record(record(response)._meta).ahp);
   const methods: Extensions['methods'] = {};
   const result: Extensions = { methods, fork: [], revert: [], subagents: false, instructions: false, userInput: false, dynamicTool: false };
-  if (extension.version !== 1) return result;
+  if (extension.version !== 1 && !(extension.version === 2 && extension.turnCorrelation === true)) return result;
+  result.nativeLifecycle = extension.version === 2 && extension.turnCorrelation === true;
   const names = record(extension.methods);
   for (const key of ['fork', 'revert', 'steer', 'history', 'goalSet', 'goalClear', 'compact', 'review'] as ExtensionKey[]) {
     const name = names[key]; if (typeof name === 'string' && /^_[a-zA-Z0-9/_.-]+$/.test(name)) methods[key] = name;
@@ -105,11 +107,14 @@ export class AcpAdapter implements HarnessAdapter {
   private openTail = Promise.resolve();
   private readonly deliveries = new Map<acp.JsonRpcId, Deferred>();
   private closing = false;
+  private connectionLost = false;
+  private sourceFailure?: HarnessSdkError;
   extension: Extensions = { methods: {}, fork: [], revert: [], subagents: false, instructions: false, userInput: false, dynamicTool: false };
   capabilities: Capabilities = {};
   constructor(readonly options: AcpAdapterOptions) {}
   get nativeCapabilities(): acp.AgentCapabilities { return this.info?.agentCapabilities ?? {}; }
   get agent(): acp.ClientContext { if (!this.connection) throw new HarnessSdkError('ACP_CONNECTION_CLOSED'); return this.connection.agent; }
+  get connected(): boolean { return !!this.connection && !this.connectionLost; }
   private backend(nativeId: string, allowOpening = false): AcpBackendSession {
     const existing = this.nativeSessions.get(nativeId);
     if (existing) return existing;
@@ -117,6 +122,7 @@ export class AcpAdapter implements HarnessAdapter {
     throw new acp.RequestError(-32602, 'Unknown ACP session');
   }
   private async interaction<T>(session: AcpBackendSession, requestId: acp.JsonRpcId, request: InteractionRequested, transform: (response: InteractionResponse | null) => T): Promise<T> {
+    await session.ensureStandardStarted();
     const delivery = deferred(); this.deliveries.set(requestId, delivery);
     return new Promise<T>((resolve, reject) => {
       let answered = false;
@@ -127,16 +133,25 @@ export class AcpAdapter implements HarnessAdapter {
     });
   }
   async initialize(params: InitializeParams): Promise<InitializeResult> {
+    if (this.closing) throw new HarnessSdkError('RUNTIME_DISPOSED');
+    assertRequest("initialize", params);
     negotiateVersion(params.protocolVersions);
-    if (this.info) return { protocolVersion: 1, runtime: this.runtime(), capabilities: structuredClone(this.capabilities) };
-    this.channel = this.options.connect ? await this.options.connect() : await processStream(this.options);
+    if (this.info) return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: this.runtime(), capabilities: structuredClone(this.capabilities) };
+    const channel = this.options.connect ? await this.options.connect() : await processStream(this.options);
+    if (this.closing) { await channel.dispose(); throw new HarnessSdkError('RUNTIME_DISPOSED'); }
+    this.channel = channel;
     const rawReader = this.channel.stream.readable.getReader(); const rawWriter = this.channel.stream.writable.getWriter();
     const wrapped: acp.Stream = {
       writable: new WritableStream({ write: async (frame) => {
         try {
           await rawWriter.write(frame);
           if ('id' in frame && !('method' in frame)) { this.deliveries.get(frame.id)?.resolve(); this.deliveries.delete(frame.id); }
-        } catch (error) { for (const delivery of this.deliveries.values()) delivery.reject(error); throw error; }
+        } catch (error) {
+          this.connectionLost = true; this.sourceFailure = sdkError(error, 'ACP_CONNECTION_CLOSED', true);
+          for (const delivery of this.deliveries.values()) delivery.reject(this.sourceFailure);
+          void Promise.all([...this.sessions.values()].map(session => session.sink.fail(this.sourceFailure!).catch(() => {})));
+          throw error;
+        }
       }, close: () => rawWriter.close(), abort: (reason) => rawWriter.abort(reason) }),
       readable: new ReadableStream({ pull: async (controller) => {
         try {
@@ -148,12 +163,10 @@ export class AcpAdapter implements HarnessAdapter {
               const value = record(frame.params); const session = this.backend(String(value.sessionId), true);
               await session.update(record(value.update)); continue;
             }
-            if ('method' in frame && !('id' in frame) && frame.method === '_ahp/event' && Object.keys(this.extension.methods).length) {
+            if ('method' in frame && !('id' in frame) && frame.method === '_ahp/event' && (Object.keys(this.extension.methods).length || this.extension.nativeLifecycle)) {
               const value = record(frame.params); const session = this.backend(String(value.sessionId)); const event = value.event;
-              assertDefinition<AhpEventPayload>('AhpEventPayload', event);
-              if (event.type === 'turn/started') session.activeTurn = event.payload.turnId;
-              await session.sink.emit(event, { ...(typeof value.turnId === 'string' ? { turnId: value.turnId } : {}) });
-              if (event.type === 'turn/completed' && session.activeTurn === event.payload.turnId) session.activeTurn = undefined;
+              if (this.extension.nativeLifecycle) { await session.nativeEvent(event, value); continue; }
+              await session.extensionEvent(event, value);
               continue;
             }
             if ('method' in frame && !('id' in frame) && frame.method !== 'elicitation/complete') {
@@ -164,7 +177,12 @@ export class AcpAdapter implements HarnessAdapter {
             }
             controller.enqueue(frame); return;
           }
-        } catch (error) { controller.error(error); }
+        } catch (error) {
+          this.connectionLost = true;
+          this.sourceFailure = sdkError(error, 'ACP_CONNECTION_CLOSED', true);
+          controller.error(error);
+          void Promise.all([...this.sessions.values()].map(session => session.sink.fail(this.sourceFailure!).catch(() => {})));
+        }
       }, cancel: (reason) => rawReader.cancel(reason) }),
     };
     const app = acp.client({ name: 'anureo-harness-sdk-acp' })
@@ -201,7 +219,8 @@ export class AcpAdapter implements HarnessAdapter {
     }
     this.connection = app.connect(wrapped);
     void this.connection.closed.then(async () => {
-      const error = new HarnessSdkError('ACP_CONNECTION_CLOSED', 'ACP source connection closed', false, true);
+      this.connectionLost = true;
+      const error = this.sourceFailure ?? new HarnessSdkError('ACP_CONNECTION_CLOSED', 'ACP source connection closed', false, true);
       for (const delivery of this.deliveries.values()) delivery.reject(error); this.deliveries.clear();
       if (!this.closing) await Promise.all([...this.sessions.values()].map((session) => session.sink.fail(error).catch(() => {})));
     });
@@ -216,14 +235,15 @@ export class AcpAdapter implements HarnessAdapter {
     const native = this.nativeCapabilities;
     this.capabilities = {
       session: { resume: native.loadSession === true || native.sessionCapabilities?.resume != null, fork: this.extension.fork, revert: this.extension.revert, history: !!this.extension.methods.history },
-      turn: { interrupt: true, steer: !!this.extension.methods.steer, inputModalities: ['text', ...(native.promptCapabilities?.image ? ['image' as const] : []), ...(native.promptCapabilities?.embeddedContext ? ['file' as const] : [])] },
+      input: { delivery: ['native'], interrupt: { targets: ['session'], reportsPendingInputs: false } },
+      turn: { inputModalities: ['text', ...(native.promptCapabilities?.image ? ['image' as const] : []), ...(native.promptCapabilities?.embeddedContext ? ['file' as const] : [])] },
       interactions: ['approval', 'elicitation', ...(this.extension.userInput ? ['userInput' as const] : []), ...(this.extension.dynamicTool ? ['dynamicTool' as const] : [])],
       goal: { actions: [...(this.extension.methods.goalSet ? ['set' as const] : []), ...(this.extension.methods.goalClear ? ['clear' as const] : [])] },
       compact: !!this.extension.methods.compact, review: !!this.extension.methods.review, subagents: { events: this.extension.subagents ? 'nested' : 'none' },
       mcp: { stdio: true, http: native.mcpCapabilities?.http === true, elicitation: ['form', 'url'] }, config: { options: [] },
       extensions: Object.keys(this.extension.methods).length || this.extension.subagents || this.extension.userInput || this.extension.dynamicTool ? [{ name: 'x-acp/ahp', version: '1' }] : [],
     };
-    return { protocolVersion: 1, runtime: this.runtime(), capabilities: structuredClone(this.capabilities) };
+    return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: this.runtime(), capabilities: structuredClone(this.capabilities) };
   }
   private runtime() { return { name: this.info?.agentInfo?.name ?? 'acp', version: this.info?.agentInfo?.version ?? 'unknown', adapter: 'acp/0.1.0' }; }
   async call<M extends acp.AgentRequestMethod>(method: M, params: acp.AgentRequestParamsByMethod[M]): Promise<acp.AgentRequestResponsesByMethod[M]>;
@@ -266,20 +286,28 @@ export class AcpAdapter implements HarnessAdapter {
       if (session.loadedSnapshot.length) this.options.onLoadSnapshot?.(session.binding, session.loadedSnapshot);
       const patch = { ...params.config, ...(params.model ? { model: params.model } : {}), ...(params.permissionMode ? { permissionMode: params.permissionMode } : {}) };
       if (Object.keys(patch).length) await session.setConfiguration(patch);
-      if (session.state().metadata) await sink.emit({ type: 'session/metadata', payload: session.state().metadata! });
+      if (session.snapshot().metadata) await sink.emit({ type: 'session/metadata', payload: session.snapshot().metadata! });
       return session;
     } catch (error) { for (const [id, value] of this.nativeSessions) if (value === session) this.nativeSessions.delete(id); this.sessions.delete(params.binding.sessionId); throw error; }
     finally { this.opening = undefined; release(); }
   }
   async dispose(): Promise<void> {
     if (this.closing) return; this.closing = true;
-    for (const session of this.sessions.values()) await session.dispose().catch(() => {});
-    this.connection?.close(); await this.channel?.dispose();
+    const results = await Promise.allSettled([...this.sessions.values()].map(session => session.dispose()));
+    const transport = await Promise.allSettled([Promise.resolve().then(() => this.connection?.close()), Promise.resolve().then(() => this.channel?.dispose())]);
     this.sessions.clear(); this.nativeSessions.clear();
+    const failures = [...results, ...transport].filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failures.length) throw new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'ACP resources were not fully released', false, true, { errors: failures.map(() => ({ code: 'ACP_RELEASE_FAILED' })) });
   }
 }
 
 export class AcpBackendSession implements BackendSession {
+  private readonly nativeMappers = new Map<string, AcpUpdateMapper>();
+  private readonly nativeStarted = new Set<string>();
+  private releasing?: Promise<void>;
+  private standardStarted = false;
+  private standardSubmission?: string;
+  private nativeClosed = false;
   nativeId = '';
   activeTurn: string | undefined;
   hydrating = false;
@@ -296,10 +324,95 @@ export class AcpBackendSession implements BackendSession {
   private snapshotBytes = 0;
   constructor(readonly adapter: AcpAdapter, private readonly params: SessionOpenParams, readonly sink: SessionEventSink) {
     this.capabilities = structuredClone(adapter.capabilities);
-    this.mapper = new AcpUpdateMapper(sink, () => this.activeTurn, () => this.state(), (data) => this.configure(data), adapter.extension.subagents);
+    this.mapper = new AcpUpdateMapper(sink, () => this.activeTurn, () => this.snapshot(), (data) => this.configure(data), adapter.extension.subagents);
   }
   get binding(): SessionBinding { return { ...this.params.binding, nativeRef: { provider: 'acp', value: this.nativeId } }; }
-  state(): SessionState { return { ...(this.sessionTitle !== undefined ? { metadata: { title: this.sessionTitle } } : {}), binding: this.binding, config: this.config, capabilities: this.capabilities, capabilityRevision: this.capabilityRevision, status: this.activeTurn ? 'running' : 'ready', ...(this.activeTurn ? { activeTurnId: this.activeTurn } : {}) }; }
+  get state(): SessionState { return this.snapshot(); }
+  snapshot(): SessionState { return { ...(this.sessionTitle !== undefined ? { metadata: { title: this.sessionTitle } } : {}), binding: this.binding, config: this.config, capabilities: this.capabilities, capabilityRevision: this.capabilityRevision, status: this.activeTurn ? 'running' : 'ready', activeTurnIds: [...this.nativeStarted, ...(this.standardStarted && this.activeTurn ? [this.activeTurn] : [])] }; }
+  async nativeEvent(raw: unknown, scope: Record<string, unknown>): Promise<void> {
+    const event = record(raw), payload = record(event.payload);
+    if (event.type === 'submission/bound') { assertDefinition<import('@anureo/protocol').SubmissionBound>('SubmissionBound', payload); await this.sink.bindSubmission!(payload.submissionId, payload.turnId); return; }
+    assertDefinition<AhpEventPayload>('AhpEventPayload', raw);
+    if (raw.type === 'turn/started') this.nativeStarted.add(raw.payload.turnId);
+    if (raw.type === 'turn/completed') {
+      await this.nativeMappers.get(raw.payload.turnId)?.complete();
+      this.nativeMappers.delete(raw.payload.turnId); this.nativeStarted.delete(raw.payload.turnId);
+    }
+    await this.sink.emit(raw, { ...(typeof scope.turnId === 'string' ? { turnId: scope.turnId } : {}) });
+  }
+  async extensionEvent(raw: unknown, scope: Record<string, unknown>): Promise<void> {
+    assertDefinition<AhpEventPayload>('AhpEventPayload', raw);
+    if (raw.type === 'turn/started') {
+      if (this.standardStarted && this.activeTurn !== raw.payload.turnId) throw new HarnessSdkError('PROTOCOL_ERROR', 'ACP execution identity changed');
+      this.activeTurn = raw.payload.turnId;
+      await this.sink.emit(raw);
+      if (this.standardSubmission && !this.standardStarted) {
+        this.standardStarted = true;
+        await this.sink.bindSubmission(this.standardSubmission, raw.payload.turnId);
+      }
+      return;
+    }
+    await this.sink.emit(raw, { ...(typeof scope.turnId === 'string' ? { turnId: scope.turnId } : this.activeTurn ? { turnId: this.activeTurn } : {}) });
+    if (raw.type === 'turn/completed' && this.activeTurn === raw.payload.turnId) {
+      this.activeTurn = undefined; this.standardSubmission = undefined; this.standardStarted = false;
+    }
+  }
+  private async submitReview(params: AhpRequestMap['review/start']): Promise<AhpResultMap['review/start']> {
+    const method = this.adapter.extension.methods.review; if (!method) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
+    if (this.activeTurn) throw new HarnessSdkError('NATIVE_CORRELATION_UNSUPPORTED');
+    this.activeTurn = randomUUID(); this.standardSubmission = params.submissionId; this.standardStarted = false; this.mapper.reset();
+    try {
+      await this.adapter.call(method, { ...params, sessionId: this.nativeId, turnId: this.activeTurn });
+      // The legacy extension has no revised input receipt. Only its native
+      // lifecycle notification can associate the review with an execution.
+      return { submissionId: params.submissionId, disposition: 'dispatched' };
+    } catch (cause) {
+      const error = errorFromNative(cause, 'ACP_REVIEW_REJECTED');
+      if (!this.standardStarted && !error.outcomeUnknown) { this.activeTurn = undefined; this.standardSubmission = undefined; }
+      if (error.code === 'CAPABILITY_UNSUPPORTED') {
+        delete this.adapter.extension.methods.review; this.capabilities.review = false;
+        await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
+      }
+      throw error;
+    }
+  }
+  async ensureStandardStarted(): Promise<void> {
+    if (!this.standardSubmission || !this.activeTurn || this.standardStarted) return;
+    this.standardStarted = true;
+    await this.sink.emit({ type: 'turn/started', payload: { turnId: this.activeTurn } });
+    await this.sink.bindSubmission(this.standardSubmission, this.activeTurn);
+  }
+  private async submitInput(start: AhpRequestMap['input/submit']): Promise<AhpResultMap['input/submit']> {
+    if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
+    if (start.delivery !== 'native') throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
+    if (this.adapter.extension.nativeLifecycle) {
+      try {
+        const result = record(await this.adapter.agent.request('session/prompt', { sessionId: this.nativeId, prompt: input(start.input), _meta: { ahp: { version: 2, submissionId: start.submissionId } } }));
+        const value = record(record(result._meta).ahp).acceptance;
+        assertDefinition<import('@anureo/protocol').SubmissionAcceptance>('SubmissionAcceptance', value);
+        return value;
+      } catch (cause) { throw errorFromNative(cause, 'ACP_INPUT_REJECTED'); }
+    }
+    // Standard ACP has no per-execution correlation. It can safely expose only
+    // one outstanding prompt; this is a backend-specific evidence limitation.
+    if (this.activeTurn) throw new HarnessSdkError('NATIVE_CORRELATION_UNSUPPORTED');
+    this.activeTurn = randomUUID(); this.standardSubmission = start.submissionId; this.standardStarted = false; this.mapper.reset();
+    const turnId = this.activeTurn;
+    try {
+      const completed = await this.adapter.agent.request('session/prompt', { sessionId: this.nativeId, prompt: input(start.input),
+        ...(Object.keys(this.adapter.extension.methods).length ? { _meta: { ahp: { version: 1, turnId } } } : {}) });
+      await this.ensureStandardStarted(); await this.mapper.complete();
+      await this.sink.emit({ type: 'turn/completed', payload: { turnId, status: completed.stopReason === 'cancelled' ? 'interrupted' : 'completed' } });
+      return { submissionId: start.submissionId, accepted: true, disposition: 'started', turnId };
+    } catch (cause) {
+      const error = errorFromNative(cause, 'ACP_INPUT_REJECTED');
+      if (this.standardStarted) {
+        if (error.outcomeUnknown) await this.sink.fail(error);
+        else await this.sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: { code: error.code, message: error.code, retryable: false, outcomeUnknown: false } } });
+      }
+      throw error;
+    } finally { this.activeTurn = undefined; this.standardSubmission = undefined; this.standardStarted = false; }
+  }
   configure(data: Record<string, unknown>): void {
     if (Object.hasOwn(data, 'sessionTitle')) { this.sessionTitle = data.sessionTitle as string | null; return; }
     this.configurationData = { ...this.configurationData, ...data };
@@ -319,6 +432,17 @@ export class AcpBackendSession implements BackendSession {
       if (this.loadedSnapshot.length >= 2048 || this.snapshotBytes > 16 * 1024 * 1024) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED', 'ACP load snapshot exceeds its limit');
       this.loadedSnapshot.push(safe(data) as JsonObject); return;
     }
+    if (this.adapter.extension.nativeLifecycle) {
+      const native = record(record(data._meta).ahp), turnId = typeof native.turnId === 'string' ? native.turnId : undefined;
+      if (turnId) {
+        if (!this.nativeStarted.has(turnId)) throw new HarnessSdkError('PROTOCOL_ERROR', 'ACP update arrived without its execution start');
+        let mapper = this.nativeMappers.get(turnId);
+        if (!mapper) { mapper = new AcpUpdateMapper(this.sink, () => turnId, () => this.snapshot(), value => this.configure(value), this.adapter.extension.subagents); this.nativeMappers.set(turnId, mapper); }
+        await mapper.update(data); return;
+      }
+      if (!['session_info_update', 'config_option_update', 'current_mode_update', 'usage_update', 'available_commands_update'].includes(String(data.sessionUpdate))) throw new HarnessSdkError('NATIVE_CORRELATION_UNSUPPORTED');
+    }
+    if (!['session_info_update', 'config_option_update', 'current_mode_update', 'available_commands_update'].includes(String(data.sessionUpdate))) await this.ensureStandardStarted();
     await this.mapper.update(data);
   }
   requireTerminal(id: string): void { if (!this.terminals.has(id)) throw new acp.RequestError(-32602, 'Terminal does not belong to this session'); }
@@ -333,7 +457,7 @@ export class AcpBackendSession implements BackendSession {
       }
       this.config[key] = value;
     }
-    return this.state();
+    return this.snapshot();
   }
   private async extension<M extends SessionMethod>(key: ExtensionKey, method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
     const nativeMethod = this.adapter.extension.methods[key]; if (!nativeMethod) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
@@ -350,13 +474,13 @@ export class AcpBackendSession implements BackendSession {
     } catch (error) {
       if (error instanceof HarnessSdkError && error.code === 'CAPABILITY_UNSUPPORTED') {
         delete this.adapter.extension.methods[key];
-        if (key === 'steer') this.capabilities.turn!.steer = false;
+        if (key === 'steer') delete this.capabilities.input!.steer;
         if (key === 'history') this.capabilities.session!.history = false;
         if (key === 'revert') this.capabilities.session!.revert = [];
         if (key === 'compact') this.capabilities.compact = false;
         if (key === 'review') this.capabilities.review = false;
         if (key === 'goalSet' || key === 'goalClear') this.capabilities.goal!.actions = this.capabilities.goal!.actions?.filter((action) => action !== (key === 'goalSet' ? 'set' : 'clear'));
-        await this.sink.emit({ type: 'session/state', payload: this.state() });
+        await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
       }
       throw error;
     }
@@ -364,43 +488,34 @@ export class AcpBackendSession implements BackendSession {
   async execute<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
     let result: AhpResultMap[SessionMethod];
     switch (method) {
-      case 'turn/start': {
-        const turn = params as AhpRequestMap['turn/start']; const prompt = input(turn.input);
-        this.activeTurn = turn.turnId; this.mapper.reset();
-        await this.sink.emit({ type: 'turn/started', payload: { turnId: turn.turnId } });
-        void (async () => {
-          try {
-            const completed = await this.adapter.agent.request('session/prompt', { sessionId: this.nativeId, prompt, ...(this.capabilities.extensions?.some((extension) => extension.name === 'x-acp/ahp') ? { _meta: { ahp: { version: 1, turnId: turn.turnId } } } : {}) });
-            await this.mapper.complete();
-            await this.sink.emit({ type: 'turn/completed', payload: { turnId: turn.turnId, status: completed.stopReason === 'cancelled' ? 'interrupted' : 'completed' } });
-          } catch (error) {
-            const failure = errorFromNative(error, 'ACP_TURN_FAILED');
-            if (failure.outcomeUnknown) await this.sink.fail(failure);
-            else await this.sink.emit({ type: 'turn/completed', payload: { turnId: turn.turnId, status: 'failed', error: { code: failure.code, message: failure.message, retryable: false, outcomeUnknown: false } } });
-          } finally { if (this.activeTurn === turn.turnId) this.activeTurn = undefined; }
-        })().catch(() => {});
-        result = { turnId: turn.turnId, accepted: true }; break;
-      }
-      case 'turn/interrupt': await this.adapter.agent.notify('session/cancel', { sessionId: this.nativeId }); result = { accepted: true, turnId: (params as AhpRequestMap['turn/interrupt']).turnId }; break;
+      case 'input/submit': return await this.submitInput(params as AhpRequestMap['input/submit']) as AhpResultMap[M];
+      case 'turn/interrupt': case 'turn/steer': throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
+      case 'session/interrupt': await this.adapter.agent.notify('session/cancel', { sessionId: this.nativeId }); result = { accepted: true }; break;
       case 'session/config/set': result = await this.setConfiguration((params as AhpRequestMap['session/config/set']).patch); break;
-      case 'session/close': await this.dispose(); result = { closed: true }; break;
-      case 'turn/steer': return this.extension('steer', method, params);
+      case 'session/close': {
+        if (this.adapter.nativeCapabilities.sessionCapabilities?.close != null) await this.adapter.call('session/close', { sessionId: this.nativeId });
+        this.nativeClosed = true;
+        result = { closed: true, observationClosed: true, executionStopped: 'unconfirmed' }; break;
+      }
       case 'session/revert': return this.extension('revert', method, params);
       case 'history/read': return this.extension('history', method, params);
       case 'goal/set': return this.extension('goalSet', method, params);
       case 'goal/clear': return this.extension('goalClear', method, params);
       case 'compact/start': return this.extension('compact', method, params);
-      case 'review/start': return this.extension('review', method, params);
+      case 'review/start': return this.submitReview(params as AhpRequestMap['review/start']) as Promise<AhpResultMap[M]>;
       case 'interaction/respond': case 'interaction/cancel': throw new HarnessSdkError('INTERACTION_EXPIRED');
     }
     return result as AhpResultMap[M];
   }
   async dispose(): Promise<void> {
-    if (this.closed) return; this.closed = true;
-    if (this.activeTurn) await this.adapter.agent.notify('session/cancel', { sessionId: this.nativeId }).catch(() => {});
-    for (const terminalId of this.terminals) await this.adapter.options.terminal?.releaseTerminal({ sessionId: this.nativeId, terminalId }).catch(() => {});
-    this.terminals.clear();
-    if (this.adapter.nativeCapabilities.sessionCapabilities?.close != null) await this.adapter.call('session/close', { sessionId: this.nativeId }).catch(() => {});
+    return this.releasing ??= (async () => {
+      this.closed = true;
+      const operations: Promise<unknown>[] = [...this.terminals].map(terminalId => Promise.resolve().then(() => this.adapter.options.terminal?.releaseTerminal({ sessionId: this.nativeId, terminalId })));
+      if (!this.nativeClosed && this.adapter.connected && this.adapter.nativeCapabilities.sessionCapabilities?.close != null) operations.push(this.adapter.call('session/close', { sessionId: this.nativeId }));
+      const results = await Promise.allSettled(operations); this.terminals.clear(); this.nativeMappers.clear();
+      const failures = results.filter((value): value is PromiseRejectedResult => value.status === 'rejected');
+      if (failures.length) throw new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'ACP resources were not fully released', false, true, { errors: failures.map(() => ({ code: 'ACP_RELEASE_FAILED' })) });
+    })();
   }
 }
 export function createAcpAdapter(options: AcpAdapterOptions): AcpAdapter { return new AcpAdapter(options); }

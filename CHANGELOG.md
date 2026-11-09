@@ -6,6 +6,28 @@ and versions follow [SemVer](https://semver.org/spec/v2.0.0.html). During the
 0.x line, minor versions may include breaking changes; such entries are
 marked **BREAKING**.
 
+## Unreleased
+
+- **BREAKING:** revise AHP v1 in place through package root entries. Both
+  initialization directions require `protocolContract: "native-lifecycle"`;
+  incompatible old v1 peers are rejected before business dispatch. Remove
+  experimental versioned entries and the second schema/validator contract.
+- **BREAKING:** replace `createHarnessRuntime` / `startTurn` with `createClient`
+  and `await session.submit()` returning a Turn. Replace wire `turn/start`
+  with `input/submit`; request, input and execution identities are separate.
+  No public Submission or mandatory accepted()/turn() chain remains.
+- Exact `turn.steer()` returns void on native append confirmation. Declare
+  input delivery and interrupt scopes explicitly. Claude native/afterTurn input
+  maps to next/later, with fixed Agent SDK 0.3.265 and evidence-based merged
+  execution association. Standard ACP retains serial input and session cancel.
+- Separate observation disposal/close from execution-stop evidence; preserve
+  independent observers, late results, bounded retention and source errors.
+  Fix metadata merging, revert references, result patch projection, privacy,
+  cleanup error aggregation and late notifications from closed AHP sources.
+- Migrate examples, all adapter suites, conformance and clean Node/Bun packing
+  checks. See the [design](docs/native-harness-lifecycle.md) and
+  [local validation record](docs/development.md#native-lifecycle-v1).
+
 ## [0.2.0] - 2026-10-30
 
 First public npm release of the Anureo SDK under the `@anureo` scope.

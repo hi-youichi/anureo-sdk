@@ -14,6 +14,6 @@ test('vanilla ACP and negotiated ACP extensions pass the same public SDK conform
     expect(report.cases.filter((result) => result.status === 'failed')).toEqual([]);
     expect(report.passed).toBe(true);
     if (!extended) expect(report.cases.find((result) => result.scenario === 'fork')?.status).toBe('not-applicable');
-    else expect(report.cases.every((result) => result.status === 'passed')).toBe(true);
+    else expect(report.cases.filter(result => result.status === 'not-applicable').map(result => result.scenario)).toEqual(['steer']);
   }
 }, 25_000);

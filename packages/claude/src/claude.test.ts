@@ -3,12 +3,14 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InMemorySessionStore, getSessionMessages, forkSession, renameSession, type Options, type SDKMessage, type SDKUserMessage, type SessionMessage, type SessionStore, type SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
-import { BoundedEventQueue, createHarnessRuntime, type SessionEventSink } from "@anureo/sdk";
+import { BoundedEventQueue, HarnessSdkError, createClient, type Session, type SessionEventSink } from "@anureo/sdk";
 import type { AhpEvent, InteractionRequested, InteractionResponse, SessionOpenParams } from "@anureo/protocol";
 import { createClaudeAdapter, type ClaudeAdapterOptions, type ClaudeQuery, type ClaudeQueryFactory } from "./index";
 import { FileSessionStore } from "./store";
 import { runConformance, type ConformanceScenario } from "@anureo/conformance";
 import { randomUUID } from "node:crypto";
+import { createClient as createNativeClient } from '@anureo/sdk';
+import { createClaudeAdapter as createNativeClaudeAdapter } from './index';
 import { fileURLToPath } from "node:url";
 
 class FakeQuery implements ClaudeQuery {
@@ -38,24 +40,71 @@ function factory(onInput: (input: SDKUserMessage, query: FakeQuery) => Promise<v
   const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => { const stream = new FakeQuery(options ?? {}, prompt, onInput); queries.push(stream); return stream; };
   return { queries, queryFactory };
 }
-const OPEN: SessionOpenParams = { requestId: "open", mode: "new", binding: { sessionId: "s", adapterId: "claude", runtimeConfigId: "r" }, cwd: "/tmp", model: "fake-model" };
-async function setup(options: ClaudeAdapterOptions = {}, onInput?: (input: SDKUserMessage, query: FakeQuery) => Promise<void>) {
-  const fake = factory(onInput); const adapter = createClaudeAdapter({ ...options, queryFactory: fake.queryFactory }); const runtime = createHarnessRuntime(adapter);
-  await runtime.initialize({ protocolVersions: [1], clientInfo: { name: "test", version: "1" }, clientCapabilities: { interactions: ["approval", "userInput", "elicitation", "dynamicTool"] } });
-  const session = await runtime.openSession(OPEN); return { ...fake, adapter, runtime, session };
-}
-async function collect(session: Awaited<ReturnType<ReturnType<typeof createHarnessRuntime>["openSession"]>>, answer?: (request: InteractionRequested) => InteractionResponse): Promise<AhpEvent[]> {
-  const reader = session.events()[Symbol.asyncIterator](); const events: AhpEvent[] = [];
+
+test('native lifecycle sends overlapping inputs into the SDK channel and binds results by user UUID', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; }); let n = 0;
+  const fake = factory(async (_input, stream) => {
+    const index = ++n;
+    await stream.text(`preview-${index}`);
+    if (index === 1) await gate;
+    await stream.result(`final-${index}`);
+  });
+  const client = await createNativeClient({ adapter: createNativeClaudeAdapter({ queryFactory: fake.queryFactory }), identity: { adapterId: 'claude', runtimeConfigId: 'native' } });
   try {
-    for (let i = 0; i < 100; i++) {
-      const entry = await reader.next(); if (entry.done) throw new Error("Missing terminal"); const event = entry.value; events.push(event);
-      if (event.type === "interaction/requested" && answer) await session.respond({ requestId: `answer:${event.payload.interactionId}`, sessionId: session.binding.sessionId, interactionId: event.payload.interactionId, response: answer(event.payload) });
-      if (event.type === "turn/completed") return events;
-    }
-    throw new Error("Event limit");
-  } finally { await reader.return?.(); }
+    const session = await client.sessions.create({ cwd: process.cwd() });
+    const one = session.submit({ input: 'one' }), first = await one;
+    const two = session.submit({ input: 'two' });
+    let bound = false; void two.then(() => { bound = true; }); await new Promise(resolve => setTimeout(resolve, 5)); expect(bound).toBe(false);
+    release(); const second = await two;
+    expect(first.id).not.toBe(second.id);
+    expect((await first.result()).text).toBe('final-1'); expect((await second.result()).text).toBe('final-2');
+    expect(fake.queries[0]!.calls.filter(call => call.method === 'input')).toHaveLength(2);
+    await session.close();
+  } finally { release(); await client.dispose(); }
+});
+
+test('native close retains both close and iterator release failures without repeating either release', async () => {
+  const fake = factory(); let closes = 0, returns = 0;
+  const client = await createNativeClient({ adapter: createNativeClaudeAdapter({ queryFactory: fake.queryFactory }), identity: { adapterId: 'claude', runtimeConfigId: 'release-errors' } });
+  const session = await client.sessions.create({ cwd: process.cwd() });
+  const query = fake.queries[0]!, original = query.close.bind(query);
+  query.close = () => { closes++; original(); throw new Error('private close failure'); };
+  Object.assign(query, { return: async () => { returns++; throw new Error('private return failure'); } });
+  await expect(session.close()).rejects.toMatchObject({ code: 'RESOURCE_RELEASE_FAILED' });
+  await expect(client.dispose()).rejects.toMatchObject({ code: 'RESOURCE_RELEASE_FAILED', details: { errors: [{ code: 'CLAUDE_CLOSE_FAILED' }, { code: 'CLAUDE_RETURN_FAILED' }] } });
+  expect(closes).toBe(1); expect(returns).toBe(1);
+});
+const OPEN: SessionOpenParams = { requestId: "open", mode: "new", binding: { sessionId: "s", adapterId: "claude", runtimeConfigId: "r" }, cwd: "/tmp", model: "fake-model" };
+const readers = new WeakMap<Session, AsyncIterator<AhpEvent>>();
+const runs = new WeakMap<Session, Map<string, Promise<import('@anureo/sdk').Turn>>>();
+function readerFor(session: Session) { let reader = readers.get(session); if (!reader) { reader = session.events()[Symbol.asyncIterator](); readers.set(session, reader); } return reader; }
+const ids = new WeakMap<Session, Map<string, string>>();
+function known(session: Session, alias: string): string { const id = ids.get(session)?.get(alias); if(!id)throw new Error(`Execution ${alias} is not bound`); return id; }
+async function setup(options: ClaudeAdapterOptions = {}, onInput?: (input: SDKUserMessage, query: FakeQuery) => Promise<void>) {
+  const fake = factory(onInput); const adapter = createClaudeAdapter({ ...options, queryFactory: fake.queryFactory });
+  const runtime = await createClient({adapter, identity: OPEN.binding, interactions: {approval:undefined,userInput:undefined,elicitation:undefined,dynamicTool:undefined}});
+  const session = await runtime.openSession(OPEN); readerFor(session); return { ...fake, adapter, runtime, session };
 }
-async function run(session: Awaited<ReturnType<ReturnType<typeof createHarnessRuntime>["openSession"]>>, turnId: string) { await session.startTurn({ requestId: `start:${turnId}`, sessionId: session.binding.sessionId, turnId, input: [{ type: "text", text: "conformance" }] }); }
+async function collect(session: Session, answer?: (request: InteractionRequested) => InteractionResponse): Promise<AhpEvent[]> {
+  const reader = readerFor(session), events: AhpEvent[] = [];
+  try {
+    for(let i=0;i<100;i++) {
+      const entry=await reader.next(); if(entry.done)throw new Error('Missing terminal'); const event=entry.value;events.push(event);
+      if(event.type==='interaction/requested'&&answer)await session.request('interaction/respond',{requestId:`answer:${event.payload.interactionId}`,sessionId:session.id,interactionId:event.payload.interactionId,response:answer(event.payload)});
+      if(event.type==='turn/completed')return events;
+    }
+    throw new Error('Event limit');
+  } finally { await reader.return?.(); readers.delete(session);readerFor(session); }
+}
+async function run(session: Session, alias: string) {
+  readerFor(session);
+  const pending=session.submit({ input:'conformance' });void pending.catch(()=>{});
+  const current=runs.get(session)??new Map();current.set(alias,pending);runs.set(session,current);
+  void pending.then(turn=>{const map=ids.get(session)??new Map();map.set(alias,turn.id);ids.set(session,map);}).catch(()=>{});
+  // Dispatch while the pre-installed reader can service native interaction callbacks.
+  await new Promise(resolve=>setImmediate(resolve));
+}
 
 test("Claude streams partial text and authoritative final output with native UUID and exact provided usage", async () => {
   const { runtime, session, queries } = await setup({}, async (_, stream) => {
@@ -65,11 +114,11 @@ test("Claude streams partial text and authoritative final output with native UUI
     await stream.text("authority", "message"); await stream.result("authority");
   });
   await run(session, "t"); const events = await collect(session);
-  expect(events.find((event) => event.type === "turn/started")?.payload).toMatchObject({ turnId: "t", nativeTurnId: expect.any(String) });
+  expect(events.find((event) => event.type === "turn/started")?.payload).toMatchObject({ turnId: known(session,"t") });
   expect(events.filter((event) => event.type === "item/completed").map((event) => event.payload.item)).toMatchObject([{ type: "agentMessage", text: "authority", phase: "final" }]);
   expect(events.find((event) => event.type === "usage/updated")?.payload).toMatchObject({ provider: "claude", scope: "turn", input: 7, output: 9, cacheRead: 2, cacheWrite: 1 });
   expect(queries[0]!.options.env?.ANTHROPIC_API_KEY).toBeUndefined(); expect(queries[0]!.options.settingSources).toEqual([]);
-  expect(events.map((event) => event.seq)).toEqual(events.map((_, index) => index + 1)); await runtime.dispose();
+  expect(events.map((event) => event.seq)).toEqual(events.map((_, index) => events[0]!.seq + index)); await runtime.dispose();
 });
 
 test("native tool results, task/hook lifecycle, compaction and unknown blocks remain structured", async () => {
@@ -92,10 +141,10 @@ test("native tool results, task/hook lifecycle, compaction and unknown blocks re
 });
 
 test("steer never appends Claude input; interrupt preserves the current turn identity", async () => {
-  const { runtime, session, queries } = await setup({}, async () => {}); await run(session, "t");
-  await expect(session.steer({ requestId: "steer", sessionId: "s", expectedTurnId: "t", input: [{ type: "text", text: "do not enqueue" }] })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
-  await session.interrupt({ requestId: "interrupt", sessionId: "s", turnId: "t" }); const events = await collect(session);
-  expect(events.at(-1)?.payload).toMatchObject({ turnId: "t", status: "interrupted" }); expect(queries[0]!.calls.filter((call) => call.method === "input")).toHaveLength(1); await runtime.dispose();
+  const { runtime, session, queries } = await setup({}, async (_,stream) => {await stream.text("working");}); await run(session, "t");
+  await expect(session.request("turn/steer", { requestId: "steer", sessionId: "s", submissionId:"steer-input", expectedTurnId: known(session,"t"), input: [{ type: "text", text: "do not enqueue" }] })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
+  await session.interrupt(); const events = await collect(session);
+  expect(events.at(-1)?.payload).toMatchObject({ turnId: known(session,"t"), status: "interrupted" }); expect(queries[0]!.calls.filter((call) => call.method === "input")).toHaveLength(1); await runtime.dispose();
 });
 
 test("canUseTool requests approval and only selected options enter the native callback", async () => {
@@ -117,7 +166,7 @@ test("AskUserQuestion and URL elicitation use typed interactions with private UR
   });
   await run(session, "t"); const events = await collect(session, (request) => request.kind === "userInput" ? { kind: "userInput", answers: { q0: "A" } } : { kind: "elicitation", action: "cancel" });
   expect(native[0]).toMatchObject({ behavior: "allow", updatedInput: { answers: { Choose: "A" } } }); expect(native[1]).toMatchObject({ action: "cancel" });
-  expect(events.find((event) => event.type === "interaction/requested" && event.payload.kind === "elicitation")?.payload).toMatchObject({ privatePayload: { url: "https://example.com/auth?token=PRIVATE" } }); await runtime.dispose();
+  expect(events.find((event) => event.type === "interaction/requested" && event.payload.kind === "elicitation")?.payload).toMatchObject({ privatePayloadAvailable: true }); await runtime.dispose();
 });
 
 test("form elicitation projects scalar answers; unrepresentable values cancel natively", async () => {
@@ -138,13 +187,13 @@ test("form elicitation projects scalar answers; unrepresentable values cancel na
   });
   try {
     await run(bad.session, "t");
-    const reader = bad.session.events()[Symbol.asyncIterator]();
+    const reader = readerFor(bad.session);
     let interactionId = "";
     while (true) {
       const entry = await reader.next(); if (entry.done) throw new Error("Missing interaction");
       if (entry.value.type === "interaction/requested") { interactionId = entry.value.payload.interactionId; break; }
     }
-    await expect(bad.session.respond({ requestId: "bad", sessionId: bad.session.binding.sessionId, interactionId, response: { kind: "elicitation", action: "accept", content: { nested: { deep: true } } } })).rejects.toMatchObject({ message: "Elicitation response cannot be represented by MCP" });
+    await expect(bad.session.request("interaction/respond", { requestId: "bad", sessionId: bad.session.binding.sessionId, interactionId, response: { kind: "elicitation", action: "accept", content: { nested: { deep: true } } } })).rejects.toMatchObject({ message: "Elicitation response cannot be represented by MCP" });
     let completed = false;
     while (!completed) {
       const entry = await reader.next(); if (entry.done) throw new Error("Missing terminal");
@@ -175,11 +224,11 @@ test("configuration uses actual query controls and refuses unsupported per-turn 
   const { runtime, session, adapter, queries } = await setup();
   expect(queries[0]!.options.allowDangerouslySkipPermissions).toBe(true);
   expect(queries[0]!.options.permissionMode).not.toBe('bypassPermissions');
-  await session.setConfig({ requestId: "config", sessionId: "s", patch: { model: "different", permissionMode: "plan", maxThinkingTokens: 100 } });
+  await session.request("session/config/set", { requestId: "config", sessionId: "s", patch: { model: "different", permissionMode: "plan", maxThinkingTokens: 100 } });
   expect(queries[0]!.calls.map((call) => call.method)).toEqual(["model", "permission", "thinking"]);
-  await session.setConfig({ requestId: "bypass", sessionId: "s", patch: { permissionMode: "bypassPermissions" } });
+  await session.request("session/config/set", { requestId: "bypass", sessionId: "s", patch: { permissionMode: "bypassPermissions" } });
   expect(queries[0]!.calls.at(-1)).toMatchObject({ method: "permission", value: "bypassPermissions" });
-  await expect(session.startTurn({ requestId: "schema", sessionId: "s", turnId: "t", input: [{ type: "text", text: "x" }], outputSchema: { type: "object" } })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
+  await expect(session.submit({ input: [{ type: "text", text: "x" }], outputSchema: { type: "object" } })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
   expect(await adapter.listModels()).toMatchObject([{ value: "fake-model" }]); await runtime.dispose();
 });
 
@@ -222,19 +271,19 @@ test("resume, before/through fork, paged history and conversation revert preserv
   const { runtime, session, queries } = await setup({ sessionStore: new InMemorySessionStore(), getSessionMessages: history.getSessionMessages, forkSession: history.forkSession }, async (input, stream) => { history.append(input); await stream.text("conformance"); await stream.result(); });
   await run(session, "t1"); const first = await collect(session); const firstStart = first.find((event) => event.type === "turn/started")!;
   await run(session, "t2"); await collect(session);
-  const page1 = await session.readHistory({ requestId: "history", sessionId: "s", limit: 1 });
+  const page1 = await session.request("history/read", { requestId: "history", sessionId: "s", limit: 1 });
   expect(page1.items).toHaveLength(1); expect(page1.nextCursor).toBe("1");
-  const page2 = await session.readHistory({ requestId: "history2", sessionId: "s", cursor: page1.nextCursor!, snapshotToken: page1.snapshotToken, limit: 10 });
-  expect(page2.items.some((entry) => entry.turnId === "t2")).toBe(true);
-  const before = await runtime.openSession({ ...OPEN, requestId: "before", mode: "fork", binding: { ...session.binding, sessionId: "before" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: "t1", relation: "before", nativeTurnId: firstStart.type === "turn/started" ? firstStart.payload.nativeTurnId : undefined } } });
-  expect((await before.readHistory({ requestId: "before-history", sessionId: "before" })).items).toHaveLength(0); await before.close();
-  const through = await runtime.openSession({ ...OPEN, requestId: "through", mode: "fork", binding: { ...session.binding, sessionId: "through" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: "t1", relation: "through" } } });
-  const forkHistory = await through.readHistory({ requestId: "through-history", sessionId: "through" });
-  expect(forkHistory.items.some((entry) => entry.turnId === "t1")).toBe(true); expect(forkHistory.items.some((entry) => entry.turnId === "t2")).toBe(false); await through.close();
+  const page2 = await session.request("history/read", { requestId: "history2", sessionId: "s", cursor: page1.nextCursor!, snapshotToken: page1.snapshotToken, limit: 10 });
+  expect(page2.items.some((entry) => entry.turnId === known(session,"t2"))).toBe(true);
+  const before = await runtime.openSession({ ...OPEN, requestId: "before", mode: "fork", binding: { ...session.binding, sessionId: "before" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: known(session,"t1"), relation: "before", nativeTurnId: firstStart.type === "turn/started" ? firstStart.payload.nativeTurnId : undefined } } });
+  expect((await before.request("history/read", { requestId: "before-history", sessionId: "before" })).items).toHaveLength(0); await before.close();
+  const through = await runtime.openSession({ ...OPEN, requestId: "through", mode: "fork", binding: { ...session.binding, sessionId: "through" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: known(session,"t1"), relation: "through" } } });
+  const forkHistory = await through.request("history/read", { requestId: "through-history", sessionId: "through" });
+  expect(forkHistory.items.some((entry) => entry.turnId === known(session,"t1"))).toBe(true); expect(forkHistory.items.some((entry) => entry.turnId === known(session,"t2"))).toBe(false); await through.close();
   const oldRef = session.binding.nativeRef!.value;
-  const reverted = await session.revert({ requestId: "revert", sessionId: "s", scope: "conversation", boundary: { turnId: "t2", relation: "before" } });
+  const reverted = await session.request("session/revert", { requestId: "revert", sessionId: "s", scope: "conversation", boundary: { turnId: known(session,"t2"), relation: "before" } });
   expect(reverted.nativeRef!.value).not.toBe(oldRef); expect(session.binding.nativeRef).toEqual(reverted.nativeRef);
-  expect((await session.readHistory({ requestId: "after-revert", sessionId: "s" })).items.some((entry) => entry.turnId === "t2")).toBe(false);
+  expect((await session.request("history/read", { requestId: "after-revert", sessionId: "s" })).items.some((entry) => entry.turnId === known(session,"t2"))).toBe(false);
   const currentBinding = structuredClone(session.binding); await session.close();
   const resumed = await runtime.openSession({ ...OPEN, requestId: "resume", mode: "resume", binding: currentBinding });
   expect(queries.at(-1)!.options.resume).toBe(currentBinding.nativeRef!.value); await resumed.close(); await runtime.dispose();
@@ -260,25 +309,22 @@ test("history items reuse live streamed ids and the session settles to ready aft
   await run(session, "t"); const events = await collect(session);
   const live = events.flatMap((event) => event.type === "item/started" ? [event.payload.item.id] : []);
   expect(live).toEqual(["msg_api:0", "msg_api:1"]);
-  const states: AhpEvent[] = []; const reader = session.events()[Symbol.asyncIterator]();
-  for (;;) { const next = await Promise.race([reader.next(), new Promise<undefined>((done) => setTimeout(done, 50))]); if (!next || next.done) break; states.push(next.value); }
-  await reader.return?.();
-  expect(states.filter((event) => event.type === "session/state").map((event) => event.type === "session/state" && event.payload.status).at(-1)).toBe("ready");
-  const page = await session.readHistory({ requestId: "h", sessionId: "s" });
+  expect(session.snapshot.status).toBe('ready');
+  const page = await session.request("history/read", { requestId: "h", sessionId: "s" });
   expect(page.items.filter((entry) => entry.item.type !== "userMessage").map((entry) => entry.item.id)).toEqual(live);
   await runtime.dispose();
 });
 
 test("effort is a session option passed at start and applied live", async () => {
-  const fake = factory(); const adapter = createClaudeAdapter({ queryFactory: fake.queryFactory }); const runtime = createHarnessRuntime(adapter);
-  const init = await runtime.initialize({ protocolVersions: [1], clientInfo: { name: "test", version: "1" } });
+  const fake = factory(); const adapter = createClaudeAdapter({ queryFactory: fake.queryFactory }); const runtime = await createClient({adapter,identity:OPEN.binding,interactions:{approval:undefined,userInput:undefined,elicitation:undefined,dynamicTool:undefined}});
+  const init = { capabilities: adapter.capabilities };
   expect(init.capabilities.config?.options.find((option) => option.id === "effort")).toMatchObject({ scope: "session", schema: { enum: ["low", "medium", "high", "xhigh", "max"], default: "high" } });
   const session = await runtime.openSession({ ...OPEN, config: { effort: "low" } });
   await run(session, "t"); await collect(session);
   expect(fake.queries[0]!.options.effort).toBe("low");
-  await session.setConfig({ requestId: "effort", sessionId: "s", patch: { effort: "max" } });
+  await session.request("session/config/set", { requestId: "effort", sessionId: "s", patch: { effort: "max" } });
   expect(fake.queries[0]!.calls).toContainEqual({ method: "flags", value: { effortLevel: "max" } });
-  await expect(session.setConfig({ requestId: "bad", sessionId: "s", patch: { effort: "extreme" } })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
+  await expect(session.request("session/config/set", { requestId: "bad", sessionId: "s", patch: { effort: "extreme" } })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
   await runtime.dispose();
 });
 
@@ -287,17 +333,16 @@ test("fast mode is a session option sent as flag settings, switched live, and re
     await stream.emit({ type: "system", subtype: "init", session_id: "s", fast_mode_state: "off", fast_mode_disabled_reason: "extra_usage_disabled" });
     await stream.text("ok", "m"); await stream.result("ok");
   });
-  const adapter = createClaudeAdapter({ queryFactory: fake.queryFactory }); const runtime = createHarnessRuntime(adapter);
-  const init = await runtime.initialize({ protocolVersions: [1], clientInfo: { name: "test", version: "1" } });
+  const adapter = createClaudeAdapter({ queryFactory: fake.queryFactory }); const runtime = await createClient({adapter,identity:OPEN.binding,interactions:{approval:undefined,userInput:undefined,elicitation:undefined,dynamicTool:undefined}});
+  const init = { capabilities: adapter.capabilities };
   expect(init.capabilities.config?.options.find((option) => option.id === "fastMode")).toMatchObject({ scope: "session", schema: { type: "boolean", default: false } });
   const session = await runtime.openSession({ ...OPEN, config: { fastMode: true } });
   await run(session, "t"); const events = await collect(session);
   expect(fake.queries[0]!.options.settings).toEqual({ fastMode: true });
-  const settled = events.filter((event) => event.type === "session/state").at(-1);
-  expect(settled?.type === "session/state" && settled.payload.fastMode).toEqual({ state: "off", reason: "extra_usage_disabled" });
-  await session.setConfig({ requestId: "fast", sessionId: "s", patch: { fastMode: false } });
+  expect(session.snapshot.fastMode).toEqual({ state: "off", reason: "extra_usage_disabled" });
+  await session.request("session/config/set", { requestId: "fast", sessionId: "s", patch: { fastMode: false } });
   expect(fake.queries[0]!.calls).toContainEqual({ method: "flags", value: { fastMode: false } });
-  await expect(session.setConfig({ requestId: "bad", sessionId: "s", patch: { fastMode: "yes" } })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
+  await expect(session.request("session/config/set", { requestId: "bad", sessionId: "s", patch: { fastMode: "yes" } })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
   await runtime.dispose();
 });
 
@@ -306,10 +351,10 @@ test("file rollback requires a checkpoint and scope=both reports partial effects
   const fixture = await setup({ sessionStore: new InMemorySessionStore(), enableFileCheckpointing: true, getSessionMessages: history.getSessionMessages, forkSession: async () => { throw new Error("Native fork failed"); } }, async (input, stream) => { history.append(input); await stream.text("conformance"); await stream.result(); });
   await run(fixture.session, "t1"); await collect(fixture.session); await run(fixture.session, "t2"); await collect(fixture.session);
   fixture.queries[0]!.rewindAllowed = false;
-  await expect(fixture.session.revert({ requestId: "no-checkpoint", sessionId: "s", scope: "files", boundary: { turnId: "t2", relation: "before" } })).rejects.toMatchObject({ code: "CHECKPOINT_UNAVAILABLE" });
+  await expect(fixture.session.request("session/revert", { requestId: "no-checkpoint", sessionId: "s", scope: "files", boundary: { turnId: known(fixture.session,"t2"), relation: "before" } })).rejects.toMatchObject({ code: "CHECKPOINT_UNAVAILABLE" });
   expect(fixture.queries[0]!.calls.filter((call) => call.method === "rewind")).toHaveLength(0);
   fixture.queries[0]!.rewindAllowed = true;
-  await expect(fixture.session.revert({ requestId: "partial", sessionId: "s", scope: "both", boundary: { turnId: "t2", relation: "before" } })).rejects.toMatchObject({ code: "REVERT_PARTIAL", outcomeUnknown: true, details: { appliedScope: "files" } });
+  await expect(fixture.session.request("session/revert", { requestId: "partial", sessionId: "s", scope: "both", boundary: { turnId: known(fixture.session,"t2"), relation: "before" } })).rejects.toMatchObject({ code: "REVERT_PARTIAL", outcomeUnknown: true, details: { appliedScope: "files" } });
   expect(fixture.queries[0]!.calls.filter((call) => call.method === "rewind")).toHaveLength(1); await fixture.runtime.dispose();
 });
 
@@ -317,28 +362,38 @@ test("Claude adapter passes shared conformance for all declared capabilities", a
   const report = await runConformance((scenario: ConformanceScenario) => {
     const history = historyApi(); const native = factory(async (input, stream) => {
       history.append(input);
-      if (["interrupt", "disconnect", "backpressure"].includes(scenario)) return;
+      if (["interrupt", "disconnect", "backpressure"].includes(scenario)) {await stream.text("working");return;}
       if (scenario === "approval") await stream.options.canUseTool!("Bash", { command: "fixture" }, { signal: new AbortController().signal, toolUseID: "approval", requestId: "native-approval" });
       if (scenario === "userInput") await stream.options.canUseTool!("AskUserQuestion", { questions: [{ question: "Value", header: "Value" }] }, { signal: new AbortController().signal, toolUseID: "question", requestId: "native-question" });
       if (scenario === "elicitation") await stream.options.onElicitation!({ serverName: "mcp", message: "Value", mode: "form" }, { signal: new AbortController().signal, requestId: "elicitation" });
       if (scenario === "unknown-item") await stream.emit({ type: "assistant", parent_tool_use_id: null, message: { id: "unknown", content: [{ type: "futureContent", safeField: "value" }] } });
       await stream.text("conformance"); await stream.result();
     });
-    return { adapter: createClaudeAdapter({ queryFactory: native.queryFactory, sessionStore: new InMemorySessionStore(), getSessionMessages: history.getSessionMessages, forkSession: history.forkSession }), openParams: { ...OPEN, binding: { ...OPEN.binding, sessionId: "conformance-session" } }, ...(scenario === "disconnect" || scenario === "backpressure" ? { afterStart: async () => { native.queries[0]!.output.end(new Error("Injected native source failure")); } } : {}) };
+    return { adapter: createClaudeAdapter({ queryFactory: native.queryFactory, sessionStore: new InMemorySessionStore(), getSessionMessages: history.getSessionMessages, forkSession: history.forkSession }), openParams: { ...OPEN, binding: { ...OPEN.binding, sessionId: "conformance-session" } }, ...(scenario === "disconnect" || scenario === "backpressure" ? { afterStart: async () => { native.queries[0]!.output.end(new HarnessSdkError(scenario==="disconnect"?"CONNECTION_CLOSED":"BACKPRESSURE_EXCEEDED")); } } : {}) };
   });
   expect(report.cases.filter((entry) => entry.status === "failed")).toEqual([]); expect(report.passed).toBe(true);
   expect(report.cases.filter((entry) => entry.status === "not-applicable").map((entry) => entry.scenario)).toEqual(["dynamicTool", "steer"]);
-});
+}, 20_000);
 
 test("the real pinned SDK drives an external fake executable through the native adapter", async () => {
   const directory = await mkdtemp(join(tmpdir(), "claude sdk actual "));
-  const runtime = createHarnessRuntime(createClaudeAdapter({ command: fileURLToPath(new URL("../../../scripts/harness-sdk/fixtures/fake-claude.mjs", import.meta.url)), executableRuntime: "node", stateDir: join(directory, "state") }));
+  const runtime = await createClient({identity:OPEN.binding,adapter:createClaudeAdapter({ command: fileURLToPath(new URL("../../../scripts/harness-sdk/fixtures/fake-claude.mjs", import.meta.url)), executableRuntime: "node", stateDir: join(directory, "state") })});
   try {
-    await runtime.initialize({ protocolVersions: [1], clientInfo: { name: "official-sdk-adapter-test", version: "1" } });
     const session = await runtime.openSession({ ...OPEN, cwd: directory }); await run(session, "t"); const events = await collect(session);
     expect(events.find((event) => event.type === "item/completed" && event.payload.item.type === "agentMessage")?.payload).toMatchObject({ item: { text: "external executable probe passed", phase: "final" } });
     expect(events.at(-1)?.payload).toMatchObject({ status: "completed" });
   } finally { await runtime.dispose(); await rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); }
+}, 15_000);
+
+test('native lifecycle also correlates through the pinned official SDK and an actual child executable', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'claude native actual '));
+  const client = await createNativeClient({ adapter: createNativeClaudeAdapter({ command: fileURLToPath(new URL('../../../scripts/harness-sdk/fixtures/fake-claude.mjs', import.meta.url)), executableRuntime: 'node', stateDir: join(directory, 'state') }), identity: { adapterId: 'claude', runtimeConfigId: 'native' } });
+  try {
+    const session = await client.sessions.create({ cwd: directory });
+    const turn = await session.submit({ input: 'probe' }, { timeoutMs: 3000 });
+    expect((await turn.result({ timeoutMs: 3000 })).text).toBe('external executable probe passed');
+    await session.close();
+  } finally { await client.dispose(); await rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); }
 }, 15_000);
 
 test("official history and fork helpers consume the opaque SessionStore contract", async () => {
@@ -401,7 +456,7 @@ test("Claude titles observe committed store appends while idle, isolate subpaths
     return { sessionId: id, summary: title, lastModified: Date.now() };
   } });
   const events: AhpEvent[] = [];
-  const pump = (async () => { for await (const event of f.session.events()) events.push(event); })();
+  const pump = (async () => { for await (const event of f.session.events()) events.push(event); })().catch(cause=>{if(cause.code!=='OBSERVATION_CLOSED')throw cause;});
   const until = async (check: () => boolean) => { for (let i = 0; i < 200; i++) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 2)); } throw new Error('Metadata timeout'); };
   try {
     const observed = f.queries[0]!.options.sessionStore!;

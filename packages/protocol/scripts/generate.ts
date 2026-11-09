@@ -7,7 +7,8 @@ import path from 'node:path'
  */
 type Schema = boolean | { [key: string]: unknown }
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const source = await readFile(path.join(root, 'schema/v1/ahp.schema.json'), 'utf8')
+async function generate(version: 'v1'): Promise<void> {
+const source = await readFile(path.join(root, `schema/${version}/ahp.schema.json`), 'utf8')
 const document = JSON.parse(source) as { $defs: Record<string, Schema>; 'x-methods': Record<string, [string, string]> }
 function literal(value: unknown): string { return JSON.stringify(value) }
 function emit(value: Schema): string {
@@ -42,7 +43,7 @@ function emit(value: Schema): string {
 const aliases = Object.entries(document.$defs).map(([name, schema]) => `export type ${name} = ${emit(schema)};`)
 const methods = Object.entries(document['x-methods'])
 const lines = [
-  '// Generated from schema/v1/ahp.schema.json. Run `bun run generate`; do not edit.',
+  `// Generated from schema/${version}/ahp.schema.json. Run bun run generate; do not edit.`,
   ...aliases,
   'export interface AhpRequestMap {', ...methods.map(([method, [params]]) => `  ${literal(method)}: ${params};`), '}',
   'export interface AhpResultMap {', ...methods.map(([method, [, result]]) => `  ${literal(method)}: ${result};`), '}',
@@ -55,3 +56,6 @@ const target = path.join(root, 'src/generated/types.ts')
 if (process.argv.includes('--check')) {
   if (await readFile(target, 'utf8') !== output) throw new Error('Generated AHP types differ; run bun run generate')
 } else await writeFile(target, output)
+
+}
+await generate('v1');

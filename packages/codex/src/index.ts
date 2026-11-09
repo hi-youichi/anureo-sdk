@@ -1,12 +1,12 @@
 import { catalogPhase, type CatalogProbeOptions } from '@anureo/sdk/diagnostics'
 import { randomUUID } from 'node:crypto'
 import {
-  negotiateVersion, publicInteraction, type ApprovalOption, type Capabilities, type AhpRequestMap, type AhpResultMap,
+  AHP_PROTOCOL_CONTRACT, assertRequest, negotiateVersion, publicInteraction, type ApprovalOption, type Capabilities, type AhpRequestMap, type AhpResultMap,
   type GoalState, type HistoryItem, type HistoryPage, type InitializeParams, type InitializeResult,
   type InteractionRequested, type InteractionResponse, type Item, type JsonObject, type SessionBinding,
   type SessionOpenParams, type SessionState, type Usage,
 } from '@anureo/protocol'
-import { HarnessSdkError, type BackendSession, type HarnessAdapter, type SessionEventSink, type SessionMethod } from '@anureo/sdk'
+import { HarnessSdkError, sdkError, type BackendSession, type HarnessAdapter, type SessionEventSink, type SessionMethod } from '@anureo/sdk'
 import { spawnHarnessProcess, type HarnessProcess, type HarnessProcessOptions } from '@anureo/sdk/process'
 import { CodexJsonlClient, CodexRpcError, record, string, type JsonlOptions, type NativeRecord, type NativeRequest } from './jsonl'
 import { json, mapItems, mapUsage, mapTurnError, nativeInput, safe } from './mapping'
@@ -86,7 +86,8 @@ export function codexCapabilities(version: string): Capabilities {
   // Below the oldest profile nothing is known about the native schema: publish only the safe baseline.
   if (!profile) return {
     session: { resume: false, fork: [], revert: [], history: false },
-    turn: { interrupt: true, steer: false, outputSchema: false, inputModalities: ['text', 'image', 'file'], overrides: [] },
+    input: { delivery: ['native'], interrupt: { targets: ['turn'], reportsPendingInputs: false } },
+    turn: { outputSchema: false, inputModalities: ['text', 'image', 'file'], overrides: [] },
     interactions: ['approval'],
     config: { options: [] },
   }
@@ -94,7 +95,8 @@ export function codexCapabilities(version: string): Capabilities {
   // runtime rejects as method-not-found is closed at call time (see `optional`), not by version number.
   return {
     session: { resume: true, fork: profile.fork, revert: ['conversation'], history: true },
-    turn: { interrupt: true, steer: true, outputSchema: true, inputModalities: ['text', 'image', 'file'], overrides: ['model','effort','summary','approvalPolicy','sandboxPolicy','serviceTier'] },
+    input: { delivery: ['native'], steer: { target: 'turn', atomicMatch: true }, interrupt: { targets: ['turn'], reportsPendingInputs: false } },
+    turn: { outputSchema: true, inputModalities: ['text', 'image', 'file'], overrides: ['model','effort','summary','approvalPolicy','sandboxPolicy','serviceTier'] },
     goal: { actions: ['set','clear'] as ['set','clear'] }, compact: true, review: true, subagents: { events: 'nested' as const },
     interactions: ['approval','userInput','elicitation','dynamicTool'],
     config: { options: [
@@ -135,17 +137,21 @@ async function readAccountStatus(client: CodexJsonlClient): Promise<'unknown'|'r
 }
 
 export class CodexNativeAdapter implements HarnessAdapter {
+  private disposed = false
   private version = ''
   private clientInfo?: InitializeParams['clientInfo']
   private initialized?: Promise<InitializeResult>
   private readonly sessions = new Set<CodexBackendSession>()
   constructor(readonly options: CodexAdapterOptions) {}
   initialize(params: InitializeParams): Promise<InitializeResult> {
+    if (this.disposed) return Promise.reject(new HarnessSdkError('RUNTIME_DISPOSED'))
+    assertRequest("initialize", params)
     negotiateVersion(params.protocolVersions)
     return this.initialized ??= (async () => {
       this.version = await probeVersion(this.options); this.clientInfo = params.clientInfo
+      if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
       // Read-only version/handshake is safe. No mutating method is used to discover optional support.
-      return { protocolVersion: 1, runtime: { name: 'codex', version: this.version, adapter: 'codex-native/0.1.0' }, capabilities: codexCapabilities(this.version) }
+      return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: 'codex', version: this.version, adapter: 'codex-native/0.1.0' }, capabilities: codexCapabilities(this.version) }
     })()
   }
   /** Read-only model discovery uses a short-lived native process and never creates a thread. */
@@ -194,6 +200,7 @@ export class CodexNativeAdapter implements HarnessAdapter {
     finally { await client.dispose() }
   }
   async openSession(params: SessionOpenParams, sink: SessionEventSink): Promise<BackendSession> {
+    if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
     if (!this.clientInfo) throw new HarnessSdkError('NOT_INITIALIZED')
     const capabilities = codexCapabilities(this.version)
     const native = resolveCodexProfile(this.version)
@@ -206,6 +213,7 @@ export class CodexNativeAdapter implements HarnessAdapter {
       params = { ...params, fork: { ...params.fork!, boundary: { ...params.fork!.boundary, nativeTurnId } } }
     }
     const process = await (this.options.processFactory ?? spawnHarnessProcess)({ command: this.options.command, args: this.options.args ?? ['app-server'], cwd: params.cwd, env: this.options.env })
+    if (this.disposed) { await process.dispose(); throw new HarnessSdkError('RUNTIME_DISPOSED') }
     const session = new CodexBackendSession(params, sink, { profile: native.profile ?? CODEX_PROFILES[0]!, verified: native.verified }, capabilities, this.options)
     if (source) session.importTurnMap(source)
     const client = new CodexJsonlClient(process, {
@@ -221,35 +229,41 @@ export class CodexNativeAdapter implements HarnessAdapter {
       this.sessions.add(session); return session
     } catch (cause) { await client.dispose(); throw cause }
   }
-  async dispose(): Promise<void> { await Promise.all([...this.sessions].map(session => session.dispose())); this.sessions.clear() }
+  async dispose(): Promise<void> {
+    this.disposed = true
+    const results = await Promise.allSettled([...this.sessions].map(session => session.dispose())); this.sessions.clear()
+    const failure = results.find((value): value is PromiseRejectedResult => value.status === 'rejected')
+    if (failure) throw failure.reason
+  }
 }
 export function createCodexAdapter(options: CodexAdapterOptions): CodexNativeAdapter { return new CodexNativeAdapter(options) }
 
 class CodexBackendSession implements BackendSession {
+  private readonly nativeSubmissions = new Set<string>()
+  private readonly nativeReceipts = new Map<string, string>()
+  private readonly nativeUsage = new Map<string, Usage>()
+  private readonly nativePlans = new Map<string, Item>()
   binding: SessionBinding
   readonly capabilities: Capabilities
   private client!: CodexJsonlClient
   private threadId = ''
-  private active?: { canonical: string; native?: string }
   private turnMap = new Map<string, string>()
   private nativeMap = new Map<string, string>()
   private started = new Set<string>()
   private items = new Set<string>()
   private executionOutput = new Map<string, string>()
   private itemStartedAt = new Map<string, string>()
-  private state: SessionState
+  state: SessionState
   private history = new Map<string, HistoryItem[]>()
   private lastUsage?: Usage
   private plan?: Item
-  private maintenanceTurns = new Set<string>()
-  private maintenance?: { resolve(): void; reject(cause: unknown): void; timer: ReturnType<typeof setTimeout> }
   private closing = false
   private unverifiedNoticed = false
   private capabilityRevision = 1
   constructor(private readonly params: SessionOpenParams, private readonly sink: SessionEventSink, private readonly native: { profile: CodexProfile; verified: boolean }, capabilities: Capabilities, private readonly options: CodexAdapterOptions) {
     this.binding = structuredClone(params.binding); this.capabilities = structuredClone(capabilities)
     const model = params.model ?? string(params.config?.model)
-    this.state = { binding: this.binding, status: 'ready', config: params.config ?? {}, capabilities: this.capabilities, capabilityRevision: 1, ...(model ? { model } : {}) }
+    this.state = { binding: this.binding, status: 'ready', activeTurnIds: [], config: params.config ?? {}, capabilities: this.capabilities, capabilityRevision: 1, ...(model ? { model } : {}) }
   }
   attach(client: CodexJsonlClient): void { this.client = client }
   resolveNativeTurn(canonical: string): string | undefined { return this.nativeMap.get(canonical) }
@@ -285,25 +299,52 @@ class CodexBackendSession implements BackendSession {
     if (typeof thread.name === 'string' || thread.name === null) this.state.metadata = { title: thread.name }
     if (this.state.metadata) await this.sink.emit({ type: 'session/metadata', payload: this.state.metadata })
   }
-  private nativeTurn(canonical: string, provided?: string): string {
+  private nativeTurn(canonical: string, provided?: string, missing = 'BOUNDARY_NATIVE_ID_REQUIRED'): string {
     const native = provided ?? this.nativeMap.get(canonical)
-    if (!native) throw new HarnessSdkError('BOUNDARY_NATIVE_ID_REQUIRED', 'Native turn identity is not known')
+    if (!native) throw new HarnessSdkError(missing, 'Native turn identity is not known')
     return native
   }
   private canonicalTurn(native: string): string {
-    const known = this.turnMap.get(native)
-    if (known) return known
-    if (this.active && !this.active.native) {
-      this.active.native = native; this.turnMap.set(native, this.active.canonical); this.nativeMap.set(this.active.canonical, native); this.state.status = 'running'; this.state.activeTurnId = this.active.canonical; return this.active.canonical
-    }
-    return native
+    this.nativeMap.set(native, native); this.turnMap.set(native, native); return native
   }
   private async ensureStarted(nativeId: string): Promise<string> {
     const turnId = this.canonicalTurn(nativeId)
-    if (!this.started.has(turnId)) { this.started.add(turnId); await this.sink.emit({ type: 'turn/started', payload: { turnId, nativeTurnId: nativeId } }, { turnId }) }
+    if (!this.started.has(turnId)) { this.started.add(turnId); await this.sink.emit({ type: 'turn/started', payload: { turnId, nativeTurnId: nativeId } }, { turnId }); this.state.activeTurnIds.push(turnId); this.state.status = 'running' }
+    for (const [submissionId, receipt] of this.nativeReceipts) if (receipt === nativeId) {
+      await this.sink.bindSubmission(submissionId, turnId); this.nativeReceipts.delete(submissionId); this.nativeSubmissions.delete(submissionId)
+    }
     return turnId
   }
-  private scope(params: NativeRecord): string | undefined { const native = string(params.turnId); return native ? this.canonicalTurn(native) : this.active?.canonical }
+  private scope(params: NativeRecord): string | undefined { const native = string(params.turnId); return native ? this.canonicalTurn(native) : undefined }
+  private async submitInput(method: 'input/submit' | 'review/start', params: import('@anureo/protocol').InputSubmitParams | import('@anureo/protocol').ReviewStartParams): Promise<import('@anureo/protocol').SubmissionAcceptance> {
+    if (this.nativeSubmissions.size >= (this.options.maxPending ?? 128)) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED')
+    if (this.nativeSubmissions.has(params.submissionId)) throw new HarnessSdkError('SUBMISSION_ID_CONFLICT')
+    if (!this.native.verified && !this.unverifiedNoticed) { this.unverifiedNoticed = true; await this.sink.emit({ type: 'notice', payload: { severity: 'warning', code: 'CODEX_VERSION_UNVERIFIED', message: `Codex ${this.native.profile.since}+ behaviour is used for this version; it has not been verified against the native schema.` } }); }
+    this.nativeSubmissions.add(params.submissionId)
+    const previousTurns = new Set(this.started)
+    try {
+      let value: NativeRecord
+      if (method === 'input/submit') {
+        const start = params as import('@anureo/protocol').InputSubmitParams
+        if (start.delivery !== 'native') throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
+        if (await readAccountStatus(this.client) === 'required') throw new HarnessSdkError('AUTH_REQUIRED')
+        const permissions = permissionSettings(this.state.config.permissionMode)
+        value = record(await this.client.request('turn/start', { ...Object.fromEntries(Object.entries(this.state.config).filter(([key]) => this.capabilities.turn?.overrides?.includes(key))), ...(permissions ? { approvalPolicy: permissions.approvalPolicy, sandboxPolicy: permissions.sandboxPolicy } : {}), ...('fastMode' in this.state.config ? { serviceTier: serviceTierFor(this.state.config.fastMode) } : {}), ...start.overrides, threadId: this.threadId, input: nativeInput(start.input), clientUserMessageId: params.submissionId, ...(start.outputSchema !== undefined ? { outputSchema: start.outputSchema } : {}) }))
+      } else value = record(await this.optional('review/start', { threadId: this.threadId, target: (params as import('@anureo/protocol').ReviewStartParams).target, delivery: 'inline' }, () => { this.capabilities.review = false }))
+      const id = string(record(value.turn).id)
+      if (!id) throw new HarnessSdkError('PROTOCOL_ERROR')
+      // A turn/start response can contain a submission id; only observed execution facts bind it.
+      if (this.started.has(id)) {
+        await this.sink.bindSubmission(params.submissionId, id)
+        this.nativeSubmissions.delete(params.submissionId)
+        return previousTurns.has(id)
+          ? { submissionId: params.submissionId, accepted: true, disposition: 'joined', turnId: id }
+          : { submissionId: params.submissionId, accepted: true, disposition: 'accepted', receipt: { nativeSubmissionId: id } }
+      }
+      if (this.nativeSubmissions.has(params.submissionId)) this.nativeReceipts.set(params.submissionId, id)
+      return { submissionId: params.submissionId, accepted: true, disposition: 'accepted', receipt: { nativeSubmissionId: id } }
+    } catch (cause) { if (!sdkError(cause).outcomeUnknown) this.nativeSubmissions.delete(params.submissionId); throw cause }
+  }
   private async optional<T>(method: string, params: NativeRecord, disable: () => void): Promise<T> {
     try { return await this.client.request<T>(method, params) }
     catch (cause) {
@@ -319,30 +360,16 @@ class CodexBackendSession implements BackendSession {
     let result: AhpResultMap[SessionMethod]
     const p = params as AhpRequestMap[SessionMethod]
     switch (method) {
-      case 'turn/start': {
-        const start = p as AhpRequestMap['turn/start']
-        if (await readAccountStatus(this.client) === 'required') throw new HarnessSdkError('AUTH_REQUIRED', 'Sign in to the independent Codex runtime before sending')
-        if (!this.native.verified && !this.unverifiedNoticed) { this.unverifiedNoticed = true; await this.sink.emit({ type: 'notice', payload: { severity: 'warning', code: 'CODEX_VERSION_UNVERIFIED', message: `Codex ${this.native.profile.since}+ behaviour is used for this version; it has not been verified against the native schema.` } }) }
-        this.active = { canonical: start.turnId }; this.lastUsage = undefined
-        try {
-          const permissions = permissionSettings(this.state.config.permissionMode)
-          const value = record(await this.client.request('turn/start', { ...Object.fromEntries(Object.entries(this.state.config).filter(([key]) => this.capabilities.turn?.overrides?.includes(key))), ...(permissions ? { approvalPolicy: permissions.approvalPolicy, sandboxPolicy: permissions.sandboxPolicy } : {}), ...('fastMode' in this.state.config ? { serviceTier: serviceTierFor(this.state.config.fastMode) } : {}), ...start.overrides, threadId: this.threadId, input: nativeInput(start.input), ...(start.outputSchema !== undefined ? { outputSchema: start.outputSchema } : {}) }))
-          const native = string(record(value.turn).id)
-          if (!native) throw new HarnessSdkError('PROTOCOL_ERROR')
-          await this.ensureStarted(native)
-          result = { turnId: start.turnId, accepted: true }
-        } catch (cause) { if (!(cause instanceof HarnessSdkError && cause.outcomeUnknown)) this.active = undefined; throw cause }
-        break
-      }
+      case 'input/submit': case 'review/start': return await this.submitInput(method, params as AhpRequestMap['input/submit'] | AhpRequestMap['review/start']) as AhpResultMap[M]
       case 'turn/steer': {
-        const steer = p as AhpRequestMap['turn/steer']; const native = this.nativeTurn(steer.expectedTurnId)
-        const response = record(await this.optional('turn/steer', { threadId: this.threadId, expectedTurnId: native, input: nativeInput(steer.input) }, () => { this.capabilities.turn!.steer = false }))
+        const steer = p as AhpRequestMap['turn/steer']; const native = this.nativeTurn(steer.expectedTurnId, undefined, 'TURN_MISMATCH')
+        const response = record(await this.optional('turn/steer', { threadId: this.threadId, expectedTurnId: native, input: nativeInput(steer.input), clientUserMessageId: steer.submissionId }, () => { delete this.capabilities.input!.steer }))
         if (response.turnId !== native) throw new HarnessSdkError('TURN_MISMATCH', 'Native steer did not target the same turn', false, true)
-        result = { turnId: steer.expectedTurnId, accepted: true }; break
+        result = { submissionId: steer.submissionId, turnId: steer.expectedTurnId, accepted: true }; break
       }
       case 'turn/interrupt': {
         const interrupt = p as AhpRequestMap['turn/interrupt']
-        await this.client.request('turn/interrupt', { threadId: this.threadId, turnId: this.nativeTurn(interrupt.turnId) })
+        await this.client.request('turn/interrupt', { threadId: this.threadId, turnId: this.nativeTurn(interrupt.turnId, undefined, 'TURN_MISMATCH') })
         result = { accepted: true, turnId: interrupt.turnId }; break
       }
       case 'session/config/set': {
@@ -368,22 +395,10 @@ class CodexBackendSession implements BackendSession {
       }
       case 'goal/clear': await this.optional('thread/goal/clear', { threadId: this.threadId }, () => { this.capabilities.goal = { actions: [] } }); result = { goal: null, status: 'cleared' }; this.state.goal = result as GoalState; break
       case 'compact/start': {
-        const completion = new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(() => { this.maintenance = undefined; reject(new HarnessSdkError('REQUEST_TIMEOUT', 'Compaction outcome is unknown', false, true)) }, this.options.timeoutMs ?? 30_000)
-          this.maintenance = { resolve, reject, timer }
-        })
-        void completion.catch(() => {})
-        try { await this.optional('thread/compact/start', { threadId: this.threadId }, () => { this.capabilities.compact = false }); await completion }
-        catch (cause) { if (this.maintenance) { clearTimeout(this.maintenance.timer); this.maintenance = undefined } throw cause }
-        result = { maintenanceId: randomUUID(), status: 'completed' }; break
+        await this.optional('thread/compact/start', { threadId: this.threadId }, () => { this.capabilities.compact = false })
+        result = { maintenanceId: p.requestId, status: 'accepted' }; break
       }
-      case 'review/start': {
-        const review = p as AhpRequestMap['review/start']; this.active = { canonical: review.turnId }; this.lastUsage = undefined
-        const value = record(await this.optional('review/start', { threadId: this.threadId, target: review.target, delivery: 'inline' }, () => { this.capabilities.review = false }))
-        const native = string(record(value.turn).id); if (!native) throw new HarnessSdkError('PROTOCOL_ERROR')
-        await this.ensureStarted(native); result = { turnId: review.turnId, accepted: true }; break
-      }
-      case 'session/close': this.closing = true; await this.client.request('thread/unsubscribe', { threadId: this.threadId }); result = { closed: true }; break
+      case 'session/close': await this.client.request('thread/unsubscribe', { threadId: this.threadId }); this.closing = true; result = { closed: true, observationClosed: true, executionStopped: 'unconfirmed' }; break
       default: throw new HarnessSdkError('CAPABILITY_UNSUPPORTED') // interaction actions are owned by SDK registry
     }
     return result as AhpResultMap[M]
@@ -453,10 +468,15 @@ class CodexBackendSession implements BackendSession {
   }
   async notification(method: string, params: NativeRecord): Promise<void> {
     if (typeof params.threadId === 'string' && this.threadId && params.threadId !== this.threadId) return
+    if (method === 'item/started' || method === 'item/completed') {
+      const item = record(params.item), submissionId = string(item.clientId), native = string(params.turnId)
+      if (item.type === 'userMessage' && submissionId && native && this.nativeSubmissions.has(submissionId)) {
+        const actual = await this.ensureStarted(native)
+        await this.sink.bindSubmission(submissionId, actual); this.nativeSubmissions.delete(submissionId); this.nativeReceipts.delete(submissionId)
+      }
+    }
     if (method === 'thread/started') return
     const eventNativeTurn = string(params.turnId) ?? string(record(params.turn).id)
-    if (this.maintenance && method === 'turn/started' && eventNativeTurn) this.maintenanceTurns.add(eventNativeTurn)
-    if (!this.maintenance && eventNativeTurn && this.maintenanceTurns.has(eventNativeTurn)) { if (method === 'turn/completed') this.maintenanceTurns.delete(eventNativeTurn); return }
     if (method === 'thread/name/updated') {
       const title = typeof params.threadName === 'string' ? params.threadName : null
       if (this.state.metadata?.title !== title) {
@@ -465,11 +485,6 @@ class CodexBackendSession implements BackendSession {
       }
       return
     }
-    if (this.maintenance && (method === 'thread/compacted' || method === 'turn/completed' || method === 'item/completed' && record(params.item).type === 'contextCompaction')) {
-      const wait = this.maintenance; clearTimeout(wait.timer); this.maintenance = undefined; wait.resolve()
-      await this.sink.emit({ type: 'notice', payload: { severity: 'info', code: 'CONTEXT_COMPACTED', message: 'Native context compaction completed' } }); return
-    }
-    if (this.maintenance && (method === 'turn/started' || method.startsWith('item/'))) return
     if (method === 'turn/started') { const id = string(record(params.turn).id); if (id) await this.ensureStarted(id); return }
     const turnId = this.scope(params)
     if (method === 'turn/completed') {
@@ -477,12 +492,14 @@ class CodexBackendSession implements BackendSession {
       const canonical = await this.ensureStarted(native)
       const state = turn.status === 'interrupted' ? 'interrupted' : turn.status === 'failed' ? 'failed' : 'completed'
       const nativeError = turn.error ? mapTurnError(turn.error) : state === 'failed' ? mapTurnError({}) : undefined
-      if (this.plan) { const item = { ...this.plan, status: 'completed' as const }; this.plan = undefined; await this.sink.emit({ type: 'item/completed', payload: { item } }, { turnId: canonical, itemId: item.id }) }
-      await this.sink.emit({ type: 'turn/completed', payload: { turnId: canonical, status: state, ...(nativeError ? { error: nativeError } : {}), ...(this.lastUsage ? { usage: this.lastUsage } : {}) } }, { turnId: canonical })
+      const plan = this.nativePlans.get(canonical)
+      if (plan) { const item = { ...plan, status: 'completed' as const }; this.plan = undefined; this.nativePlans.delete(canonical); await this.sink.emit({ type: 'item/completed', payload: { item } }, { turnId: canonical, itemId: item.id }) }
+      const usage = this.nativeUsage.get(canonical)
+      await this.sink.emit({ type: 'turn/completed', payload: { turnId: canonical, status: state, ...(nativeError ? { error: nativeError } : {}), ...(usage ? { usage } : {}) } }, { turnId: canonical })
+      this.nativeUsage.delete(canonical)
       for (const key of this.executionOutput.keys()) if (key.startsWith(`${canonical}\0`)) this.executionOutput.delete(key)
       for (const key of this.itemStartedAt.keys()) if (key.startsWith(`${canonical}\0`)) this.itemStartedAt.delete(key)
-      if (this.active?.canonical === canonical) this.active = undefined
-      this.state.status = 'ready'; delete this.state.activeTurnId
+      this.state.activeTurnIds = this.state.activeTurnIds.filter(id => id !== canonical); this.state.status = this.state.activeTurnIds.length ? 'running' : 'ready'
       return
     }
     if (method === 'item/started' || method === 'item/completed') {
@@ -517,14 +534,17 @@ class CodexBackendSession implements BackendSession {
     if (method === 'thread/tokenUsage/updated') {
       const tokenUsage = record(params.tokenUsage)
       this.lastUsage = mapUsage(tokenUsage.last, 'turn'); const usage = mapUsage(tokenUsage.total, 'session')
+      if (turnId) this.nativeUsage.set(turnId, this.lastUsage)
       if (typeof tokenUsage.modelContextWindow === 'number') usage.contextWindow = tokenUsage.modelContextWindow
       await this.sink.emit({ type: 'usage/updated', payload: usage }, { turnId }); return
     }
     if (method === 'turn/plan/updated' && turnId) {
       const id = `plan:${turnId}`
       const item: Item = { id, type: 'plan', status: 'completed', steps: (Array.isArray(params.plan) ? params.plan : []).map((step, i) => { const value = record(step); return { id: `${i}`, text: string(value.step) ?? '', status: value.status === 'completed' ? 'completed' : value.status === 'inProgress' ? 'inProgress' : 'pending' } }) }
-      if (!this.plan) { this.plan = { ...item, status: 'running' }; await this.sink.emit({ type: 'item/started', payload: { item: this.plan } }, { turnId, itemId: id }) }
+      const previous = this.nativePlans.get(turnId)
+      if (!previous) { this.plan = { ...item, status: 'running' }; await this.sink.emit({ type: 'item/started', payload: { item: this.plan } }, { turnId, itemId: id }) }
       else { this.plan = item; await this.sink.emit({ type: 'item/delta', payload: { itemId: id, kind: 'patch', value: json(item) } }, { turnId, itemId: id }) }
+      this.nativePlans.set(turnId, this.plan!)
       return
     }
     if ((method === 'hook/started' || method === 'hook/completed') && turnId) {
@@ -532,6 +552,7 @@ class CodexBackendSession implements BackendSession {
       if (id) await this.sink.emit({ type: method === 'hook/started' ? 'item/started' : 'item/completed', payload: { item: { id, type: 'hook', name: string(hook.name) ?? 'hook', status: method === 'hook/started' ? 'running' : 'completed', output: safe(hook.output) } } }, { turnId, itemId: id })
       return
     }
+    if (method === 'thread/compacted') { await this.sink.emit({ type: 'notice', payload: { severity: 'info', code: 'CONTEXT_COMPACTED', message: 'Native context compaction completed' } }, { turnId }); return; }
     await this.sink.emit({ type: 'notice', payload: { severity: method === 'error' ? 'error' : 'info', code: 'NATIVE_NOTIFICATION', message: method, raw: safe(params) } }, { turnId })
   }
   async serverRequest(request: NativeRequest, reply: (result: unknown) => Promise<void>, reject: (code: number, message: string) => Promise<void>): Promise<void> {
@@ -577,8 +598,8 @@ class CodexBackendSession implements BackendSession {
     try { await this.sink.requestInteraction(interaction, answer => reply(encode(answer))) }
     catch { /* Registry has already sent non-authorizing cancellation when possible. */ }
   }
-  async failure(cause: HarnessSdkError): Promise<void> { if (this.maintenance) { clearTimeout(this.maintenance.timer); this.maintenance.reject(cause); this.maintenance = undefined } if (!this.closing) await this.sink.fail(cause) }
-  async dispose(): Promise<void> { this.closing = true; if (this.maintenance) { clearTimeout(this.maintenance.timer); this.maintenance.reject(new HarnessSdkError('RUNTIME_DISPOSED')); this.maintenance = undefined } this.history.clear(); this.executionOutput.clear(); await this.client.dispose() }
+  async failure(cause: HarnessSdkError): Promise<void> { if (!this.closing) await this.sink.fail(cause) }
+  async dispose(): Promise<void> { this.closing = true; this.history.clear(); this.executionOutput.clear(); await this.client.dispose() }
 }
 
 async function readCodexModels(client: CodexJsonlClient): Promise<CodexModel[]> {

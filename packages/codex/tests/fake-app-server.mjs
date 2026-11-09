@@ -34,6 +34,7 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
       if (msg.method === 'thread/fork') allowedHistory = msg.params.beforeTurnId ? [] : [msg.params.lastTurnId]
       reply({ thread: { id: threadId, ...(mode === 'titles' ? { name: 'Restored title' } : {}) } }); break
     case 'turn/start': case 'review/start': {
+      if(mode==='hold'&&msg.method==='turn/start'&&counter>0){send({id:msg.id,error:{code:-32602,message:'Native busy'}});break}
       turnId = msg.method === 'review/start' ? 'native-review' : `native-turn-${++counter}`
       notify('turn/started', { turn: { id: turnId, status: 'inProgress', items: [] } })
       reply({ turn: { id: turnId, status: 'inProgress', items: [] } })
@@ -103,7 +104,7 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
     case 'thread/items/list': if (mode === 'no-history') { send({ id: msg.id, error: { code: -32601, message: 'No optional native history method' } }); break }; if (!allowedHistory.length) { reply({ data: [], nextCursor: null }); break }; reply({ data: [{ turnId: msg.params.cursor ? allowedHistory[1] : allowedHistory[0], ...(mode === 'timing' ? { startedAtMs: Date.parse(msg.params.cursor ? '2026-10-28T01:01:03Z' : '2026-10-28T01:00:03Z'), completedAtMs: Date.parse('2026-10-28T01:02:00Z') } : {}), item: { id: 'reused', type: 'agentMessage', text: msg.params.cursor ? 'two' : 'one' } }], nextCursor: msg.params.cursor || allowedHistory.length < 2 ? null : 'page-two' }); break
     case 'thread/goal/set': reply({ goal: { objective: msg.params.objective ?? 'goal', status: 'active' } }); break
     case 'thread/goal/clear': reply({ cleared: true }); break
-    case 'thread/compact/start': reply({}); if (mode === 'compact-hang') break; notify('turn/started', { turn: { id: 'compact-turn', status: 'inProgress', items: [] } }); setTimeout(() => notify('thread/compacted', { turnId: 'compact-turn' }), 10); break
+    case 'thread/compact/start': reply({}); if (mode === 'compact-hang') break; notify('turn/started', { turn: { id: 'compact-turn', status: 'inProgress', items: [] } }); setTimeout(() => {notify('thread/compacted', { turnId: 'compact-turn' });notify('turn/completed',{turn:{id:'compact-turn',status:'completed'}})}, 10); break
     case 'thread/unsubscribe': reply({ status: 'unsubscribed' }); break
     default: send({ id: msg.id, error: { code: -32601, message: 'Method missing' } })
   }

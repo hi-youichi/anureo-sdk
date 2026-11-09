@@ -101,23 +101,33 @@ try {
       verification.push({runtime:'official-acp-sdk',result:{status:'passed',version:officialSdk.version,legacyObserveSessionPatch:false,install:'clean npm, no root patchedDependencies'}})
     }
     await cp(path.join(repository,'scripts/harness-sdk/independent-examples/smoke.mjs'),path.join(clean,'smoke.mjs'))
+    await cp(path.join(repository,'scripts/harness-sdk/independent-examples/native-lifecycle.mjs'),path.join(clean,'native-lifecycle.mjs'))
+    for (const fixture of ['fake-acp.mjs', 'fake-claude.mjs', 'fake-ahp-native.mjs']) await cp(path.join(repository,'scripts/harness-sdk/fixtures',fixture),path.join(clean,fixture))
+    if(selected.includes('codex')) await cp(path.join(repository,'packages/codex/tests/native-lifecycle-fixture.mjs'),path.join(clean,'fake-codex-native.mjs'))
     await cp(path.join(repository,'scripts/harness-sdk/independent-examples/acp-agent.mjs'),path.join(clean,'acp-agent.mjs'))
     if(selected.includes('ahp')) await cp(path.join(clean,'node_modules/@anureo/adapter-ahp/examples/reference.mjs'),path.join(clean,'ahp-reference.mjs'))
     const adapterTypes = selected.filter(leaf=>['codex','claude','acp','ahp'].includes(leaf)).map(leaf=>`import {create${leaf[0]!.toUpperCase()+leaf.slice(1)}Adapter} from '@anureo/adapter-${leaf}'; void create${leaf[0]!.toUpperCase()+leaf.slice(1)}Adapter;`).join('\n')
-    await writeFile(path.join(clean,'typecheck.ts'),adapterTypes+'\n'+`import {type TurnStartParams,validateRequest} from '@anureo/protocol';
-import {createHarnessRuntime} from '@anureo/sdk';
-import {createScriptedAdapter} from '@anureo/conformance';
-const good:TurnStartParams={requestId:'r',sessionId:'s',turnId:'t',input:[{type:'text',text:'x'}]};
-// @ts-expect-error invalid input discriminant must remain rejected after packing
-const bad:TurnStartParams={requestId:'r',sessionId:'s',turnId:'t',input:[{type:'invalid'}]};
-const runtime=createHarnessRuntime(createScriptedAdapter());
-validateRequest('turn/start',good);void runtime;void bad;
+    await writeFile(path.join(clean,'typecheck.ts'),adapterTypes+'\n'+`import {type InputSubmitParams,validateRequest} from '@anureo/protocol';
+import {createClient,type Session,type Turn} from '@anureo/sdk';
+import {createScriptedAdapter,runNativeConformance} from '@anureo/conformance';
+// @ts-expect-error submission bookkeeping is not a public resource
+import type {Submission} from '@anureo/sdk';
+const input:InputSubmitParams={requestId:'r',sessionId:'s',submissionId:'input',delivery:'native',input:[{type:'text',text:'x'}]};
+// @ts-expect-error a submission cannot allocate an execution
+const fake:InputSubmitParams={requestId:'r',sessionId:'s',submissionId:'input',delivery:'native',turnId:'fake',input:[{type:'text',text:'x'}]};
+// @ts-expect-error invalid input discriminant remains rejected after packing
+const bad:InputSubmitParams={requestId:'r',sessionId:'s',submissionId:'input',delivery:'native',input:[{type:'invalid'}]};
+const submit=(session:Session):Promise<Turn>=>session.submit({input:'x'});
+const steer=(turn:Turn):Promise<void>=>turn.steer({input:'guide'});
+const client=createClient({adapter:createScriptedAdapter(),identity:{adapterId:'scripted',runtimeConfigId:'clean'}});
+validateRequest('input/submit',input);void client;void submit;void steer;void runNativeConformance;void fake;void bad;
 `)
     await writeFile(path.join(clean,'tsconfig.json'),JSON.stringify({compilerOptions:{target:'ES2022',module:'NodeNext',moduleResolution:'NodeNext',strict:true,noEmit:true,skipLibCheck:false,resolveJsonModule:true,types:['node']},files:['typecheck.ts']}))
     await run('node',['node_modules/typescript/bin/tsc','--pretty','false'],clean)
     verification.push({runtime:'typescript',result:{status:'passed',strict:true,skipLibCheck:false,moduleResolution:'NodeNext'}})
     const adapterNames=selected.filter(leaf=>['codex','claude','acp','ahp'].includes(leaf))
     for (const runtime of ['node','bun']) verification.push({runtime,result:JSON.parse((await run(runtime,['smoke.mjs',...adapterNames],clean)).trim())})
+    for (const runtime of ['node','bun']) verification.push({runtime:`${runtime}-native-lifecycle`,result:JSON.parse((await run(runtime,['native-lifecycle.mjs',...adapterNames],clean)).trim())})
     for (const pkg of packages) {
       const installed = JSON.parse(await readFile(path.join(clean,'node_modules',...pkg.name.split('/'),'package.json'),'utf8'))
       if (JSON.stringify(installed).includes('workspace:')) throw new Error(`Installed manifest retains workspace dependency ${pkg.name}`)

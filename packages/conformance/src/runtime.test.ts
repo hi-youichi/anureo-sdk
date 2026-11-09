@@ -1,12 +1,13 @@
 import { expect, test } from "bun:test";
-import { createHarnessRuntime, HarnessSdkError, ManagedHarnessSession, type HarnessRuntime, type SessionEventSink } from "@anureo/sdk";
+import { createClient, HarnessSdkError, type Client, type Session, type RuntimeOptions, type SessionEventSink } from "@anureo/sdk";
 import type { AhpEvent, GoalState, InteractionRequested, InteractionResponse, SessionOpenParams, SessionState } from "@anureo/protocol";
 import { createScriptedAdapter, FAKE_CAPABILITIES, type FakeAdapterOptions } from "./fake";
 
 const OPEN: SessionOpenParams = { requestId: "open", mode: "new", binding: { sessionId: "s", adapterId: "fake", runtimeConfigId: "r" }, cwd: "/tmp" };
-async function setup(options?: FakeAdapterOptions, runtimeOptions?: Parameters<typeof createHarnessRuntime>[1]) {
-  const adapter = createScriptedAdapter(options); const runtime = createHarnessRuntime(adapter, runtimeOptions);
-  await runtime.initialize({ protocolVersions: [1], clientInfo: { name: "test", version: "1" }, clientCapabilities: { interactions: ["approval", "userInput", "elicitation", "dynamicTool"] } });
+async function setup(options?: FakeAdapterOptions, runtimeOptions?: RuntimeOptions) {
+  const adapter = createScriptedAdapter(options);
+  const runtime = await createClient({ adapter, identity: OPEN.binding, runtime: runtimeOptions,
+    interactions: { approval: undefined, userInput: undefined, elicitation: undefined, dynamicTool: undefined } });
   const session = await runtime.openSession(OPEN); return { adapter, runtime, session, sink: adapter.sinks.get("s")! };
 }
 async function nextType(reader: AsyncIterator<AhpEvent>, type: AhpEvent["type"]): Promise<AhpEvent> {
@@ -14,69 +15,87 @@ async function nextType(reader: AsyncIterator<AhpEvent>, type: AhpEvent["type"])
   throw new Error(`Missing ${type}`);
 }
 
-test("standalone runtime captures immediate events before start returns and authoritative completed text", async () => {
+test("root client retains immediate results and emits authoritative completed text", async () => {
   const { runtime, session, adapter } = await setup();
-  const result = await session.startTurn({ requestId: "run", sessionId: "s", turnId: "t", input: [{ type: "text", text: "authority" }] });
-  expect(result.turnId).toBe("t");
-  const events: AhpEvent[] = []; const reader = session.events()[Symbol.asyncIterator]();
-  while (true) { const event = (await reader.next()).value!; events.push(event); if (event.type === "turn/completed") break; }
-  expect(events.map((event) => event.seq)).toEqual([1, 2, 3, 4, 5, 6]);
-  expect(events.filter((event) => event.type === "item/completed").map((event) => event.payload.item)).toMatchObject([{ text: "authority" }]);
-  expect(session.binding.nativeRef).toEqual({ provider: "scripted", value: "native:s" });
+  const reader = session.events()[Symbol.asyncIterator]();
+  const turn = await session.submit({ input: 'authority' });
+  expect((await turn.result()).text).toBe('authority');
+  const events: AhpEvent[] = [];
+  while (true) { const event = (await reader.next()).value!; events.push(event); if (event.type === 'turn/completed') break; }
+  expect(events.every((event, index) => event.seq === events[0]!.seq + index)).toBe(true);
+  expect(events.filter(event => event.type === 'item/completed').map(event => event.payload.item)).toMatchObject([{ text: 'authority' }]);
+  expect(session.binding.nativeRef).toEqual({ provider: 'scripted', value: 'native:s' });
   await reader.return?.(); await runtime.dispose(); expect(adapter.disposeCount).toBe(1);
 });
 
 test("immutable binding and unsupported capabilities never reach the backend", async () => {
   const { runtime, session, adapter } = await setup({ capabilities: {} });
   expect(Object.isFrozen(session.binding)).toBe(true); expect(Object.isFrozen(session.capabilities)).toBe(true);
-  await expect(session.revert({ requestId: "rev", sessionId: "s", boundary: { turnId: "t", relation: "before" }, scope: "both" })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
+  await expect(session.request("session/revert", { requestId: "rev", sessionId: "s", boundary: { turnId: "t", relation: "before" }, scope: "both" })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
   expect(adapter.calls).toHaveLength(0);
   await expect(runtime.openSession({ ...OPEN, binding: { ...OPEN.binding, sessionId: "resume", nativeRef: { provider: "scripted", value: "native:s" } }, mode: "resume" })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
   await runtime.dispose();
 });
 
-test("busy rejects rather than queues; steer targets the current turn; interrupt waits for native completion", async () => {
-  const { runtime, session, adapter, sink } = await setup({ execute: async (call, events) => {
-    if (call.method === "turn/start") { const turnId = (call.params as { turnId: string }).turnId; await events.emit({ type: "turn/started", payload: { turnId } }); return { accepted: true, turnId }; }
+test("native admission owns overlap; exact steer and interrupt use the observed execution", async () => {
+  const { runtime, session, adapter } = await setup({ execute: async (call, sink) => {
+    if (call.method === 'input/submit') {
+      const { submissionId } = call.params as import('@anureo/protocol').InputSubmitParams;
+      const turnId = `native:${submissionId}`;
+      await sink.emit({ type: 'turn/started', payload: { turnId } });
+      return { submissionId, accepted: true, disposition: 'started', turnId };
+    }
+    if (call.method === 'turn/steer') {
+      const value = call.params as import('@anureo/protocol').TurnSteerParams;
+      return { submissionId: value.submissionId, accepted: true, turnId: value.expectedTurnId };
+    }
   } });
-  await session.startTurn({ requestId: "run", sessionId: "s", turnId: "t", input: [{ type: "text", text: "hold" }] });
-  await expect(session.startTurn({ requestId: "second", sessionId: "s", turnId: "t2", input: [{ type: "text", text: "hold" }] })).rejects.toMatchObject({ code: "SESSION_BUSY" });
-  await expect(session.steer({ requestId: "steer", sessionId: "s", expectedTurnId: "wrong", input: [{ type: "text", text: "fix" }] })).rejects.toMatchObject({ code: "TURN_MISMATCH" });
-  await session.interrupt({ requestId: "interrupt", sessionId: "s", turnId: "t" });
-  const reader = session.events()[Symbol.asyncIterator](); const terminal = await nextType(reader, "turn/completed");
-  expect(terminal.payload).toMatchObject({ status: "interrupted" });
-  expect(adapter.calls.filter((call) => call.method === "turn/start")).toHaveLength(1);
-  await sink.emit({ type: "turn/completed", payload: { turnId: "t", status: "interrupted" } });
-  await reader.return?.(); await runtime.dispose();
+  const first = await session.submit({ input: 'first' });
+  const second = await session.submit({ input: 'second' });
+  expect(first.id).not.toBe(second.id);
+  expect(session.snapshot.activeTurnIds).toEqual([first.id, second.id]);
+  await first.steer({ input: 'guide first' });
+  expect(adapter.calls.find(call => call.method === 'turn/steer')?.params).toMatchObject({ expectedTurnId: first.id });
+  await first.interrupt(); expect((await first.result()).status).toBe('interrupted');
+  expect(session.snapshot.activeTurnIds).toEqual([second.id]);
+  await runtime.dispose();
 });
 
-test("item IDs reused by different turns remain separate and duplicate terminals are suppressed", async () => {
+test("item IDs reused by different executions remain separate; duplicate native terminals are suppressed", async () => {
   const { runtime, session, sink } = await setup();
-  for (const turnId of ["a", "b"]) await session.startTurn({ requestId: turnId, sessionId: "s", turnId, input: [{ type: "text", text: turnId }] });
-  await sink.emit({ type: "turn/completed", payload: { turnId: "a", status: "completed" } });
-  const reader = session.events()[Symbol.asyncIterator](); const terminals: string[] = []; const items: string[] = [];
-  while (terminals.length < 2) { const event = (await reader.next()).value!; if (event.type === "turn/completed") terminals.push(event.payload.turnId); if (event.type === "item/completed") items.push(`${event.turnId}:${event.payload.item.id}`); }
-  expect(terminals).toEqual(["a", "b"]); expect(items).toEqual(["a:native-reused", "b:native-reused"]);
+  const reader = session.events()[Symbol.asyncIterator]();
+  const first = await session.submit({ input: 'a' }), second = await session.submit({ input: 'b' });
+  await sink.emit({ type: 'turn/completed', payload: { turnId: first.id, status: 'completed' } });
+  const terminals: string[] = [], items: string[] = [];
+  while (terminals.length < 2) { const event = (await reader.next()).value!; if(event.type === 'turn/completed') terminals.push(event.payload.turnId); if(event.type === 'item/completed') items.push(`${event.turnId}:${event.payload.item.id}`); }
+  expect(terminals).toEqual([first.id, second.id]);
+  expect(items).toEqual([`${first.id}:native-reused`, `${second.id}:native-reused`]);
+  expect((await first.result()).text).toBe('a'); expect((await second.result()).text).toBe('b');
   await reader.return?.(); await runtime.dispose();
 });
 
-test("non-pausable overflow emits a failed turn in the reserved slot", async () => {
+test("non-pausable source overflow fails observation without inventing a native terminal", async () => {
   const { runtime, session, sink } = await setup({ execute: async (call, events) => {
-    if (call.method === "turn/start") { const turnId = (call.params as { turnId: string }).turnId; await events.emit({ type: "turn/started", payload: { turnId } }); return { accepted: true, turnId }; }
-  } }, { queue: { maxEvents: 2 } });
-  await session.startTurn({ requestId: "run", sessionId: "s", turnId: "t", input: [{ type: "text", text: "hold" }] });
-  expect(sink.tryEmit({ type: "notice", payload: { severity: "info", code: "N", message: "overflow" } })).toBe(false);
-  const reader = session.events()[Symbol.asyncIterator](); const terminal = await nextType(reader, "turn/completed");
-  expect(terminal.payload).toMatchObject({ status: "failed", error: { code: "BACKPRESSURE_EXCEEDED" } });
-  expect((await reader.next()).done).toBe(true); await runtime.dispose();
+    if(call.method !== 'input/submit')return undefined;
+    const { submissionId } = call.params as import('@anureo/protocol').InputSubmitParams;
+    await events.emit({type:'turn/started',payload:{turnId:'active'}});
+    return {submissionId,accepted:true,disposition:'started',turnId:'active'};
+  } }, { queue: { maxFrameBytes: 4096 } });
+  const turn = await session.submit({ input:'hold' }), reader = session.events()[Symbol.asyncIterator]();
+  expect(sink.tryEmit({type:'notice',payload:{severity:'info',code:'FLOOD',message:'x'.repeat(8192)}})).toBe(false);
+  await expect(turn.result()).rejects.toMatchObject({code:'BACKPRESSURE_EXCEEDED',details:{source:'sdk'}});
+  await expect(reader.next()).rejects.toMatchObject({code:'BACKPRESSURE_EXCEEDED'});
+  await reader.return?.(); await runtime.dispose();
 });
 
-test("detach releases the only reader without interrupting a running turn", async () => {
-  const { runtime, session, adapter } = await setup(); const reader = session.events()[Symbol.asyncIterator]();
-  await reader.next(); await reader.return?.();
-  await session.startTurn({ requestId: "run", sessionId: "s", turnId: "t", input: [{ type: "text", text: "after detach" }] });
-  expect(adapter.calls.some((call) => call.method === "turn/interrupt")).toBe(false);
-  const again = session.events()[Symbol.asyncIterator](); await nextType(again, "turn/completed"); await again.return?.(); await runtime.dispose();
+test("detaching an event reader does not interrupt execution or replay old events", async () => {
+  const { runtime, session, adapter } = await setup();
+  const reader = session.events()[Symbol.asyncIterator](); await reader.return?.();
+  const again = session.events()[Symbol.asyncIterator]();
+  const turn = await session.submit({ input:'after detach' }); await nextType(again,'turn/completed');
+  expect((await turn.result()).text).toBe('after detach');
+  expect(adapter.calls.some(call=>call.method==='turn/interrupt'||call.method==='session/interrupt')).toBe(false);
+  await again.return?.(); await runtime.dispose();
 });
 
 const interactions: Array<{ request: InteractionRequested; response: InteractionResponse }> = [
@@ -89,10 +108,10 @@ for (const entry of interactions) test(`interaction ${entry.request.kind} waits 
   const { runtime, session, sink } = await setup(); let received: InteractionResponse | null | undefined;
   const answer = sink.requestInteraction(entry.request, async (response) => { received = response; });
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
-  const result = await session.respond({ requestId: "response", sessionId: "s", interactionId: entry.request.interactionId, response: entry.response });
+  const result = await session.request("interaction/respond", { requestId: "response", sessionId: "s", interactionId: entry.request.interactionId, response: entry.response });
   expect(result.outcome).toBe("responded"); expect(await answer).toEqual(entry.response); expect(received).toEqual(entry.response);
   const event = await nextType(reader, "interaction/resolved"); expect(event.payload).toMatchObject({ outcome: "responded" });
-  await expect(session.respond({ requestId: "other", sessionId: "s", interactionId: entry.request.interactionId, response: entry.response })).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
+  await expect(session.request("interaction/respond", { requestId: "other", sessionId: "s", interactionId: entry.request.interactionId, response: entry.response })).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
   await reader.return?.(); await runtime.dispose();
 });
 
@@ -100,9 +119,9 @@ test("invalid interaction answers keep pending; racing valid replies invoke nati
   const { runtime, session, sink } = await setup(); let release!: () => void; let calls = 0;
   const pending = sink.requestInteraction(interactions[0].request, async () => { calls++; await new Promise<void>((resolve) => { release = resolve; }); });
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
-  await expect(session.respond({ requestId: "invalid", sessionId: "s", interactionId: "approval", response: { kind: "approval", optionId: "invented" } })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
-  const first = session.respond({ requestId: "first", sessionId: "s", interactionId: "approval", response: interactions[0].response });
-  await expect(session.respond({ requestId: "second", sessionId: "s", interactionId: "approval", response: { kind: "approval", optionId: "no" } })).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
+  await expect(session.request("interaction/respond", { requestId: "invalid", sessionId: "s", interactionId: "approval", response: { kind: "approval", optionId: "invented" } })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
+  const first = session.request("interaction/respond", { requestId: "first", sessionId: "s", interactionId: "approval", response: interactions[0].response });
+  await expect(session.request("interaction/respond", { requestId: "second", sessionId: "s", interactionId: "approval", response: { kind: "approval", optionId: "no" } })).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
   expect(calls).toBe(1); release(); await first; await pending; await reader.return?.(); await runtime.dispose();
 });
 
@@ -121,17 +140,18 @@ test("native response loss is unknown and not automatically retried", async () =
   void pending.catch(() => {});
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
   const params = { requestId: "response", sessionId: "s", interactionId: "approval", response: interactions[0].response };
-  await expect(session.respond(params)).rejects.toMatchObject({ outcomeUnknown: true }); await expect(pending).rejects.toMatchObject({ outcomeUnknown: true });
+  await expect(session.request("interaction/respond", params)).rejects.toMatchObject({ outcomeUnknown: true }); await expect(pending).rejects.toMatchObject({ outcomeUnknown: true });
   expect((await nextType(reader, "interaction/resolved")).payload).toMatchObject({ outcome: "unknown" });
-  await expect(session.respond(params)).rejects.toMatchObject({ outcomeUnknown: true }); expect(calls).toBe(1);
+  await expect(session.request("interaction/respond", params)).rejects.toMatchObject({ outcomeUnknown: true }); expect(calls).toBe(1);
   await reader.return?.(); await runtime.dispose();
 });
 
-test("request IDs dedupe accepted operations and reject changed payload", async () => {
-  const { runtime, session, adapter } = await setup(); const params = { requestId: "same", sessionId: "s", turnId: "t", input: [{ type: "text" as const, text: "one" }] };
-  await session.startTurn(params); await session.startTurn(params);
-  await expect(session.startTurn({ ...params, input: [{ type: "text", text: "changed" }] })).rejects.toMatchObject({ code: "REQUEST_ID_CONFLICT" });
-  expect(adapter.calls).toHaveLength(1); await runtime.dispose();
+test("raw request IDs dedupe dispatched inputs and reject changed payload", async () => {
+  const {runtime,session,adapter}=await setup();
+  const params={requestId:'same',sessionId:'s',submissionId:'input',delivery:'native' as const,input:[{type:'text' as const,text:'one'}]};
+  await session.request('input/submit',params);await session.request('input/submit',params);
+  await expect(session.request('input/submit',{...params,input:[{type:'text',text:'changed'}]})).rejects.toMatchObject({code:'REQUEST_ID_CONFLICT'});
+  expect(adapter.calls).toHaveLength(1);await runtime.dispose();
 });
 
 test("runtime disposal is idempotent and disposes each backend once", async () => {
@@ -146,8 +166,8 @@ test("runtime disposal preserves backend stop failure after cleaning every owner
   let attempts = 0;
   adapter.backends.get("s")!.dispose = async () => { attempts++; throw failure; };
   const disposal = runtime.dispose();
-  await expect(disposal).rejects.toBe(failure);
-  await expect(runtime.dispose()).rejects.toBe(failure);
+  await expect(disposal).rejects.toMatchObject({ code: "RESOURCE_RELEASE_FAILED", details: { errors: [{ code: "PROCESS_DISPOSE_FAILED", outcomeUnknown: true }] } });
+  await expect(runtime.dispose()).rejects.toMatchObject({ code: "RESOURCE_RELEASE_FAILED", details: { errors: [{ code: "PROCESS_DISPOSE_FAILED", outcomeUnknown: true }] } });
   expect(attempts).toBe(1);
   expect(adapter.backends.get("other")?.disposeCount).toBe(1);
   expect(adapter.disposeCount).toBe(1);
@@ -161,40 +181,38 @@ test("remote resolved events retire the registry without submitting another nati
   await sink.resolveInteraction({ interactionId: "approval", outcome: "expired" });
   await expect(pending).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
   expect((await nextType(reader, "interaction/resolved")).payload).toMatchObject({ outcome: "expired" });
-  await expect(session.respond({ requestId: "late", sessionId: "s", interactionId: "approval", response: interactions[0].response })).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
+  await expect(session.request("interaction/respond", { requestId: "late", sessionId: "s", interactionId: "approval", response: interactions[0].response })).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
   await new Promise((resolve) => setTimeout(resolve, 25)); expect(calls).toBe(0);
   await reader.return?.(); await runtime.dispose();
 });
 
 test("open configuration and model survive the initial authority snapshot", async () => {
-  const adapter = createScriptedAdapter(); const runtime = createHarnessRuntime(adapter);
-  await runtime.initialize({ protocolVersions: [1], clientInfo: { name: "test", version: "1" } });
+  const adapter = createScriptedAdapter(); const runtime = await createClient({ adapter, identity: OPEN.binding });
   const session = await runtime.openSession({ ...OPEN, config: { effort: "high" }, model: "configured-model" });
-  const reader = session.events()[Symbol.asyncIterator](); const state = await nextType(reader, "session/state");
-  expect(state.payload).toMatchObject({ config: { effort: "high" }, model: "configured-model" });
+  const reader = session.events()[Symbol.asyncIterator](); const state = session.snapshot;
+  expect(state).toMatchObject({ config: { effort: "high" }, model: "configured-model" });
   await reader.return?.(); await session.close(); await runtime.dispose(); expect(adapter.backends.get("s")?.disposeCount).toBe(1);
 });
 
 test("a revert result updates the recoverable native reference without changing fixed session identity", async () => {
   const { runtime, session, sink } = await setup({ execute: async (call) => call.method === "session/revert" ? { appliedScope: "conversation", boundary: { turnId: "old", relation: "before" }, nativeRef: { provider: "scripted", value: "native:reverted" } } : undefined });
-  await session.revert({ requestId: "revert", sessionId: "s", scope: "conversation", boundary: { turnId: "old", relation: "before" } });
+  await session.request("session/revert", { requestId: "revert", sessionId: "s", scope: "conversation", boundary: { turnId: "old", relation: "before" } });
   expect(session.binding).toEqual({ ...OPEN.binding, nativeRef: { provider: "scripted", value: "native:reverted" } });
   expect(Object.isFrozen(session.binding.nativeRef)).toBe(true);
-  await sink.emit({ type: "session/state", payload: { binding: { ...session.binding, nativeRef: { provider: "scripted", value: "native:authoritative" } }, capabilities: structuredClone(session.capabilities), config: {}, status: "ready", capabilityRevision: 1 } });
+  await sink.emit({ type: "session/state", payload: { binding: { ...session.binding, nativeRef: { provider: "scripted", value: "native:authoritative" } }, capabilities: structuredClone(session.capabilities), config: {}, status: "ready", activeTurnIds: [], capabilityRevision: 1 } });
   expect(session.binding.nativeRef).toEqual({ provider: "scripted", value: "native:authoritative" });
   await runtime.dispose();
 });
 
 test("a backend failing during open cannot be returned as a successfully opened session", async () => {
   const adapter = createScriptedAdapter({ onOpen: async (_, sink) => { await sink.fail(new HarnessSdkError("HARNESS_UNAVAILABLE")); } });
-  const runtime = createHarnessRuntime(adapter); await runtime.initialize({ protocolVersions: [1], clientInfo: { name: "test", version: "1" } });
+  const runtime = await createClient({ adapter, identity: OPEN.binding });
   await expect(runtime.openSession(OPEN)).rejects.toMatchObject({ code: "HARNESS_UNAVAILABLE" });
   expect(adapter.backends.get("s")?.disposeCount).toBe(1); await runtime.dispose();
 });
 
 test("an omitted client interaction capability fails closed at the SDK boundary", async () => {
-  const adapter = createScriptedAdapter(); const runtime = createHarnessRuntime(adapter);
-  await runtime.initialize({ protocolVersions: [1], clientInfo: { name: "test", version: "1" } });
+  const adapter = createScriptedAdapter(); const runtime = await createClient({ adapter, identity: OPEN.binding });
   await runtime.openSession(OPEN); let response: InteractionResponse | null | undefined;
   await expect(adapter.sinks.get("s")!.requestInteraction(interactions[0].request, async (value) => { response = value; })).rejects.toMatchObject({ code: "INTERACTION_UNSUPPORTED" });
   expect(response).toBeNull(); await runtime.dispose();
@@ -205,12 +223,12 @@ test("marked secret answers are redacted from native echoes, split deltas and hi
   const { runtime, session, sink } = await setup();
   const pending = sink.requestInteraction({ kind: "userInput", interactionId: "secret", questions: [{ id: "password", prompt: "Secret", secret: true }] }, async (answer) => { nativeAnswers.push(answer); });
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
-  await session.respond({ requestId: "respond", sessionId: "s", interactionId: "secret", response: { kind: "userInput", answers: { password: secret } } }); await pending;
+  await session.request("interaction/respond", { requestId: "respond", sessionId: "s", interactionId: "secret", response: { kind: "userInput", answers: { password: secret } } }); await pending;
   expect(nativeAnswers).toEqual([{ kind: "userInput", answers: { password: secret } }]);
-  await session.startTurn({ requestId: "echo", sessionId: "s", turnId: "echo", input: [{ type: "text", text: `echo ${secret}` }] });
+  await session.submit({ input: [{ type: "text", text: `echo ${secret}` }] });
   const events: AhpEvent[] = [];
   while (true) { const event = (await reader.next()).value!; events.push(event); if (event.type === "turn/completed") break; }
-  expect(JSON.stringify(events)).not.toContain(secret); expect(JSON.stringify(await session.readHistory({ requestId: "history", sessionId: "s" }))).not.toContain(secret);
+  expect(JSON.stringify(events)).not.toContain(secret); expect(JSON.stringify(await session.request("history/read", { requestId: "history", sessionId: "s" }))).not.toContain(secret);
   await sink.emit({ type: "turn/started", payload: { turnId: "split" } });
   await sink.emit({ type: "item/started", payload: { item: { id: "split-text", type: "agentMessage", text: "" } } }, { turnId: "split" });
   for (const part of ["PRIVATE_", "ANSWER_", "123"]) await sink.emit({ type: "item/delta", payload: { itemId: "split-text", kind: "text", text: part } }, { turnId: "split" });
@@ -226,45 +244,39 @@ test("elicitation writeOnly values are marked before a synchronous native echo",
   const { runtime, session, sink } = await setup(); const secret = "WRITE_ONLY_SECRET";
   const pending = sink.requestInteraction({ kind: "elicitation", interactionId: "form", mode: "form", schema: { type: "object", properties: { credential: { type: "string", writeOnly: true } }, required: ["credential"] } }, async () => { await sink.emit({ type: "notice", payload: { severity: "info", code: "ECHO", message: secret, raw: { generic: secret } } }); });
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
-  await session.respond({ requestId: "response", sessionId: "s", interactionId: "form", response: { kind: "elicitation", action: "accept", content: { credential: secret } } }); await pending;
+  await session.request("interaction/respond", { requestId: "response", sessionId: "s", interactionId: "form", response: { kind: "elicitation", action: "accept", content: { credential: secret } } }); await pending;
   const echo = await nextType(reader, "notice"); expect(echo.payload).toMatchObject({ message: "[redacted]", raw: { generic: "[redacted]" } });
   await reader.return?.(); await runtime.dispose();
 });
 
-test("accepted asynchronous compaction blocks new work until a native ready state confirms completion", async () => {
-  const { runtime, session, sink, adapter } = await setup({ execute: async (call) => call.method === "compact/start" ? { maintenanceId: "async", status: "accepted" } : undefined });
-  expect(await session.compact({ requestId: "compact", sessionId: "s" })).toMatchObject({ status: "accepted" });
-  await sink.emit({ type: "session/metadata", payload: { title: "Title during maintenance" } });
-  await expect(session.startTurn({ requestId: "too-early", sessionId: "s", turnId: "t", input: [{ type: "text", text: "wait" }] })).rejects.toMatchObject({ code: "SESSION_BUSY" });
-  await expect(runtime.openSession({ ...OPEN, binding: { ...OPEN.binding, sessionId: "branch" }, mode: "fork", fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: "old", relation: "through" } } })).rejects.toMatchObject({ code: "SESSION_BUSY" });
-  await sink.emit({ type: "session/state", payload: { binding: structuredClone(session.binding), capabilities: structuredClone(session.capabilities), config: {}, capabilityRevision: 1, status: "ready" } });
-  await session.startTurn({ requestId: "after-ready", sessionId: "s", turnId: "t", input: [{ type: "text", text: "go" }] });
-  expect(adapter.calls.filter((call) => call.method === "turn/start")).toHaveLength(1); await runtime.dispose();
+test("accepted compaction does not impose a universal Core busy scheduler", async () => {
+  const {runtime,session,sink,adapter}=await setup({execute:async call=>call.method==='compact/start'?{maintenanceId:'async',status:'accepted'}:undefined});
+  expect(await session.request('compact/start',{requestId:'compact',sessionId:'s'})).toMatchObject({status:'accepted'});
+  await sink.emit({type:'session/metadata',payload:{title:'Maintenance'}});
+  const turn=await session.submit({ input:'native admission' });expect((await turn.result()).status).toBe('completed');
+  expect(adapter.calls.filter(call=>call.method==='input/submit')).toHaveLength(1);await runtime.dispose();
 });
 
-test("an in-flight fork reserves its live source against concurrent mutation without queuing", async () => {
-  let entered!: () => void; const opening = new Promise<void>((resolve) => { entered = resolve; });
-  let release!: () => void; const hold = new Promise<void>((resolve) => { release = resolve; });
-  const { runtime, session } = await setup({ onOpen: async (params) => { if (params.mode === "fork") { entered(); await hold; } } });
-  await session.startTurn({ requestId: "initial", sessionId: "s", turnId: "old", input: [{ type: "text", text: "boundary" }] });
-  const branch = runtime.openSession({ ...OPEN, binding: { ...OPEN.binding, sessionId: "branch" }, mode: "fork", fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: "old", relation: "through" } } });
-  await opening;
-  await expect(session.startTurn({ requestId: "during-fork", sessionId: "s", turnId: "next", input: [{ type: "text", text: "wait" }] })).rejects.toMatchObject({ code: "SESSION_BUSY" });
-  release(); await branch;
-  await session.startTurn({ requestId: "after-fork", sessionId: "s", turnId: "next", input: [{ type: "text", text: "continue" }] });
-  await runtime.dispose();
+test("an in-flight fork does not add a universal Core mutation lock", async () => {
+  let entered!:()=>void,release!:()=>void;
+  const opening=new Promise<void>(resolve=>{entered=resolve}),hold=new Promise<void>(resolve=>{release=resolve});
+  const {runtime,session}=await setup({onOpen:async params=>{if(params.mode==='fork'){entered();await hold;}}});
+  const original=await session.submit({ input:'boundary' });await original.result();
+  const branch=runtime.sessions.fork(session.reference,{boundary:{turnId:original.id,relation:'through'}});
+  await opening;const during=await session.submit({ input:'during fork' });expect((await during.result()).status).toBe('completed');
+  release();await branch;await runtime.dispose();
 });
 
 test("a compact completion snapshot before acknowledgement cannot leave the session stuck busy", async () => {
-  let session!: Awaited<ReturnType<HarnessRuntime["openSession"]>>;
+  let session!: Awaited<ReturnType<Client["openSession"]>>;
   const fixture = await setup({ execute: async (call, sink) => {
     if (call.method !== "compact/start") return undefined;
-    await sink.emit({ type: "session/state", payload: { binding: structuredClone(session.binding), capabilities: structuredClone(session.capabilities), config: {}, capabilityRevision: 1, status: "ready" } });
+    await sink.emit({ type: "session/state", payload: { binding: structuredClone(session.binding), capabilities: structuredClone(session.capabilities), config: {}, capabilityRevision: 1, activeTurnIds: [], status: "ready" } });
     return { maintenanceId: "fast", status: "accepted" };
   } });
   session = fixture.session;
-  expect(await session.compact({ requestId: "compact", sessionId: "s" })).toMatchObject({ status: "completed" });
-  await session.startTurn({ requestId: "after-ready", sessionId: "s", turnId: "t", input: [{ type: "text", text: "go" }] }); await fixture.runtime.dispose();
+  expect(await session.request("compact/start", { requestId: "compact", sessionId: "s" })).toMatchObject({ status: "accepted" });
+  await session.submit({ input: [{ type: "text", text: "go" }] }); await fixture.runtime.dispose();
 });
 
 test("privacy metadata ports run before native submission and project restored authoritative history", async () => {
@@ -275,9 +287,9 @@ test("privacy metadata ports run before native submission and project restored a
   });
   const pending = sink.requestInteraction({ interactionId: "private", kind: "userInput", questions: [{ id: "q", prompt: "Secret", secret: true }] }, async () => { nativeSeen = true; expect(remembered).toEqual([{ sessionId: "s", value: "secret-port-value" }]); });
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
-  await session.respond({ requestId: "answer", sessionId: "s", interactionId: "private", response: { kind: "userInput", answers: { q: "secret-port-value" } } }); await pending; expect(nativeSeen).toBe(true);
-  await session.startTurn({ requestId: "run", sessionId: "s", turnId: "t", input: [{ type: "text", text: "original" }] });
-  expect((await session.readHistory({ requestId: "history", sessionId: "s" })).items[0]?.item).toMatchObject({ text: "host-persistent-projection" });
+  await session.request("interaction/respond", { requestId: "answer", sessionId: "s", interactionId: "private", response: { kind: "userInput", answers: { q: "secret-port-value" } } }); await pending; expect(nativeSeen).toBe(true);
+  await session.submit({ input: [{ type: "text", text: "original" }] });
+  expect((await session.request("history/read", { requestId: "history", sessionId: "s" })).items[0]?.item).toMatchObject({ text: "host-persistent-projection" });
   await reader.return?.(); await runtime.dispose();
 });
 
@@ -294,16 +306,16 @@ test("successful configuration, goal results and state displays redact marked co
     if (call.method === "goal/clear") return clearedGoal;
     return undefined;
   } });
-  nativeState = { binding: structuredClone(session.binding), status: "ready", config: { model: secret, numericAnswer: 1 }, model: "model", capabilityRevision: 1, capabilities, goal: { goal: { text: secret }, status: "active" } };
-  const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "session/state");
+  nativeState = { binding: structuredClone(session.binding), status: "ready", activeTurnIds: [], config: { model: secret, numericAnswer: 1 }, model: "model", capabilityRevision: 1, capabilities, goal: { goal: { text: secret }, status: "active" } };
+  const reader = session.events()[Symbol.asyncIterator]();
   const pending = sink.requestInteraction({ interactionId: "result-secret", kind: "userInput", questions: Object.keys(marked).map((id) => ({ id, prompt: id, secret: true })) }, async () => {});
   await nextType(reader, "interaction/requested");
-  await session.respond({ requestId: "mark", sessionId: "s", interactionId: "result-secret", response: { kind: "userInput", answers: marked } }); await pending;
-  const configured = await session.setConfig({ requestId: "configure", sessionId: "s", patch: { model: "model" } });
-  expect(configured).toMatchObject({ binding: { sessionId: "s", adapterId: "fake", runtimeConfigId: "r" }, status: "ready", capabilityRevision: 1, model: "model", config: { model: "[redacted]", numericAnswer: "[redacted]" }, goal: { goal: { text: "[redacted]" }, status: "active" } });
+  await session.request("interaction/respond", { requestId: "mark", sessionId: "s", interactionId: "result-secret", response: { kind: "userInput", answers: marked } }); await pending;
+  const configured = await session.request("session/config/set", { requestId: "configure", sessionId: "s", patch: { model: "model" } });
+  expect(configured).toMatchObject({ binding: { sessionId: "s", adapterId: "fake", runtimeConfigId: "r" }, status: "ready", activeTurnIds: [], capabilityRevision: 1, model: "model", config: { model: "[redacted]", numericAnswer: "[redacted]" }, goal: { goal: { text: "[redacted]" }, status: "active" } });
   expect(configured.capabilities.config!.options[0]).toEqual({ ...capabilities.config.options[0], title: "[redacted]", value: "[redacted]", schema: { type: "string", title: "[redacted]", description: "[redacted]", default: "[redacted]", examples: ["[redacted]"], enum: ["model", "string"], $defs: { choice: { type: "string", description: "[redacted]" } }, properties: { title: { type: "string", description: "[redacted]" } } } });
-  expect(await session.setGoal({ requestId: "goal", sessionId: "s", goal: { text: "ordinary" } })).toEqual({ goal: { text: "[redacted]", numericAnswer: "[redacted]" }, status: "active" });
-  expect(await session.clearGoal({ requestId: "clear", sessionId: "s" })).toEqual({ goal: { echo: "[redacted]" }, status: "cleared" });
+  expect(await session.request("goal/set", { requestId: "goal", sessionId: "s", goal: { text: "ordinary" } })).toEqual({ goal: { text: "[redacted]", numericAnswer: "[redacted]" }, status: "active" });
+  expect(await session.request("goal/clear", { requestId: "clear", sessionId: "s" })).toEqual({ goal: { echo: "[redacted]" }, status: "cleared" });
   await sink.emit({ type: "session/state", payload: nativeState });
   const event = await nextType(reader, "session/state"); expect(event.payload).toEqual(configured);
   expect(JSON.stringify(configured)).not.toContain(secret); expect(JSON.stringify(event)).not.toContain(secret);

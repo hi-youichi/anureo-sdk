@@ -4,8 +4,13 @@
   "private": true,
   "type": "module",
   "packageManager": "bun@1.4.2",
-  "engines": { "node": ">=22", "bun": ">=1.4.2" },
-  "workspaces": ["packages/*"],
+  "engines": {
+    "node": ">=22",
+    "bun": ">=1.4.2"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "check:boundaries": "bun scripts/check-boundaries.ts",
     "generate": "bun run --filter @anureo/protocol generate",
@@ -16,7 +21,8 @@
     "test": "bun test --timeout 15000 packages scripts/harness-sdk",
     "build": "bun scripts/harness-sdk/pack.ts --out artifacts",
     "verify:pack": "bun scripts/harness-sdk/pack.ts --verify --out artifacts",
-    "example": "bun examples/standalone.ts"
+    "example": "bun examples/standalone.ts",
+    "example:native": "bun examples/native-lifecycle.ts"
   },
   "devDependencies": {
     "@anureo/sdk": "workspace:*",
@@ -24,6 +30,7 @@
     "@anureo/adapter-codex": "workspace:*",
     "@types/bun": "1.4.0",
     "@types/node": "22.15.3",
-    "typescript": "5.8.3"
+    "typescript": "5.8.3",
+    "@anureo/protocol": "workspace:*"
   }
 }

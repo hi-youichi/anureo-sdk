@@ -32,6 +32,7 @@ jobs:
       - run: bun run typecheck:tooling
       - run: bun test --timeout 15000 packages scripts/harness-sdk
       - run: bun run example
+      - run: bun run example:native
       - run: bun run verify:pack
       - uses: actions/upload-artifact@v4
         if: always()

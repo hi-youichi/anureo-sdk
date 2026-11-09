@@ -1,79 +1,104 @@
 # @anureo/sdk
 
-The runtime core of the Anureo SDK. `createHarnessRuntime(adapter)` wraps any `HarnessAdapter` — Codex, Claude, ACP, an external AHP harness, or your own — behind the unified `HarnessRuntime` / `HarnessSession` interface, and enforces the AHP semantics that hosts should not have to re-implement:
+The runtime core of Anureo SDK. The native lifecycle revision updates **AHP v1
+in place** through this root entry. The workspace exports `createClient`,
+`Client`, `Session` and `Turn`; root-entry migration and local validation are complete.
+These examples do not describe the published 0.2.0 API. See the
+[design and implementation plan](../../docs/native-harness-lifecycle.md).
 
-- Request, result, binding, and capability validation; turn and item lifecycle state machines
-- Event delivery with `streamId`, `seq`, and timestamps through a bounded queue (backpressure is explicit, never silent)
-- Interaction registration, answering, and cancellation, with cleanup on timeout, turn end, or disconnection
-- Per-method request caching, waiting timeouts, typed errors, and recovery state
-- Secret redaction for events, histories, and file-change materials marked as secret
+Core validates requests, results, binding and capabilities; correlates inputs with
+actual executions; manages interactions, privacy, bounded observations and retained
+results. Adapters provide native admission, association and terminal evidence.
+Core does not impose a universal business queue.
 
-> Part of the [Anureo SDK workspace](../../README.md). Install with `npm install @anureo/sdk`.
+> Part of the [Anureo SDK workspace](../../README.md).
 
 ## Exports
 
 | Entry | Contents |
-|---|---|
-| `@anureo/sdk` | `createHarnessRuntime`, `HarnessRuntime`, `HarnessSession`, `ManagedHarnessSession`, `HarnessAdapter`, `BackendSession`, `SessionEventSink`, `RuntimeOptions`, `HarnessSdkError`, `BoundedEventQueue`, `SecretRedactor`, and related types |
-| `@anureo/sdk/process` | `spawnHarnessProcess` — child-process helper used by the stdio adapters |
-| `@anureo/sdk/queue` | The bounded event queue used for host consumption and stream buffering |
-| `@anureo/sdk/diagnostics` | `catalogPhase` and helpers for progress-reporting probes (model catalog sessions) |
+| --- | --- |
+| `@anureo/sdk` | `createClient`, `Client`, `Session`, `Turn`, `Input`, `SubmitOptions`, `TurnResult`, adapter ports and shared runtime utilities |
+| `@anureo/sdk/process` | `spawnHarnessProcess` for stdio adapters |
+| `@anureo/sdk/queue` | Bounded event queues |
+| `@anureo/sdk/diagnostics` | Model-catalog progress probes |
 
-Core never imports a concrete adapter. Adapters implement `HarnessAdapter` (initialize / openSession / dispose) and receive a `SessionEventSink` (`emit`, `tryEmit`, `requestInteraction`, `resolveInteraction`, `fail`) to publish into the managed session. The dependency direction is one-way: adapters depend on core and protocol.
+Core never imports a concrete adapter. Adapters implement `HarnessAdapter`
+(initialize / openSession / dispose). Their `SessionEventSink` publishes events,
+binds submissions to executions, manages interactions and reports source failure.
+The dependency direction is adapters → core/protocol.
 
-## Usage
+## Submit, steer and result
 
-The scripted adapter from `@anureo/conformance` runs without a model or credentials; replace it with any real adapter to talk to a live backend.
+The following fragment assumes an open session whose backend supports exact-turn
+steer. See the [complete Codex setup](../../README.md#usage-example) or run the
+[scripted example](../../examples/native-lifecycle.ts) with `bun run example:native`.
 
 ```typescript
-import { createHarnessRuntime } from '@anureo/sdk'
-import { createScriptedAdapter } from '@anureo/conformance'
-
-const runtime = createHarnessRuntime(createScriptedAdapter())
-try {
-  await runtime.initialize({
-    protocolVersions: [1],
-    clientInfo: { name: 'my-host', version: '0.1.0' },
-  })
-  const session = await runtime.openSession({
-    requestId: 'open', mode: 'new', cwd: process.cwd(),
-    binding: { sessionId: 's1', adapterId: 'scripted', runtimeConfigId: 'local' },
-  })
-
-  // Start consuming events before submitting input: the queue is bounded.
-  const consume = (async () => {
-    for await (const event of session.events()) {
-      if (event.type === 'item/completed' && event.payload.item.type === 'agentMessage') {
-        console.log(event.payload.item.text)
-      }
-      if (event.type === 'turn/completed') return
-    }
-  })()
-  void consume.catch(() => {})
-
-  await session.startTurn({
-    requestId: 'start', sessionId: session.binding.sessionId, turnId: 't1',
-    input: [{ type: 'text', text: 'Hello' }],
-  })
-  await consume
-  await session.close()
-} finally {
-  await runtime.dispose()
-}
+const turn = await session.submit({
+  input: 'Investigate and fix the failing login tests.',
+  delivery: 'native',
+})
+await turn.steer({ input: 'Keep all changes inside the authentication module.' })
+const result = await turn.result()
+console.log(result.status, result.text)
 ```
 
-The runnable version lives at [examples/standalone.ts](../../examples/standalone.ts) (run with `bun run example` from the workspace root).
+| Call | Waits for | Returns |
+| --- | --- | --- |
+| `session.submit(options, wait?)` | Reliable input-to-execution association | `Promise<Turn>` |
+| `turn.steer({ input }, wait?)` | Native confirmation that input was appended to the exact target | `Promise<void>` |
+| `turn.result(wait?)` | Actual execution terminal | `Promise<TurnResult>` |
 
-## Session surface
+`submit()` needs `await` because admission may queue input or merge it into an
+existing execution. The execution identity is only known from native evidence.
+It may already be complete when association arrives. `result()` then reads its
+retained result; status can be completed, interrupted or failed.
 
-`HarnessSession` exposes `startTurn`, `steer`, `interrupt`, `respond`, `cancelInteraction`, `setConfig`, `revert`, `readHistory`, `setGoal`, `clearGoal`, `compact`, `review`, and `close`. The interface existing does not mean the backend supports the operation: every optional method is gated on the capabilities negotiated at initialization, and calls that exceed them fail with typed errors rather than undefined behavior.
+There is no public `Submission`, `accepted()` or `submission.turn()`. Core keeps
+submission identities internally. An optional native acceptance receipt is useful
+progress evidence, but it is not required before returning an associated Turn.
+Local queue/write success alone is not native acceptance.
 
-Operational notes hosts should rely on:
+`Input` accepts a string or input blocks. `delivery` defaults to `native`;
+`afterTurn` requires declared native support. Exact steer requires
+`session.capabilities.input?.steer?.atomicMatch`. An unsupported or stale target
+rejects; steer does not create a Turn or silently fall back to session input.
 
-- **Event identity.** Sequence numbers belong to a `streamId`; a new open produces a new stream. Do not treat `seq` across streams as one persistent log.
-- **Backpressure.** The queue bounds both queued events and waiters. Non-pausable sources use `tryEmit()` and observe failure; slow consumers surface as explicit errors.
-- **Outcome ambiguity.** Stopping a wait after a request was sent can yield `outcomeUnknown`; that never implies the backend did not act. Cancelling a wait and interrupting backend execution are distinct operations.
-- **Session binding.** A session is bound to one adapter and runtime config. Resume and fork must honor the binding; switching backends inside a session is not supported.
+Claude-style additional input uses another submission to the same session:
+
+```typescript
+const first = await session.submit({ input: 'Investigate the login tests.' })
+const actual = await session.submit({ input: 'Focus on authentication.' })
+console.log(first.id, actual.id) // May match, according to native evidence.
+const result = await actual.result()
+```
+
+## Observation, progress and control
+
+- `session.events()` reports future session events, including `submission/status`
+  and `submission/bound`. Subscribe before submitting if you need that progress;
+  there is no replay guarantee. `turn.events()` observes that execution's future
+  events; `turn.result()` reads its retained terminal snapshot.
+- Each submission returns an independent observation. Multiple handles may share
+  one execution ID, terminal and usage. Do not count the same execution twice.
+- `turn.interrupt()` requires exact-turn interrupt support. `session.interrupt()`
+  requires session scope. Acknowledgement does not prove termination or withdrawal
+  of queued input; await native terminal evidence.
+- Wait options such as `{ timeoutMs: 30_000, signal }` apply to observation.
+  Cancelling a wait or disposing a Turn does not retract input, interrupt execution
+  or affect sibling observers. A timeout after sending does not justify resending.
+- `session.close()` separates `observationClosed` from `executionStopped`.
+  Local cleanup does not prove a native execution stopped. Always release the
+  client with `await client.dispose()` in `finally`.
+
+Declare supported interactions in client options. A handler function answers
+automatically; an explicitly present key with value `undefined` enables manual
+responses through session events and `session.request('interaction/respond', ...)`.
+An absent kind is unsupported and cannot authorize a native request.
+
+Optional operations remain capability gated. Source sequence numbers belong to a
+`streamId`; session binding fixes the adapter and runtime configuration. Queues,
+results and correlation records are bounded, with explicit errors on overflow.
 
 ## Development
 
@@ -83,7 +108,6 @@ bun run typecheck
 bun test src
 ```
 
-## Documentation
-
-- [Architecture](../../docs/architecture.md) — interfaces, turn/approval sequences, and safety boundaries (currently in Chinese)
-- [AHP v1 protocol](../../spec/ahp-v1.md)
+See the [architecture](../../docs/architecture.md), [AHP v1 specification](../../spec/ahp-v1.md)
+and [migration ledger](../../docs/development.md#native-lifecycle-v1) for ownership,
+wire semantics and outstanding validation.

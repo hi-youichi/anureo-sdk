@@ -1,19 +1,15 @@
-import { createHarnessRuntime } from '@anureo/sdk'
+import { createClient } from '@anureo/sdk'
 import { createCodexAdapter } from '@anureo/adapter-codex'
 
 // Real-backend greeting example: submit one hello prompt to the local Codex CLI
 // and print the assistant reply as it streams in.
 // Requires the Codex CLI on PATH (override with CODEX_BIN) and an authenticated OpenAI account.
-const runtime = createHarnessRuntime(createCodexAdapter({
+const client = await createClient({identity:{adapterId:"codex",runtimeConfigId:"local"},adapter:createCodexAdapter({
   command: process.env.CODEX_BIN ?? 'codex',
   timeoutMs: 60_000,
-}))
+})})
 try {
-  await runtime.initialize({ protocolVersions: [1], clientInfo: { name: 'anureo-example', version: '0.2.0' } })
-  const session = await runtime.openSession({
-    requestId: 'open', mode: 'new', cwd: process.cwd(),
-    binding: { sessionId: 'greeting', adapterId: 'codex', runtimeConfigId: 'local' },
-  })
+  const session = await client.sessions.create({cwd:process.cwd()})
 
   // Consume events before submitting input so the bounded queue never fills up.
   let streamed = false
@@ -35,12 +31,10 @@ try {
   })()
   void consume.catch(() => {})
 
-  await session.startTurn({
-    requestId: 'start', sessionId: session.binding.sessionId, turnId: 'greet-1',
-    input: [{ type: 'text', text: 'こんにちは！用一句话打个招呼。' }],
-  })
+  const turn = await session.submit({input:'こんにちは！用一句话打个招呼。'})
+  await turn.result()
   await consume
   await session.close()
 } finally {
-  await runtime.dispose()
+  await client.dispose()
 }

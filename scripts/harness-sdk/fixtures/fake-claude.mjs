@@ -18,9 +18,9 @@ for await (const line of input) {
     } } });
   } else if (frame.type === 'user') {
     send({ type: 'system', subtype: 'init', session_id: sessionId, uuid: '00000000-0000-4000-8000-000000000002', cwd: process.cwd(), tools: [], mcp_servers: [], model: 'fake-probe', permissionMode: 'default', slash_commands: [], output_style: 'default', apiKeySource: 'none', claude_code_version: 'fake-transport-probe' });
-    send({ type: 'assistant', session_id: sessionId, uuid: '00000000-0000-4000-8000-000000000003', parent_tool_use_id: null, message: {
+    send({ type: 'assistant', user_message_uuid: frame.uuid, session_id: sessionId, uuid: '00000000-0000-4000-8000-000000000003', parent_tool_use_id: null, message: {
       id: 'probe-message', type: 'message', role: 'assistant', model: 'fake-probe', content: [{ type: 'text', text: 'external executable probe passed' }], stop_reason: 'end_turn', stop_sequence: null, usage,
     } });
-    send({ type: 'result', subtype: 'success', session_id: sessionId, uuid: '00000000-0000-4000-8000-000000000004', is_error: false, duration_ms: 1, duration_api_ms: 0, num_turns: 1, result: 'external executable probe passed', stop_reason: 'end_turn', usage, modelUsage: {}, permission_denials: [], total_cost_usd: 0 });
+    send({ type: 'result', user_message_uuid: frame.uuid, subtype: 'success', session_id: sessionId, uuid: '00000000-0000-4000-8000-000000000004', is_error: false, duration_ms: 1, duration_api_ms: 0, num_turns: 1, result: 'external executable probe passed', stop_reason: 'end_turn', usage, modelUsage: {}, permission_denials: [], total_cost_usd: 0 });
   }
 }

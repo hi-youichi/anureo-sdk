@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test'
-import { ManagedHarnessSession } from '@anureo/sdk'
+import { createClient } from '@anureo/sdk'
+import { createScriptedAdapter } from '@anureo/conformance'
 import { AcpUpdateMapper, mcp } from '../src/mapping'
 import type { SessionState } from '@anureo/protocol'
 
@@ -18,31 +19,33 @@ test('http and stdio MCP servers map to explicit native ACP entries', () => {
 
 test('mapper reset forgets tracked state without breaking later updates', async () => {
   const binding = { sessionId: 's', adapterId: 'acp', runtimeConfigId: 'r' }
-  const sink = new ManagedHarnessSession(binding, {})
-  const state: SessionState = { binding, capabilities: {}, capabilityRevision: 1, status: 'ready', config: {} }
+  const client=await createClient({adapter:createScriptedAdapter(),identity:binding})
+  const sink=await client.openSession({requestId:'open',mode:'new',binding,cwd:process.cwd()})
+  const state: SessionState = { binding, capabilities: {}, capabilityRevision: 1, status: 'ready', activeTurnIds: [], config: {} }
   const mapper = new AcpUpdateMapper(sink, () => 'turn-1', () => state, data => { state.metadata = { title: data.sessionTitle as string | null } }, false)
   await mapper.update({ sessionUpdate: 'session_info_update', title: 'Before' })
   mapper.reset()
   await mapper.update({ sessionUpdate: 'session_info_update', title: 'After' })
   expect(state.metadata?.title).toBe('After')
-  await sink.dispose()
+  await client.dispose()
 })
 
 test('ACP idle metadata patches preserve absent titles and explicitly clear, without lifecycle events', async () => {
   const binding = { sessionId: 's', adapterId: 'acp', runtimeConfigId: 'r' }
-  const sink = new ManagedHarnessSession(binding, {})
-  const state: SessionState = { binding, capabilities: {}, capabilityRevision: 1, status: 'ready', config: {} }
+  const client=await createClient({adapter:createScriptedAdapter(),identity:binding})
+  const sink=await client.openSession({requestId:'open',mode:'new',binding,cwd:process.cwd()})
+  const state: SessionState = { binding, capabilities: {}, capabilityRevision: 1, status: 'ready', activeTurnIds: [], config: {} }
   const mapper = new AcpUpdateMapper(sink, () => undefined, () => state, data => { state.metadata = { title: data.sessionTitle as string | null } }, false)
+  const reader = sink.events()[Symbol.asyncIterator]()
   await mapper.update({ sessionUpdate: 'session_info_update', updatedAt: 'now' })
   await mapper.update({ sessionUpdate: 'session_info_update', title: 'Generated' })
   await mapper.update({ sessionUpdate: 'session_info_update', title: 'Generated' })
   await mapper.update({ sessionUpdate: 'session_info_update', updatedAt: 'later' })
   expect(state.metadata?.title).toBe('Generated')
   await mapper.update({ sessionUpdate: 'session_info_update', title: null })
-  const reader = sink.events()[Symbol.asyncIterator]()
   try {
     expect((await reader.next()).value).toMatchObject({ type: 'session/metadata', payload: { title: 'Generated' } })
     expect((await reader.next()).value).toMatchObject({ type: 'session/metadata', payload: { title: null } })
-    expect(sink.snapshot).toMatchObject({ metadata: { title: null }, status: 'opening' })
-  } finally { await reader.return?.(); await sink.dispose() }
+    expect(sink.snapshot).toMatchObject({ metadata: { title: null }, status: 'ready' })
+  } finally { await reader.return?.(); await client.dispose() }
 })

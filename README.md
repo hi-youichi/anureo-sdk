@@ -16,59 +16,64 @@ To work on this repository itself, you also need npm installed with Node.js and 
 
 ```sh
 bun install --frozen-lockfile
-bun run example
+bun run example:native
 ```
 
-The example uses a scripted backend and requires no model account or credentials. Real backends require their respective executables, configuration, and authentication.
+The native lifecycle example uses a scripted backend and requires no model account or credentials. Real backends require their respective executables, configuration, and authentication.
 
 ## Usage example
 
-This example initializes a runtime, opens a session, starts a turn, consumes events, and releases resources. The runnable version is [examples/standalone.ts](examples/standalone.ts). After installing this workspace's dependencies, run it with `bun run example`.
+The native lifecycle revision updates **AHP v1 in place**, through package root
+entries. The following shows the revised workspace API; it is not the published
+0.2.0 API. Root-entry migration and local adapter/packaging validation are complete.
+See the [design and implementation plan](docs/native-harness-lifecycle.md).
+
+`submit()` waits until the input is reliably associated with an actual execution
+and returns a `Turn`. `steer()` waits for confirmation that guidance was appended
+to that exact execution. `result()` waits for its terminal result. There is no
+public `Submission` or mandatory `accepted()` / `turn()` chain.
+
+This example requires a configured Codex executable and a profile supporting
+exact-turn steer. Guidance must arrive while the execution is active; a stale
+target rejects instead of silently starting another execution.
 
 ```typescript
-import { createHarnessRuntime } from '@anureo/sdk'
-import { createScriptedAdapter } from '@anureo/conformance'
+import { createClient } from '@anureo/sdk'
+import { createCodexAdapter } from '@anureo/adapter-codex'
 
-const runtime = createHarnessRuntime(createScriptedAdapter())
+const client = await createClient({
+  adapter: createCodexAdapter({ command: 'codex' }),
+  identity: { adapterId: 'codex', runtimeConfigId: 'local' },
+})
 try {
-  await runtime.initialize({ protocolVersions: [1], clientInfo: { name: 'anureo-example', version: '0.2.0' } })
-  const session = await runtime.openSession({
-    requestId: 'open', mode: 'new', cwd: process.cwd(),
-    binding: { sessionId: 'example', adapterId: 'scripted', runtimeConfigId: 'local' },
+  const session = await client.sessions.create({ cwd: process.cwd() })
+  const turn = await session.submit({
+    input: 'Investigate and fix the failing login tests.',
+    delivery: 'native',
   })
-  // Start consuming events before submitting input to avoid filling the bounded queue.
-  const consume = (async () => {
-    for await (const event of session.events()) {
-      if (event.type === 'item/completed' && event.payload.item.type === 'agentMessage') {
-        console.log(event.payload.item.text)
-      }
-      if (event.type === 'turn/completed') {
-        if (event.payload.status !== 'completed') throw new Error(`Turn ended: ${event.payload.status}`)
-        return
-      }
-    }
-    throw new Error('Event stream ended without a terminal event')
-  })()
-  void consume.catch(() => {})
-  await session.startTurn({
-    requestId: 'start', sessionId: session.binding.sessionId, turnId: 'turn-1',
-    input: [{ type: 'text', text: 'Hello from Anureo SDK' }],
-  })
-  await consume
+  // In an application, this is triggered by the user while work is running.
+  await turn.steer({ input: 'Keep all changes inside the authentication module.' })
+  const result = await turn.result()
+  console.log(result.status, result.text)
   await session.close()
 } finally {
-  await runtime.dispose()
+  await client.dispose()
 }
 ```
 
-The example prints `Hello from Anureo SDK`. Here, `createScriptedAdapter()` provides a demo backend without calling a model. To connect a real harness, replace it with the appropriate adapter and supply that adapter's required configuration.
+Claude receives additional session input through another `session.submit()`;
+its native input priority does not provide Codex's atomic target guarantee.
+The returned handles may identify the same execution or different executions.
+See the [Claude example and await semantics](docs/native-harness-lifecycle.md#4-建议的输入与控制-api).
+The [scripted native lifecycle example](examples/native-lifecycle.ts) demonstrates
+submit, exact steer and result without a model account: `bun run example:native`.
 
 ## Packages
 
 | Package | Description |
 |---|---|
 | `@anureo/protocol` | AHP v1 JSON Schema, TypeScript types, and validation |
-| `@anureo/sdk` | `HarnessRuntime`, `HarnessSession`, and shared runtime components |
+| `@anureo/sdk` | `createClient`, `Session`, `Turn`, and shared runtime components |
 | `@anureo/adapter-codex` | Codex app-server adapter |
 | `@anureo/adapter-claude` | Adapter for the official Claude Agent SDK |
 | `@anureo/adapter-acp` | Standard ACP agent adapter |
@@ -105,7 +110,7 @@ CI validates Windows, macOS, and Linux on every push; all three platforms are gr
 
 ## Documentation
 
-- [AHP v1 specification](spec/ahp-v1.md) — the published protocol contract (English, authoritative); a [Chinese reference translation](spec/ahp-v1.zh.md) is available.
+- [AHP v1 specification](spec/ahp-v1.md) — the revised v1 lifecycle and wire contract (English); a [Chinese reference translation](spec/ahp-v1.zh.md) is available.
 - [Governance](GOVERNANCE.md) — versioning, the extension registry, and conformance policy.
 - [Contributing](CONTRIBUTING.md) — setup, validation commands, and the adapter checklist.
 - [Security](SECURITY.md) — the reporting channel and the redaction/secret-handling invariants.

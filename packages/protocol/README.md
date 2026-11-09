@@ -1,5 +1,13 @@
 # @anureo/protocol
 
+AHP v1 is being revised in place. The target remains the root entry,
+`@anureo/protocol/schema`, and `schema/v1/ahp.schema.json`; there will be one
+maintained lifecycle contract. The workspace schema and generated types now use the revised contract; local
+adapter and packaging validation have passed. These are not the published
+0.2.0 wire semantics. See the
+[design](../../docs/native-harness-lifecycle.md) and the
+[v1 amendment](../../spec/ahp-v1.md#native-lifecycle-amendment).
+
 The Anureo Harness Protocol (AHP) v1 contract: a JSON Schema, generated TypeScript types, runtime validation, and version/capability negotiation helpers shared by every other Anureo SDK package.
 
 The schema at `schema/v1/ahp.schema.json` is the single source of truth. TypeScript types, the method table, and runtime validators are generated from it — nothing is typed by hand. Validation runs on Ajv 8.20.0 with JSON Schema draft 2020-12.
@@ -12,6 +20,7 @@ The schema at `schema/v1/ahp.schema.json` is the single source of truth. TypeScr
 |---|---|
 | `ahpSchema` | The raw AHP v1 JSON Schema (also via `@anureo/protocol/schema`) |
 | `AHP_PROTOCOL_VERSION` | The protocol major version implemented here (`1`) |
+| `AHP_PROTOCOL_CONTRACT` | Required initialization discriminator (`native-lifecycle`) |
 | `validateDefinition` / `assertDefinition` | Validate any named `$defs` entry from the schema |
 | `validateRequest` / `assertRequest` | Validate request params for a given AHP method |
 | `validateResult` / `assertResult` | Validate the result for a given AHP method |
@@ -31,21 +40,35 @@ Generated domain types (`AhpMethod`, `AhpRequestMap`, `AhpResultMap`, `Capabilit
 ## Usage
 
 ```typescript
-import { negotiateVersion, supportsCapability, assertRequest } from '@anureo/protocol'
+import {
+  AHP_PROTOCOL_CONTRACT, assertRequest, negotiateVersion,
+  supportsExtension, type Capabilities,
+} from '@anureo/protocol'
 
-// Handshake: pick the highest mutually supported protocol version.
 const protocolVersion = negotiateVersion([1], [1])
+assertRequest('initialize', {
+  protocolVersions: [protocolVersion],
+  protocolContract: AHP_PROTOCOL_CONTRACT,
+  clientInfo: { name: 'example-host', version: '0.3.0' },
+})
 
-// Capabilities are declarative: undeclared means unsupported.
-const supportsSteer = supportsCapability(capabilities, 'turn.steer')
+const capabilities: Capabilities = {
+  input: { delivery: ['native'], steer: { target: 'turn', atomicMatch: true } },
+}
+const supportsSteer = capabilities.input?.steer?.atomicMatch === true
 const supportsReplay = supportsExtension(capabilities, 'x-anureo/event-replay', '1')
 
-// Validate untrusted wire input before using it.
-assertRequest('turn/start', {
-  requestId: 'start-1', sessionId: 's1', turnId: 't1',
-  input: [{ type: 'text', text: 'Inspect the workspace' }],
+assertRequest('input/submit', {
+  requestId: 'submit-1', sessionId: 's1', submissionId: 'input-1',
+  delivery: 'native', input: [{ type: 'text', text: 'Inspect the workspace' }],
 })
 ```
+
+Initialization results also require `protocolContract: "native-lifecycle"`.
+A missing or mismatched discriminator is rejected before business dispatch,
+even when both peers negotiate major 1. Submission identity does not allocate an
+execution; `submission/bound` reports the actual association. The SDK keeps that
+identity internal and returns a Turn directly from `await session.submit()`.
 
 ## Privacy projections
 

@@ -22,7 +22,8 @@ bun run protocol:check     # schema fixtures
 bun run typecheck          # strict NodeNext, all packages
 bun run typecheck:tooling  # build tooling
 bun test --timeout 15000 packages scripts/harness-sdk
-bun run example            # standalone example
+bun run example            # standalone v1 example
+bun run example:native     # existing experimental fixture; pending root-entry migration
 bun run verify:pack        # full pack + clean-install + dual-runtime verification
 ```
 
@@ -47,6 +48,13 @@ when all three pass.
    [GOVERNANCE.md](GOVERNANCE.md) if you add a new capability surface.
 
 ## Changing the protocol
+
+The current native lifecycle change directly revises AHP v1; do not add a
+parallel major or a versioned SDK subentry. Update `schema/v1`, the v1 English
+and Chinese specifications, root exports, peer compatibility checks and all
+adapter conformance cases together. The
+[design plan](docs/native-harness-lifecycle.md) distinguishes pending proposals
+from implemented behavior; documentation approval alone is not runtime acceptance.
 
 Protocol changes are never code-only. A change must update, in the same
 pull request:

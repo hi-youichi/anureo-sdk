@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:anureo:ahp:v1",
-  "title": "AHP v1",
-  "description": "Anureo Harness Protocol v1: JSON Schema is the single source of protocol types.",
+  "title": "Anureo Harness Protocol v2",
+  "description": "Anureo Harness Protocol v2: native admission, submission identities and independent execution observations.",
   "$defs": {
     "JsonValue": {
       "anyOf": [
@@ -171,12 +171,6 @@
         "turn": {
           "type": "object",
           "properties": {
-            "steer": {
-              "type": "boolean"
-            },
-            "interrupt": {
-              "type": "boolean"
-            },
             "outputSchema": {
               "type": "boolean"
             },
@@ -287,6 +281,67 @@
           "items": {
             "$ref": "#/$defs/ExtensionDescriptor"
           }
+        },
+        "input": {
+          "type": "object",
+          "properties": {
+            "delivery": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "native",
+                  "afterTurn"
+                ]
+              },
+              "uniqueItems": true
+            },
+            "steer": {
+              "type": "object",
+              "properties": {
+                "target": {
+                  "const": "turn"
+                },
+                "atomicMatch": {
+                  "const": true
+                }
+              },
+              "required": [
+                "target",
+                "atomicMatch"
+              ],
+              "additionalProperties": false
+            },
+            "interrupt": {
+              "type": "object",
+              "properties": {
+                "targets": {
+                  "type": "array",
+                  "items": {
+                    "enum": [
+                      "turn",
+                      "session"
+                    ]
+                  },
+                  "uniqueItems": true
+                },
+                "reportsPendingInputs": {
+                  "type": "boolean"
+                },
+                "cancelQueued": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "targets",
+                "reportsPendingInputs"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "delivery"
+          ],
+          "additionalProperties": false
         }
       },
       "required": [],
@@ -353,11 +408,15 @@
         },
         "clientCapabilities": {
           "$ref": "#/$defs/Capabilities"
+        },
+        "protocolContract": {
+          "const": "native-lifecycle"
         }
       },
       "required": [
         "protocolVersions",
-        "clientInfo"
+        "clientInfo",
+        "protocolContract"
       ],
       "additionalProperties": true
     },
@@ -372,12 +431,16 @@
         },
         "capabilities": {
           "$ref": "#/$defs/Capabilities"
+        },
+        "protocolContract": {
+          "const": "native-lifecycle"
         }
       },
       "required": [
         "protocolVersion",
         "runtime",
-        "capabilities"
+        "capabilities",
+        "protocolContract"
       ],
       "additionalProperties": true
     },
@@ -669,7 +732,8 @@
             "ready",
             "running",
             "closed",
-            "recoveryRequired"
+            "recoveryRequired",
+            "closing"
           ]
         },
         "config": {
@@ -681,10 +745,6 @@
         "capabilityRevision": {
           "type": "integer",
           "minimum": 0
-        },
-        "activeTurnId": {
-          "type": "string",
-          "minLength": 1
         },
         "model": {
           "type": "string"
@@ -716,6 +776,14 @@
         },
         "metadata": {
           "$ref": "#/$defs/SessionMetadata"
+        },
+        "activeTurnIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
         }
       },
       "required": [
@@ -723,7 +791,8 @@
         "status",
         "config",
         "capabilities",
-        "capabilityRevision"
+        "capabilityRevision",
+        "activeTurnIds"
       ],
       "additionalProperties": true
     },
@@ -877,10 +946,21 @@
       "properties": {
         "closed": {
           "const": true
+        },
+        "observationClosed": {
+          "const": true
+        },
+        "executionStopped": {
+          "enum": [
+            "confirmed",
+            "unconfirmed"
+          ]
         }
       },
       "required": [
-        "closed"
+        "closed",
+        "observationClosed",
+        "executionStopped"
       ],
       "additionalProperties": true
     },
@@ -1034,7 +1114,7 @@
       ],
       "additionalProperties": true
     },
-    "TurnStartParams": {
+    "InputSubmitParams": {
       "type": "object",
       "properties": {
         "requestId": {
@@ -1042,10 +1122,6 @@
           "minLength": 1
         },
         "sessionId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "turnId": {
           "type": "string",
           "minLength": 1
         },
@@ -1061,32 +1137,36 @@
         },
         "outputSchema": {
           "$ref": "#/$defs/JsonSchema"
+        },
+        "submissionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "delivery": {
+          "enum": [
+            "native",
+            "afterTurn"
+          ]
         }
       },
       "required": [
         "requestId",
         "sessionId",
-        "turnId",
-        "input"
+        "submissionId",
+        "input",
+        "delivery"
       ],
-      "additionalProperties": true
+      "additionalProperties": false
     },
-    "TurnStartResult": {
-      "type": "object",
-      "properties": {
-        "turnId": {
-          "type": "string",
-          "minLength": 1
+    "InputSubmitResult": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SubmissionDispatch"
         },
-        "accepted": {
-          "const": true
+        {
+          "$ref": "#/$defs/SubmissionAcceptance"
         }
-      },
-      "required": [
-        "turnId",
-        "accepted"
-      ],
-      "additionalProperties": true
+      ]
     },
     "TurnSteerParams": {
       "type": "object",
@@ -1109,19 +1189,28 @@
             "$ref": "#/$defs/InputBlock"
           },
           "minItems": 1
+        },
+        "submissionId": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "required": [
         "requestId",
         "sessionId",
         "expectedTurnId",
-        "input"
+        "input",
+        "submissionId"
       ],
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "TurnSteerResult": {
       "type": "object",
       "properties": {
+        "submissionId": {
+          "type": "string",
+          "minLength": 1
+        },
         "turnId": {
           "type": "string",
           "minLength": 1
@@ -1131,9 +1220,11 @@
         }
       },
       "required": [
-        "turnId"
+        "submissionId",
+        "turnId",
+        "accepted"
       ],
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "TurnInterruptParams": {
       "type": "object",
@@ -1288,21 +1379,21 @@
           "type": "string",
           "minLength": 1
         },
-        "turnId": {
-          "type": "string",
-          "minLength": 1
-        },
         "target": {
           "$ref": "#/$defs/JsonObject"
+        },
+        "submissionId": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "required": [
         "requestId",
         "sessionId",
-        "turnId",
+        "submissionId",
         "target"
       ],
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "UserMessageItem": {
       "type": "object",
@@ -2711,6 +2802,12 @@
         },
         {
           "$ref": "#/$defs/ExtensionEvent"
+        },
+        {
+          "$ref": "#/$defs/SubmissionBoundEvent"
+        },
+        {
+          "$ref": "#/$defs/SubmissionStatusEvent"
         }
       ]
     },
@@ -2935,7 +3032,7 @@
       ],
       "additionalProperties": false
     },
-    "TurnStartRpcRequest": {
+    "InputSubmitRpcRequest": {
       "type": "object",
       "properties": {
         "jsonrpc": {
@@ -2945,10 +3042,10 @@
           "$ref": "#/$defs/RpcId"
         },
         "method": {
-          "const": "turn/start"
+          "const": "input/submit"
         },
         "params": {
-          "$ref": "#/$defs/TurnStartParams"
+          "$ref": "#/$defs/InputSubmitParams"
         }
       },
       "required": [
@@ -3172,7 +3269,7 @@
           "$ref": "#/$defs/HistoryReadRpcRequest"
         },
         {
-          "$ref": "#/$defs/TurnStartRpcRequest"
+          "$ref": "#/$defs/InputSubmitRpcRequest"
         },
         {
           "$ref": "#/$defs/TurnSteerRpcRequest"
@@ -3197,6 +3294,9 @@
         },
         {
           "$ref": "#/$defs/ReviewStartRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/SessionInterruptRpcRequest"
         }
       ]
     },
@@ -3242,10 +3342,13 @@
               "$ref": "#/$defs/TurnInterruptResult"
             },
             {
-              "$ref": "#/$defs/TurnStartResult"
+              "$ref": "#/$defs/InputSubmitResult"
             },
             {
               "$ref": "#/$defs/TurnSteerResult"
+            },
+            {
+              "$ref": "#/$defs/SessionInterruptResult"
             }
           ]
         }
@@ -3442,6 +3545,18 @@
                 },
                 {
                   "$ref": "#/$defs/ItemStartedEvent"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "turnId": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "turnId"
+                  ]
                 }
               ]
             }
@@ -3469,6 +3584,18 @@
                 },
                 {
                   "$ref": "#/$defs/ItemDeltaEvent"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "turnId": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "turnId"
+                  ]
                 }
               ]
             }
@@ -3496,6 +3623,18 @@
                 },
                 {
                   "$ref": "#/$defs/ItemCompletedEvent"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "turnId": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "turnId"
+                  ]
                 }
               ]
             }
@@ -3631,6 +3770,60 @@
                 },
                 {
                   "$ref": "#/$defs/ExtensionEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "submission/bound"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/SubmissionBoundEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "submission/status"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/SubmissionStatusEvent"
                 }
               ]
             }
@@ -3916,6 +4109,287 @@
         "payload"
       ],
       "additionalProperties": true
+    },
+    "SubmissionAcceptance": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "submissionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "accepted": {
+              "const": true
+            },
+            "disposition": {
+              "const": "started"
+            },
+            "receipt": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "turnId": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "submissionId",
+            "accepted",
+            "disposition",
+            "turnId"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "submissionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "accepted": {
+              "const": true
+            },
+            "disposition": {
+              "const": "joined"
+            },
+            "receipt": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "turnId": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "submissionId",
+            "accepted",
+            "disposition",
+            "turnId"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "submissionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "accepted": {
+              "const": true
+            },
+            "disposition": {
+              "const": "queued"
+            },
+            "receipt": {
+              "$ref": "#/$defs/JsonObject"
+            }
+          },
+          "required": [
+            "submissionId",
+            "accepted",
+            "disposition",
+            "receipt"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "submissionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "accepted": {
+              "const": true
+            },
+            "disposition": {
+              "const": "accepted"
+            },
+            "receipt": {
+              "$ref": "#/$defs/JsonObject"
+            }
+          },
+          "required": [
+            "submissionId",
+            "accepted",
+            "disposition"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SubmissionBound": {
+      "type": "object",
+      "properties": {
+        "submissionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "submissionId",
+        "turnId"
+      ],
+      "additionalProperties": false
+    },
+    "SubmissionBoundEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "submission/bound"
+        },
+        "payload": {
+          "$ref": "#/$defs/SubmissionBound"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "SubmissionDispatch": {
+      "type": "object",
+      "properties": {
+        "submissionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "disposition": {
+          "const": "dispatched"
+        }
+      },
+      "required": [
+        "submissionId",
+        "disposition"
+      ],
+      "additionalProperties": false
+    },
+    "SubmissionStatus": {
+      "type": "object",
+      "properties": {
+        "submissionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "submitted",
+            "dispatched",
+            "accepted",
+            "queued",
+            "rejected",
+            "unknown"
+          ]
+        },
+        "error": {
+          "$ref": "#/$defs/HarnessError"
+        },
+        "receipt": {
+          "$ref": "#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "submissionId",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "SubmissionStatusEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "submission/status"
+        },
+        "payload": {
+          "$ref": "#/$defs/SubmissionStatus"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "SessionInterruptParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cancelQueued": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId"
+      ],
+      "additionalProperties": false
+    },
+    "SessionInterruptResult": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "const": true
+        },
+        "stillQueued": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "cancelled": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "additionalProperties": false
+    },
+    "SessionInterruptRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "session/interrupt"
+        },
+        "params": {
+          "$ref": "#/$defs/SessionInterruptParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
     }
   },
   "x-methods": {
@@ -3943,9 +4417,9 @@
       "HistoryReadParams",
       "HistoryPage"
     ],
-    "turn/start": [
-      "TurnStartParams",
-      "TurnStartResult"
+    "input/submit": [
+      "InputSubmitParams",
+      "InputSubmitResult"
     ],
     "turn/steer": [
       "TurnSteerParams",
@@ -3977,7 +4451,11 @@
     ],
     "review/start": [
       "ReviewStartParams",
-      "TurnStartResult"
+      "InputSubmitResult"
+    ],
+    "session/interrupt": [
+      "SessionInterruptParams",
+      "SessionInterruptResult"
     ]
   }
 }
