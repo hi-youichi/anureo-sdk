@@ -1,0 +1,11 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersions":[1],"protocolContract":"native-lifecycle","clientInfo":{"name":"example-host","version":"0.1.0"},"clientCapabilities":{"interactions":["approval"]}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"protocolContract":"native-lifecycle","runtime":{"name":"example","version":"0.1.0","adapter":"example/0.1.0"},"capabilities":{"input":{"delivery":["native"]},"interactions":["approval"]}}}
+{"jsonrpc":"2.0","method":"initialized"}
+{"jsonrpc":"2.0","id":2,"method":"session/open","params":{"requestId":"open-1","mode":"new","binding":{"sessionId":"s1","adapterId":"example","runtimeConfigId":"example-1"},"cwd":"/workspace"}}
+{"jsonrpc":"2.0","id":3,"method":"input/submit","params":{"requestId":"submit-1","sessionId":"s1","submissionId":"input-1","delivery":"native","input":[{"type":"text","text":"Inspect the workspace"}]}}
+{"jsonrpc":"2.0","method":"turn/started","params":{"sessionId":"s1","streamId":"stream-1","seq":1,"timestamp":"2026-10-26T00:00:00Z","turnId":"t1","type":"turn/started","payload":{"turnId":"t1"}}}
+{"jsonrpc":"2.0","method":"submission/bound","params":{"sessionId":"s1","streamId":"stream-1","seq":2,"timestamp":"2026-10-26T00:00:00Z","turnId":"t1","type":"submission/bound","payload":{"submissionId":"input-1","turnId":"t1"}}}
+{"jsonrpc":"2.0","method":"interaction/requested","params":{"sessionId":"s1","streamId":"stream-1","seq":3,"timestamp":"2026-10-26T00:00:01Z","turnId":"t1","type":"interaction/requested","payload":{"interactionId":"approve-1","kind":"approval","options":[{"id":"allow","label":"Allow once","semantic":"allowOnce"},{"id":"deny","label":"Deny","semantic":"deny"}]}}}
+{"jsonrpc":"2.0","id":4,"method":"interaction/respond","params":{"requestId":"respond-1","sessionId":"s1","interactionId":"approve-1","response":{"kind":"approval","optionId":"deny"}}}
+{"jsonrpc":"2.0","method":"interaction/resolved","params":{"sessionId":"s1","streamId":"stream-1","seq":4,"timestamp":"2026-10-26T00:00:02Z","turnId":"t1","type":"interaction/resolved","payload":{"interactionId":"approve-1","outcome":"responded"}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"sessionId":"s1","streamId":"stream-1","seq":5,"timestamp":"2026-10-26T00:00:03Z","turnId":"t1","type":"turn/completed","payload":{"turnId":"t1","status":"completed"}}}

@@ -165,7 +165,7 @@ describe('interactions and private payload projection', () => {
   })
 })
 
-describe('JSON-RPC wire and documentation', () => {
+describe('JSON-RPC wire', () => {
   test('wire notification method must match full event payload type', () => {
     const message = { jsonrpc: '2.0', method: 'turn/started', params: { ...envelope, type: 'turn/started', payload: { turnId: 't' } } }
     expect(validateDefinition('AhpRpcMessage', message)).toBe(true)
@@ -173,17 +173,13 @@ describe('JSON-RPC wire and documentation', () => {
     expect(validateDefinition('AhpRpcMessage', { ...message, id: 1 })).toBe(false)
     expect(validateDefinition('AhpRpcMessage', { ...message, jsonrpc: undefined })).toBe(false)
   })
-  test('every JSONL documentation example is schema-valid', () => {
-    const doc = readFileSync(new URL('../../../spec/ahp-v1.md', import.meta.url), 'utf8')
-    const blocks = [...doc.matchAll(/```jsonl\n([\s\S]*?)\n```/g)]
-    expect(blocks.length).toBeGreaterThan(0)
-    let count = 0
-    for (const block of blocks) for (const line of block[1]!.split('\n')) {
-      if (!line.trim()) continue
-      expect(validateDefinition('AhpRpcMessage', JSON.parse(line))).toBe(true)
-      count++
+  test('every JSONL wire fixture message is schema-valid', () => {
+    const fixture = readFileSync(new URL('./fixtures/native-lifecycle.jsonl', import.meta.url), 'utf8')
+    const lines = fixture.trim().split('\n')
+    expect(lines).toHaveLength(11)
+    for (const [index, line] of lines.entries()) {
+      expect(validateDefinition('AhpRpcMessage', JSON.parse(line)), `fixture line ${index + 1}`).toBe(true)
     }
-    expect(count).toBeGreaterThanOrEqual(10)
   })
 })
 
