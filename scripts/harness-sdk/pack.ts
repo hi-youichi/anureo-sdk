@@ -7,7 +7,7 @@ import { resolveNpmCommand } from './npm-runner'
 import { distributableDependencies } from './dependencies'
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
-const leaves = ['protocol','core','conformance','codex','claude','acp','ahp'] as const
+const leaves = ['protocol','core','conformance','codex','claude','acp','ahp','readability'] as const
 const args = process.argv.slice(2)
 function option(name: string): string | undefined { const index = args.indexOf(name); return index < 0 ? undefined : args[index + 1] }
 const selected = (option('--only')?.split(',') ?? [...leaves])
@@ -102,6 +102,7 @@ try {
     }
     await cp(path.join(repository,'scripts/harness-sdk/independent-examples/smoke.mjs'),path.join(clean,'smoke.mjs'))
     await cp(path.join(repository,'scripts/harness-sdk/independent-examples/native-lifecycle.mjs'),path.join(clean,'native-lifecycle.mjs'))
+    if (selected.includes('readability')) await cp(path.join(repository,'scripts/harness-sdk/independent-examples/readability.mjs'),path.join(clean,'readability.mjs'))
     for (const fixture of ['fake-acp.mjs', 'fake-claude.mjs', 'fake-ahp-native.mjs']) await cp(path.join(repository,'scripts/harness-sdk/fixtures',fixture),path.join(clean,fixture))
     if(selected.includes('codex')) await cp(path.join(repository,'packages/codex/tests/native-lifecycle-fixture.mjs'),path.join(clean,'fake-codex-native.mjs'))
     await cp(path.join(repository,'scripts/harness-sdk/independent-examples/acp-agent.mjs'),path.join(clean,'acp-agent.mjs'))
@@ -122,12 +123,17 @@ const steer=(turn:Turn):Promise<void>=>turn.steer({input:'guide'});
 const client=createClient({adapter:createScriptedAdapter(),identity:{adapterId:'scripted',runtimeConfigId:'clean'}});
 validateRequest('input/submit',input);void client;void submit;void steer;void runNativeConformance;void fake;void bad;
 `)
+    if (selected.includes('readability')) await writeFile(path.join(clean, 'typecheck.ts'),
+      await readFile(path.join(clean, 'typecheck.ts'), 'utf8') + `\nimport {analyzeReadability,createSdkReadabilityAgent,type ReadabilityAgent} from '@anureo/readability';
+const analyzer=createSdkReadabilityAgent({createClient:()=>createClient({adapter:createScriptedAdapter(),identity:{adapterId:'scripted',runtimeConfigId:'readability'}})});
+const analyze=(agent:ReadabilityAgent)=>analyzeReadability({root:'.',agent,packages:[{path:'.',agents:2}]});void analyzer;void analyze;\n`)
     await writeFile(path.join(clean,'tsconfig.json'),JSON.stringify({compilerOptions:{target:'ES2022',module:'NodeNext',moduleResolution:'NodeNext',strict:true,noEmit:true,skipLibCheck:false,resolveJsonModule:true,types:['node']},files:['typecheck.ts']}))
     await run('node',['node_modules/typescript/bin/tsc','--pretty','false'],clean)
     verification.push({runtime:'typescript',result:{status:'passed',strict:true,skipLibCheck:false,moduleResolution:'NodeNext'}})
     const adapterNames=selected.filter(leaf=>['codex','claude','acp','ahp'].includes(leaf))
     for (const runtime of ['node','bun']) verification.push({runtime,result:JSON.parse((await run(runtime,['smoke.mjs',...adapterNames],clean)).trim())})
     for (const runtime of ['node','bun']) verification.push({runtime:`${runtime}-native-lifecycle`,result:JSON.parse((await run(runtime,['native-lifecycle.mjs',...adapterNames],clean)).trim())})
+    if (selected.includes('readability')) for (const runtime of ['node','bun']) verification.push({runtime:`${runtime}-readability`,result:JSON.parse((await run(runtime,['readability.mjs'],clean)).trim())})
     for (const pkg of packages) {
       const installed = JSON.parse(await readFile(path.join(clean,'node_modules',...pkg.name.split('/'),'package.json'),'utf8'))
       if (JSON.stringify(installed).includes('workspace:')) throw new Error(`Installed manifest retains workspace dependency ${pkg.name}`)

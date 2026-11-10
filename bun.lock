@@ -5,9 +5,11 @@
     "": {
       "name": "anureo-sdk-workspace",
       "devDependencies": {
+        "@anureo/adapter-acp": "workspace:*",
         "@anureo/adapter-codex": "workspace:*",
         "@anureo/conformance": "workspace:*",
         "@anureo/protocol": "workspace:*",
+        "@anureo/readability": "workspace:*",
         "@anureo/sdk": "workspace:*",
         "@types/bun": "1.4.0",
         "@types/node": "22.15.3",
@@ -82,6 +84,18 @@
         "ajv": "8.20.0",
       },
     },
+    "packages/readability": {
+      "name": "@anureo/readability",
+      "version": "0.1.0",
+      "dependencies": {
+        "@anureo/protocol": "workspace:*",
+        "@anureo/sdk": "workspace:*",
+        "ajv": "8.20.0",
+      },
+      "devDependencies": {
+        "@anureo/conformance": "workspace:*",
+      },
+    },
   },
   "packages": {
     "@agentclientprotocol/sdk": ["@agentclientprotocol/sdk@1.4.0", "", { "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" } }, "sha512-/eufudw+aFY1LKLolT6yFE6UMmYRl7fMJ/DEONSIyR6wI3slHWITBsANRGqXEY8FRzqUxwh7QEaGiZHcJPVThg=="],
@@ -117,6 +131,8 @@
     "@anureo/conformance": ["@anureo/conformance@workspace:packages/conformance"],
 
     "@anureo/protocol": ["@anureo/protocol@workspace:packages/protocol"],
+
+    "@anureo/readability": ["@anureo/readability@workspace:packages/readability"],
 
     "@anureo/sdk": ["@anureo/sdk@workspace:packages/core"],
 

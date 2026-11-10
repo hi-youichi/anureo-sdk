@@ -149,6 +149,7 @@ export class ClaudeBackendSession implements BackendSession {
   private active?: ActiveTurn;
   private generation = 0;
   private closed = false;
+  private reverting = false;
   private config: JsonObject;
   private capabilityRevision = 1;
   private model?: string;
@@ -239,6 +240,7 @@ export class ClaudeBackendSession implements BackendSession {
   }
   private snapshot(): SessionState { return { ...(this.sessionTitle !== undefined ? { metadata: { title: this.sessionTitle } } : {}), binding: structuredClone(this.binding), status: this.active ? "running" : "ready", config: structuredClone(this.config), capabilities: this.capabilities, capabilityRevision: this.capabilityRevision, ...(this.model ? { model: this.model } : {}), ...(this.fastMode ? { fastMode: this.fastMode } : {}), activeTurnIds: this.active ? [this.active.id] : [] }; }
   private async startQuery(fresh: boolean, resumeAt?: string): Promise<void> {
+    if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
     const generation = ++this.generation;
     this.input = new BoundedEventQueue<SDKUserMessage>({ maxEvents: 64 });
     const mcpServers: NonNullable<Options["mcpServers"]> = {};
@@ -519,6 +521,7 @@ export class ClaudeBackendSession implements BackendSession {
   }
   async execute<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
     if (this.closed || !this.query) throw new HarnessSdkError("SESSION_CLOSED");
+    if (this.reverting && method === 'session/config/set') throw new HarnessSdkError('SESSION_BUSY', 'Claude configuration cannot change during revert');
     let result: AhpResultMap[SessionMethod];
     switch (method) {
       case 'input/submit': return await this.submitInput(params as AhpRequestMap['input/submit']) as AhpResultMap[M];
@@ -542,34 +545,52 @@ export class ClaudeBackendSession implements BackendSession {
       case "history/read": {
         const request = params as AhpRequestMap["history/read"]; result = await this.readHistory(request); break;
       }
-      case "session/revert": {
-        const request = params as AhpRequestMap["session/revert"]; const point = await this.boundaryPoint(this.nativeId, request.boundary);
-        let appliedFiles = false;
-        if (request.scope === "files" || request.scope === "both") {
-          if (!this.adapter.options.enableFileCheckpointing) throw new HarnessSdkError("CAPABILITY_UNSUPPORTED");
-          const checkpoint = request.boundary.relation === "before" ? point.promptUuid : point.nextPromptUuid;
-          if (!checkpoint) throw new HarnessSdkError("CAPABILITY_UNSUPPORTED", "No verified post-turn checkpoint exists");
-          const preview = await this.query.rewindFiles(checkpoint, { dryRun: true }); if (!preview.canRewind) throw new HarnessSdkError("CHECKPOINT_UNAVAILABLE");
-          const rewound = await this.query.rewindFiles(checkpoint); if (!rewound.canRewind || rewound.skippedLinks) throw new HarnessSdkError("REVERT_PARTIAL", "Some files could not be restored", false, true, { appliedScope: "files" }); appliedFiles = true;
-        }
-        if (request.scope !== "files") {
-          try {
-            const native = point.uuid ? await (this.adapter.options.forkSession ?? forkSession)(this.nativeId, { dir: this.params.cwd, sessionStore: this.adapter.sessionStore, upToMessageId: point.uuid }) : { sessionId: randomUUID() };
-            this.generation++; this.input?.end(); this.query.close();
-            this.binding = { ...this.binding, nativeRef: { provider: "claude", value: native.sessionId } };
-            this.adapter.turnMaps.set(this.nativeId, this.turns); await this.fileStore?.saveTurnMap(this.nativeId, this.turns);
-            await this.startQuery(!point.uuid); await this.sink.emit({ type: "session/state", payload: this.snapshot() });
-          } catch (cause) { if (appliedFiles) throw new HarnessSdkError("REVERT_PARTIAL", "Files were restored but conversation restore could not be confirmed", false, true, { appliedScope: "files" }); throw cause; }
-        }
-        result = { appliedScope: request.scope, boundary: request.boundary, nativeRef: this.binding.nativeRef }; break;
-      }
+      case "session/revert": result = await this.revert(params as AhpRequestMap['session/revert']); break;
       case "session/close": await this.dispose(); result = { closed: true, observationClosed: true, executionStopped: "unconfirmed" }; break;
       default: throw new HarnessSdkError("CAPABILITY_UNSUPPORTED");
     }
     return result as AhpResultMap[M];
   }
+  private async revert(request: AhpRequestMap['session/revert']): Promise<AhpResultMap['session/revert']> {
+    const query = this.query;
+    if (this.closed || !query) throw new HarnessSdkError('SESSION_CLOSED');
+    if (this.reverting || this.active || this.nativeInputs.size) throw new HarnessSdkError('SESSION_BUSY', 'Claude revert requires no active or pending inputs');
+    this.reverting = true;
+    try {
+      const point = await this.boundaryPoint(this.nativeId, request.boundary);
+      if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
+      let appliedFiles = false;
+      if (request.scope === 'files' || request.scope === 'both') {
+        if (!this.adapter.options.enableFileCheckpointing) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
+        const checkpoint = request.boundary.relation === 'before' ? point.promptUuid : point.nextPromptUuid;
+        if (!checkpoint) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'No verified post-turn checkpoint exists');
+        const preview = await query.rewindFiles(checkpoint, { dryRun: true });
+        if (!preview.canRewind) throw new HarnessSdkError('CHECKPOINT_UNAVAILABLE');
+        if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
+        const rewound = await query.rewindFiles(checkpoint);
+        if (!rewound.canRewind || rewound.skippedLinks) throw new HarnessSdkError('REVERT_PARTIAL', 'Some files could not be restored', false, true, { appliedScope: 'files' });
+        appliedFiles = true;
+      }
+      if (request.scope !== 'files') {
+        try {
+          if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
+          const native = point.uuid ? await (this.adapter.options.forkSession ?? forkSession)(this.nativeId, { dir: this.params.cwd, sessionStore: this.adapter.sessionStore, upToMessageId: point.uuid }) : { sessionId: randomUUID() };
+          if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
+          this.generation++; this.input?.end(); query.close();
+          this.binding = { ...this.binding, nativeRef: { provider: 'claude', value: native.sessionId } };
+          this.adapter.turnMaps.set(this.nativeId, this.turns); await this.fileStore?.saveTurnMap(this.nativeId, this.turns);
+          await this.startQuery(!point.uuid); await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
+        } catch (cause) {
+          if (appliedFiles) throw new HarnessSdkError('REVERT_PARTIAL', 'Files were restored but conversation restore could not be confirmed', false, true, { appliedScope: 'files' });
+          throw sdkError(cause, 'CLAUDE_REVERT_FAILED', true);
+        }
+      }
+      return { appliedScope: request.scope, boundary: request.boundary, nativeRef: this.binding.nativeRef };
+    } finally { this.reverting = false; }
+  }
   private async submitInput(start: AhpRequestMap['input/submit']): Promise<AhpResultMap['input/submit']> {
     if (this.closed || !this.input) throw new HarnessSdkError('SESSION_CLOSED');
+    if (this.reverting) throw new HarnessSdkError('SESSION_BUSY', 'Claude input cannot be submitted during revert');
     // Native association echoes are bounded to 64 UUIDs. Do not admit more
     // unresolved inputs than we can correlate without guessing.
     if (this.nativeInputs.size >= 64) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED');

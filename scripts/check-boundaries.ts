@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { distributableDependencies } from './harness-sdk/dependencies'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const leaves = ['protocol', 'core', 'conformance', 'codex', 'claude', 'acp', 'ahp']
+const leaves = ['protocol', 'core', 'conformance', 'codex', 'claude', 'acp', 'ahp', 'readability']
 type Manifest = { name: string; version: string; private?: boolean; description?: string; license?: string; repository?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string>; peerDependencies?: Record<string, string>; optionalDependencies?: Record<string, string> }
 const manifests = await Promise.all(leaves.map(async leaf => JSON.parse(await readFile(path.join(root, 'packages', leaf, 'package.json'), 'utf8')) as Manifest))
 const versions = new Map(manifests.map(manifest => [manifest.name, manifest.version]))

@@ -1,5 +1,7 @@
 import { acpFileChanges } from './file-changes';
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import * as acp from '@agentclientprotocol/sdk';
 import {
   spawnHarnessProcess, HarnessSdkError, sdkError, waitForRequest,
@@ -11,7 +13,9 @@ import {
   type InitializeResult, type AhpRequestMap, type AhpResultMap, type JsonObject, type InteractionRequested,
   type InteractionResponse, type AhpEventPayload,
 } from '@anureo/protocol';
-import { AcpUpdateMapper, record, safe, input, mcp, configuration } from './mapping';
+import { AcpUpdateMapper, record, safe, input, mcp, configuration, resolveConfigValue } from './mapping';
+import { StderrTail } from './diagnostics';
+import { stopOutcome } from './stop';
 
 export interface AcpFileSystemPort {
   readTextFile?: (params: acp.ReadTextFileRequest) => Promise<acp.ReadTextFileResponse>;
@@ -24,12 +28,43 @@ export interface AcpTerminalPort {
   waitForTerminalExit(params: acp.WaitForTerminalExitRequest): Promise<acp.WaitForTerminalExitResponse>;
   killTerminal(params: acp.KillTerminalRequest): Promise<acp.KillTerminalResponse | void>;
 }
+export interface AcpChannel {
+  stream: acp.Stream;
+  dispose(): Promise<void>;
+  /** Redacted stderr tail captured so far; absent for injected streams. */
+  diagnostics?(): string;
+}
+export type AcpPermissionDecision = 'allow-once' | 'reject-once';
+export interface AcpPermissionContext {
+  sessionId: string;
+  toolCallId: string;
+  title?: string;
+  kind?: string;
+  rawInput?: unknown;
+  /** Options actually offered by the agent; a policy never fabricates an optionId. */
+  options: readonly acp.PermissionOption[];
+  signal: AbortSignal;
+}
+export type AcpPermissionPolicy =
+  | AcpPermissionDecision
+  | ((context: AcpPermissionContext) => AcpPermissionDecision | undefined | Promise<AcpPermissionDecision | undefined>);
 export interface AcpAdapterOptions {
   command?: string; args?: readonly string[]; cwd?: string; env?: Record<string, string | undefined>;
   fs?: AcpFileSystemPort; terminal?: AcpTerminalPort;
   /** Inject an official v1 message stream for remote transports or deterministic wire tests. */
-  connect?: () => Promise<{ stream: acp.Stream; dispose(): Promise<void> }>;
+  connect?: () => Promise<AcpChannel>;
   requestTimeoutMs?: number; maxFrameBytes?: number;
+  /** Retained stderr lines for failure diagnostics; 0 disables capture. Defaults to 200. */
+  stderrTailLines?: number;
+  /** Receives each redacted stderr line as it arrives (never raw). */
+  onStderr?: (line: string) => void;
+  /**
+   * Answer `session/request_permission` without surfacing an AHP interaction.
+   * Returning undefined (or a kind the agent did not offer) falls back to the
+   * interactive path. Auto decisions are reported as `ACP_PERMISSION_AUTO_ANSWERED`
+   * notices so they remain auditable.
+   */
+  autoRespondPermission?: AcpPermissionPolicy;
   /** session/load snapshots have no turn boundaries; expose them separately from AHP realtime events. */
   onLoadSnapshot?: (binding: SessionBinding, updates: readonly JsonObject[]) => void;
 }
@@ -66,7 +101,7 @@ function extensions(response: unknown): Extensions {
   result.userInput = requests.userInput === '_ahp/user_input'; result.dynamicTool = requests.dynamicTool === '_ahp/dynamic_tool';
   return result;
 }
-async function processStream(options: AcpAdapterOptions): Promise<{ stream: acp.Stream; dispose(): Promise<void> }> {
+async function processStream(options: AcpAdapterOptions): Promise<AcpChannel> {
   if (!options.command) throw new HarnessSdkError('HARNESS_UNAVAILABLE', 'An ACP executable or stream factory is required');
   const child: HarnessProcess = await spawnHarnessProcess({ command: options.command, args: options.args, cwd: options.cwd, env: options.env });
   const iterator = child.stdout[Symbol.asyncIterator](); let lineBytes = 0;
@@ -92,14 +127,28 @@ async function processStream(options: AcpAdapterOptions): Promise<{ stream: acp.
     }
     return child.write(chunk);
   }, close: () => child.closeInput() });
-  // Drain stderr without retaining raw provider data or credentials in diagnostics.
-  void (async () => { try { for await (const _chunk of child.stderr) { /* explicitly discarded */ } } catch {} })();
-  return { stream: acp.ndJsonStream(outgoing, incoming), dispose: () => child.dispose() };
+  // Retain a short redacted tail: a child that dies before initialize is otherwise
+  // invisible, and raw stderr may carry credentials or prompts.
+  const tail = new StderrTail(options.stderrTailLines ?? 200, options.onStderr);
+  const decoder = new TextDecoder();
+  void (async () => {
+    try {
+      for await (const chunk of child.stderr) tail.write(decoder.decode(chunk, { stream: true }));
+    } catch { /* a closed stderr pipe is not a protocol failure */ }
+    finally { tail.flush(); }
+  })();
+  return { stream: acp.ndJsonStream(outgoing, incoming), dispose: () => child.dispose(), diagnostics: () => tail.text() };
+}
+
+function selectPermissionOption(options: readonly acp.PermissionOption[], decision: AcpPermissionDecision): string | undefined {
+  const kind = decision === 'allow-once' ? 'allow_once' : 'reject_once';
+  return options.find((option) => option.kind === kind)?.optionId
+    ?? options.find((option) => option.optionId === decision)?.optionId;
 }
 
 export class AcpAdapter implements HarnessAdapter {
   private connection: acp.ClientConnection | undefined;
-  private channel: { stream: acp.Stream; dispose(): Promise<void> } | undefined;
+  private channel: AcpChannel | undefined;
   private info: acp.InitializeResponse | undefined;
   readonly sessions = new Map<string, AcpBackendSession>();
   private nativeSessions = new Map<string, AcpBackendSession>();
@@ -115,6 +164,15 @@ export class AcpAdapter implements HarnessAdapter {
   get nativeCapabilities(): acp.AgentCapabilities { return this.info?.agentCapabilities ?? {}; }
   get agent(): acp.ClientContext { if (!this.connection) throw new HarnessSdkError('ACP_CONNECTION_CLOSED'); return this.connection.agent; }
   get connected(): boolean { return !!this.connection && !this.connectionLost; }
+  /** Attach the redacted stderr tail so a silent startup crash stays diagnosable. */
+  private withDiagnostics(error: HarnessSdkError): HarnessSdkError {
+    const tail = this.channel?.diagnostics?.();
+    if (!tail) return error;
+    return new HarnessSdkError(error.code, error.message, error.retryable, error.outcomeUnknown, {
+      ...error.details,
+      diagnostics: { stderrTail: tail },
+    });
+  }
   private backend(nativeId: string, allowOpening = false): AcpBackendSession {
     const existing = this.nativeSessions.get(nativeId);
     if (existing) return existing;
@@ -186,8 +244,30 @@ export class AcpAdapter implements HarnessAdapter {
       }, cancel: (reason) => rawReader.cancel(reason) }),
     };
     const app = acp.client({ name: 'anureo-harness-sdk-acp' })
-      .onRequest('session/request_permission', (context) => {
+      .onRequest('session/request_permission', async (context) => {
         const session = this.backend(context.params.sessionId);
+        const policy = this.options.autoRespondPermission;
+        if (policy !== undefined) {
+          const decision = typeof policy === 'function'
+            ? await policy({
+                sessionId: context.params.sessionId,
+                toolCallId: context.params.toolCall.toolCallId,
+                title: context.params.toolCall.title ?? undefined,
+                kind: context.params.toolCall.kind ?? undefined,
+                rawInput: context.params.toolCall.rawInput,
+                options: context.params.options,
+                signal: context.signal,
+              })
+            : policy;
+          const optionId = decision ? selectPermissionOption(context.params.options, decision) : undefined;
+          if (optionId !== undefined) {
+            await session.sink.emit({ type: 'notice', payload: {
+              severity: 'info', code: 'ACP_PERMISSION_AUTO_ANSWERED', message: 'Permission request answered by adapter policy',
+              raw: safe({ toolCallId: context.params.toolCall.toolCallId, optionId, decision }),
+            } }, { ...(session.activeTurn ? { turnId: session.activeTurn } : {}) });
+            return { outcome: { outcome: 'selected', optionId } };
+          }
+        }
         return this.interaction<acp.RequestPermissionResponse>(session, context.requestId, {
           kind: 'approval', interactionId: `acp-permission:${String(context.requestId)}`, turnId: session.activeTurn,
           itemId: context.params.toolCall.toolCallId,
@@ -220,16 +300,20 @@ export class AcpAdapter implements HarnessAdapter {
     this.connection = app.connect(wrapped);
     void this.connection.closed.then(async () => {
       this.connectionLost = true;
-      const error = this.sourceFailure ?? new HarnessSdkError('ACP_CONNECTION_CLOSED', 'ACP source connection closed', false, true);
+      const error = this.withDiagnostics(this.sourceFailure ?? new HarnessSdkError('ACP_CONNECTION_CLOSED', 'ACP source connection closed', false, true));
       for (const delivery of this.deliveries.values()) delivery.reject(error); this.deliveries.clear();
       if (!this.closing) await Promise.all([...this.sessions.values()].map((session) => session.sink.fail(error).catch(() => {})));
     });
-    this.info = await this.call('initialize', { protocolVersion: acp.PROTOCOL_VERSION, clientInfo: { name: 'anureo-harness-sdk', version: '0.1.0' }, clientCapabilities: {
-      fs: { readTextFile: !!this.options.fs?.readTextFile, writeTextFile: !!this.options.fs?.writeTextFile }, terminal: !!terminal,
-      session: { configOptions: { boolean: {} }, compaction: {} }, plan: {},
-      elicitation: params.clientCapabilities?.interactions?.includes('elicitation') ? { form: {}, url: {} } : undefined,
-      _meta: { ahp: { version: 1, clientRequests: ['_ahp/user_input', '_ahp/dynamic_tool'] } },
-    } });
+    try {
+      this.info = await this.call('initialize', { protocolVersion: acp.PROTOCOL_VERSION, clientInfo: { name: 'anureo-harness-sdk', version: '0.1.0' }, clientCapabilities: {
+        fs: { readTextFile: !!this.options.fs?.readTextFile, writeTextFile: !!this.options.fs?.writeTextFile }, terminal: !!terminal,
+        session: { configOptions: { boolean: {} }, compaction: {} }, plan: {},
+        elicitation: params.clientCapabilities?.interactions?.includes('elicitation') ? { form: {}, url: {} } : undefined,
+        _meta: { ahp: { version: 1, clientRequests: ['_ahp/user_input', '_ahp/dynamic_tool'] } },
+      } });
+    } catch (error) {
+      throw this.withDiagnostics(error instanceof HarnessSdkError ? error : sdkError(error, 'ACP_HANDSHAKE_FAILED', true));
+    }
     if (this.info.protocolVersion !== acp.PROTOCOL_VERSION) { await this.dispose(); throw new HarnessSdkError('PROTOCOL_VERSION_UNSUPPORTED'); }
     this.extension = extensions(this.info);
     const native = this.nativeCapabilities;
@@ -284,7 +368,7 @@ export class AcpAdapter implements HarnessAdapter {
       this.nativeSessions.set(session.nativeId, session); this.sessions.set(params.binding.sessionId, session);
       session.configure(response); session.hydrating = false;
       if (session.loadedSnapshot.length) this.options.onLoadSnapshot?.(session.binding, session.loadedSnapshot);
-      const patch = { ...params.config, ...(params.model ? { model: params.model } : {}), ...(params.permissionMode ? { permissionMode: params.permissionMode } : {}) };
+      const patch = { ...params.config, ...(params.model ? { model: resolveConfigValue(session.capabilities, 'model', params.model) } : {}), ...(params.permissionMode ? { permissionMode: params.permissionMode } : {}) };
       if (Object.keys(patch).length) await session.setConfiguration(patch);
       if (session.snapshot().metadata) await sink.emit({ type: 'session/metadata', payload: session.snapshot().metadata! });
       return session;
@@ -402,7 +486,9 @@ export class AcpBackendSession implements BackendSession {
       const completed = await this.adapter.agent.request('session/prompt', { sessionId: this.nativeId, prompt: input(start.input),
         ...(Object.keys(this.adapter.extension.methods).length ? { _meta: { ahp: { version: 1, turnId } } } : {}) });
       await this.ensureStandardStarted(); await this.mapper.complete();
-      await this.sink.emit({ type: 'turn/completed', payload: { turnId, status: completed.stopReason === 'cancelled' ? 'interrupted' : 'completed' } });
+      const outcome = stopOutcome(completed.stopReason);
+      if (outcome.notice) await this.sink.emit({ type: 'notice', payload: { severity: 'warning', code: outcome.notice.code, message: outcome.notice.message } }, { turnId });
+      await this.sink.emit({ type: 'turn/completed', payload: { turnId, status: outcome.status } });
       return { submissionId: start.submissionId, accepted: true, disposition: 'started', turnId };
     } catch (cause) {
       const error = errorFromNative(cause, 'ACP_INPUT_REJECTED');
@@ -448,14 +534,25 @@ export class AcpBackendSession implements BackendSession {
   requireTerminal(id: string): void { if (!this.terminals.has(id)) throw new acp.RequestError(-32602, 'Terminal does not belong to this session'); }
   async setConfiguration(patch: JsonObject): Promise<SessionState> {
     for (const key of Object.keys(patch)) if (!this.configKeys.has(key)) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
+    const appliedKeys: string[] = [];
     for (const [key, value] of Object.entries(patch)) {
-      const option = this.configKeys.get(key)!;
-      if (option.type === 'mode') await this.adapter.call('session/set_mode', { sessionId: this.nativeId, modeId: String(value) });
-      else {
-        const response = await this.adapter.call('session/set_config_option', { sessionId: this.nativeId, configId: String(option.id), type: option.type === 'boolean' ? 'boolean' : 'select', value });
-        this.configure(record(response));
+      try {
+        const option = this.configKeys.get(key)!;
+        if (option.type === 'mode') await this.adapter.call('session/set_mode', { sessionId: this.nativeId, modeId: String(value) });
+        else {
+          const response = await this.adapter.call('session/set_config_option', { sessionId: this.nativeId, configId: String(option.id), type: option.type === 'boolean' ? 'boolean' : 'select', value });
+          this.configure(record(response));
+        }
+      } catch (cause) {
+        const error = errorFromNative(cause);
+        if (!appliedKeys.length) throw error;
+        throw new HarnessSdkError('CONFIG_PARTIAL', 'Some configuration changes were applied', error.retryable, error.outcomeUnknown,
+          { appliedKeys, failedKey: key, cause: { code: error.code } });
       }
       this.config[key] = value;
+      appliedKeys.push(key);
+      // Native config methods commit independently; publish each confirmed state.
+      await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
     }
     return this.snapshot();
   }
@@ -519,3 +616,35 @@ export class AcpBackendSession implements BackendSession {
   }
 }
 export function createAcpAdapter(options: AcpAdapterOptions): AcpAdapter { return new AcpAdapter(options); }
+
+export interface DshAcpOptions extends Omit<AcpAdapterOptions, 'command' | 'args'> {
+  /** `dsh` executable; defaults to `dsh` on PATH. */
+  command?: string;
+  /** Profile under `$DSH_HOME/profiles`; defaults to `acp`. */
+  profile?: string;
+  /** Overrides `$DSH_HOME`; defaults to the env var, then `~/.dsh`. */
+  dshHome?: string;
+  /** Shorthand for `autoRespondPermission: 'allow-once'` (unattended hosts only). */
+  autoApprove?: boolean;
+}
+
+/**
+ * Preset for `dsh --profile acp`: pure standard ACP v1, persistent sessions,
+ * stdio + Streamable HTTP MCP, `session/resume` and `session/close`.
+ *
+ * DSH needs Node.js >= 24.9 and a `$DSH_HOME` with provider credentials; a wrong
+ * runtime exits before `initialize`, so the retained stderr tail is the only
+ * diagnostic that survives.
+ */
+export function createDshAcpAdapter(options: DshAcpOptions = {}): AcpAdapter {
+  const { dshHome, profile = 'acp', autoApprove = false, ...rest } = options;
+  return createAcpAdapter({
+    stderrTailLines: 200,
+    requestTimeoutMs: 120_000,
+    ...rest,
+    command: rest.command ?? 'dsh',
+    args: ['--profile', profile],
+    env: { ...process.env, DSH_HOME: dshHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh'), ...rest.env },
+    ...(autoApprove ? { autoRespondPermission: 'allow-once' as const } : {}),
+  });
+}

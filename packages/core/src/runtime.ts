@@ -236,6 +236,11 @@ export class Session implements SessionEventSink {
     record.target ??= this.context(turnId);
     record.completion.resolve(record.target);
   }
+  private rejectSubmission(record: SubmissionRecord, cause: unknown, acknowledged = true): void {
+    record.failed = !sdkError(cause).outcomeUnknown;
+    record.acknowledged ||= acknowledged;
+    record.completion.reject(cause);
+  }
   private record(id: string): SubmissionRecord {
     const existing = this.submissions.get(id);
     if (existing) return existing;
@@ -266,7 +271,11 @@ export class Session implements SessionEventSink {
     let record: SubmissionRecord;
     try { record = this.record(submissionId); } catch (cause) { return Promise.reject(cause); }
     // Observe the association independently: no native acceptance receipt is required.
-    void this.dispatch(method, params, {}, false).catch(cause => { record.failed = !sdkError(cause).outcomeUnknown; record.completion.reject(cause); });
+    void this.dispatchOperation(method, params).catch(cause => {
+      // Preserve the original dispatch error, but keep admitted records pinned
+      // until their status event is published.
+      this.rejectSubmission(record, cause, !record.requestId);
+    });
     return waitForRequest(async () => new Turn(await record.completion.promise), wait, this.options.runtime?.requestTimeoutMs);
   }
   interrupt(options: { cancelQueued?: boolean } = {}, wait?: RequestOptions): Promise<AhpResultMap['session/interrupt']> {
@@ -283,17 +292,18 @@ export class Session implements SessionEventSink {
       try { guardRequest(method, params, this.id, this.capabilities); } catch (cause) { return Promise.reject(cause); }
       return this.closeRequest(params as AhpRequestMap['session/close'], wait) as Promise<AhpResultMap[M]>;
     }
-    return this.dispatch(method, params, wait);
-  }
-  private dispatch<M extends SessionMethod>(method: M, params: AhpRequestMap[M], wait: RequestOptions = {}, observe = true): Promise<AhpResultMap[M]> {
     if (invalidWait(wait)) return Promise.reject(new HarnessSdkError('INVALID_PARAMS'));
     if (wait.signal?.aborted) return Promise.reject(new HarnessSdkError('REQUEST_ABORTED'));
+    return waitForRequest(() => this.dispatchOperation(method, params), wait, this.options.runtime?.requestTimeoutMs);
+  }
+  /** Owns dispatch and late outcomes independently of any caller's wait deadline. */
+  private dispatchOperation<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
     try { this.assertCallable(method); guardRequest(method, params, this.id, this.capabilities); } catch (cause) { return Promise.reject(cause); }
     if (Buffer.byteLength(JSON.stringify(params)) > (this.options.runtime?.queue?.maxFrameBytes ?? 8 * 1024 * 1024)) return Promise.reject(new HarnessSdkError('FRAME_TOO_LARGE'));
     params = structuredClone(params);
     const key = JSON.stringify([method, params.requestId]), fingerprint = JSON.stringify(params);
     const previous = this.requests.get(key);
-    if (previous) return previous.fingerprint === fingerprint ? waitForRequest(() => previous.result as Promise<AhpResultMap[M]>, wait, this.options.runtime?.requestTimeoutMs) : Promise.reject(new HarnessSdkError('REQUEST_ID_CONFLICT'));
+    if (previous) return previous.fingerprint === fingerprint ? previous.result as Promise<AhpResultMap[M]> : Promise.reject(new HarnessSdkError('REQUEST_ID_CONFLICT'));
     const limit = this.options.runtime?.requestCacheSize ?? 1024;
     if (this.requests.size >= limit) { for (const [id, value] of this.requests) if (value.settled) { this.requests.delete(id); break; } }
     if (this.requests.size >= limit) return Promise.reject(new HarnessSdkError('BACKPRESSURE_EXCEEDED'));
@@ -356,11 +366,10 @@ export class Session implements SessionEventSink {
       if (method === 'input/submit' || method === 'review/start' || method === 'turn/steer') {
         const id = (params as AhpRequestMap['input/submit']).submissionId, record = this.submissions.get(id);
         if (record && !this.closed) await this.emit({ type: 'submission/status', payload: { submissionId: id, status: error.outcomeUnknown ? 'unknown' : 'rejected', error: { code: error.code, message: error.code, retryable: error.retryable, outcomeUnknown: error.outcomeUnknown } } });
-        if (record) { record.failed = !error.outcomeUnknown; record.acknowledged = true; record.completion.reject(error); }
+        if (record) this.rejectSubmission(record, error);
       }
     }).catch(cause => { void this.fail(cause); });
-    if (!observe) return operation;
-    return waitForRequest(() => operation, wait, this.options.runtime?.requestTimeoutMs);
+    return operation;
   }
   async requestInteraction(request: InteractionRequested, responder: NativeInteractionResponder): Promise<InteractionResponse> {
     if (this.closed) { await responder(null, 'session_closed'); throw new HarnessSdkError('SESSION_CLOSED'); }
@@ -402,7 +411,7 @@ export class Session implements SessionEventSink {
     if (this.closed) return waitForRequest(async () => { await this.disposeBackend(); return this.closeReceipt ?? { closed: true as const, observationClosed: true as const, executionStopped: 'unconfirmed' as const }; }, wait, this.options.runtime?.requestTimeoutMs);
     if (!this.closing) {
       // Dispatch before setting closing; later business calls are rejected while controls stay usable.
-      const native = this.dispatch('session/close', params);
+      const native = this.dispatchOperation('session/close', params);
       this.closing = native.then(async result => {
         this.closeReceipt = result;
         const causes: unknown[] = [];

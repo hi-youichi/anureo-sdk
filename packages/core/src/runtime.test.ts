@@ -192,6 +192,71 @@ test('definite close rejection restores an active session',async()=>{
   finally{await f.client.dispose();}
 });
 
+test('close honors a longer caller deadline than the default request timeout', async () => {
+  const release = deferred<void>();
+  const f = await fixture(async () => { await release.promise; return closeResult; }, { runtime: { requestTimeoutMs: 5 } });
+  try {
+    let settled = false;
+    const closing = f.session.close({ timeoutMs: 1000 });
+    void closing.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    release.resolve();
+    expect(await closing).toEqual(closeResult);
+    expect(f.session.snapshot.status).toBe('closed');
+    expect(f.disposals).toBe(1);
+  } finally { release.resolve(); await f.client.dispose(); }
+});
+
+test('timing out or aborting a close observer preserves the shared close and its late cleanup', async () => {
+  const release = deferred<void>();
+  const f = await fixture(async () => { await release.promise; return closeResult; });
+  try {
+    const controller = new AbortController();
+    const aborted = f.session.close({ signal: controller.signal });
+    controller.abort();
+    await expect(aborted).rejects.toMatchObject({ code: 'REQUEST_ABORTED' });
+    await expect(f.session.close({ timeoutMs: 5 })).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT' });
+    expect(f.session.snapshot.status).toBe('closing');
+    const closing = f.session.close();
+    release.resolve();
+    expect(await closing).toEqual(closeResult);
+    expect(f.session.snapshot.status).toBe('closed');
+    expect(f.calls.filter(call => call.method === 'session/close')).toHaveLength(1);
+    expect(f.disposals).toBe(1);
+  } finally { release.resolve(); await f.client.dispose(); }
+});
+
+test('inputs rejected before native dispatch do not exhaust submission capacity', async () => {
+  const f = await fixture(async (_method, params, sink) => {
+    await started(sink, 'valid'); await sink.bindSubmission(input(params).submissionId, 'valid');
+    await completed(sink, 'valid');
+    return { submissionId: input(params).submissionId, disposition: 'dispatched' };
+  }, { limits: { maxSubmissions: 1 }, runtime: { queue: { maxFrameBytes: 2048 } } });
+  try {
+    for (let i = 0; i < 3; i++) await expect(f.session.submit({ input: 'x'.repeat(3000) })).rejects.toMatchObject({ code: 'FRAME_TOO_LARGE' });
+    expect((await (await f.session.submit({ input: 'valid' })).result()).status).toBe('completed');
+    expect(f.calls).toHaveLength(1);
+  } finally { await f.client.dispose(); }
+});
+
+test('request-cache backpressure before dispatch also releases submission capacity', async () => {
+  const release = deferred<void>();
+  const f = await fixture(async (method, params, sink) => {
+    if (method === 'compact/start') { await release.promise; return { maintenanceId: 'compact', status: 'completed' }; }
+    await started(sink, 'valid'); await sink.bindSubmission(input(params).submissionId, 'valid');
+    await completed(sink, 'valid');
+    return { submissionId: input(params).submissionId, disposition: 'dispatched' };
+  }, { limits: { maxSubmissions: 1 }, runtime: { requestCacheSize: 1 } });
+  try {
+    const compact = f.session.request('compact/start', { sessionId: f.session.id, requestId: 'compact' });
+    for (let i = 0; i < 3; i++) await expect(f.session.submit({ input: 'blocked' })).rejects.toMatchObject({ code: 'BACKPRESSURE_EXCEEDED' });
+    release.resolve(); await compact;
+    expect((await (await f.session.submit({ input: 'valid' })).result()).status).toBe('completed');
+    expect(f.calls.map(call => call.method)).toEqual(['compact/start', 'input/submit']);
+  } finally { release.resolve(); await f.client.dispose(); }
+});
+
 test('invalid wait and binding/capability requests never dispatch',async()=>{
   const f=await fixture(async()=>closeResult);
   try{

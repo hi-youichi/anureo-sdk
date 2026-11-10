@@ -7,12 +7,13 @@ export class AhpWire {
   private nextId=1;
   private readonly pending=new Map<number,{resolve:(r:unknown)=>void;reject:(e:unknown)=>void;timer:ReturnType<typeof setTimeout>}>();
   private closing=false;
+  private disposal?:Promise<void>;
   private tail=Promise.resolve();
   private backlog=0;
   private readonly loop:Promise<void>;
   onNotification?:(method:string,params:unknown)=>Promise<void>|void;
   onClose?:(cause:unknown)=>Promise<void>|void;
-  constructor(private readonly transport:AhpTransport,private readonly options:WireOptions={}){this.loop=this.read();}
+  constructor(private readonly transport:AhpTransport,private readonly options:WireOptions={}){this.loop=this.read();void this.loop.catch(()=>{});}
   request(method:string,params:unknown):Promise<unknown> {
     if(this.closing)return Promise.reject(new HarnessSdkError("RPC_CONNECTION_CLOSED","RPC_CONNECTION_CLOSED",false,true));
     if(this.pending.size>=(this.options.maxPending??256))return Promise.reject(new HarnessSdkError("BACKPRESSURE_EXCEEDED"));
@@ -38,7 +39,7 @@ export class AhpWire {
         if(typeof message.method==="string") {
           if(message.id!==undefined){await this.transport.send(JSON.stringify({jsonrpc:"2.0",id:message.id,error:{code:-32601,message:"Method not found"}}));continue;}
           if(++this.backlog>(this.options.maxNotifications??2048))throw new HarnessSdkError("BACKPRESSURE_EXCEEDED");
-          this.tail=this.tail.then(()=>this.onNotification?.(message.method as string,message.params)).catch(async cause=>{await this.fail(cause);}).finally(()=>this.backlog--);
+          this.tail=this.tail.then(()=>this.onNotification?.(message.method as string,message.params)).catch(cause=>this.fail(cause).catch(()=>{})).finally(()=>this.backlog--);
         }else{
           const pending=this.pending.get(message.id as number);if(!pending)continue;clearTimeout(pending.timer);this.pending.delete(message.id as number);
           if(message.error&&typeof message.error==="object"){
@@ -50,13 +51,18 @@ export class AhpWire {
     }catch(cause){failure=cause;}
     if(!this.closing)await this.fail(failure);
   }
-  private async fail(cause:unknown):Promise<void>{
-    if(this.closing)return;this.closing=true;
+  private fail(cause:unknown):Promise<void>{
+    if(this.disposal)return this.disposal;
+    this.closing=true;
     for(const pending of this.pending.values()){clearTimeout(pending.timer);pending.reject(new HarnessSdkError("RPC_CONNECTION_CLOSED","RPC_CONNECTION_CLOSED",false,true));}this.pending.clear();
-    this.options.diagnostic?.(cause instanceof HarnessSdkError?cause.code:"PROTOCOL_ERROR");
-    await this.onClose?.(cause);await this.transport.close();
+    return this.disposal=Promise.resolve().then(async()=>{
+      try{this.options.diagnostic?.(cause instanceof HarnessSdkError?cause.code:"PROTOCOL_ERROR");}catch{/* Diagnostics do not own connection cleanup. */}
+      const results=await Promise.allSettled([Promise.resolve().then(()=>this.onClose?.(cause)),Promise.resolve().then(()=>this.transport.close())]);
+      const errors=results.flatMap((result,index)=>result.status==='rejected'?[{code:index===0?'AHP_CLOSE_HANDLER_FAILED':'AHP_TRANSPORT_CLOSE_FAILED'}]:[]);
+      if(errors.length)throw new HarnessSdkError('RESOURCE_RELEASE_FAILED','AHP connection cleanup failed',false,true,{errors});
+    });
   }
-  async close():Promise<void>{if(!this.closing)await this.fail(new HarnessSdkError("RUNTIME_DISPOSED"));}
+  close():Promise<void>{return this.fail(new HarnessSdkError("RUNTIME_DISPOSED"));}
 }
 
 export async function createStdioTransport(options:HarnessProcessOptions&{processFactory?:(p:HarnessProcessOptions)=>Promise<HarnessProcess>;maxFrameBytes?:number}):Promise<AhpTransport> {

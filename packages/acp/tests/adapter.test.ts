@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
 import { resolve } from 'node:path';
-import { createClient, type Session } from '@anureo/sdk';
+import { createClient, HarnessSdkError, type Session } from '@anureo/sdk';
 import type { AhpEvent, InteractionRequested, InteractionResponse } from '@anureo/protocol';
 import { createAcpAdapter, type AcpAdapterOptions } from '../src/index';
 import { rejectionOf } from '../../../scripts/harness-sdk/test-helpers';
@@ -79,6 +79,42 @@ test('mode/config native operations update declared schemas and load snapshots d
     await f.resume();
     expect(snapshots).toHaveLength(1); expect(JSON.stringify(snapshots)).toContain('loaded snapshot');
     expect(JSON.stringify(f.events)).not.toContain('loaded snapshot');
+  } finally { await f.close(); }
+});
+
+for (const outcomeUnknown of [false, true]) test(`partial ACP config preserves confirmed fields and reports uncertainty=${outcomeUnknown}`, async () => {
+  const f = await fixture();
+  const original = f.adapter.call.bind(f.adapter);
+  f.adapter.call = (async (method: string, params: unknown) => {
+    if (method === 'session/set_mode') throw new HarnessSdkError('MODE_REJECTED', 'private native detail', false, outcomeUnknown);
+    return original(method, params);
+  }) as typeof f.adapter.call;
+  try {
+    await expect(f.session.request('session/config/set', { sessionId: 's', requestId: 'partial', patch: { enabled: true, mode: 'plan' } })).rejects.toMatchObject({
+      code: 'CONFIG_PARTIAL', outcomeUnknown, details: { appliedKeys: ['enabled'], failedKey: 'mode', cause: { code: 'MODE_REJECTED' } },
+    });
+    expect(f.session.snapshot.config.enabled).toBe(true);
+    expect(f.session.snapshot.config.mode).toBe('code');
+    expect(f.session.snapshot.status).toBe(outcomeUnknown ? 'recoveryRequired' : 'ready');
+    if (!outcomeUnknown) {
+      await f.session.request('session/config/set', { sessionId: 's', requestId: 'next', patch: { enabled: false } });
+      expect(f.session.snapshot.config.enabled).toBe(false);
+    }
+  } finally { await f.close(); }
+});
+
+test('a definite first-field ACP config rejection leaves the session unchanged and usable', async () => {
+  const f = await fixture();
+  const original = f.adapter.call.bind(f.adapter);
+  f.adapter.call = (async (method: string, params: unknown) => {
+    if (method === 'session/set_mode') throw new HarnessSdkError('MODE_REJECTED');
+    return original(method, params);
+  }) as typeof f.adapter.call;
+  try {
+    const before = f.session.snapshot.config;
+    await expect(f.session.request('session/config/set', { sessionId: 's', requestId: 'rejected', patch: { mode: 'plan', enabled: true } })).rejects.toMatchObject({ code: 'MODE_REJECTED', outcomeUnknown: false });
+    expect(f.session.snapshot.config).toEqual(before);
+    expect(f.session.snapshot.status).toBe('ready');
   } finally { await f.close(); }
 });
 

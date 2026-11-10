@@ -158,3 +158,23 @@ export class AcpUpdateMapper {
     await this.sink.emit({ type: 'notice', payload: { severity: 'info', code: 'ACP_UNKNOWN_UPDATE', message: 'Unmapped ACP update retained', raw: safe(update) } }, { turnId });
   }
 }
+
+/**
+ * Resolves a host-supplied config value to the exact wire value an agent advertises.
+ *
+ * Agents such as DSH publish model choices as `provider/model`, so a bare
+ * `deepseek-v4-flash` must be resolved before `session/set_config_option`;
+ * otherwise the AHP schema guard or the backend rejects the value.
+ */
+export function resolveConfigValue(capabilities: Capabilities, key: string, wanted: string): string {
+  const option = (capabilities.config?.options ?? []).find((entry) => entry.id === key && entry.scope === 'session');
+  if (!option) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', `Backend does not expose the ${key} config option`);
+  const schema = option.schema;
+  const values = schema && typeof schema === 'object' && !Array.isArray(schema) && schema.type === 'string' && Array.isArray(schema.enum)
+    ? schema.enum.filter((value): value is string => typeof value === 'string')
+    : [];
+  if (values.length === 0 || values.includes(wanted)) return wanted;
+  const matches = values.filter((value) => value.endsWith(`/${wanted}`) || value.split('/').pop() === wanted);
+  if (matches.length === 1) return matches[0]!;
+  throw new HarnessSdkError('INVALID_PARAMS', `Unknown ${key} value`, false, false, { key, wanted, accepted: values });
+}
