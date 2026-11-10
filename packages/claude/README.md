@@ -43,12 +43,61 @@ result before reverting.
 
 The revised workspace exposes native input delivery (`native` → `next`,
 `afterTurn` → `later`) and **session-scoped** interrupt with pending-input receipts.
-Exact-turn steer and interrupt are not declared. It also supports `approval` / `userInput` / `elicitation` interactions, nested subagent events, and MCP (stdio + http, with `form`/`url` elicitation). Output schemas are not offered. The fixed SDK is 0.3.265; multi-message
+Exact-turn steer and interrupt are not declared. It also supports `approval` / `userInput` / `elicitation` interactions, nested subagent events, MCP (stdio + http, with `form`/`url` elicitation), and `turn.outputSchema`. The fixed SDK is 0.3.265; multi-message
 correlation and interrupt mapping have dedicated fixture and transport coverage.
 
 Additional guidance uses another `await session.submit({ input, delivery: 'native' })`.
 It may join the same execution or reach a later one. See the
 [Claude example](../../docs/native-harness-lifecycle.md#42-claude追加会话指导与精确-steer-分开).
+
+## Structured output
+
+Pass a self-contained draft-07 JSON Schema with `type: 'object'` at its root:
+
+```typescript
+const turn = await session.submit({
+  input: 'Return the number of matching files.',
+  outputSchema: {
+    type: 'object',
+    properties: { count: { type: 'integer', minimum: 0 } },
+    required: ['count'],
+    additionalProperties: false,
+  },
+})
+const result = await turn.result()
+if (result.status === 'completed') {
+  const data = JSON.parse(result.text)
+  console.log(data.count)
+}
+```
+
+The adapter passes the schema to the official Agent SDK's `outputFormat` option.
+The SDK handles tool use, output validation and correction attempts. The adapter
+validates the returned `structured_output` with draft-07 AJV and publishes its
+JSON serialization as the final `agentMessage` and `TurnResult.text`. Intermediate
+prose remains commentary. `format` annotations are accepted without enforcement;
+asynchronous schemas, external references and newer schema dialects are rejected
+with `INVALID_PARAMS` before input dispatch.
+
+The pinned SDK sets output format at Query initialization. Equal schemas (object
+key order does not matter) reuse the existing Query, including native overlapping
+input. Changing or omitting the schema closes and drains that Query, then starts
+another with the same native session ID and the latest session configuration.
+After an execution, the new Query resumes the saved conversation. This adds
+process startup cost when switching formats. A switch requires no active execution,
+pending inputs or configuration changes; otherwise it rejects with `SESSION_BUSY`,
+including for `delivery: 'afterTurn'`. Omit `outputSchema` to return to ordinary text;
+the previous schema is never implicitly inherited. Input and configuration changes
+are also refused while a format switch is in progress.
+
+Missing or invalid structured output fails the turn with
+`CLAUDE_STRUCTURED_OUTPUT_MISSING` or `CLAUDE_STRUCTURED_OUTPUT_INVALID`.
+Native correction-limit exhaustion maps to
+`CLAUDE_STRUCTURED_OUTPUT_RETRIES_EXCEEDED`; interruption remains `interrupted`.
+The adapter never resubmits the task to repair output or recover a failed switch.
+When a session store is available, history also exposes saved validated output
+attachments linked to surviving `StructuredOutput` calls, including after resume
+or fork.
 
 ## Exports
 

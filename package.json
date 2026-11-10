@@ -21,12 +21,14 @@
     "example": "bun examples/greeting.ts",
     "example:dsh": "bun examples/dsh.ts",
     "example:workflow": "bun examples/workflow.ts",
-    "example:readability": "bun examples/readability-review.ts"
+    "example:readability": "bun examples/readability-review.ts",
+    "example:schema": "bun examples/structured-output.ts"
   },
   "devDependencies": {
     "@anureo/sdk": "workspace:*",
     "@anureo/conformance": "workspace:*",
     "@anureo/adapter-codex": "workspace:*",
+    "@anureo/adapter-claude": "workspace:*",
     "@types/bun": "1.4.0",
     "@types/node": "22.15.3",
     "typescript": "5.8.3",

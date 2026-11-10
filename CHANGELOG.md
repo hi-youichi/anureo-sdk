@@ -8,6 +8,10 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- Claude adapter supports per-submit `outputSchema` through the native Agent
+  SDK output format. Return validated JSON as final text, retain saved structured
+  output in history, and switch formats only when the session has no active or
+  pending inputs. Schema changes preserve the native session ID and configuration.
 - Add `@anureo/workflow` with only three directly imported primitives: `agent`,
   `parallel`, and `pipeline`. Workflows are ordinary TypeScript functions;
   each agent owns a fresh Session and returns final text. Preserve typed task

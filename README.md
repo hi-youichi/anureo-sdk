@@ -31,6 +31,22 @@ bun run example
 The greeting example submits one prompt through the Codex adapter. It requires
 a configured, authenticated Codex CLI on PATH; `CODEX_BIN` can override its path.
 
+The [structured output example](examples/structured-output.ts) uses real installed
+Codex and Claude CLIs and their existing login profiles:
+
+```sh
+bun run example:schema          # both backends; makes real model requests
+bun run example:schema codex    # or: claude
+```
+
+Log in first with `codex login` and `claude auth login`. The Claude example checks
+authentication with the same child environment before submitting a model request.
+It checks two output schemas, conversation memory across format changes, and
+returning to plain text. Claude also checks saved structured-output history.
+Results are written to `artifacts/schema-live.json`. Optional environment settings:
+`CODEX_BIN`, `CLAUDE_BIN`, `CODEX_MODEL`, `CLAUDE_MODEL`, `SCHEMA_TIMEOUT_MS`
+(per submission/result wait, default 180000), and `SCHEMA_REPORT` (report path).
+
 ## Usage example
 
 The following uses the revised workspace API, which differs from the published

@@ -220,7 +220,7 @@ test("unmapped system notices surface as typed warnings without private content"
   await runtime.dispose();
 });
 
-test("configuration uses actual query controls and refuses unsupported per-turn output schemas", async () => {
+test("configuration uses actual query controls and advertises output schemas", async () => {
   const { runtime, session, adapter, queries } = await setup();
   expect(queries[0]!.options.allowDangerouslySkipPermissions).toBe(true);
   expect(queries[0]!.options.permissionMode).not.toBe('bypassPermissions');
@@ -228,7 +228,7 @@ test("configuration uses actual query controls and refuses unsupported per-turn 
   expect(queries[0]!.calls.map((call) => call.method)).toEqual(["model", "permission", "thinking"]);
   await session.request("session/config/set", { requestId: "bypass", sessionId: "s", patch: { permissionMode: "bypassPermissions" } });
   expect(queries[0]!.calls.at(-1)).toMatchObject({ method: "permission", value: "bypassPermissions" });
-  await expect(session.submit({ input: [{ type: "text", text: "x" }], outputSchema: { type: "object" } })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
+  expect(session.capabilities.turn?.outputSchema).toBe(true);
   expect(await adapter.listModels()).toMatchObject([{ value: "fake-model" }]); await runtime.dispose();
 });
 
