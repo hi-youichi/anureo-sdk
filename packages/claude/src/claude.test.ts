@@ -377,7 +377,7 @@ test("Claude adapter passes shared conformance for all declared capabilities", a
 
 test("the real pinned SDK drives an external fake executable through the native adapter", async () => {
   const directory = await mkdtemp(join(tmpdir(), "claude sdk actual "));
-  const runtime = await createClient({identity:OPEN.binding,adapter:createClaudeAdapter({ command: fileURLToPath(new URL("../../../scripts/harness-sdk/fixtures/fake-claude.mjs", import.meta.url)), executableRuntime: "node", stateDir: join(directory, "state") })});
+  const runtime = await createClient({identity:OPEN.binding,adapter:createClaudeAdapter({ command: fileURLToPath(new URL("../tests/fixtures/fake-claude.mjs", import.meta.url)), executableRuntime: "node", stateDir: join(directory, "state") })});
   try {
     const session = await runtime.openSession({ ...OPEN, cwd: directory }); await run(session, "t"); const events = await collect(session);
     expect(events.find((event) => event.type === "item/completed" && event.payload.item.type === "agentMessage")?.payload).toMatchObject({ item: { text: "external executable probe passed", phase: "final" } });
@@ -387,7 +387,7 @@ test("the real pinned SDK drives an external fake executable through the native 
 
 test('native lifecycle also correlates through the pinned official SDK and an actual child executable', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'claude native actual '));
-  const client = await createNativeClient({ adapter: createNativeClaudeAdapter({ command: fileURLToPath(new URL('../../../scripts/harness-sdk/fixtures/fake-claude.mjs', import.meta.url)), executableRuntime: 'node', stateDir: join(directory, 'state') }), identity: { adapterId: 'claude', runtimeConfigId: 'native' } });
+  const client = await createNativeClient({ adapter: createNativeClaudeAdapter({ command: fileURLToPath(new URL('../tests/fixtures/fake-claude.mjs', import.meta.url)), executableRuntime: 'node', stateDir: join(directory, 'state') }), identity: { adapterId: 'claude', runtimeConfigId: 'native' } });
   try {
     const session = await client.sessions.create({ cwd: directory });
     const turn = await session.submit({ input: 'probe' }, { timeoutMs: 3000 });

@@ -54,7 +54,7 @@ Also included: `ScriptedClaudeQuery` / `createFakeClaudeQuery` — a minimal inj
 
 ## Scripted backends under scripts/
 
-`scripts/` contains standalone fake backend processes (`fake-acp.ts`, `fake-ahp.ts`, `fake-codex.ts`, `fake-wire.ts`) that speak their real native wire protocols over stdio. They power the pack-verification flows: a clean npm install of the built packages must complete real ACP and AHP conversations — text, rejected approvals, interrupts — against these processes.
+`scripts/` contains standalone fake backend processes (`fake-acp.ts`, `fake-ahp.ts`, `fake-codex.ts`, `fake-wire.ts`) that speak their real native wire protocols over stdio. Conformance tests use these processes to exercise real wire conversations over stdio.
 
 ## Development
 
@@ -62,7 +62,6 @@ Also included: `ScriptedClaudeQuery` / `createFakeClaudeQuery` — a minimal inj
 cd packages/conformance
 bun run typecheck
 bun test src
-bun examples/standalone.ts   # scripted round-trip without any backend
 ```
 
 ## Documentation

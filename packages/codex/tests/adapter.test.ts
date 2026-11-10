@@ -7,7 +7,7 @@ import { createClient, type Client } from '@anureo/sdk'
 import { spawnHarnessProcess, type HarnessProcess } from '@anureo/sdk/process'
 import { type AhpEvent, type InteractionResponse, type JsonObject } from '@anureo/protocol'
 import { createCodexAdapter, codexCapabilities, mapItems, mapUsage, resolveCodexProfile, type CodexAdapterOptions } from '../src'
-import { rejectionOf } from '../../../scripts/harness-sdk/test-helpers'
+import { rejectionOf } from './test-helpers'
 
 const resources: Array<{dispose():Promise<void>}> = []; const dirs: string[] = []
 afterEach(async () => { await Promise.all(resources.splice(0).map(runtime => runtime.dispose())); await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))) })

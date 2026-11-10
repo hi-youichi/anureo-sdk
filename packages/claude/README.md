@@ -36,6 +36,11 @@ What the adapter can offer depends on the options it was constructed with:
 | A session store is present (`stateDir`, or injected `sessionStore`) | `session.resume`, fork (`before`/`through`), `revert: conversation`, `history` |
 | `enableFileCheckpointing: true` | `revert: files` (and `both` together with a store), backed by the SDK's checkpoint/rewind support |
 
+Revert requires no active execution or pending input. Those cases, and input,
+configuration changes or another revert attempted during a revert, reject with
+`SESSION_BUSY`. Finish or interrupt the current execution and await its terminal
+result before reverting.
+
 The revised workspace exposes native input delivery (`native` → `next`,
 `afterTurn` → `later`) and **session-scoped** interrupt with pending-input receipts.
 Exact-turn steer and interrupt are not declared. It also supports `approval` / `userInput` / `elicitation` interactions, nested subagent events, and MCP (stdio + http, with `form`/`url` elicitation). Output schemas are not offered. The fixed SDK is 0.3.265; multi-message

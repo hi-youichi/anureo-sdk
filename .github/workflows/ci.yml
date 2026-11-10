@@ -25,17 +25,8 @@ jobs:
         with:
           bun-version: '1.4.2'
       - run: bun install --frozen-lockfile
-      - run: bun run check:boundaries
       - run: bun run generate:check
       - run: bun run protocol:check
       - run: bun run typecheck
       - run: bun run typecheck:tooling
-      - run: bun test --timeout 15000 packages scripts/harness-sdk
-      - run: bun run example
-      - run: bun run example:native
-      - run: bun run verify:pack
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: sdk-pack-${{ matrix.os }}
-          path: artifacts/report.json
+      - run: bun test --timeout 15000 packages

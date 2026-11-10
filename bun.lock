@@ -10,6 +10,7 @@
         "@anureo/conformance": "workspace:*",
         "@anureo/protocol": "workspace:*",
         "@anureo/sdk": "workspace:*",
+        "@anureo/workflow": "workspace:*",
         "@types/bun": "1.4.0",
         "@types/node": "22.15.3",
         "typescript": "5.8.3",
@@ -83,6 +84,16 @@
         "ajv": "8.20.0",
       },
     },
+    "packages/workflow": {
+      "name": "@anureo/workflow",
+      "version": "0.2.0",
+      "dependencies": {
+        "@anureo/sdk": "workspace:*",
+      },
+      "devDependencies": {
+        "@anureo/conformance": "workspace:*",
+      },
+    },
   },
   "packages": {
     "@agentclientprotocol/sdk": ["@agentclientprotocol/sdk@1.4.0", "", { "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" } }, "sha512-/eufudw+aFY1LKLolT6yFE6UMmYRl7fMJ/DEONSIyR6wI3slHWITBsANRGqXEY8FRzqUxwh7QEaGiZHcJPVThg=="],
@@ -120,6 +131,8 @@
     "@anureo/protocol": ["@anureo/protocol@workspace:packages/protocol"],
 
     "@anureo/sdk": ["@anureo/sdk@workspace:packages/core"],
+
+    "@anureo/workflow": ["@anureo/workflow@workspace:packages/workflow"],
 
     "@babel/runtime": ["@babel/runtime@7.29.13", "", {}, "sha512-v+oN26xP4YIlQsbQ/CbTH1WG5m/l/DjKKZNy/Kp3f/AFvbgt7Em/D0FeMM3O2hX0YzeN2M16W8lOpyhIkfCBcQ=="],
 

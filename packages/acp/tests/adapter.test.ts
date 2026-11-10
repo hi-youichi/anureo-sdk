@@ -3,9 +3,9 @@ import { resolve } from 'node:path';
 import { createClient, HarnessSdkError, type Session } from '@anureo/sdk';
 import type { AhpEvent, InteractionRequested, InteractionResponse } from '@anureo/protocol';
 import { createAcpAdapter, type AcpAdapterOptions } from '../src/index';
-import { rejectionOf } from '../../../scripts/harness-sdk/test-helpers';
+import { rejectionOf } from './test-helpers';
 
-const executable = resolve(import.meta.dirname, '../../../scripts/harness-sdk/fixtures/fake-acp.mjs');
+const executable = resolve(import.meta.dirname, './fixtures/fake-acp.mjs');
 async function fixture(args: string[] = [], options: Partial<AcpAdapterOptions> = {}) {
   const adapter = createAcpAdapter({ command: process.execPath, args: [executable, ...args], ...options });
   const runtime = await createClient({adapter,identity:{adapterId:'acp',runtimeConfigId:'fixture'},interactions:{approval:undefined,userInput:undefined,elicitation:undefined,dynamicTool:undefined}});

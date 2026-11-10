@@ -31,12 +31,11 @@ The dependency direction is adapters → core/protocol.
 
 The following fragment assumes an open session whose backend supports exact-turn
 steer. See the [complete Codex setup](../../README.md#usage-example) or run the
-[scripted example](../../examples/native-lifecycle.ts) with `bun run example:native`.
+[greeting example](../../examples/greeting.ts) with `bun run example`.
 
 ```typescript
 const turn = await session.submit({
   input: 'Investigate and fix the failing login tests.',
-  delivery: 'native',
 })
 await turn.steer({ input: 'Keep all changes inside the authentication module.' })
 const result = await turn.result()

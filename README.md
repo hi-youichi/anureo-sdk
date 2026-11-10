@@ -4,6 +4,15 @@ Connect Codex, Claude, ACP agents, and external AHP harnesses through a unified 
 
 > The seven packages are published to npm under the `@anureo` scope. AHP is vendor-neutral: the SDK treats every backend — Codex, Claude, ACP agents, external AHP harnesses — identically, and the conformance suite is the arbiter.
 
+The workspace also includes [`@anureo/workflow`](packages/workflow/README.md),
+pending publication with the revised lifecycle API. It exports only `agent`,
+`parallel`, and `pipeline` for direct imports from ordinary TypeScript workflows.
+Clients and function arguments are explicit; each agent call uses a fresh Session.
+Run `bun run example:workflow` for a Codex arithmetic example that prints
+all agent inputs and outputs. See the [migration plan](docs/workflow-primitives-plan.md).
+For a real-model example, run `bun run example:readability` to review the three
+primitive implementations with local Codex. See the [usage and report format](docs/readability-review-example.md).
+
 ## Getting started
 
 ```sh
@@ -16,26 +25,17 @@ To work on this repository itself, you also need npm installed with Node.js and 
 
 ```sh
 bun install --frozen-lockfile
-bun run example:native
+bun run example
 ```
 
-The native lifecycle example uses a scripted backend and requires no model account or credentials. Real backends require their respective executables, configuration, and authentication.
+The greeting example submits one prompt through the Codex adapter. It requires
+a configured, authenticated Codex CLI on PATH; `CODEX_BIN` can override its path.
 
 ## Usage example
 
-The native lifecycle revision updates **AHP v1 in place**, through package root
-entries. The following shows the revised workspace API; it is not the published
-0.2.0 API. Root-entry migration and local adapter/packaging validation are complete.
-See the [design and implementation plan](docs/native-harness-lifecycle.md).
-
-`submit()` waits until the input is reliably associated with an actual execution
-and returns a `Turn`. `steer()` waits for confirmation that guidance was appended
-to that exact execution. `result()` waits for its terminal result. There is no
-public `Submission` or mandatory `accepted()` / `turn()` chain.
-
-This example requires a configured Codex executable and a profile supporting
-exact-turn steer. Guidance must arrive while the execution is active; a stale
-target rejects instead of silently starting another execution.
+The following uses the revised workspace API, which differs from the published
+0.2.0 API. Create a client with an existing adapter, open a session, submit input,
+and await the result.
 
 ```typescript
 import { createClient } from '@anureo/sdk'
@@ -49,10 +49,7 @@ try {
   const session = await client.sessions.create({ cwd: process.cwd() })
   const turn = await session.submit({
     input: 'Investigate and fix the failing login tests.',
-    delivery: 'native',
   })
-  // In an application, this is triggered by the user while work is running.
-  await turn.steer({ input: 'Keep all changes inside the authentication module.' })
   const result = await turn.result()
   console.log(result.status, result.text)
   await session.close()
@@ -61,12 +58,11 @@ try {
 }
 ```
 
-Claude receives additional session input through another `session.submit()`;
-its native input priority does not provide Codex's atomic target guarantee.
-The returned handles may identify the same execution or different executions.
-See the [Claude example and await semantics](docs/native-harness-lifecycle.md#4-建议的输入与控制-api).
-The [scripted native lifecycle example](examples/native-lifecycle.ts) demonstrates
-submit, exact steer and result without a model account: `bun run example:native`.
+The [DSH example](examples/dsh.ts) drives `dsh --profile acp` through
+`createDshAcpAdapter()`: it streams one turn, answers DSH's per-call
+`allow_once` / `reject_once` permission requests, and reports stop notices. Run it
+with `bun run example:dsh`; it requires `dsh` 0.2.2+ (running on Node.js >= 24.9)
+and credentials under `$DSH_HOME` (defaults to `~/.dsh`).
 
 ## Packages
 
@@ -79,6 +75,7 @@ submit, exact steer and result without a model account: `bun run example:native`
 | `@anureo/adapter-acp` | Standard ACP agent adapter |
 | `@anureo/adapter-ahp` | Adapter for external AHP harnesses over stdio or WebSocket |
 | `@anureo/conformance` | Shared conformance tests and scripted fixtures |
+| `@anureo/workflow` | Agent, parallel, and pipeline primitives for TypeScript workflows (workspace; pending publication) |
 
 ## Why AHP?
 
@@ -95,16 +92,12 @@ instead of competing against — the neighboring protocols:
 ## Development and validation
 
 ```sh
-bun run check:boundaries
 bun run generate:check
 bun run protocol:check
 bun run typecheck
 bun run typecheck:tooling
-bun test --timeout 15000 packages scripts/harness-sdk
-bun run verify:pack
+bun test --timeout 15000 packages
 ```
-
-`bun run build` produces seven standalone `.tgz` packages in `artifacts/`. `verify:pack` also installs them in a clean directory and runs strict NodeNext type checks, examples under both Node and Bun, and ACP/AHP exchanges over actual stdio connections. Build artifacts and dependency directories are excluded from version control.
 
 CI validates Windows, macOS, and Linux on every push; all three platforms are green on the released revision.
 
@@ -119,6 +112,10 @@ CI validates Windows, macOS, and Linux on every push; all three platforms are gr
 The following prose documents are currently in Chinese:
 
 - [Architecture](docs/architecture.md): layers, interfaces, event flow, and approval sequences.
+- [Workflow primitive migration plan](docs/workflow-primitives-plan.md): direct TypeScript imports, the three-function API, and migration from the retired runtime/MCP design.
+- [Claude Code CLI reverse engineering](docs/research/claude-code/README.md): the pinned executable, stream controls, Workflow runtime, evidence, and reproduction scripts.
+- [Readability problem summary](docs/readability-summary.md): the main reading obstacles, representative code, and design-pattern choices.
+- [Readability improvement plan](docs/readability-plan.md): file-by-file and function-by-function proposals, design-pattern choices, and implementation checks.
 - [Development and migration notes](docs/development.md): implementation scope, naming changes, and validation records.
 - [Extraction plan](extraction-plan.md): the original migration sequence, public release goals, and pending decisions.
 

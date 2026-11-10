@@ -55,8 +55,6 @@ bun run typecheck
 bun test tests
 ```
 
-The workspace's `bun run verify:pack` runs real stdio conversations against the reference harness, covering text turns, rejected approvals, and interrupts.
-
 ## Documentation
 
 - [AHP v1 protocol](../../spec/ahp-v1.md) — the wire contract

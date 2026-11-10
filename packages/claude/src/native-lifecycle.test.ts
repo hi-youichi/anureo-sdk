@@ -142,7 +142,7 @@ test('active close ends observation without an invented native terminal', async 
 test('the pinned official SDK correlates root submissions through an actual child executable', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'anureo-native-sdk-'));
   const client = await createClient({
-    adapter: createClaudeAdapter({ command: fileURLToPath(new URL('../../../scripts/harness-sdk/fixtures/fake-claude.mjs', import.meta.url)), executableRuntime: 'node', stateDir: join(directory, 'state') }),
+    adapter: createClaudeAdapter({ command: fileURLToPath(new URL('../tests/fixtures/fake-claude.mjs', import.meta.url)), executableRuntime: 'node', stateDir: join(directory, 'state') }),
     identity: { adapterId: 'claude', runtimeConfigId: 'official-sdk' },
   });
   try {

@@ -8,6 +8,17 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- Add `@anureo/workflow` with only three directly imported primitives: `agent`,
+  `parallel`, and `pipeline`. Workflows are ordinary TypeScript functions;
+  each agent owns a fresh Session and returns final text. Preserve typed task
+  results, per-item stage sequencing, native failures, and session cleanup.
+  Remove the unpublished runtime, MCP, profiles, source-string execution,
+  shared scheduling, events, workspace management, `phase`, and `log` design.
+  Include a scripted arithmetic example and clean Node/Bun package checks.
+- Add `example:readability`: a normal TypeScript workflow using local Codex for
+  two review perspectives and independent verification, with source citation/hash
+  validation, explicit incomplete coverage, Markdown reports, and optional raw traces.
+
 - **BREAKING:** revise AHP v1 in place through package root entries. Both
   initialization directions require `protocolContract: "native-lifecycle"`;
   incompatible old v1 peers are rejected before business dispatch. Remove
@@ -25,8 +36,15 @@ marked **BREAKING**.
   Fix metadata merging, revert references, result patch projection, privacy,
   cleanup error aggregation and late notifications from closed AHP sources.
 - Migrate examples, all adapter suites, conformance and clean Node/Bun packing
-  checks. See the [design](docs/native-harness-lifecycle.md) and
+  checks; add `bun run example:dsh` driving `dsh --profile acp`. See the
+  [design](docs/native-harness-lifecycle.md) and
   [local validation record](docs/development.md#native-lifecycle-v1).
+- `@anureo/adapter-acp`: retain a bounded, redacted stderr tail and attach it to
+  handshake and disconnect failures; map ACP `stopReason` explicitly so unknown
+  reasons fail closed instead of reporting success; add `autoRespondPermission`
+  for unattended hosts with auditable `ACP_PERMISSION_AUTO_ANSWERED` notices;
+  resolve model aliases against the advertised enum before dispatch. Add
+  `createDshAcpAdapter()` for `dsh --profile acp` plus a DSH-shaped wire fixture.
 
 ## [0.2.0] - 2026-10-30
 

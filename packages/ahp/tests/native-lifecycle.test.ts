@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { resolve } from 'node:path';
 import { createClient } from '@anureo/sdk';
 import { createAhpAdapter } from '../src';
-const executable = resolve(import.meta.dir, '../../../scripts/harness-sdk/fixtures/fake-ahp-native.mjs');
+const executable = resolve(import.meta.dir, './fixtures/fake-ahp-native.mjs');
 test('external revised-v1 peer negotiates on the real wire and preserves overlapping execution identity', async () => {
   const client = await createClient({ adapter: createAhpAdapter({ command: process.execPath, args: [executable], timeoutMs: 1000 }), identity: { adapterId: 'ahp', runtimeConfigId: 'native' } });
   try {

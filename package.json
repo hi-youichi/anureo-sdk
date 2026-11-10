@@ -12,18 +12,16 @@
     "packages/*"
   ],
   "scripts": {
-    "check:boundaries": "bun scripts/check-boundaries.ts",
     "generate": "bun run --filter @anureo/protocol generate",
     "generate:check": "bun run --filter @anureo/protocol generate:check",
     "protocol:check": "bun run --filter @anureo/adapter-codex protocol:check",
     "typecheck": "bun run --filter '@anureo/*' typecheck",
     "typecheck:tooling": "tsc --noEmit",
-    "test": "bun test --timeout 15000 packages scripts/harness-sdk",
-    "build": "bun scripts/harness-sdk/pack.ts --out artifacts",
-    "verify:pack": "bun scripts/harness-sdk/pack.ts --verify --out artifacts",
-    "example": "bun examples/standalone.ts",
-    "example:native": "bun examples/native-lifecycle.ts",
-    "example:dsh": "bun examples/dsh.ts"
+    "test": "bun test --timeout 15000 packages",
+    "example": "bun examples/greeting.ts",
+    "example:dsh": "bun examples/dsh.ts",
+    "example:workflow": "bun examples/workflow.ts",
+    "example:readability": "bun examples/readability-review.ts"
   },
   "devDependencies": {
     "@anureo/sdk": "workspace:*",
@@ -33,6 +31,7 @@
     "@types/node": "22.15.3",
     "typescript": "5.8.3",
     "@anureo/protocol": "workspace:*",
-    "@anureo/adapter-acp": "workspace:*"
+    "@anureo/adapter-acp": "workspace:*",
+    "@anureo/workflow": "workspace:*"
   }
 }

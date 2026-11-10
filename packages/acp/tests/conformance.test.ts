@@ -4,7 +4,7 @@ import { runConformance } from '@anureo/conformance';
 import { createAcpAdapter } from '../src/index';
 
 test('vanilla ACP and negotiated ACP extensions pass the same public SDK conformance suite', async () => {
-  const executable = resolve(import.meta.dirname, '../../../scripts/harness-sdk/fixtures/fake-acp.mjs');
+  const executable = resolve(import.meta.dirname, './fixtures/fake-acp.mjs');
   for (const extended of [false, true]) {
     const report = await runConformance((scenario) => ({
       adapter: createAcpAdapter({ command: process.execPath, args: [executable, '--scenario', scenario, ...(extended ? ['--extensions'] : [])], ...(scenario === 'backpressure' ? { maxFrameBytes: 1024 } : {}) }),

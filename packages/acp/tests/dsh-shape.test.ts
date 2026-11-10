@@ -4,9 +4,9 @@ import { createClient, type Session } from '@anureo/sdk';
 import type { AhpEvent, Capabilities } from '@anureo/protocol';
 import { createAcpAdapter, createDshAcpAdapter, type AcpAdapterOptions } from '../src/index';
 import { resolveConfigValue } from '../src/mapping';
-import { rejectionOf } from '../../../scripts/harness-sdk/test-helpers';
+import { rejectionOf } from './test-helpers';
 
-const executable = resolve(import.meta.dirname, '../../../scripts/harness-sdk/fixtures/dsh-acp.mjs');
+const executable = resolve(import.meta.dirname, './fixtures/dsh-acp.mjs');
 // `turnId` lives on the source envelope; turn events also repeat it inside the payload.
 const turnIdOf = (event: AhpEvent): string | undefined => event.turnId ?? (('turnId' in event.payload) ? (event.payload as { turnId?: string }).turnId : undefined);
 

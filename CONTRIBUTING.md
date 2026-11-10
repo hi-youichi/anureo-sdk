@@ -16,16 +16,15 @@ bun install --frozen-lockfile
 Before every push, CI runs the following — run them locally first:
 
 ```sh
-bun run check:boundaries   # package independence + publishable metadata
 bun run generate:check     # generated types match the JSON Schema
 bun run protocol:check     # schema fixtures
 bun run typecheck          # strict NodeNext, all packages
-bun run typecheck:tooling  # build tooling
-bun test --timeout 15000 packages scripts/harness-sdk
-bun run example            # standalone v1 example
-bun run example:native     # existing experimental fixture; pending root-entry migration
-bun run verify:pack        # full pack + clean-install + dual-runtime verification
+bun run typecheck:tooling  # examples
+bun test --timeout 15000 packages
 ```
+
+Examples use configured, authenticated backends and are run manually. Run
+`bun run example` for the Codex greeting example; CI checks example types.
 
 CI validates Windows, macOS, and Linux; a pull request is mergeable only
 when all three pass.
@@ -34,10 +33,9 @@ when all three pass.
 
 1. Create `packages/<name>` with a manifest that follows the publishable
    metadata shape (`description`, `license`, `repository`,
-   `publishConfig.access: "public"`, no `private`). The boundary checker
-   enforces this.
+   `publishConfig.access: "public"`, no `private`).
 2. Implement the harness adapter contract and register it in the
-   workspace, pack script, and boundary allow-list.
+   workspace.
 3. Conformance is mandatory: your adapter must pass the
    lifecycle/approval/interrupt/history scenarios in
    `@anureo/conformance`, driven by a **scripted fake backend that

@@ -39,6 +39,12 @@ Agents that do not advertise the extension still work: the adapter publishes onl
 
 Session snapshots loaded via ACP `session/load` have no turn boundaries; they are handed to the host through `onLoadSnapshot` instead of being replayed as realtime events.
 
+Configuration patches apply one field at a time. Each confirmed field updates
+the session state immediately. If a later field fails, `CONFIG_PARTIAL` reports
+`details.appliedKeys`, `details.failedKey` and the underlying `details.cause.code`;
+confirmed changes remain applied. `outcomeUnknown` describes uncertainty about
+the failed field and requires recovery when true.
+
 ## Options
 
 | Option | Purpose |
@@ -49,8 +55,31 @@ Session snapshots loaded via ACP `session/load` have no turn boundaries; they ar
 | `terminal` (`AcpTerminalPort`) | Host-implemented terminal lifecycle callbacks |
 | `requestTimeoutMs`, `maxFrameBytes` | Bound each request and every line (default 8 MiB; oversized frames fail with `BACKPRESSURE_EXCEEDED`) |
 | `onLoadSnapshot` | Receive `session/load` snapshot updates separately from the realtime event stream |
+| `stderrTailLines`, `onStderr` | Retain a bounded, redacted stderr tail for diagnostics (default 200 lines; `0` disables) |
+| `autoRespondPermission` | Answer `session/request_permission` without an AHP interaction; undecided or unoffered kinds fall back to the human path |
 
-ACP JSON-RPC error codes map to typed SDK errors (`-32601` → `CAPABILITY_UNSUPPORTED`, `-32602` → `INVALID_PARAMS`, `-32000` → `AUTH_REQUIRED`, `-32002` → `RESOURCE_NOT_FOUND`); a dropped connection surfaces as `ACP_CONNECTION_CLOSED` with `outcomeUnknown`, never as a silent success. Stderr from the agent is drained and discarded — raw provider output and credentials are not retained in diagnostics.
+ACP JSON-RPC error codes map to typed SDK errors (`-32601` → `CAPABILITY_UNSUPPORTED`, `-32602` → `INVALID_PARAMS`, `-32000` → `AUTH_REQUIRED`, `-32002` → `RESOURCE_NOT_FOUND`); a dropped connection surfaces as `ACP_CONNECTION_CLOSED` with `outcomeUnknown`, never as a silent success. Agent stderr is never forwarded raw: the adapter keeps at most 200 redacted lines (`sk-…`, bearer tokens, `key=value` secrets, URL credentials) and attaches that tail to startup and disconnect failures as `details.diagnostics.stderrTail`.
+
+`session/prompt` stop reasons map explicitly: `end_turn` and `cancelled` keep their existing meaning, `max_tokens` / `max_turn_requests` complete the turn with an `ACP_STOP_MAX_TOKENS` / `ACP_STOP_MAX_TURN_REQUESTS` notice, `refusal` fails it, and any unclassified reason fails closed with `ACP_STOP_UNKNOWN`. A backend that stops for an unknown reason is never reported as clean success.
+
+Automatic approval decisions emit an `ACP_PERMISSION_AUTO_ANSWERED` notice carrying only the tool-call id and chosen option; the request's raw input never reaches the notice. Policies never fabricate an option id: when the agent does not offer the requested kind, the request falls back to `interaction/requested`.
+
+## Driving DeepSeek Harness
+
+`createDshAcpAdapter()` presets the one-liner for `dsh --profile acp` (DSH 0.2.2+, Node.js ≥ 24.9):
+
+```typescript
+import { createClient } from '@anureo/sdk'
+import { createDshAcpAdapter } from '@anureo/adapter-acp'
+
+const client = await createClient({
+  adapter: createDshAcpAdapter({ cwd: workspace, autoApprove: true }),
+  identity: { adapterId: 'dsh-acp', runtimeConfigId: 'local' },
+})
+const session = await client.sessions.create({ cwd: workspace, model: 'deepseek-v4-flash' })
+```
+
+DSH advertises the standard ACP v1 baseline only — no `_ahp` extension, no modes, `embeddedContext: false` — so `fork`, `revert`, `steer`, `history`, `goal`, `compact`, `review` and `file` prompt blocks stay unavailable, and `permissionMode` must not be passed. Model values resolve against the advertised `provider/model` enum, so a bare `deepseek-v4-flash` becomes `deepseek-official/deepseek-v4-flash` before it reaches the backend. Auto-approval is opt-in because DSH offers only `allow_once` / `reject_once`; the policy is the only way to run unattended.
 
 ## Development
 
@@ -60,7 +89,7 @@ bun run typecheck
 bun test tests
 ```
 
-The conformance tests spawn a scripted ACP agent (implementing the standard wire protocol) as a real child process over stdio; `bun run verify:pack` at the workspace root repeats the full text, approval-rejection, and interrupt flows against clean npm installs.
+The conformance tests spawn a scripted ACP agent (implementing the standard wire protocol) as a real child process over stdio.
 
 ## Documentation
 

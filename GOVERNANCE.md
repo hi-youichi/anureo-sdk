@@ -58,9 +58,7 @@ version and must be declared in both parties' capabilities during
 An implementation claims a capability only after passing
 `@anureo/conformance` for that capability surface (lifecycle, approval,
 interrupt, history). The conformance suite spawns scripted backends that
-speak their real native wire protocols — not mocks of the SDK — and
-`bun run verify:pack` repeats the flows against clean npm installs of
-the built packages.
+speak their real native wire protocols — not mocks of the SDK.
 
 The implementations below refer to the published baseline. They must pass
 new lifecycle scenarios before claiming conformance to the revised v1.

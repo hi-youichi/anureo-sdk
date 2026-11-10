@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { resolve } from 'node:path';
 import { createClient } from '@anureo/sdk';
 import { createAcpAdapter } from '../src';
-const executable = resolve(import.meta.dir, '../../../scripts/harness-sdk/fixtures/fake-acp.mjs');
+const executable = resolve(import.meta.dir, './fixtures/fake-acp.mjs');
 test('official ACP transport preserves explicit native turn correlation and early result snapshots', async () => {
   const client = await createClient({ adapter: createAcpAdapter({ command: process.execPath, args: [executable, '--native-lifecycle'] }), identity: { adapterId: 'acp', runtimeConfigId: 'native' } });
   try {

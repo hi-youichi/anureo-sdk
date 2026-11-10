@@ -37,7 +37,7 @@ test('cancellation during Query creation closes it without submitting a message'
 
 test('the pinned SDK refreshes a real external directory process without user input', async () => {
   const root = await mkdtemp(join(tmpdir(), 'claude catalog actual ')), log = join(root, 'calls.jsonl')
-  const session = createClaudeCatalogSession({ command: fileURLToPath(new URL('../../../scripts/harness-sdk/fixtures/fake-claude.mjs', import.meta.url)), executableRuntime: 'node', stateDir: join(root, 'state'), env: { FAKE_CATALOG_LOG: log } })
+  const session = createClaudeCatalogSession({ command: fileURLToPath(new URL('../tests/fixtures/fake-claude.mjs', import.meta.url)), executableRuntime: 'node', stateDir: join(root, 'state'), env: { FAKE_CATALOG_LOG: log } })
   try {
     expect((await session.listModels())[0]?.value).toBe('catalog-1')
     expect((await session.listModels())[0]?.value).toBe('catalog-2')
