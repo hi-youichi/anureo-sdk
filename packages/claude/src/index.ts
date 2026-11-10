@@ -2,6 +2,7 @@ import { claudeFileChanges, completeClaudeTool } from './file-changes';
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   query, getSessionMessages, getSessionInfo, forkSession,
   type Options, type Query, type SDKMessage, type SDKUserMessage,
@@ -18,6 +19,7 @@ import {
   type Item, type JsonObject, type JsonValue, type SessionBinding, type SessionOpenParams, type SessionState, type Boundary,
 } from "@anureo/protocol";
 import { FileSessionStore } from "./store";
+import { compileOutputSchema, type OutputSchema } from './output-schema';
 
 export type ClaudeQuery = AsyncIterable<SDKMessage> & Pick<Query, "interrupt" | "setModel" | "setPermissionMode" | "setMaxThinkingTokens" | "applyFlagSettings" | "rewindFiles" | "supportedModels" | "close">;
 export type ClaudeQueryFactory = (params: Parameters<typeof query>[0]) => ClaudeQuery;
@@ -60,7 +62,7 @@ function capabilities(store: boolean, checkpoints: boolean): Capabilities {
   return {
     session: { resume: store, fork: store ? ["before", "through"] : [], revert: [...(store ? ["conversation" as const] : []), ...(checkpoints ? ["files" as const] : []), ...(store && checkpoints ? ["both" as const] : [])], history: store },
     input: { delivery: ['native', 'afterTurn'], interrupt: { targets: ['session'], reportsPendingInputs: true } },
-    turn: { outputSchema: false, overrides: [], inputModalities: ["text", "image"] },
+    turn: { outputSchema: true, overrides: [], inputModalities: ["text", "image"] },
     interactions: ["approval", "userInput", "elicitation"], subagents: { events: "nested" },
     mcp: { stdio: true, http: true, elicitation: ["form", "url"] },
     config: { options: [{ id: "model", scope: "session", schema: { type: "string", minLength: 1 } }, { id: "permissionMode", title: "Permissions", scope: "session", schema: { type: "string", enum: PERMISSION_MODES, default: "default" } }, { id: "effort", title: "Effort", scope: "session", schema: { type: "string", enum: [...EFFORT_LEVELS], default: "high" } }, { id: "fastMode", title: "Fast mode", scope: "session", schema: { type: "boolean", default: false } }, { id: "maxThinkingTokens", scope: "session", schema: { type: ["integer", "null"], minimum: 0 } }] },
@@ -145,6 +147,14 @@ export class ClaudeBackendSession implements BackendSession {
   binding: SessionBinding;
   readonly capabilities: Capabilities;
   private query?: ClaudeQuery;
+  private pumping?: Promise<void>;
+  private readonly queryReleases = new WeakMap<ClaudeQuery, Promise<void>>();
+  private outputSchema?: OutputSchema;
+  private switchingOutput = false;
+  private queryFresh = false;
+  private queryResumeAt?: string;
+  private queryFailure?: HarnessSdkError;
+  private configOperations = 0;
   private input?: BoundedEventQueue<SDKUserMessage>;
   private active?: ActiveTurn;
   private generation = 0;
@@ -242,6 +252,8 @@ export class ClaudeBackendSession implements BackendSession {
   private async startQuery(fresh: boolean, resumeAt?: string): Promise<void> {
     if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
     const generation = ++this.generation;
+    this.queryFresh = fresh;
+    this.queryResumeAt = resumeAt;
     this.input = new BoundedEventQueue<SDKUserMessage>({ maxEvents: 64 });
     const mcpServers: NonNullable<Options["mcpServers"]> = {};
     for (const server of this.params.mcpServers ?? []) mcpServers[server.name] = server.type === "stdio" ? { type: "stdio", command: server.command, args: server.args, env: server.env } : { type: "http", url: server.url, headers: server.headers };
@@ -257,13 +269,14 @@ export class ClaudeBackendSession implements BackendSession {
       allowDangerouslySkipPermissions: true,
       ...(typeof this.config.maxThinkingTokens === "number" ? { maxThinkingTokens: this.config.maxThinkingTokens } : {}),
       ...(isEffort(this.config.effort) ? { effort: this.config.effort } : {}),
-      ...(this.config.fastMode === true ? { settings: { fastMode: true } } : {}),
+      ...(typeof this.config.fastMode === 'boolean' ? { settings: { fastMode: this.config.fastMode } } : {}),
+      ...(this.outputSchema ? { outputFormat: { type: 'json_schema' as const, schema: this.outputSchema.schema } } : {}),
       mcpServers,
       canUseTool: async (toolName, input, details) => this.permissionRequest(toolName, input, details),
       onElicitation: async (request, details) => this.elicitationRequest(request, details),
     };
     this.query = (this.adapter.options.queryFactory ?? query)({ prompt: this.input, options });
-    void this.pump(this.query, generation);
+    this.pumping = this.pump(this.query, generation);
     if (!fresh) await this.refreshMetadata();
   }
   private async pump(stream: ClaudeQuery, generation: number): Promise<void> {
@@ -274,6 +287,8 @@ export class ClaudeBackendSession implements BackendSession {
   }
   private async beginExecution(userUuid: string = randomUUID()): Promise<ActiveTurn> {
     if (!this.active) {
+      this.queryFresh = false;
+      this.queryResumeAt = undefined;
       this.active = { id: randomUUID(), userUuid, consumed: new Set(), output: new Map(), stoppedTools: new Map(), blockIndex: 0 };
       await this.sink.emit({ type: 'turn/started', payload: { turnId: this.active.id } });
     }
@@ -337,22 +352,37 @@ export class ClaudeBackendSession implements BackendSession {
       return;
     }
     if (message.type === "result") {
-      const resultText = message.subtype === "success" ? message.result : undefined;
+      const interrupted = str(message.stop_reason) === "interrupted" || str(value.terminal_reason) === "interrupted";
+      let error = message.subtype !== 'success' || message.is_error
+        ? { code: message.subtype === 'error_max_structured_output_retries' ? 'CLAUDE_STRUCTURED_OUTPUT_RETRIES_EXCEEDED' : 'CLAUDE_TURN_FAILED', message: 'Claude turn failed', retryable: false, outcomeUnknown: false }
+        : undefined;
+      let structuredText: string | undefined;
+      if (this.outputSchema && !error && !interrupted) {
+        if (value.structured_output === undefined) {
+          error = { code: 'CLAUDE_STRUCTURED_OUTPUT_MISSING', message: 'Claude completed without the requested structured output', retryable: false, outcomeUnknown: false };
+        } else if (!this.outputSchema.validate(value.structured_output)) {
+          error = { code: 'CLAUDE_STRUCTURED_OUTPUT_INVALID', message: 'Claude structured output does not match outputSchema', retryable: false, outcomeUnknown: false };
+        } else structuredText = JSON.stringify(value.structured_output);
+      }
+      const resultText = !this.outputSchema && message.subtype === "success" ? message.result : undefined;
       const textItems = [...active.output.values()].filter((item) => item.type === "agentMessage" && item.status !== "completed");
       for (let index = 0; index < textItems.length; index++) {
         const item = textItems[index]!; if (item.type !== "agentMessage") continue;
-        const completed: Item = { ...item, text: index === textItems.length - 1 && resultText !== undefined ? resultText : item.text, phase: index === textItems.length - 1 ? "final" : "commentary", status: "completed" };
+        const completed: Item = { ...item, text: index === textItems.length - 1 && resultText !== undefined ? resultText : item.text, phase: !this.outputSchema && index === textItems.length - 1 ? "final" : "commentary", status: "completed" };
         active.output.set(item.id, completed); await this.sink.emit({ type: "item/completed", payload: { item: completed } }, { turnId: active.id });
       }
       if (!textItems.length && resultText) {
         const item: Item = { id: `${active.userUuid}:final`, type: "agentMessage", phase: "final", text: resultText, status: "completed" };
         await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
       }
+      if (structuredText !== undefined) {
+        const item: Item = { id: `${active.id}:structured-output`, type: 'agentMessage', phase: 'final', text: structuredText, status: 'completed' };
+        await this.sink.emit({ type: 'item/completed', payload: { item } }, { turnId: active.id });
+      }
       const nativeUsage = record(message.usage);
       const usage = { provider: "claude", scope: "turn" as const, source: "native" as const, ...(typeof nativeUsage.input_tokens === "number" ? { input: nativeUsage.input_tokens } : {}), ...(typeof nativeUsage.output_tokens === "number" ? { output: nativeUsage.output_tokens } : {}), ...(typeof nativeUsage.cache_read_input_tokens === "number" ? { cacheRead: nativeUsage.cache_read_input_tokens } : {}), ...(typeof nativeUsage.cache_creation_input_tokens === "number" ? { cacheWrite: nativeUsage.cache_creation_input_tokens } : {}) };
       await this.sink.emit({ type: "usage/updated", payload: usage }, { turnId: active.id });
-      const interrupted = str(message.stop_reason) === "interrupted" || str(value.terminal_reason) === "interrupted";
-      const failed = message.subtype !== "success" || message.is_error;
+      const failed = error !== undefined;
       for (const pending of active.output.values()) {
         if (pending.type !== "toolCall" || pending.kind !== "fileChange" || pending.status === "completed" || pending.status === "failed") continue;
         const item: Item = { ...pending, status: active.stoppedTools.get(pending.id) ?? (interrupted ? "interrupted" : failed ? "failed" : undefined) };
@@ -362,7 +392,7 @@ export class ClaudeBackendSession implements BackendSession {
       this.active = undefined;
       for (const id of active.consumed) this.nativeInputs.delete(id);
       this.trackFastMode(value);
-      await this.sink.emit({ type: "turn/completed", payload: { turnId: active.id, status: interrupted ? "interrupted" : failed ? "failed" : "completed", usage, ...(failed && !interrupted ? { error: { code: "CLAUDE_TURN_FAILED", message: "Claude turn failed", retryable: false, outcomeUnknown: false } } : {}) } });
+      await this.sink.emit({ type: "turn/completed", payload: { turnId: active.id, status: interrupted ? "interrupted" : failed ? "failed" : "completed", usage, ...(error && !interrupted ? { error } : {}) } });
       void this.refreshMetadata();
       // The init snapshot was taken mid-turn ("running"); publish the settled state.
       await this.sink.emit({ type: "session/state", payload: this.snapshot() });
@@ -520,27 +550,35 @@ export class ClaudeBackendSession implements BackendSession {
     return { promptUuid, ...(next >= 0 ? { nextPromptUuid: messages[next]!.uuid } : {}), ...(uuid ? { uuid } : {}) };
   }
   async execute<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
-    if (this.closed || !this.query) throw new HarnessSdkError("SESSION_CLOSED");
+    if (this.closed) throw new HarnessSdkError("SESSION_CLOSED");
+    if (this.switchingOutput && method !== 'session/close' && method !== 'history/read') throw new HarnessSdkError('SESSION_BUSY', 'Claude output format is changing');
+    if (method !== 'session/close' && method !== 'history/read') {
+      if (this.queryFailure) throw this.queryFailure;
+      if (!this.query) throw new HarnessSdkError('SESSION_CLOSED');
+    }
     if (this.reverting && method === 'session/config/set') throw new HarnessSdkError('SESSION_BUSY', 'Claude configuration cannot change during revert');
     let result: AhpResultMap[SessionMethod];
     switch (method) {
       case 'input/submit': return await this.submitInput(params as AhpRequestMap['input/submit']) as AhpResultMap[M];
       case 'session/interrupt': {
-        const receipt = await this.query.interrupt();
+        const receipt = await this.query!.interrupt();
         const stillQueued = receipt?.still_queued?.flatMap(id => { const pending = this.nativeInputs.get(id); return pending ? [pending.submissionId] : []; });
         result = { accepted: true, ...(stillQueued ? { stillQueued } : {}) }; break;
       }
       case 'turn/interrupt': case 'turn/steer': throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Claude controls target the session, not an atomically matched Turn');
       case "session/config/set": {
         const patch = (params as AhpRequestMap["session/config/set"]).patch;
+        this.configOperations++;
         try {
-          if (patch.model !== undefined) { if (typeof patch.model !== "string") throw new HarnessSdkError("INVALID_PARAMS"); await this.query.setModel(patch.model); this.model = patch.model; }
-          if (patch.permissionMode !== undefined) await this.query.setPermissionMode(permission(patch.permissionMode));
-          if (patch.fastMode !== undefined) { if (typeof patch.fastMode !== "boolean") throw new HarnessSdkError("INVALID_PARAMS"); await this.query.applyFlagSettings({ fastMode: patch.fastMode }); }
-          if (patch.effort !== undefined) { if (patch.effort !== null && !isEffort(patch.effort)) throw new HarnessSdkError("INVALID_PARAMS"); await this.query.applyFlagSettings({ effortLevel: patch.effort }); }
-          if (patch.maxThinkingTokens !== undefined) { if (patch.maxThinkingTokens !== null && typeof patch.maxThinkingTokens !== "number") throw new HarnessSdkError("INVALID_PARAMS"); await this.query.setMaxThinkingTokens(patch.maxThinkingTokens); }
+          if (patch.model !== undefined) { if (typeof patch.model !== "string") throw new HarnessSdkError("INVALID_PARAMS"); await this.query!.setModel(patch.model); this.model = patch.model; }
+          if (patch.permissionMode !== undefined) await this.query!.setPermissionMode(permission(patch.permissionMode));
+          if (patch.fastMode !== undefined) { if (typeof patch.fastMode !== "boolean") throw new HarnessSdkError("INVALID_PARAMS"); await this.query!.applyFlagSettings({ fastMode: patch.fastMode }); }
+          if (patch.effort !== undefined) { if (patch.effort !== null && !isEffort(patch.effort)) throw new HarnessSdkError("INVALID_PARAMS"); await this.query!.applyFlagSettings({ effortLevel: patch.effort }); }
+          if (patch.maxThinkingTokens !== undefined) { if (patch.maxThinkingTokens !== null && typeof patch.maxThinkingTokens !== "number") throw new HarnessSdkError("INVALID_PARAMS"); await this.query!.setMaxThinkingTokens(patch.maxThinkingTokens); }
+          this.config = { ...this.config, ...patch }; this.capabilityRevision++; result = this.snapshot(); await this.sink.emit({ type: "session/state", payload: result });
         } catch (cause) { throw sdkError(cause, "CLAUDE_CONFIG_FAILED", true); }
-        this.config = { ...this.config, ...patch }; this.capabilityRevision++; result = this.snapshot(); await this.sink.emit({ type: "session/state", payload: result }); break;
+        finally { this.configOperations--; }
+        break;
       }
       case "history/read": {
         const request = params as AhpRequestMap["history/read"]; result = await this.readHistory(request); break;
@@ -576,7 +614,9 @@ export class ClaudeBackendSession implements BackendSession {
           if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
           const native = point.uuid ? await (this.adapter.options.forkSession ?? forkSession)(this.nativeId, { dir: this.params.cwd, sessionStore: this.adapter.sessionStore, upToMessageId: point.uuid }) : { sessionId: randomUUID() };
           if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
-          this.generation++; this.input?.end(); query.close();
+          this.generation++; this.input?.end();
+          await this.releaseQuery(query); await this.pumping;
+          if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
           this.binding = { ...this.binding, nativeRef: { provider: 'claude', value: native.sessionId } };
           this.adapter.turnMaps.set(this.nativeId, this.turns); await this.fileStore?.saveTurnMap(this.nativeId, this.turns);
           await this.startQuery(!point.uuid); await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
@@ -594,14 +634,57 @@ export class ClaudeBackendSession implements BackendSession {
     // Native association echoes are bounded to 64 UUIDs. Do not admit more
     // unresolved inputs than we can correlate without guessing.
     if (this.nativeInputs.size >= 64) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED');
-    const userUuid = randomUUID();
-    this.nativeInputs.set(userUuid, { submissionId: start.submissionId });
+    const nativeContent = content(start.input);
+    const changing = !isDeepStrictEqual(this.outputSchema?.schema, start.outputSchema);
+    if (changing && (this.active || this.nativeInputs.size || this.configOperations)) throw new HarnessSdkError('SESSION_BUSY', 'Claude output format can change only with no active execution, pending input or configuration change');
+    const outputSchema = changing && start.outputSchema !== undefined ? compileOutputSchema(start.outputSchema) : undefined;
+    if (changing) this.switchingOutput = true;
     try {
-      this.input.push({ type: 'user', uuid: userUuid, session_id: this.nativeId,
-        message: { role: 'user', content: content(start.input) }, parent_tool_use_id: null,
-        priority: start.delivery === 'afterTurn' ? 'later' : 'next' });
-      return { submissionId: start.submissionId, disposition: 'dispatched' };
-    } catch (cause) { this.nativeInputs.delete(userUuid); throw cause; }
+      // Do not yield admission for an unchanged format: another submission could
+      // otherwise start a switch before this input is recorded as pending.
+      if (changing) await this.replaceOutputFormat(outputSchema);
+      if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
+      const userUuid = randomUUID();
+      this.nativeInputs.set(userUuid, { submissionId: start.submissionId });
+      try {
+        this.input!.push({ type: 'user', uuid: userUuid, session_id: this.nativeId,
+          message: { role: 'user', content: nativeContent }, parent_tool_use_id: null,
+          priority: start.delivery === 'afterTurn' ? 'later' : 'next' });
+        return { submissionId: start.submissionId, disposition: 'dispatched' };
+      } catch (cause) { this.nativeInputs.delete(userUuid); throw cause; }
+    } finally { if (changing) this.switchingOutput = false; }
+  }
+  private async replaceOutputFormat(outputSchema?: OutputSchema): Promise<void> {
+    const query = this.query!, pumping = this.pumping;
+    this.generation++;
+    this.input?.end();
+    try {
+      // Query.return() awaits the official SDK's mirror flush and cleanup.
+      await this.releaseQuery(query);
+      await pumping;
+      if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
+      this.query = undefined;
+      this.outputSchema = outputSchema;
+      await this.startQuery(this.queryFresh, this.queryResumeAt);
+    } catch (cause) {
+      const error = sdkError(cause, 'CLAUDE_OUTPUT_FORMAT_FAILED');
+      // The new input has not been enqueued. Never replay it to recover a Query.
+      const failure = new HarnessSdkError(error.code, error.message, false, false, error.details);
+      if (!this.closed) this.queryFailure = failure;
+      throw failure;
+    }
+  }
+  private releaseQuery(query: ClaudeQuery): Promise<void> {
+    const previous = this.queryReleases.get(query);
+    if (previous) return previous;
+    const release = Promise.resolve().then(async () => {
+      const errors: Array<{ code: string }> = [];
+      try { query.close(); } catch { errors.push({ code: 'CLAUDE_CLOSE_FAILED' }); }
+      try { await (query as ClaudeQuery & Partial<Pick<Query, 'return'>>).return?.(); } catch { errors.push({ code: 'CLAUDE_RETURN_FAILED' }); }
+      if (errors.length) throw new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'Claude resources were not fully released', false, true, { errors });
+    });
+    this.queryReleases.set(query, release);
+    return release;
   }
   private async readHistory(request: AhpRequestMap["history/read"]): Promise<HistoryPage> {
     let snapshotToken = request.snapshotToken;
@@ -628,7 +711,8 @@ export class ClaudeBackendSession implements BackendSession {
           items.push({ turnId: currentTurn, ...(currentNativeTurn ? { nativeTurnId: currentNativeTurn } : {}), nativeItemId: message.uuid, item });
         }
       }
-      snapshotToken = randomUUID(); this.historySnapshots.set(snapshotToken, items);
+      const withStructuredOutput = await this.structuredHistory(items);
+      snapshotToken = randomUUID(); this.historySnapshots.set(snapshotToken, withStructuredOutput);
       if (this.historySnapshots.size > 8) this.historySnapshots.delete(this.historySnapshots.keys().next().value!);
     }
     const snapshot = this.historySnapshots.get(snapshotToken); if (!snapshot) throw new HarnessSdkError("CURSOR_EXPIRED");
@@ -637,14 +721,34 @@ export class ClaudeBackendSession implements BackendSession {
     const limit = Math.min(request.limit ?? 200, 1000); const page = snapshot.slice(offset, offset + limit);
     return { items: structuredClone(page), ...(offset + page.length < snapshot.length ? { nextCursor: String(offset + page.length) } : {}), snapshotToken, source: this.binding.nativeRef };
   }
+  private async structuredHistory(items: HistoryItem[]): Promise<HistoryItem[]> {
+    const key = this.storeKeys.get(this.nativeId), store = this.adapter.sessionStore;
+    if (!key || !store) return items;
+    // The public history helper omits attachments. Only expose validated output
+    // attachments linked to a StructuredOutput call surviving in that history.
+    const calls = new Map(items.flatMap(entry => entry.item.type === 'toolCall' && entry.item.nativeType === 'StructuredOutput' ? [[entry.item.id, entry] as const] : []));
+    if (!calls.size) return items;
+    const finals = new Map<string, HistoryItem>();
+    for (const entry of await store.load(key) ?? []) {
+      if (entry.type !== 'attachment' || entry.isSidechain || entry.teamName) continue;
+      const attachment = record(entry.attachment), call = calls.get(str(attachment.toolUseID) ?? '');
+      if (attachment.type !== 'structured_output' || attachment.data === undefined || !call) continue;
+      finals.set(call.turnId, {
+        turnId: call.turnId, ...(call.nativeTurnId ? { nativeTurnId: call.nativeTurnId } : {}), ...(typeof entry.uuid === 'string' ? { nativeItemId: entry.uuid } : {}),
+        item: { id: `${call.turnId}:structured-output`, type: 'agentMessage', phase: 'final', status: 'completed', text: JSON.stringify(attachment.data) },
+      });
+    }
+    const last = new Map(items.map((entry, index) => [entry.turnId, index]));
+    return items.flatMap((entry, index) => {
+      const final = finals.get(entry.turnId);
+      return final && last.get(entry.turnId) === index ? [entry, final] : [entry];
+    });
+  }
   async dispose(): Promise<void> {
     return this.release ??= (async () => {
       this.closed = true; this.generation++;
       this.nativeInputs.clear(); this.input?.end();
-      const errors: Array<{ code: string }> = [];
-      try { this.query?.close(); } catch { errors.push({ code: 'CLAUDE_CLOSE_FAILED' }); }
-      try { await (this.query as (ClaudeQuery & Partial<Pick<Query, 'return'>>) | undefined)?.return?.(); } catch { errors.push({ code: 'CLAUDE_RETURN_FAILED' }); }
-      if (errors.length) throw new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'Claude resources were not fully released', false, true, { errors });
+      if (this.query) await this.releaseQuery(this.query);
     })();
   }
 }

@@ -23,12 +23,14 @@
     "verify:pack": "bun scripts/harness-sdk/pack.ts --verify --out artifacts",
     "example": "bun examples/standalone.ts",
     "example:native": "bun examples/native-lifecycle.ts",
-    "example:dsh": "bun examples/dsh.ts"
+    "example:dsh": "bun examples/dsh.ts",
+    "example:schema": "bun examples/structured-output.ts"
   },
   "devDependencies": {
     "@anureo/sdk": "workspace:*",
     "@anureo/conformance": "workspace:*",
     "@anureo/adapter-codex": "workspace:*",
+    "@anureo/adapter-claude": "workspace:*",
     "@types/bun": "1.4.0",
     "@types/node": "22.15.3",
     "typescript": "5.8.3",

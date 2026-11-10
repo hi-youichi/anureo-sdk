@@ -8,6 +8,10 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- Claude adapter supports per-submit `outputSchema` through the native Agent
+  SDK output format. Return validated JSON as final text, retain saved structured
+  output in history, and switch formats only when the session has no active or
+  pending inputs. Schema changes preserve the native session ID and configuration.
 - **BREAKING:** revise AHP v1 in place through package root entries. Both
   initialization directions require `protocolContract: "native-lifecycle"`;
   incompatible old v1 peers are rejected before business dispatch. Remove
