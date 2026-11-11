@@ -8,6 +8,14 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- Add optional workflow persistence: `workflow(options, body)` provides a durable
+  run ID and explicit, schema-inferred `run.step()` checkpoints. Resume creates a
+  new run, validates and imports compatible results, and preserves effective
+  history across branches. Storage and unknown execution failures stop dispatch.
+  Code-review persists accepted plans and task evidence independently of final
+  reports; `--resume` can recover failed runs with an explicit backend configuration
+  fingerprint. Add deterministic persistence and process-crash recovery examples/tests.
+
 - Add `@anureo/adapter-pi`, an in-process adapter for the Pi coding agent
   (`@earendil-works/pi-coding-agent`, verified against 1.5.2). Supports submit,
   steer/follow-up, interrupt, history, fork, resume and compaction, plus model,

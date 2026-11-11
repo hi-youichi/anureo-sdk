@@ -1,13 +1,14 @@
 # Workflow primitives: parameters and return values
 
 This document defines the parameter and result contracts for `agent()`,
-`parallel()`, and `pipeline()` from `@anureo/workflow`. Anureo workflows use direct
+`parallel()`, `pipeline()`, and optional `workflow()` from `@anureo/workflow`. Anureo workflows use direct
 imports in ordinary TypeScript modules, with an explicit SDK Client and working
 directory for agent calls.
 
 - [agent](#agent): independent agent execution, options, and results.
 - [parallel](#parallel): concurrent callbacks and an input-ordered result barrier.
 - [pipeline](#pipeline): independent item chains with sequential stages.
+- [workflow](persistence.md): run identities, explicit step checkpoints, and failure recovery.
 
 The primitives implement the contracts below as ordinary TypeScript functions.
 Their comparison with the recovered Claude Code 2.1.296 Workflow implementation

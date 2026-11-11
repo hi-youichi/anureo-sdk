@@ -18,7 +18,7 @@ export const planningSchema = z.strictObject({
   contextRequests: analysisSchema.shape.contextRequests, gaps: z.array(z.string()),
 })
 export type Planning = z.output<typeof planningSchema>
-export type PlanningOptions = { scope?: string[]; dimensions?: string[]; contracts?: string[]; flows?: Array<{ id: string; purpose: string; paths: string[]; symbols: string[] }>; contextRounds?: number; contextFiles?: number; planningCorrections?: number; maxInputBytes?: number }
+export type PlanningOptions = { scope?: string[]; dimensions?: string[]; contracts?: string[]; flows?: Array<{ id: string; purpose: string; paths: string[]; symbols: string[] }>; contextRounds?: number; contextFiles?: number; planningCorrections?: number; responseCorrections?: number; maxInputBytes?: number }
 export type PlanningIssue = { path: string; message: string }
 export type PlanningAttempt = {
   callId: string; stage: string; outcome: 'accepted' | 'invalid' | 'needs_context' | 'incomplete'
@@ -39,10 +39,12 @@ export class PlanningValidationError extends Error {
 export function inventoryPlan(context: ReviewContext, options: PlanningOptions = {}) {
   const contextRounds = options.contextRounds ?? 2, contextFiles = options.contextFiles ?? 10, maxInputBytes = options.maxInputBytes ?? 256_000
   const planningCorrections = options.planningCorrections ?? 2
+  const responseCorrections = options.responseCorrections ?? 2
   if (!Number.isInteger(contextRounds) || contextRounds < 0 || contextRounds > 4) throw new Error('contextRounds must be 0..4')
   if (!Number.isInteger(contextFiles) || contextFiles < 1 || contextFiles > 50) throw new Error('contextFiles must be 1..50')
   if (!Number.isSafeInteger(maxInputBytes) || maxInputBytes < 1024) throw new Error('maxInputBytes must be >= 1024')
   if (!Number.isInteger(planningCorrections) || planningCorrections < 0 || planningCorrections > 4) throw new Error('planningCorrections must be 0..4')
+  if (!Number.isInteger(responseCorrections) || responseCorrections < 0 || responseCorrections > 4) throw new Error('responseCorrections must be 0..4')
   const primaryFiles = [...new Set(options.scope ?? context.baseline.keys())].sort()
   if (!primaryFiles.length || primaryFiles.some(path => !context.baseline.has(path))) throw new Error('Scope must name existing Git-visible files')
   const contractPaths = [...new Set(options.contracts ?? [])].sort()
@@ -53,7 +55,7 @@ export function inventoryPlan(context: ReviewContext, options: PlanningOptions =
     inventoryFiles: [...context.baseline.keys()], primaryFiles, contractPaths,
     packages: context.packages, requestedDimensions: options.dimensions ?? null,
     flowHints: options.flows ?? [],
-    budgets: { contextRounds, contextFiles, planningCorrections, maxInputBytes, baseCalls: 5, maxCalls: 5 + contextRounds + planningCorrections },
+    budgets: { contextRounds, contextFiles, planningCorrections, responseCorrections, maxInputBytes, baseCalls: 5, maxCalls: 5 + contextRounds + planningCorrections + responseCorrections },
     navigation: context.index.map(i => ({ path: i.path, language: i.language, adapter: i.adapter, capabilities: i.capabilities, unknowns: i.unknowns })),
     note: 'One planner agent discovers modules and angles before module × angle analysis. Task count is unknown until planning completes.',
   }
@@ -116,6 +118,7 @@ export function createModulePlan(context: ReviewContext, inventory: InventoryPla
     purpose: `${module.name}：${module.purpose}\n审查角度：${angle.title}；${angle.question}`, dependsOn: [],
   })))
   const count = tasks.length
+  const maximumCalls = 4 + inventory.budgets.responseCorrections + (inventory.budgets.contextRounds + 1) * (1 + count * 2 * (1 + inventory.budgets.responseCorrections)) + inventory.budgets.planningCorrections
   return { ...inventory, planning: planningProgress(), modules, angles: catalog, selectedDimensions: angles.map(a => a.id), referenceCoverage: discovery?.referenceCoverage ?? [],
     dimensions: angles.map(a => [a.id, a.title, a.question] as const),
     discovery: { status: (discovery?.status ?? 'pending') as Planning['status'] | 'pending' | 'failed', summary: discovery?.summary ?? 'Modules and angles have not been discovered',
@@ -123,10 +126,10 @@ export function createModulePlan(context: ReviewContext, inventory: InventoryPla
     planningHash: hash(JSON.stringify({ modules: modules.map(m => ({ ...m, evidence: m.evidence.map(e => [e.path, e.sha256]) })), angles: catalog, selected: angles.map(a => a.id) })),
     tasks, summaryIds: ['project-summary'],
     callEstimate: { planningBase: 1, planningMax: inventory.budgets.contextRounds + 1 + inventory.budgets.planningCorrections, analysisTasks: discovery ? count : null,
-      totalMaximum: discovery ? 4 + (inventory.budgets.contextRounds + 1) * (1 + count * 2) + inventory.budgets.planningCorrections : null },
+      totalMaximum: discovery ? maximumCalls : null },
     applicability: tasks.map(t => ({ unitId: t.unitId, dimension: t.angleId, taskId: t.id, status: 'pending' as const, reason: 'One owner per module/angle pair' })),
     continuationTasks: [] as Array<{ id: string; parentTaskId: string; stage: string; sourceSnapshotIds: string[]; sourcePaths: string[] }>,
-    budgets: { ...inventory.budgets, baseCalls: 5 + count, maxCalls: 4 + (inventory.budgets.contextRounds + 1) * (1 + count * 2) + inventory.budgets.planningCorrections },
+    budgets: { ...inventory.budgets, baseCalls: 5 + count, maxCalls: maximumCalls },
   }
 }
 

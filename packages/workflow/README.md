@@ -1,7 +1,7 @@
 # @anureo/workflow
 
-Three directly imported primitives for ordinary TypeScript workflows:
-`agent`, `parallel`, and `pipeline`. The host creates SDK Clients, imports its
+Directly imported primitives for ordinary TypeScript workflows:
+`agent`, `parallel`, `pipeline`, and optional `workflow`. The host creates SDK Clients, imports its
 workflow functions, awaits their results, and handles errors with normal TS.
 
 See the [workflow authoring reference](../../docs/workflow/SKILL.md) for current
@@ -50,8 +50,10 @@ In this example, `pipeline` and `parallel` convert internal `agent` rejections t
 explicit checks then throw summary errors for `null` results, so those errors do
 not preserve the original agent failure classification.
 
-Import `reviewFiles` from another TS file and call it with a Client. There is no
-workflow registration, source-string execution, ambient context, or runtime setup.
+Import `reviewFiles` from another TS file and call it with a Client. Calls do not
+require workflow registration, source-string execution, ambient context, or runtime setup.
+Use [durable workflow steps](../../docs/workflow/persistence.md) when a function
+needs a persisted run ID and recoverable results.
 
 ## agent
 
@@ -137,6 +139,18 @@ becomes `null`. The returned Promise waits for all item chains to settle; its
 result type always includes `null`. Stage input types exclude only `null`, so
 `undefined` and other falsy values continue normally. Invalid composition
 arguments still reject the call.
+
+## Durable workflow
+
+`workflow(options, body)` saves an initial manifest before passing explicit
+`runId`, `input` and `step` to the body. Use `run.step({ key, input, schema }, execute)`
+to persist validated results and `resumeFrom` to reuse them in a new run. Existing
+three-primitive functions keep their independent behavior.
+
+The [persistence reference](../../docs/workflow/persistence.md) defines JSON inputs,
+schema inference, manual/repeatable recovery, error handling and file guarantees.
+Try `bun run example:workflow-persistence` and then repeat with its printed run ID.
+This example uses deterministic callbacks and makes no model requests.
 
 ## Examples
 

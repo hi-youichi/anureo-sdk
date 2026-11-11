@@ -42,7 +42,7 @@ export async function withClient<T>(cwd: string, maxOutputBytes: number, editing
   run: (client: Client, shouldStop: () => boolean) => Promise<T>): Promise<T> {
   const client = await createClient({
     adapter: createCodexAdapter({ command: process.env.CODEX_BIN ?? 'codex', cwd,
-      ...(editing ? { args: ['app-server', '-c', 'sandbox_mode="workspace-write"', '-c', 'approval_policy="never"'] } : {}),
+      args: ['app-server', '-c', `sandbox_mode="${editing ? 'workspace-write' : 'read-only'}"`, '-c', 'approval_policy="never"'],
     }),
     identity: { adapterId: 'codex', runtimeConfigId: editing ? 'code-review-fix' : 'code-review' },
     limits: { maxResultBytes: maxOutputBytes },

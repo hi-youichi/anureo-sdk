@@ -49,9 +49,11 @@ that Git does not ignore. It does not expand into Git submodules or dependencies
 | `--model <model>` | Override the model; otherwise use `ANUREO_REVIEW_MODEL`, then the backend default. |
 | `--concurrency <1..16>` | Shared limit across model calls. Default: 4. |
 | `--resume <directory>` | Revalidate and reuse compatible completed tasks from a prior review. Use a separate output directory. |
+| `--backend-config-digest <id>` | Caller-maintained fingerprint of the effective backend configuration. Supply the same value on the original run and resume to enable automatic result reuse; `ANUREO_REVIEW_BACKEND_CONFIG_DIGEST` is the environment fallback. |
 | `--context-rounds <0..4>` | Additional reads per planning, analysis or verification. Default: 2. |
 | `--context-files <1..50>` | File limit per additional read. Default: 10. |
 | `--planning-corrections <0..4>` | Additional calls to correct returned planner proposals that fail host validation. Default: 2. Set 0 to fail immediately. Separate from context reads. |
+| `--response-corrections <0..4>` | Additional calls per returned analysis, verification or summary response that fails host validation. Default: 2. Separate from context reads and planning corrections. |
 | `--max-input-bytes <bytes>` | Input budget per model call, at least 1024. Default: 256000. |
 | `--max-output-bytes <bytes>` | SDK result budget, at least 1024. Default: 1048576. |
 | `--dry-run` | Print inventory and planning budgets without a backend or artifacts. Modules, concrete angles and worker counts remain unknown. |
@@ -67,13 +69,50 @@ the angle catalog after planning; an absent ID fails planning instead of silentl
 omitting work. A worker may inspect another module as context and reject a
 proposal that harms another angle, but its primary findings belong to its assigned
 module and angle. The former file/flow/package/project levels and readability/all
-modes are removed. Resume replans first, then reuses workers only when the current
-module/angle plan, inputs, contracts and schema remain compatible.
+modes are removed. Resume reuses a compatible accepted plan and completed tasks,
+then repeats the current Client's schema probes and generates a fresh summary.
+Changed planning inputs trigger replanning; changed task inputs or supplemental
+source evidence trigger only the necessary new work under the resulting plan.
 
 ```sh
-bun run review ../another-project --format json --output ./review-report > report.json
-bun run review ../another-project --resume ./review-report --output ./review-report-next
+bun run review ../another-project --backend-config-digest codex-review-config-v1 --format json --output ./review-report > report.json
+bun run review ../another-project --backend-config-digest codex-review-config-v1 --resume ./review-report --output ./review-report-next
 ```
+
+## Failure recovery
+
+Reviews run through `workflow()` and save a run manifest, accepted planning
+checkpoint and validated per-task results with complete source evidence. After a
+failure or process exit, `--resume` reads those checkpoints even when `report.json`
+was never produced. It creates a separate new run, keeps the old directory unchanged,
+and carries prior effective history into the new directory. Failed or unfinished
+read-only tasks can be attempted again during this explicit resume; there is no
+automatic retry of invocation failures inside a run.
+
+Use the same backend configuration fingerprint on the original and resumed calls.
+Change it when the executable, backend defaults, permissions or other effective
+configuration changes. The SDK Client does not expose those internals for reliable
+automatic fingerprinting. Without an explicit fingerprint, a fresh cache identity
+disables automatic cross-run reuse. Inputs, schema, instructions, planning and
+every actually read source snapshot are checked in addition to this fingerprint.
+
+The artifact path is printed before execution; the workflow run ID is logged after
+its manifest is initialized. Storage failures, unknown native execution outcomes
+and Session cleanup failures stop further dispatch and return a failing exit code.
+Already running work settles where possible. A source run with an active or
+unverifiable writer cannot be resumed. Dead same-host writers can be recovered
+after their PIDs are confirmed absent; this does not prove that a native backend
+execution stopped.
+
+Corrupt or missing committed materials fail recovery instead of silently rerunning.
+Complete legacy version-2 reports can still seed new checkpoints after the existing
+source, evidence and ownership validations. Incomplete legacy artifacts without
+the required report are not inferred to be successful.
+
+Task failures remain visible coverage gaps, and a new summary is generated from
+the currently validated tasks. Review's CLI configures a read-only backend and
+declares those tasks repeatable. The explicit editing/fix command retains its
+existing conservative behavior and does not automatically replay modifications.
 
 ## Project configuration
 
@@ -150,10 +189,20 @@ an additional call carrying the previous result and snapshots under the same
 logical task assignment; call counts are recorded separately from worker counts.
 The planner uses at most `1 + context-rounds + planning-corrections` calls.
 For N module/angle pairs, the full upper bound is
-`4 + (1 + context-rounds) * (1 + 2 * N) + planning-corrections`, including
+`4 + response-corrections + (1 + context-rounds) * (1 + 2 * N * (1 + response-corrections)) + planning-corrections`, including
 three worker-schema probes and one summary. Counts remain unknown before planning.
 Planning failure prevents worker dispatch. Failed pairs remain coverage gaps;
 zero findings can still be a completed review.
+
+Analysis, verification and summary responses also have bounded corrections.
+The host aggregates citation errors and checks dimension ownership, context
+requests, decision IDs and summary coverage before accepting each response.
+A replacement carries the original assignment, the same supplied sources,
+the rejected response and validation feedback. It uses a fresh session under the
+same module/angle task and concurrency gate. `calls/<call-id>.validation.json`
+records acceptance or validation errors; original outputs remain unchanged.
+Failed invocations, persistence failures, unknown outcomes and explicit incomplete
+responses do not enter this correction loop. Exhaustion leaves a coverage gap.
 
 Analysis records actual participants, collaboration, state and effects,
 invariants and uncertainties. Collaboration forms are open; no fixed pattern
@@ -165,7 +214,8 @@ symbol or call indexes mean unindexed, not absent. Necessary unknown language or
 runtime semantics remain explicit gaps. Binary files, submodules and symlinks are
 recorded as metadata or unavailable input; source symlinks are never followed.
 
-Review artifacts include `plan.json`, `planning/`, `index.json`, snapshots, call records,
+Review artifacts include `run.json`, `attempts/`, `results/`, `checkpoints/`, `inherited/`,
+`result.json`, `plan.json`, `planning/`, `index.json`, snapshots, call records,
 per-task analysis and verification, summaries, `report.json` and `report.md`. Report format version 2 records planner output,
 reference-angle decisions and module/angle task ownership. Version 1 reports are
 not compatible with the new resume/repair path.
@@ -182,14 +232,15 @@ duration and completed/failed outcome. Duration covers invocation and response
 persistence, not a provider-only measurement. A completed invocation may still
 produce a proposal rejected by host validation. These records do not infer token
 usage, costs or remote cancellation.
-The default review/fix artifact roots, legacy review roots and the current output directory
+The default review/fix/workflow artifact roots, legacy review roots, resume directory and current output directory
 are excluded from discovery and contextual reads. For repeated custom output
 locations, use an ignored artifact parent to keep earlier runs outside the target
 inventory. The output directory cannot be the project or an ancestor of it.
 
 Review does not execute target code, run tests or apply changes. Model tasks are
-instructed to analyze the supplied sources without commands or tools. Coverage
-and evidence checks do not establish that the model's design conclusions are
+instructed to analyze the supplied sources without commands or tools. Review
+calls request a read-only Codex sandbox with approvals disabled; the explicit fix
+command requests workspace-write. Coverage and evidence checks do not establish that the model's design conclusions are
 correct. Real-model quality acceptance remains unfinished.
 
 Exit status is `0` for a complete review, `1` for an error or coverage gap, and

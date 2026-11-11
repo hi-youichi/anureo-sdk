@@ -1,3 +1,5 @@
 export { agent, type AgentOptions } from './agent'
 export { parallel } from './parallel'
 export { pipeline } from './pipeline'
+export { workflow } from './workflow'
+export type { WorkflowOptions, StepOptions, WorkflowContext, WorkflowResult } from './workflow-types'

@@ -25,9 +25,11 @@ Options:
   --model <model>             Backend model; defaults to ANUREO_REVIEW_MODEL
   --concurrency <1..16>       Shared concurrency limit (default: 4)
   --resume <directory>        Revalidate and reuse an earlier review
+  --backend-config-digest <id>  Stable backend configuration fingerprint for result reuse
   --context-rounds <0..4>     Additional reads per planning/analysis/verification (default: 2)
   --context-files <1..50>     Files per additional read (default: 10)
   --planning-corrections <0..4>  Corrections of returned planner proposals (default: 2)
+  --response-corrections <0..4>  Corrections per analysis/verification/summary response (default: 2)
   --max-input-bytes <bytes>   Input budget per model call (default: 256000)
   --max-output-bytes <bytes>  SDK result budget (default: 1048576)
   --dry-run                  Print inventory and planning budgets; modules/angles remain unknown
@@ -49,8 +51,10 @@ export async function main(args: string[]): Promise<void> {
     scope: { type: 'string', multiple: true },
     config: { type: 'string' }, output: { type: 'string' }, format: { type: 'string', default: 'markdown' },
     model: { type: 'string' }, concurrency: { type: 'string', default: '4' }, resume: { type: 'string' },
+    'backend-config-digest': { type: 'string' },
     'context-rounds': { type: 'string', default: '2' }, 'context-files': { type: 'string', default: '10' },
     'planning-corrections': { type: 'string', default: '2' },
+    'response-corrections': { type: 'string', default: '2' },
     'max-input-bytes': { type: 'string', default: '256000' }, 'max-output-bytes': { type: 'string', default: '1048576' },
     'dry-run': { type: 'boolean', default: false }, help: { type: 'boolean', default: false }, version: { type: 'boolean', default: false },
   } })
@@ -68,6 +72,11 @@ export async function main(args: string[]): Promise<void> {
   if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1024) throw new Error('max-output-bytes must be an integer >= 1024')
   const config = values.config ? await readDesignConfig(resolve(values.config)) : undefined
   const { outputDir, outputExclusions } = await chooseOutput(cwd, values.output, 'reviews')
+  const resumeFrom = values.resume ? await realpath(resolve(values.resume)) : undefined
+  if (resumeFrom) {
+    const old = relative(cwd, resumeFrom)
+    if (!outside(old)) outputExclusions.push(repoPath(old))
+  }
   const packages = await discoverPackages(cwd, config?.groups, outputExclusions)
   const files = packages.flatMap(pkg => pkg.files)
   if (!files.length) throw new Error('No Git-visible project files found')
@@ -83,6 +92,7 @@ export async function main(args: string[]): Promise<void> {
     scope, dimensions: values.dimension?.map(value => dimensionSchema.parse(value)), flows: config?.flows, contracts: config?.contracts, outputExclusions,
     contextRounds: Number(values['context-rounds']), contextFiles: Number(values['context-files']), maxInputBytes: Number(values['max-input-bytes']),
     planningCorrections: Number(values['planning-corrections']),
+    responseCorrections: Number(values['response-corrections']),
   }
   const context = await ReviewContext.create(cwd, packages, [], outputExclusions)
   for (const path of config?.contracts ?? []) await context.acquire(path)
@@ -90,11 +100,14 @@ export async function main(args: string[]): Promise<void> {
   if (values['dry-run']) {
     console.log(JSON.stringify({ ...plan, cwd, outputDir, concurrency }, null, 2)); return
   }
-  const resumeFrom = values.resume ? await realpath(resolve(values.resume)) : undefined
   const model = values.model ?? process.env.ANUREO_REVIEW_MODEL
+  const backendConfigDigest = values['backend-config-digest'] ?? process.env.ANUREO_REVIEW_BACKEND_CONFIG_DIGEST
+  if (backendConfigDigest !== undefined && !backendConfigDigest.trim()) throw new Error('backend-config-digest must not be empty')
+  if (resumeFrom && !backendConfigDigest) progress('Backend configuration fingerprint omitted; prior results will be revalidated but not automatically reused.')
+  console.error(`Artifacts: ${outputDir}`)
   await withClient(cwd, maxOutputBytes, false, async (client, shouldStop) => {
-    const report = await reviewDesign({ ...options, client, cwd, packages, outputDir, concurrency, resumeFrom, model, shouldStop, progress })
-    console.error(`Artifacts: ${outputDir}`)
+    const report = await reviewDesign({ ...options, client, cwd, packages, outputDir, concurrency, resumeFrom, model,
+      backendConfigDigest, repeatable: true, shouldStop, progress })
     process.stdout.write(values.format === 'json' ? `${JSON.stringify(report, null, 2)}\n` : await readFile(join(outputDir, 'report.md'), 'utf8'))
     if (!shouldStop() && !report.complete) process.exitCode = 1
   })

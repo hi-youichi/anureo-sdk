@@ -3,9 +3,10 @@ import { lstat, mkdir, readFile, realpath, writeFile, rename } from 'node:fs/pro
 import { randomUUID } from 'node:crypto'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { isProjectMarker, type DesignConfig } from './project'
+import { HarnessSdkError } from '@anureo/sdk'
 
 export type Package = { path: string; name: string; files: string[] }
-export const reportRoots = ['.anureo/reviews', '.anureo/fixes', 'draft/docs/readability-review', 'draft/docs/readability-fix', 'draft/docs/design-review']
+export const reportRoots = ['.anureo/reviews', '.anureo/fixes', '.anureo/workflows', 'draft/docs/readability-review', 'draft/docs/readability-fix', 'draft/docs/design-review']
 export function isReviewOutput(path: string, exclusions: readonly string[] = []) {
   return [...reportRoots, ...exclusions].some(root => path === root || path.startsWith(`${root}/`))
 }
@@ -65,10 +66,12 @@ export function createGate(concurrency: number) {
 
 /** Unique temp paths avoid torn records; each logical artifact has one writer. */
 export async function saveJson(path: string, value: unknown) {
-  await mkdir(dirname(path), { recursive: true })
-  const temp = `${path}.${randomUUID()}.tmp`
-  await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`)
-  await rename(temp, path)
+  try {
+    await mkdir(dirname(path), { recursive: true })
+    const temp = `${path}.${randomUUID()}.tmp`
+    await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
+    await rename(temp, path)
+  } catch { throw new HarnessSdkError('WORKFLOW_STORAGE_FAILED') }
 }
 export function errorText(error: unknown): string {
   return error instanceof Error ? `${error.name}: ${error.message}` : String(error)
