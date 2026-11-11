@@ -8,6 +8,26 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- **BREAKING:** workflow `agent` supports Zod object schemas and infers
+  `z.output<S> | null`; text mode now returns `string | null`. Convert schemas to
+  native JSON Schema before submission, validate raw JSON and the original Zod
+  schema, and reject unsupported schema forms before creating a Session.
+  Confirmed terminal authentication, usage/rate limit and service errors become
+  `null`; startup/submission errors, unknown outcomes and other failures still
+  reject. Never replay input; cleanup failure also rejects after a null candidate.
+  Preserve optional interrupted reason metadata in SDK results for trusted
+  adapters. Bundled adapters do not infer user skip or classifier denial.
+- Claude adapter preserves typed terminal API error categories and HTTP status,
+  distinguishes native execution limits from API failures, and never uses
+  free-form error text for classification. Add a Zod workflow example for both
+  native backends: `bun run example:workflow-schema all`.
+- **BREAKING:** workflow `parallel` and `pipeline` now wait for every task/item
+  to settle and return `null` at failed positions instead of rejecting the batch;
+  inferred result types include `null`. Validate composition arguments before
+  starting work. Pipeline stages receive `(prevResult, originalItem, index)`,
+  await input values, and skip remaining stages on `null`. Allow zero stages;
+  empty inputs return before stage validation. These composition semantics follow
+  Claude Code 2.1.296 without introducing its VM or shared host controls.
 - Claude adapter supports per-submit `outputSchema` through the native Agent
   SDK output format. Return validated JSON as final text, retain saved structured
   output in history, and switch formats only when the session has no active or

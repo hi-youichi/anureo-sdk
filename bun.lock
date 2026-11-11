@@ -15,6 +15,7 @@
         "@types/bun": "1.4.0",
         "@types/node": "22.15.3",
         "typescript": "5.8.3",
+        "zod": "4.6.7",
       },
     },
     "packages/acp": {
@@ -90,9 +91,14 @@
       "name": "@anureo/workflow",
       "version": "0.2.0",
       "dependencies": {
+        "@anureo/protocol": "workspace:*",
         "@anureo/sdk": "workspace:*",
+        "ajv": "8.20.0",
+        "zod": "4.6.7",
       },
       "devDependencies": {
+        "@anureo/adapter-claude": "workspace:*",
+        "@anureo/adapter-codex": "workspace:*",
         "@anureo/conformance": "workspace:*",
       },
     },

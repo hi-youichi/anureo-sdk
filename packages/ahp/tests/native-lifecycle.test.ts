@@ -15,3 +15,12 @@ test('external revised-v1 peer negotiates on the real wire and preserves overlap
 test('old v1 peer without the lifecycle marker is rejected during initialization', async () => {
   await expect(createClient({ adapter: createAhpAdapter({ command: process.execPath, args: [executable, '--old-peer'], timeoutMs: 1000 }), identity: { adapterId: 'ahp', runtimeConfigId: 'native' } })).rejects.toThrow();
 });
+test('interrupted reason metadata survives the wire and privacy/result projection before the submit reply', async () => {
+  const client = await createClient({ adapter: createAhpAdapter({ command: process.execPath, args: [executable, '--skip'], timeoutMs: 1000 }), identity: { adapterId: 'ahp', runtimeConfigId: 'reason' } });
+  try {
+    const session = await client.sessions.create({ cwd: process.cwd() });
+    const turn = await session.submit({ input: 'skip' });
+    expect(await turn.result()).toMatchObject({ status: 'interrupted', error: { code: 'USER_SKIPPED', outcomeUnknown: false, details: { workflowDisposition: 'skipped' } } });
+    await session.close();
+  } finally { await client.dispose(); }
+});

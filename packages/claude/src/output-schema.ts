@@ -14,7 +14,7 @@ export function compileOutputSchema(schema: JsonSchema): OutputSchema {
   }
   try {
     const copy = structuredClone(schema)
-    const ajv = new Ajv({ allErrors: true, validateFormats: false, multipleOfPrecision: 6 })
+    const ajv = new Ajv({ allErrors: true, validateFormats: false, multipleOfPrecision: 6, logger: false })
     return { schema: copy, validate: ajv.compile(copy) }
   } catch {
     // Schema descriptions, enum values and reference URLs may contain private data.

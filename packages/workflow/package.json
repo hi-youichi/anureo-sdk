@@ -9,8 +9,11 @@
   "exports": { ".": "./src/index.ts" },
   "scripts": { "build": "tsc --noEmit", "typecheck": "tsc --noEmit --pretty false", "test": "bun test src" },
   "dependencies": {
-    "@anureo/sdk": "workspace:*"
+    "@anureo/sdk": "workspace:*",
+    "@anureo/protocol": "workspace:*",
+    "ajv": "8.20.0",
+    "zod": "4.6.7"
   },
-  "devDependencies": { "@anureo/conformance": "workspace:*" },
+  "devDependencies": { "@anureo/conformance": "workspace:*", "@anureo/adapter-claude": "workspace:*", "@anureo/adapter-codex": "workspace:*" },
   "engines": { "node": ">=22" }
 }

@@ -1,138 +1,136 @@
 # Anureo SDK
 
-Connect Codex, Claude, ACP agents, and external AHP harnesses through a unified host interface. Anureo SDK provides the Anureo Harness Protocol (AHP), a shared runtime, four backend adapters, and conformance tests, independently of Cowork's application orchestration layer.
+Build TypeScript applications that use Codex, Claude, ACP agents, and external
+AHP harnesses through a shared client interface.
 
-> The seven packages are published to npm under the `@anureo` scope. AHP is vendor-neutral: the SDK treats every backend — Codex, Claude, ACP agents, external AHP harnesses — identically, and the conformance suite is the arbiter.
+- **Connect backends:** choose an adapter and manage it through the same SDK.
+- **Manage conversations:** create Sessions, submit input, observe Turn results,
+  and handle approvals and execution controls supported by the backend.
+- **Compose workflows:** combine independent agent calls with `agent`, `parallel`,
+  and `pipeline` in ordinary TypeScript functions.
 
-The workspace also includes [`@anureo/workflow`](packages/workflow/README.md),
-pending publication with the revised lifecycle API. It exports only `agent`,
-`parallel`, and `pipeline` for direct imports from ordinary TypeScript workflows.
-Clients and function arguments are explicit; each agent call uses a fresh Session.
-Run `bun run example:workflow` for a Codex arithmetic example that prints
-all agent inputs and outputs. See the [migration plan](docs/workflow-primitives-plan.md).
-For a real-model example, run `bun run example:readability` to review the three
-primitive implementations with local Codex. See the [usage and report format](docs/readability-review-example.md).
+The Anureo Harness Protocol (AHP) defines the shared lifecycle and wire contract.
+Available operations depend on each adapter's declared capabilities; check those
+capabilities before using optional features such as fork, revert, or steering.
 
 ## Getting started
 
+> This README describes the unreleased workspace API, including `createClient`,
+> `Session`, `Turn`, and `@anureo/workflow`. The published 0.2.0 API differs;
+> see the [changelog](CHANGELOG.md) for release and migration details. Use the
+> source checkout below to run these examples.
+
+Requirements: Node.js 22+ with npm, Bun 1.4.2+, Git, and the Codex CLI on PATH.
+The example uses your Codex account and makes a real model request.
+
 ```sh
-npm install @anureo/sdk @anureo/adapter-codex
-```
-
-`@anureo/sdk` is the runtime; pick one or more adapters (`@anureo/adapter-codex`, `@anureo/adapter-claude`, `@anureo/adapter-acp`, `@anureo/adapter-ahp`) plus `@anureo/protocol` if you need the wire contract directly. Everything requires Node.js 22+.
-
-To work on this repository itself, you also need npm installed with Node.js and Bun 1.4.2+:
-
-```sh
+git clone https://github.com/hi-youichi/anureo-sdk.git
+cd anureo-sdk
 bun install --frozen-lockfile
+codex login
 bun run example
 ```
 
-The greeting example submits one prompt through the Codex adapter. It requires
-a configured, authenticated Codex CLI on PATH; `CODEX_BIN` can override its path.
-
-The [structured output example](examples/structured-output.ts) uses real installed
-Codex and Claude CLIs and their existing login profiles:
-
-```sh
-bun run example:schema          # both backends; makes real model requests
-bun run example:schema codex    # or: claude
-```
-
-Log in first with `codex login` and `claude auth login`. The Claude example checks
-authentication with the same child environment before submitting a model request.
-It checks two output schemas, conversation memory across format changes, and
-returning to plain text. Claude also checks saved structured-output history.
-Results are written to `artifacts/schema-live.json`. Optional environment settings:
-`CODEX_BIN`, `CLAUDE_BIN`, `CODEX_MODEL`, `CLAUDE_MODEL`, `SCHEMA_TIMEOUT_MS`
-(per submission/result wait, default 180000), and `SCHEMA_REPORT` (report path).
+The [greeting example](examples/greeting.ts) prints the model's greeting as it
+streams in. The wording varies between runs. Set `CODEX_BIN` if the Codex CLI is
+installed outside PATH.
 
 ## Usage example
 
-The following uses the revised workspace API, which differs from the published
-0.2.0 API. Create a client with an existing adapter, open a session, submit input,
-and await the result.
+Save the following as `examples/hello.ts` in the checkout and run
+`bun examples/hello.ts` after completing the setup above. It opens a conversation,
+waits for the final answer, checks the terminal status, and releases resources.
 
 ```typescript
 import { createClient } from '@anureo/sdk'
 import { createCodexAdapter } from '@anureo/adapter-codex'
 
 const client = await createClient({
-  adapter: createCodexAdapter({ command: 'codex' }),
+  adapter: createCodexAdapter({ command: process.env.CODEX_BIN ?? 'codex' }),
   identity: { adapterId: 'codex', runtimeConfigId: 'local' },
 })
 try {
-  const session = await client.sessions.create({ cwd: process.cwd() })
-  const turn = await session.submit({
-    input: 'Investigate and fix the failing login tests.',
+  const session = await client.sessions.create({
+    cwd: process.cwd(),
+    permissionMode: 'read-only',
+    instructions: 'Answer directly without reading files or running commands.',
   })
+  const turn = await session.submit({ input: 'Say hello in one sentence.' })
   const result = await turn.result()
-  console.log(result.status, result.text)
+  if (result.status === 'failed') throw new Error(result.error.message)
+  if (result.status !== 'completed') throw new Error(`Turn ${result.status}`)
+  console.log(result.text)
   await session.close()
 } finally {
   await client.dispose()
 }
 ```
 
-The [DSH example](examples/dsh.ts) drives `dsh --profile acp` through
-`createDshAcpAdapter()`: it streams one turn, answers DSH's per-call
-`allow_once` / `reject_once` permission requests, and reports stop notices. Run it
-with `bun run example:dsh`; it requires `dsh` 0.2.2+ (running on Node.js >= 24.9)
-and credentials under `$DSH_HOME` (defaults to `~/.dsh`).
+A Session holds a conversation; a Turn represents an execution associated with
+submitted input. Use `session.events()` for streaming progress. The
+[SDK guide](packages/core/README.md) covers events, approvals, interruption,
+capability checks, and resource ownership.
+
+## Workflow
+
+`@anureo/workflow` provides three primitives for ordinary TypeScript functions:
+
+| Primitive | Purpose |
+| --- | --- |
+| `agent(prompt, { client, cwd })` | Run a fresh Session and return text or typed Zod data, with designated failures as `null`. |
+| `parallel(tasks)` | Start callbacks concurrently, wait for all to settle, and return results in input order. |
+| `pipeline(items, ...stages)` | Advance each item independently through its sequential stages and return results in input order. |
+
+Direct `agent()` calls return `null` for designated confirmed terminal failures;
+other failures throw. Pass a Zod object as `schema` to infer structured results.
+Inside `parallel()` and `pipeline()`, callback failures become `null` at their
+original positions. A pipeline also skips an item's remaining stages on `null`.
+
+Start with the [workflow package guide](packages/workflow/README.md). The
+[authoring guide](docs/workflow/SKILL.md) covers composition patterns and recovery;
+the [primitives reference](docs/workflow/README.md) documents parameters, results,
+and supported behavior, including differences from the Claude Code reference.
 
 ## Packages
 
-| Package | Description |
-|---|---|
-| `@anureo/protocol` | AHP v1 JSON Schema, TypeScript types, and validation |
-| `@anureo/sdk` | `createClient`, `Session`, `Turn`, and shared runtime components |
-| `@anureo/adapter-codex` | Codex app-server adapter |
-| `@anureo/adapter-claude` | Adapter for the official Claude Agent SDK |
-| `@anureo/adapter-acp` | Standard ACP agent adapter |
-| `@anureo/adapter-ahp` | Adapter for external AHP harnesses over stdio or WebSocket |
-| `@anureo/conformance` | Shared conformance tests and scripted fixtures |
-| `@anureo/workflow` | Agent, parallel, and pipeline primitives for TypeScript workflows (workspace; pending publication) |
+Choose `@anureo/sdk` and an adapter for your backend. Add `@anureo/workflow` for
+composition, or `@anureo/protocol` for direct access to the wire contract.
 
-## Why AHP?
+| Package and guide | Purpose |
+| --- | --- |
+| [@anureo/sdk](packages/core/README.md) | Client, Session, Turn, and shared runtime components |
+| [@anureo/adapter-codex](packages/codex/README.md) | Codex app-server adapter |
+| [@anureo/adapter-claude](packages/claude/README.md) | Claude Agent SDK adapter |
+| [@anureo/adapter-acp](packages/acp/README.md) | Standard ACP agents, including DSH |
+| [@anureo/adapter-ahp](packages/ahp/README.md) | External AHP harnesses over stdio or WebSocket |
+| [@anureo/workflow](packages/workflow/README.md) | Agent calls, parallel tasks, and per-item pipelines |
+| [@anureo/protocol](packages/protocol/README.md) | AHP v1 JSON Schema, TypeScript types, and validation |
+| [@anureo/conformance](packages/conformance/README.md) | Shared conformance tests and scripted fixtures |
 
-AHP sits at the harness layer: one host, many agent backends, uniform
-approvals, history, fork/revert, and steering. It interoperates with —
-instead of competing against — the neighboring protocols:
+## Examples
 
-| Protocol | Layer | Relationship to AHP |
-|---|---|---|
-| [MCP](https://modelcontextprotocol.io) | Tools & resources | MCP tool calls ride inside AHP `toolCall` items; the host may proxy MCP servers while turns stay AHP-shaped |
-| [ACP](https://agentclientprotocol.com) | Editor ↔ agent | `@anureo/adapter-acp` brings any ACP agent behind AHP — an interop proof, not a fork |
-| AG-UI and UI event streams | UI rendering | AHP adds approvals, goals, fork/revert, steering, and replayable history with source sequence numbers |
+Run these commands from the source checkout after installing dependencies.
+Every example uses a real backend and requires its credentials.
 
-## Development and validation
+| Example | Command | Prerequisites and output |
+| --- | --- | --- |
+| [Greeting](examples/greeting.ts) | `bun run example` | Authenticated Codex CLI; streams a greeting. |
+| [Workflow](examples/workflow.ts) | `bun run example:workflow` | Authenticated Codex CLI; prints arithmetic agent inputs, outputs, and a checked summary. |
+| [Zod workflow](examples/workflow-structured.ts) | `bun run example:workflow-schema all` | Authenticated Codex and Claude CLIs; returns typed `{ sum: 42 }` from the same Zod schema. Select `codex` or `claude` to run one backend. |
+| [Structured output](examples/structured-output.ts) | `bun run example:schema codex` | Authenticated Codex CLI; prints a parsed JSON result for `17 + 25`. Use `claude` for Claude, or omit the argument to run both backends. |
+| [DSH over ACP](examples/dsh.ts) | `bun run example:dsh` | DSH 0.2.2+ on PATH, Node.js 24.9+ for DSH, and configured DSH credentials; streams a reply and handles per-call approvals. |
 
-```sh
-bun run generate:check
-bun run protocol:check
-bun run typecheck
-bun run typecheck:tooling
-bun test --timeout 15000 packages
-```
-
-CI validates Windows, macOS, and Linux on every push; all three platforms are green on the released revision.
+For Claude, log in with `claude auth login` before running its example. Backend
+paths, model overrides, and other settings are documented in the linked example
+sources and adapter guides.
 
 ## Documentation
 
-- [AHP v1 specification](spec/ahp-v1.md) — the revised v1 lifecycle and wire contract (English); a [Chinese reference translation](spec/ahp-v1.zh.md) is available.
-- [Governance](GOVERNANCE.md) — versioning, the extension registry, and conformance policy.
-- [Contributing](CONTRIBUTING.md) — setup, validation commands, and the adapter checklist.
-- [Security](SECURITY.md) — the reporting channel and the redaction/secret-handling invariants.
-- [Changelog](CHANGELOG.md) — release history with BREAKING markers for the 0.x line.
-
-The following prose documents are currently in Chinese:
-
-- [Architecture](docs/architecture.md): layers, interfaces, event flow, and approval sequences.
-- [Workflow primitive migration plan](docs/workflow-primitives-plan.md): direct TypeScript imports, the three-function API, and migration from the retired runtime/MCP design.
-- [Claude Code CLI reverse engineering](docs/research/claude-code/README.md): the pinned executable, stream controls, Workflow runtime, evidence, and reproduction scripts.
-- [Readability problem summary](docs/readability-summary.md): the main reading obstacles, representative code, and design-pattern choices.
-- [Readability improvement plan](docs/readability-plan.md): file-by-file and function-by-function proposals, design-pattern choices, and implementation checks.
-- [Development and migration notes](docs/development.md): implementation scope, naming changes, and validation records.
-- [Extraction plan](extraction-plan.md): the original migration sequence, public release goals, and pending decisions.
-
-The [upstream provenance manifest](docs/upstream-provenance.json) records the source revision, source file SHA-256 hashes, and destination paths.
+- [SDK guide](packages/core/README.md): lifecycle, events, and execution controls.
+- [Workflow authoring guide](docs/workflow/SKILL.md): composition and recovery patterns.
+- [Workflow primitives reference](docs/workflow/README.md): parameter and result contracts.
+- [AHP v1 JSON Schema](packages/protocol/schema/v1/ahp.schema.json): the wire contract.
+- [Contributing](CONTRIBUTING.md): development setup, validation commands, and adapter requirements. CI runs validation on Windows, macOS, and Linux for pushes and pull requests.
+- [Governance](GOVERNANCE.md): versioning, extensions, and conformance policy.
+- [Security](SECURITY.md): vulnerability reporting and secret handling.
+- [Changelog](CHANGELOG.md): release history and breaking changes.

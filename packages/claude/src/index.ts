@@ -20,6 +20,7 @@ import {
 } from "@anureo/protocol";
 import { FileSessionStore } from "./store";
 import { compileOutputSchema, type OutputSchema } from './output-schema';
+import { claudeTurnError } from './turn-error';
 
 export type ClaudeQuery = AsyncIterable<SDKMessage> & Pick<Query, "interrupt" | "setModel" | "setPermissionMode" | "setMaxThinkingTokens" | "applyFlagSettings" | "rewindFiles" | "supportedModels" | "close">;
 export type ClaudeQueryFactory = (params: Parameters<typeof query>[0]) => ClaudeQuery;
@@ -140,7 +141,7 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
   }
 }
 
-interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageId?: string; blockIndex: number }
+interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageId?: string; blockIndex: number; apiError?: Extract<SDKMessage, { type: 'assistant' }>['error'] }
 export class ClaudeBackendSession implements BackendSession {
   private release?: Promise<void>;
   private readonly nativeInputs = new Map<string, { submissionId: string; turnId?: string }>();
@@ -337,6 +338,7 @@ export class ClaudeBackendSession implements BackendSession {
     }
     if (!active) { await this.notice(value); return; }
     if (message.type === "assistant") {
+      if (!message.parent_tool_use_id) active.apiError = message.error;
       for (const block of message.message.content) await this.completeBlock(record(block), message.message.id, message.parent_tool_use_id !== null);
       return;
     }
@@ -353,9 +355,7 @@ export class ClaudeBackendSession implements BackendSession {
     }
     if (message.type === "result") {
       const interrupted = str(message.stop_reason) === "interrupted" || str(value.terminal_reason) === "interrupted";
-      let error = message.subtype !== 'success' || message.is_error
-        ? { code: message.subtype === 'error_max_structured_output_retries' ? 'CLAUDE_STRUCTURED_OUTPUT_RETRIES_EXCEEDED' : 'CLAUDE_TURN_FAILED', message: 'Claude turn failed', retryable: false, outcomeUnknown: false }
-        : undefined;
+      let error = claudeTurnError(message, active.apiError);
       let structuredText: string | undefined;
       if (this.outputSchema && !error && !interrupted) {
         if (value.structured_output === undefined) {

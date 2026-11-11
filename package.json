@@ -21,7 +21,8 @@
     "example": "bun examples/greeting.ts",
     "example:dsh": "bun examples/dsh.ts",
     "example:workflow": "bun examples/workflow.ts",
-    "example:readability": "bun examples/readability-review.ts",
+    "example:workflow-schema": "bun examples/workflow-structured.ts",
+    "review:readability": "bun examples/readability-review.ts",
     "example:schema": "bun examples/structured-output.ts"
   },
   "devDependencies": {
@@ -34,6 +35,7 @@
     "typescript": "5.8.3",
     "@anureo/protocol": "workspace:*",
     "@anureo/adapter-acp": "workspace:*",
-    "@anureo/workflow": "workspace:*"
+    "@anureo/workflow": "workspace:*",
+    "zod": "4.6.7"
   }
 }

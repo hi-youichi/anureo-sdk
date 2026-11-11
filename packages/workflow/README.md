@@ -4,6 +4,17 @@ Three directly imported primitives for ordinary TypeScript workflows:
 `agent`, `parallel`, and `pipeline`. The host creates SDK Clients, imports its
 workflow functions, awaits their results, and handles errors with normal TS.
 
+See the [workflow authoring reference](../../docs/workflow/SKILL.md) for current
+APIs, composition patterns, failure handling, and application-owned recovery.
+
+The [Workflow primitives reference](../../docs/workflow/README.md) defines
+parameters and result semantics for `agent`, `parallel`, and `pipeline`,
+and records current support.
+
+See the [composition comparison](../../draft/docs/workflow-composition-differences.md)
+and [alignment plan](../../draft/docs/workflow-composition-plan.md) for Claude Code
+semantics, the implemented changes, and retained host differences (Chinese).
+
 This workspace package uses the revised native lifecycle API and is pending
 publication with that revision. Requires Node.js 22+; TypeScript loading and
 compilation are provided by your project (for example, Bun, tsx, or tsc).
@@ -22,12 +33,14 @@ export async function reviewFiles(client: Client, files: readonly string[], cwd:
   const verified = await pipeline(
     files,
     file => agent(`Review ${file}; include code locations and evidence.`, options),
-    findings => agent(`Independently verify these findings:\n${findings}`, options),
+    (findings, file) => agent(`Independently verify ${file}:\n${findings}`, options),
   )
+  if (verified.some(value => value === null)) throw new Error('Some file reviews failed')
   const [summary, tests] = await parallel([
     () => agent(`Summarize: ${JSON.stringify(verified)}`, options),
     () => agent(`Suggest regression tests: ${JSON.stringify(verified)}`, options),
   ])
+  if (summary === null || tests === null) throw new Error('Review synthesis failed')
   return { verified, summary, tests }
 }
 ```
@@ -38,30 +51,52 @@ workflow registration, source-string execution, ambient context, or runtime setu
 ## agent
 
 ```ts
-import { agent, type AgentOptions } from '@anureo/workflow'
+import { z } from 'zod'
+import { agent } from '@anureo/workflow'
 
-const options: AgentOptions = { client, cwd: process.cwd() }
-const text: string = await agent('Inspect the authentication module.', options)
+const options = { client, cwd: process.cwd() }
+const text: string | null = await agent('Inspect the authentication module.', options)
+const findings = await agent('List authentication issues.', {
+  ...options,
+  schema: z.strictObject({ issues: z.array(z.string()) }),
+})
+// findings: { issues: string[] } | null
+if (findings !== null) console.log(findings.issues)
 ```
 
-`AgentOptions` requires `client` and `cwd`; `model` and `instructions` are optional
-session settings. Every call creates a fresh Session, submits once, waits for
-the associated Turn's actual terminal result, and returns its final text.
-Pass a different Client to select a different backend. The Client is borrowed;
-the caller owns its lifetime and must eventually call `client.dispose()`.
+Each call owns a fresh Session, submits once, waits for its native terminal
+result, and releases its resources. `client` and `cwd` are required; `model` and
+`instructions` are optional. The caller owns the borrowed Client.
 
-Failed executions throw a `HarnessSdkError` preserving the native error fields;
-interrupted executions throw `AGENT_INTERRUPTED`. Unknown outcomes keep
-`outcomeUnknown: true` and are never retried. Closing or disposing the owned
-session observation is not a claim that an uncertain backend execution stopped.
-Cleanup is attempted on success and failure. A cleanup-only failure throws
-`RESOURCE_RELEASE_FAILED`; when execution also failed, the primary code and
-uncertainty remain intact and cleanup errors are attached in `details.cleanupErrors`.
+`schema` accepts a Zod 4 object schema. The library converts it to draft-07 JSON
+Schema, requires backend `turn.outputSchema` support, validates the raw JSON
+result, then validates it with the original Zod schema and returns `z.output<S>`.
+This package depends on Zod 4.6.7. Applications that import Zod to author schemas
+should also declare it as their own dependency. Schema-associated types infer business fields;
+there is no unbound result-type generic or raw JSON Schema overload.
 
-The primitive does not parse JSON, enforce an output schema, or introduce its own
-execution deadline. For raw items, usage, event observation, or exact execution
-controls, use the SDK Session/Turn APIs directly. Project functions can explicitly
-parse agent text and pass typed values to later stages.
+Use closed objects and required fields; nullable fields, array properties, enums,
+nested unions and local recursion are supported. Optional properties, open
+objects, records, tuples, value transformations and non-JSON types are rejected.
+Defaults do not fill omitted model answers. Async refinements are supported
+locally; their failures reject without replaying input. See the
+[full schema and failure contract](../../docs/workflow/README.md#schema-mode).
+
+Confirmed native failed terminals for authentication, usage/rate limits, and
+service unavailability return `null`. Other failures and ordinary interruptions
+reject. Trusted adapters may explicitly report user skip or classifier startup
+denial; bundled adapters do not infer these reasons. Unknown execution outcomes
+retain `outcomeUnknown: true` and always reject. No input is automatically retried.
+
+Cleanup is attempted for successful, failed and discarded executions. A cleanup
+failure rejects with `RESOURCE_RELEASE_FAILED`, or preserves a primary execution
+exception with attached `details.cleanupErrors`. Releasing observation does not
+prove the backend stopped. Use SDK Session/Turn APIs for raw items, usage, event
+observation, multi-turn context, and exact execution controls.
+
+Run `bun run example:workflow-schema [all|codex|claude]` for the
+[Zod example](../../examples/workflow-structured.ts) using authenticated local
+CLIs and real model requests.
 
 ## parallel
 
@@ -69,24 +104,34 @@ parse agent text and pass typed values to later stages.
 input-ordered results. Callbacks may return ordinary values or Promises; inline
 heterogeneous tuples preserve each result's type. An empty batch returns `[]`.
 
-Synchronous throws become rejected tasks without skipping the other callbacks.
-The returned Promise rejects on failure; already-started siblings continue.
+The array and every entry are validated before any callback starts. The call
+waits for all callbacks to settle and uses `null` at each failed position,
+including synchronous throws. Result types include `null` at every position.
+Invalid arguments still reject the call. Use `value !== null` to filter failures
+without dropping valid `0`, `false`, or empty-string results.
 There is no implicit interruption, shared scheduler, or concurrency limit.
 
 ## pipeline
 
 `pipeline(items, stage1, stage2, ...)` runs each item through its own sequence of
 stages. A fast item can enter stage two while another item is still in stage one.
-Results retain input order. Empty input returns `[]`; at least one stage is required.
+Results retain input order. Empty input returns `[]` before stage validation.
+Zero stages are allowed and return the awaited inputs, with failures as `null`.
 
-The first stage receives the original item. Each later stage receives the awaited
-result of the previous stage. Stages may change types and pass ordinary TS values,
-including objects and Maps, without a JSON serialization boundary.
+Every stage receives `(prevResult, originalItem, index)`. The first stage gets
+the awaited input value; later stages get the awaited prior result. The original
+input entry and zero-based index remain available throughout. Stages may change
+types and pass ordinary TS values, including objects and Maps, without a JSON
+serialization boundary.
 
 Inline callbacks have contextual type inference for up to six stages. Longer
 chains accept typed stage functions with no runtime stage-count limit. Incompatible
-stage inputs are compile-time errors. If one item fails, its subsequent stages
-are skipped and the returned Promise rejects; other started items continue.
+stage inputs are compile-time errors. A `null` input or stage result skips that
+item's remaining stages. An item failure also skips its remaining stages and
+becomes `null`. The returned Promise waits for all item chains to settle; its
+result type always includes `null`. Stage input types exclude only `null`, so
+`undefined` and other falsy values continue normally. Invalid composition
+arguments still reject the call.
 
 ## Examples
 
@@ -100,13 +145,7 @@ For `[2, 3, 4]`, the pipeline asks the model to double then square each value, e
 `[16, 36, 64]`. Two parallel agent calls then calculate the sum `116` and maximum `64`.
 The eight agent calls each use an independent Session.
 
-For an example using a real model on actual code, run `bun run example:readability`.
-The [readability review workflow](../../examples/readability-review.ts) imports the
-same three primitives, performs two review perspectives and independent verification,
-and writes a Chinese Markdown report. It requires a logged-in local Codex CLI.
-See the [usage guide](../../docs/readability-review-example.md) for paths and trace output.
-
-The [migration plan](../../docs/workflow-primitives-plan.md) records the removed
-framework and the [development record](../../docs/development.md#workflow-原语收敛)
+The [migration plan](../../draft/docs/workflow-primitives-plan.md) records the removed
+framework and the [development record](../../draft/docs/development.md#workflow-agent-zod)
 contains current verification evidence. The package has only its root entry;
 there is no `/mcp` subentry.

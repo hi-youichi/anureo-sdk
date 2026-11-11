@@ -8,6 +8,16 @@ function event(payload: AhpEventPayload): AhpEvent {
 const bytes = (item: Item) => Buffer.byteLength(JSON.stringify(item));
 const terminal = { turnId: 'turn', status: 'interrupted' as const };
 
+test('interrupted results preserve immutable native reason metadata without becoming failed', () => {
+  const accumulator = new ResultAccumulator(1024, 10);
+  const error = { code: 'USER_SKIPPED', message: 'skipped', retryable: false, outcomeUnknown: false, details: { workflowDisposition: 'skipped' } };
+  const result = accumulator.finish({ ...terminal, error });
+  expect(result).toMatchObject({ status: 'interrupted', error });
+  error.details.workflowDisposition = 'changed';
+  expect(result.status === 'interrupted' && result.error?.details?.workflowDisposition).toBe('skipped');
+  expect(accumulator.finish(terminal)).not.toHaveProperty('error');
+});
+
 test('streamed text keeps exact serialized byte budgets across escapes and split surrogate pairs', () => {
   const accumulator = new ResultAccumulator(1024 * 1024, 10);
   const item: Item = { id: 'answer', type: 'agentMessage', phase: 'final', text: '' };

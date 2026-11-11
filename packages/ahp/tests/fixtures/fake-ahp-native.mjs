@@ -14,6 +14,7 @@ for await (const line of input) {
     const joined = active; if (!active) { active = true; event('turn/started', { turnId: 'actual-ahp' }); }
     event('submission/bound', { submissionId: p.submissionId, turnId: 'actual-ahp' });
     result = { accepted: true, submissionId: p.submissionId, disposition: joined ? 'joined' : 'started', turnId: 'actual-ahp' };
+    if (process.argv.includes('--skip')) event('turn/completed', { turnId: 'actual-ahp', status: 'interrupted', error: { code: 'USER_SKIPPED', message: 'skipped', retryable: false, outcomeUnknown: false, details: { workflowDisposition: 'skipped' } } });
     if (joined) { event('item/completed', { item: { id: 'result', type: 'agentMessage', phase: 'final', text: 'peer result' } }); event('turn/completed', { turnId: 'actual-ahp', status: 'completed' }); }
   }
   if (frame.method === 'session/close') result = { closed: true, observationClosed: true, executionStopped: 'unconfirmed' };

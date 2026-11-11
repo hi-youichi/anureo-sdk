@@ -74,6 +74,7 @@ export class ResultAccumulator {
     const usage = payload.usage?.scope === 'turn' ? payload.usage : this.usage;
     const common = { text, items, ...(usage ? { usage } : {}) };
     if (payload.status === 'failed') return immutable({ ...common, status: 'failed', error: payload.error ?? { code: 'TURN_FAILED', message: 'Turn failed', retryable: false, outcomeUnknown: false } });
+    if (payload.status === 'interrupted') return immutable({ ...common, status: 'interrupted', ...(payload.error ? { error: payload.error } : {}) });
     return immutable({ ...common, status: payload.status });
   }
   clear(): void { this.items.clear(); this.completed.clear(); this.usage = undefined; this.bytes = 0; }

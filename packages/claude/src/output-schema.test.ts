@@ -101,6 +101,30 @@ test('outputSchema uses native options, returns only validated JSON, and switche
   expect(f.queries.map(query => [query.closes, query.returns])).toEqual([[1, 1], [1, 1], [1, 1], [1, 1]])
 })
 
+test('terminal API failures use only the latest main-assistant category and native result fields', async () => {
+  const f = await fixture()
+  try {
+    for (const [latest, code] of [['rate_limit', 'RATE_LIMITED'], [undefined, 'CLAUDE_TURN_FAILED']] as const) {
+      const pending = f.session.submit({ input: 'api failure' })
+      const user = await f.input(0)
+      const send = (id: string, error?: string, parent: string | null = null) => f.send(0, {
+        type: 'assistant', user_message_uuids: [user.uuid], parent_tool_use_id: parent, error,
+        message: { id, content: [{ type: 'text', text: 'private API prose' }] },
+      })
+      await send('earlier', 'authentication_failed')
+      await send('latest', latest)
+      await send('child', 'billing_error', 'nested-tool')
+      await f.result(0, [user.uuid!], { is_error: true })
+      const turn = await pending
+      expect(await turn.result()).toMatchObject({ status: 'failed', error: { code, outcomeUnknown: false } })
+    }
+    const nativeStatus = await f.execute(undefined, 0, { is_error: true, api_error_status: 401 })
+    expect(nativeStatus.result).toMatchObject({ status: 'failed', error: { code: 'AUTH_REQUIRED' } })
+    const limit = await f.execute(undefined, 0, { subtype: 'error_max_turns', is_error: true })
+    expect(limit.result).toMatchObject({ status: 'failed', error: { code: 'CLAUDE_MAX_TURNS_EXCEEDED' } })
+  } finally { await f.dispose() }
+})
+
 test('pending and active inputs forbid changing or clearing schema, while equal-schema inputs may share an execution', async () => {
   const f = await fixture()
   try {

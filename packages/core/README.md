@@ -52,6 +52,9 @@ console.log(result.status, result.text)
 existing execution. The execution identity is only known from native evidence.
 It may already be complete when association arrives. `result()` then reads its
 retained result; status can be completed, interrupted or failed.
+An interrupted result may include optional native `error` reason metadata; core
+retains it without changing the status or inferring a user skip. The result snapshot
+is immutable, including error details, even if termination preceded the submit reply.
 
 There is no public `Submission`, `accepted()` or `submission.turn()`. Core keeps
 submission identities internally. An optional native acceptance receipt is useful

@@ -15,17 +15,22 @@ async function calculate(client: Client, inputs: readonly number[]) {
     console.log(JSON.stringify({ input, output }))
     return output
   }
-  const squares = await pipeline(
+  const results = await pipeline(
     inputs,
     value => ask(`double ${value}`),
     text => Number(text),
     value => ask(`square ${value}`),
     text => Number(text),
   )
+  const squares = results.map((value, index) => {
+    if (value === null) throw new Error(`Calculation failed for input ${inputs[index]}`)
+    return value
+  })
   const [sum, max] = await parallel([
     () => ask(`sum ${squares.join(',')}`),
     () => ask(`max ${squares.join(',')}`),
   ])
+  if (sum === null || max === null) throw new Error('Summary calculation failed')
   return { squares, sum: Number(sum), max: Number(max) }
 }
 

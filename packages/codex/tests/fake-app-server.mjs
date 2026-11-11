@@ -47,6 +47,12 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
         break
       }
       if (mode === 'auth-expired') { notify('turn/completed', { turn: { id: turnId, status: 'failed', error: { codexErrorInfo: 'unauthorized', message: 'PRIVATE_PROVIDER_DIAGNOSTIC https://auth.test/?token=private' } } }); break }
+      if (mode === 'workflow-schema') {
+        const schema = msg.params.outputSchema
+        notify('item/completed', { turnId, item: { id: 'message', type: 'agentMessage', text: JSON.stringify({ answer: schema?.properties?.answer?.const ?? 42 }), phase: 'final_answer' } })
+        notify('turn/completed', { turn: { id: turnId, status: 'completed', items: [] } })
+        break
+      }
       if (mode === 'disconnect') { setTimeout(() => process.exit(0), 10); break }
       if (mode === 'backpressure') { setTimeout(() => process.stdout.write(JSON.stringify({ method: 'future/big', params: { text: 'x'.repeat(100000) } }) + '\n'), 10); break }
       if (mode === 'timing') {
