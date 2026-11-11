@@ -8,6 +8,7 @@
         "@anureo/adapter-acp": "workspace:*",
         "@anureo/adapter-claude": "workspace:*",
         "@anureo/adapter-codex": "workspace:*",
+        "@anureo/code-review": "workspace:*",
         "@anureo/conformance": "workspace:*",
         "@anureo/protocol": "workspace:*",
         "@anureo/sdk": "workspace:*",
@@ -49,6 +50,23 @@
         "@anureo/protocol": "workspace:*",
         "@anureo/sdk": "workspace:*",
         "ajv": "8.20.0",
+      },
+      "devDependencies": {
+        "@anureo/conformance": "workspace:*",
+      },
+    },
+    "packages/code-review": {
+      "name": "@anureo/code-review",
+      "version": "0.2.0",
+      "bin": {
+        "anureo-review": "./bin/anureo-review.ts",
+      },
+      "dependencies": {
+        "@anureo/adapter-codex": "workspace:*",
+        "@anureo/sdk": "workspace:*",
+        "@anureo/workflow": "workspace:*",
+        "typescript": "5.8.3",
+        "zod": "4.6.7",
       },
       "devDependencies": {
         "@anureo/conformance": "workspace:*",
@@ -133,6 +151,8 @@
     "@anureo/adapter-claude": ["@anureo/adapter-claude@workspace:packages/claude"],
 
     "@anureo/adapter-codex": ["@anureo/adapter-codex@workspace:packages/codex"],
+
+    "@anureo/code-review": ["@anureo/code-review@workspace:packages/code-review"],
 
     "@anureo/conformance": ["@anureo/conformance@workspace:packages/conformance"],
 

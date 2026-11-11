@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createClient, HarnessSdkError, type Client } from '@anureo/sdk'
 import { createScriptedAdapter } from '@anureo/conformance'
-import { fixReadability, parseReport, type Finding } from './readability-fix'
+import { fixReadability, parseReport, type Finding } from '../src/fix'
 
 const clients: Client[] = []
 const directories: string[] = []
@@ -53,22 +53,16 @@ async function backend(execute: (input: FixInput) => Promise<Reply>) {
   return { client, adapter, calls }
 }
 
-test('extracts each file finding once, retains synthesis context and reports coverage gaps', () => {
-  const source = [
-    '# 项目代码可读性审阅', '## Project agent 汇总', '- **medium: 合并建议**', '来源：`a.ts#1`',
-    '## Package: example (.)', '先保持契约。', '### a.ts', `SHA-256: \`${'a'.repeat(64)}\``,
-    '状态：reviewed。', '- **a.ts#1 (medium)**：one，L1–L2', '  改进方案：改名。',
-    '  > oldName', '- **a.ts#2 (low)**：two，L3–L3', '  改进方案：排版。',
-    '### missing.ts', 'SHA-256: `unavailable`', '审阅失败：无法读取',
-    '### unfinished.ts', '状态：incomplete。未读完。',
-  ].join('\n')
-  const parsed = parseReport(source)
-  expect(parsed.findings.map(item => item.id)).toEqual(['a.ts#1', 'a.ts#2'])
-  expect(parsed.findings[0]!.detail).toContain('> oldName')
-  expect(parsed.findings[0]!.detail).not.toContain('a.ts#2')
-  expect(parsed.findings[0]!.context).toContain('先保持契约。')
-  expect(parsed.coverageGaps).toEqual(['missing.ts', 'unfinished.ts'])
-  expect(() => parseReport(source.replace('a.ts#2 (low)', 'a.ts#1 (low)'))).toThrow('duplicate finding')
+test('repair parsing requires unified JSON and preserves incomplete task coverage', () => {
+  const report = { reportKind: 'design-review', formatVersion: 2, cwd: '/project', changedPaths: [], findings: [],
+    tasks: [{ task: { id: 'file:a.ts', level: 'module', primaryFiles: ['a.ts'], dimensions: ['D12'] },
+      status: 'failed', error: 'Unavailable source', analysis: null }],
+  }
+  const parsed = parseReport(JSON.stringify(report))
+  expect(parsed.coverageGaps).toEqual(['file:a.ts'])
+  expect(parsed.findings).toEqual([])
+  expect(() => parseReport('# legacy readability report')).toThrow('report.json')
+  expect(() => parseReport(JSON.stringify({ ...report, tasks: [...report.tasks, ...report.tasks] }))).toThrow('duplicate')
 })
 
 test('uses one session per finding, serializes file edits and bounds cross-file concurrency', async () => {
@@ -101,9 +95,9 @@ test('uses one session per finding, serializes file edits and bounds cross-file 
 })
 
 test('serializes schema and generator ownership while keeping one agent per suggestion', async () => {
-  const schema = 'packages/protocol/schema/v1/ahp.schema.json'
-  const generator = 'packages/protocol/scripts/generate.ts'
-  const generated = 'packages/protocol/src/generated/types.ts'
+  const schema = 'schema/contract.json'
+  const generator = 'tools/generate.ts'
+  const generated = 'generated/types.ts'
   const cwd = await fixture([schema, generator, generated])
   const harness = await backend(async input => {
     if (input.finding.path === generated) expect(await readFile(join(cwd, generated), 'utf8')).toBe('regenerated\n')
@@ -111,9 +105,9 @@ test('serializes schema and generator ownership while keeping one agent per sugg
     return { status: input.finding.path === generated ? 'already_satisfied' : 'changed', summary: '维护入口已核实。', checks: [] }
   })
   const result = await fixReadability({ ...harness, cwd, findings: [finding(schema), finding(generated)],
-    outputDir: join(cwd, 'out'), concurrency: 2,
+    outputDir: join(cwd, 'out'), concurrency: 2, writeGroups: [[schema, generator, generated]],
   })
-  expect(harness.calls.map(call => call.ownedFiles)).toEqual([[schema, generated], [generator, generated]])
+  expect(harness.calls.map(call => call.ownedFiles)).toEqual([[schema, generator, generated], [schema, generator, generated]])
   expect(result.results.map(item => item.status)).toEqual(['changed', 'already_satisfied'])
 })
 
