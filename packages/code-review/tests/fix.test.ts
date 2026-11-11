@@ -139,9 +139,11 @@ test('an unknown native outcome prevents queued sessions and is never retried', 
   expect(result.results.map(item => item.status)).toEqual(['failed', 'not_started', 'not_started'])
   expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('partial write before losing observation\n')
   expect(result.results[0]!.changesKnown).toBe(false)
+  expect(result.results[0]!.unknownFiles.map(file => file.path)).toEqual(['a.ts'])
   expect(result.results.slice(1).every(item => item.changesKnown)).toBe(true)
   const saved = JSON.parse(await readFile(join(cwd, 'out/results.json'), 'utf8'))
   expect(saved.results[0].changesKnown).toBe(false)
+  expect(saved.results[0].unknownFiles.map((file: { path: string }) => file.path)).toEqual(['a.ts'])
 })
 
 test('validates paths and concurrency before starting any agent', async () => {
@@ -176,11 +178,13 @@ test('fix CLI reports unknown changes after an editing observation fails', async
   const [code, stdout] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
   expect(code).toBe(1)
   expect(stdout).toContain('修改文件：未知')
+  expect(stdout).toContain('未观察：a.ts')
   expect(stdout).not.toContain('修改文件：无')
   expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('partial write before losing observation\n')
   const saved = JSON.parse(await readFile(join(outputDir, 'report.json'), 'utf8'))
   expect(saved.complete).toBe(false)
   expect(saved.results[0].changesKnown).toBe(false)
+  expect(saved.results[0].unknownFiles.map((file: { path: string }) => file.path)).toEqual(['a.ts'])
 })
 
 test('rejects pre-existing report drift before starting any repair session', async () => {
@@ -269,4 +273,27 @@ test('fix CLI waits for Client cleanup and records its failure before publishing
     expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('original\n')
     await expect(access(join(outputDir, 'writer.lock'))).rejects.toMatchObject({ code: 'ENOENT' })
   }
+})
+
+
+test('failed group observation retains confirmed changes and the path-specific unreadable reason', async () => {
+  const cwd = await fixture()
+  const harness = await backend(async () => {
+    await writeFile(join(cwd, 'a.ts'), 'observed change\n')
+    await rm(join(cwd, 'b.ts'))
+    return { status: 'changed', summary: 'controlled edits', checks: [] }
+  })
+  const report = await fixReadability({ ...harness, cwd, findings: [finding('a.ts')],
+    writeGroups: [['a.ts', 'b.ts']], outputDir: join(cwd, 'out'), concurrency: 1,
+  })
+  const result = report.results[0]!
+  expect(result.status).toBe('failed')
+  expect(result.changedFiles).toEqual(['a.ts'])
+  expect(result.changesKnown).toBe(false)
+  expect(result.unknownFiles.map(file => file.path)).toEqual(['b.ts'])
+  expect(result.unknownFiles[0]!.error).toContain('ENOENT')
+  expect(harness.calls).toHaveLength(1)
+  const saved = JSON.parse(await readFile(join(cwd, 'out/results.json'), 'utf8'))
+  expect(saved.results[0].unknownFiles).toEqual(result.unknownFiles)
+  expect(saved.results[0].changedFiles).toEqual(['a.ts'])
 })

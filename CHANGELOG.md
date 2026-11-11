@@ -8,6 +8,8 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- Retain per-file unreadable paths and observation errors in repair JSON and Markdown.
+
 - Publish readability repair reports after Client cleanup; retain successful findings
   alongside lifecycle failures and preserve report publication errors.
 

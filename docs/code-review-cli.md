@@ -339,7 +339,10 @@ starting the agent; tasks stopped during preparation persist as `not_started`.
 The host compares
 owned-file hashes with reported `changed` / `already_satisfied` / `deferred`
 outcomes. `changedFiles` lists observed changes within the owned paths;
-`changesKnown=false` means the final change set could not be confirmed. Markdown
+`changesKnown=false` means the final change set could not be confirmed.
+`unknownFiles` identifies each unread or skipped owned path and its observation
+error. An uncertain execution skips observation of all owned paths; a known
+failure preserves confirmed changes alongside the paths that could not be read. Markdown
 shows an unknown change state in that case, including after an uncertain native
 outcome. A failed task stops later tasks in that write group; uncertain execution
 or cleanup stops new model work across groups. Ownership instructions do not

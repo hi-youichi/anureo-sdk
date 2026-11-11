@@ -29,6 +29,7 @@ type Result = {
   checks: string[]
   changedFiles: string[]
   changesKnown: boolean
+  unknownFiles: Array<{ path: string; error: string }>
 }
 type FixOptions = {
   client: Client
@@ -194,7 +195,7 @@ export async function fixReadability(options: FixOptions) {
       const currentSha256 = await fileHash(cwd, finding.path)
       const reason = stopReason ?? (options.shouldStop?.() ? 'Repair interrupted by host' : undefined)
       if (reason) {
-        result = { id: finding.id, status: 'not_started', summary: reason, checks: [], changedFiles: [], changesKnown: true }
+        result = { id: finding.id, status: 'not_started', summary: reason, checks: [], changedFiles: [], changesKnown: true, unknownFiles: [] }
       } else {
         const response = await agent(JSON.stringify({
           task: 'fix-readability', finding, ownedFiles: paths,
@@ -210,7 +211,7 @@ export async function fixReadability(options: FixOptions) {
         if ((response.status === 'changed') !== (changedFiles.length > 0)) {
           throw new Error(`Reported status ${response.status} does not match file changes`)
         }
-        result = { id: finding.id, ...response, changedFiles, changesKnown: true }
+        result = { id: finding.id, ...response, changedFiles, changesKnown: true, unknownFiles: [] }
       }
     } catch (error) {
       // Observation/cleanup failure cannot prove a native writer stopped; launch no more jobs.
@@ -227,8 +228,14 @@ export async function fixReadability(options: FixOptions) {
         const after = observed[index]
         return after?.status === 'fulfilled' && after.value !== before?.[index]
       })
-      const changesKnown = !before || (observed.length === paths.length && observed.every(after => after.status === 'fulfilled'))
-      result = { id: finding.id, status: 'failed', summary: errorText(error), checks: [], changedFiles, changesKnown }
+      const unknownFiles = before ? paths.flatMap((path, index) => {
+        const observation = observed[index]
+        if (observation?.status === 'fulfilled') return []
+        return [{ path, error: observation?.status === 'rejected' ? errorText(observation.reason)
+          : `File observation skipped after stopping: ${stopReason ?? 'host failure'}` }]
+      }) : []
+      const changesKnown = !unknownFiles.length
+      result = { id: finding.id, status: 'failed', summary: errorText(error), checks: [], changedFiles, changesKnown, unknownFiles }
     }
     results.set(finding.id, result)
     try { await saveJson(join(outputDir, 'findings', `${encodeURIComponent(finding.id)}.json`), result) }
@@ -247,7 +254,7 @@ export async function fixReadability(options: FixOptions) {
       await gated(async () => {
         const reason = stopReason ?? groupFailure ?? (options.shouldStop?.() ? 'Repair interrupted by host' : undefined)
         if (reason) {
-          results.set(finding.id, { id: finding.id, status: 'not_started', summary: reason, checks: [], changedFiles: [], changesKnown: true })
+          results.set(finding.id, { id: finding.id, status: 'not_started', summary: reason, checks: [], changedFiles: [], changesKnown: true, unknownFiles: [] })
           return
         }
         const result = await fixOne(finding)
@@ -260,6 +267,7 @@ export async function fixReadability(options: FixOptions) {
   // parallel converts unexpected host failures to null; missing entries remain explicit failures.
   const ordered = findings.map(finding => results.get(finding.id) ?? {
     id: finding.id, status: 'failed' as const, summary: 'Host task failed before recording a result', checks: [], changedFiles: [], changesKnown: false,
+    unknownFiles: ownedFiles(finding).map(path => ({ path, error: 'Host task failed before recording file observations' })),
   })
   const report = { createdAt: new Date().toISOString(), stopReason: stopReason ?? null, results: ordered }
   await saveJson(join(outputDir, 'results.json'), report)
