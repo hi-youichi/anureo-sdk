@@ -3,7 +3,7 @@ import { HarnessSdkError } from '@anureo/sdk'
 import { z } from 'zod'
 import type { WorkflowContext } from '@anureo/workflow'
 import { analysisSchema, verificationSchema } from './schema'
-import { hash, type ReviewContext, type Snapshot } from './context'
+import { hash, snapshotSchema, SnapshotIntegrityError, type ReviewContext, type Snapshot } from './context'
 import { saveJson } from './io'
 import type { TaskResult } from './review'
 import { planningSchema, validatePlanning, PlanningValidationError, type InventoryPlan, type Planning } from './planning'
@@ -14,11 +14,7 @@ const taskSchema = z.strictObject({
   primaryFiles: z.array(z.string()), packagePaths: z.array(z.string()),
   purpose: z.string(), dependsOn: z.array(z.string()),
 })
-const snapshotSchema = z.strictObject({
-  id: z.string(), path: z.string(), sha256: z.string().nullable(),
-  kind: z.enum(['text', 'binary', 'symlink', 'unavailable']),
-  text: z.string(), error: z.string().nullable(),
-})
+
 const taskResultSchema = z.strictObject({
   task: taskSchema, status: z.literal('completed'), error: z.null(),
   snapshotIds: z.array(z.string()), analysis: analysisSchema,
@@ -39,20 +35,19 @@ export function fatalReviewError(cause: unknown): boolean {
 
 /** Agent failures already carry native uncertainty; local evidence/coverage failures are known. */
 function reviewError(cause: unknown): HarnessSdkError {
+  if (cause instanceof SnapshotIntegrityError) return new HarnessSdkError('WORKFLOW_CHECKPOINT_INVALID')
   return cause instanceof HarnessSdkError ? cause
     : new HarnessSdkError('REVIEW_VALIDATION_FAILED', cause instanceof Error ? cause.message : 'Review validation failed')
 }
 
 async function matchingSnapshots(context: ReviewContext, snapshots: readonly Snapshot[]) {
-  if (new Set(snapshots.map(s => s.id)).size !== snapshots.length) throw new HarnessSdkError('WORKFLOW_CHECKPOINT_INVALID')
-  for (const snapshot of snapshots) {
-    if (snapshot.kind === 'text' && hash(snapshot.text) !== snapshot.sha256) throw new HarnessSdkError('WORKFLOW_CHECKPOINT_INVALID')
-    let current: Snapshot
-    try { current = await context.currentSnapshot(snapshot.path) }
-    catch (cause) { if ((cause as NodeJS.ErrnoException).code === 'ENOENT') return false; throw cause }
-    if (current.kind !== snapshot.kind || current.sha256 !== snapshot.sha256) return false
-  }
-  return true
+  try { return await context.matchesSavedSnapshots(snapshots) }
+  catch (cause) { if (cause instanceof SnapshotIntegrityError) throw new HarnessSdkError('WORKFLOW_CHECKPOINT_INVALID'); throw cause }
+}
+
+function adoptSnapshots(context: ReviewContext, snapshots: readonly Snapshot[], validate: () => true) {
+  try { context.adoptSnapshots(snapshots, validate) }
+  catch (cause) { if (cause instanceof SnapshotIntegrityError) throw new HarnessSdkError('WORKFLOW_CHECKPOINT_INVALID'); throw cause }
 }
 
 function snapshotsFor(context: ReviewContext, ids: readonly string[]) {
@@ -63,8 +58,7 @@ function snapshotsFor(context: ReviewContext, ids: readonly string[]) {
   })
 }
 
-async function saveSnapshots(context: ReviewContext, outputDir: string, snapshots: readonly Snapshot[]) {
-  for (const snapshot of snapshots) context.snapshots.set(snapshot.id, snapshot)
+async function saveSnapshots(outputDir: string, snapshots: readonly Snapshot[]) {
   for (const snapshot of snapshots) await saveJson(join(outputDir, 'snapshots', `${hash(snapshot.id)}.json`), snapshot)
 }
 
@@ -75,10 +69,12 @@ export async function checkpointPlanning<Input>(options: {
 }) {
   const schema = z.strictObject({ proposal: planningSchema, snapshots: z.array(snapshotSchema) })
   const restoreValidateAndSave = async (value: z.output<typeof schema>) => {
-    for (const snapshot of value.snapshots) options.context.snapshots.set(snapshot.id, snapshot)
-    const issues = validatePlanning(options.context, options.inventory, value.proposal, value.snapshots.map(s => s.id))
-    if (value.proposal.status !== 'planned' || issues.length) throw new PlanningValidationError(issues)
-    await saveSnapshots(options.context, options.outputDir, value.snapshots)
+    adoptSnapshots(options.context, value.snapshots, () => {
+      const issues = validatePlanning(options.context, options.inventory, value.proposal, value.snapshots.map(s => s.id))
+      if (value.proposal.status !== 'planned' || issues.length) throw new PlanningValidationError(issues)
+      return true
+    })
+    await saveSnapshots(options.outputDir, value.snapshots)
   }
   return options.run.step({ key: 'planning', schema, input: options.input,
     recovery: options.repeatable ? 'repeatable' : 'manual', reuse: async saved => {
@@ -109,12 +105,9 @@ export async function checkpointTask<Input>(options: {
   const { run, context, outputDir } = options
   let reused = false
   async function materialize(bundle: z.output<typeof taskCheckpointSchema>, reused = false) {
-    for (const snapshot of bundle.snapshots) context.snapshots.set(snapshot.id, snapshot)
-    options.validate(bundle.result) // 使用现有 analysis/verification/ownership 校验。
+    adoptSnapshots(context, bundle.snapshots, () => { options.validate(bundle.result); return true })
     try {
-      for (const snapshot of bundle.snapshots) {
-        await saveJson(join(outputDir, 'snapshots', `${hash(snapshot.id)}.json`), snapshot)
-      }
+      await saveSnapshots(outputDir, bundle.snapshots)
       await saveJson(join(outputDir, 'tasks', `${hash(options.taskId)}.json`), { ...bundle.result, reused })
     } catch { throw new HarnessSdkError('WORKFLOW_STORAGE_FAILED') }
   }

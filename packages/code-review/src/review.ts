@@ -8,7 +8,7 @@ import { resolveDuplicateRoots } from './duplicates'
 import { checkpointPlanning, checkpointTask, fatalReviewError } from './checkpoints'
 import { z } from 'zod'
 import { createGate, errorText, saveJson, type Package } from './io'
-import { ContextSelectionRequired, hash, ReviewContext, sourceInput, type Snapshot } from './context'
+import { ContextSelectionRequired, hash, ReviewContext, sourceInput, SnapshotIntegrityError, type Snapshot } from './context'
 import {
   analysisSchema, verificationSchema, summarySchema, dimensions, dimensionIds,
   type Analysis, type DesignSummary, type DesignTask, type Dimension, type Finding, type ReviewDecision, type Verification,
@@ -408,28 +408,18 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
         execute: async () => {
           let old = prior?.tasks.find(r => r.task.id === task.id && r.status === 'completed' && r.inputHash === inputHash)
           if (old && !taskLocalDuplicates(old)) old = undefined
+          const restored: Snapshot[] = []
           if (old) {
-            // A task may have read sources outside primaryFiles. A changed contextual source
-            // invalidates that task even when its primary input and dependencies did not change.
             for (const id of old.snapshotIds) {
               const saved = JSON.parse(await readFile(join(resolve(options.resumeFrom!), 'snapshots', `${hash(id)}.json`), 'utf8')) as Snapshot
-              if (saved.id !== id || (saved.kind === 'text' && hash(saved.text) !== saved.sha256)) throw new Error('Corrupt resumed snapshot')
-              const current = await context.currentSnapshot(saved.path)
-              if (current.sha256 !== saved.sha256 || current.kind !== saved.kind) { old = undefined; break }
+              if (saved.id !== id) throw new SnapshotIntegrityError()
+              restored.push(saved)
             }
+            if (!await context.matchesSavedSnapshots(restored)) old = undefined
           }
           if (old) {
-            // Hydrate saved immutable source snapshots and rerun the same host validation.
-            for (const id of old.snapshotIds) {
-              const snapshot = JSON.parse(await readFile(join(resolve(options.resumeFrom!), 'snapshots', `${hash(id)}.json`), 'utf8')) as Snapshot
-              const current = await context.currentSnapshot(snapshot.path)
-              if (current.sha256 !== snapshot.sha256 || current.kind !== snapshot.kind) throw new Error('Resume source baseline changed')
-              context.snapshots.set(id, snapshot)
-            }
-            if (!old.analysis) throw new Error('Missing resumed analysis')
-            checkAnalysis(task, analysisSchema.parse(old.analysis), new Set(old.snapshotIds))
-            if (!isDeepStrictEqual(old.findings, old.analysis.findings.map((f, i) => ({ ...f, id: `${task.id}#${i + 1}`, taskId: task.id })))) throw new Error('Invalid resumed finding ownership')
-            if (old.findings.length) checkVerification(old.findings, verificationSchema.parse(old.verification), new Set(old.snapshotIds))
+            const saved = old
+            context.adoptSnapshots(restored, () => { validate(saved); return true })
             imported = true
             result = { ...old, task, reused: true }
           } else {

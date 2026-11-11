@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { parseReport } from '../src/fix'
 import { discoverPackages } from '../src/io'
-import { hash, ReviewContext } from '../src/context'
+import { hash, ReviewContext, SnapshotIntegrityError } from '../src/context'
 import { createDesignPlan } from '../src/review'
 import { readDesignConfig } from '../src/project'
 import type { LanguageAdapter } from '../src/language'
@@ -270,4 +270,63 @@ test('bare-package root entries cannot resolve sibling files outside the package
     expect(unresolved.imports[0]!.target).toBeNull()
     expect(unresolved.calls[0]!.target).toBeNull()
   }
+})
+
+
+test('snapshot adoption stages business evidence and rolls back registry and symbol state on rejection', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n', '.gitignore': 'contract.md\n', 'contract.md': 'old' })
+  const adapter: LanguageAdapter = { id: 'contract-test', supports: source => source.path === 'contract.md',
+    index: sources => sources.map(source => ({ path: source.path, language: 'contract', adapter: 'contract-test', capabilities: ['symbols'],
+      symbols: [{ name: source.text, startLine: 1, endLine: 1, column: 1, kind: 'contract' }], imports: [], exports: [], calls: [], unknowns: [] })) }
+  const packages = await discoverPackages(cwd)
+  const producer = await ReviewContext.create(cwd, packages, [adapter])
+  const saved = { ...await producer.acquire('contract.md'), id: 'historical-contract' }
+  const context = await ReviewContext.create(cwd, packages, [adapter])
+  const before = [...context.snapshots.keys()]
+  const citation = (snapshot: typeof saved) => [{ path: snapshot.path, snapshotId: snapshot.id, sha256: snapshot.sha256!,
+    symbol: snapshot.text, startLine: 1, endLine: 1, quote: snapshot.text, role: 'contract' }]
+  expect(() => context.adoptSnapshots([saved], () => {
+    context.validateEvidence(citation(saved), new Set([saved.id]))
+    throw new Error('business rejection')
+  })).toThrow('business rejection')
+  expect([...context.snapshots.keys()]).toEqual(before)
+  await writeFile(join(cwd, 'contract.md'), 'new')
+  const incoming = { ...saved, text: 'new', sha256: hash('new') }
+  expect(await context.matchesSavedSnapshots([incoming])).toBe(true)
+  context.adoptSnapshots([incoming], () => {
+    context.validateEvidence(citation(incoming), new Set([incoming.id]))
+    return true
+  })
+  expect(Object.isFrozen(context.snapshots.get(incoming.id))).toBe(true)
+  incoming.text = 'caller mutation'
+  expect(context.snapshots.get(incoming.id)!.text).toBe('new')
+})
+
+test('snapshot admission rejects corrupt batches and conflicting identities without partial registration', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n' })
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  const source = context.baseline.get('a.ts')!
+  const saved = { ...source, id: `${source.id}:saved` }
+  const before = [...context.snapshots.keys()]
+  expect(() => context.adoptSnapshots([saved, { ...saved, id: 'corrupt', text: 'changed without digest' }], () => true)).toThrow(SnapshotIntegrityError)
+  expect([...context.snapshots.keys()]).toEqual(before)
+  await expect(context.matchesSavedSnapshots([saved, saved])).rejects.toBeInstanceOf(SnapshotIntegrityError)
+  context.adoptSnapshots([saved], () => true)
+  const conflicting = { ...saved, text: 'different', sha256: hash('different') }
+  expect(() => context.adoptSnapshots([conflicting], () => true)).toThrow(SnapshotIntegrityError)
+  expect(context.snapshots.get(saved.id)!.text).toBe(source.text)
+})
+
+test('changed and missing saved sources are cache misses without granting evidence access', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n', '.gitignore': 'contract.md\n', 'contract.md': 'original' })
+  const packages = await discoverPackages(cwd)
+  const producer = await ReviewContext.create(cwd, packages)
+  const saved = await producer.acquire('contract.md')
+  const context = await ReviewContext.create(cwd, packages)
+  expect(await context.matchesSavedSnapshots([saved])).toBe(true)
+  await writeFile(join(cwd, 'contract.md'), 'changed')
+  expect(await context.matchesSavedSnapshots([saved])).toBe(false)
+  await rm(join(cwd, 'contract.md'))
+  expect(await context.matchesSavedSnapshots([saved])).toBe(false)
+  expect(context.snapshots.has(saved.id)).toBe(false)
 })

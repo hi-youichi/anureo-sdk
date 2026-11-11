@@ -97,6 +97,10 @@ configuration changes. The SDK Client does not expose those internals for reliab
 automatic fingerprinting. Without an explicit fingerprint, a fresh cache identity
 disables automatic cross-run reuse. Inputs, schema, instructions, planning and
 every actually read source snapshot are checked in addition to this fingerprint.
+The source context owns saved-snapshot format, content and identity checks and
+current-file matching. Business validation can query staged immutable snapshots;
+rejection rolls back new registrations and derived symbol state. Task ownership,
+allowed evidence IDs and persistence remain the caller's checks.
 Restored findings are compared by structured value; JSON object key order does not
 change the result or its ownership.
 

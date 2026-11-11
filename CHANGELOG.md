@@ -24,6 +24,8 @@ marked **BREAKING**.
   grouping in the final summary so earlier task results cannot become hidden
   verification inputs during recovery. Compact unrelated consumer navigation in
   task prompts while retaining complete primary navigation and source snapshots.
+  Centralize snapshot adoption, validate immutable source identities, and roll back
+  provisional evidence when business validation rejects a restored result.
 
 - Code-review repair reports expose `changesKnown`; uncertain native outcomes no
   longer display an empty change set as no changes. Keep bare-package import

@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
+import { z } from 'zod'
 import { execFileSync } from 'node:child_process'
 import { lstat, readFile, readlink, realpath } from 'node:fs/promises'
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
@@ -8,10 +10,16 @@ export type { SourceIndex, SourceSymbol } from './language'
 import { discoverPackages, isReviewOutput, saveJson, type Package } from './io'
 import type { ContextRequest, Evidence } from './schema'
 
-export type Snapshot = {
-  id: string; path: string; sha256: string | null; kind: 'text' | 'binary' | 'symlink' | 'unavailable'
-  text: string; error: string | null
+export const snapshotSchema = z.strictObject({
+  id: z.string(), path: z.string(), sha256: z.string().nullable(),
+  kind: z.enum(['text', 'binary', 'symlink', 'unavailable']),
+  text: z.string(), error: z.string().nullable(),
+})
+export type Snapshot = Readonly<z.output<typeof snapshotSchema>>
+export class SnapshotIntegrityError extends Error {
+  constructor() { super('Invalid source snapshot') }
 }
+
 export function hash(value: string | Uint8Array) { return createHash('sha256').update(value).digest('hex') }
 export class ContextSelectionRequired extends Error {
   constructor(readonly paths: string[], readonly limit: number) { super(`Context file budget exceeded: ${paths.length} > ${limit}; choose explicit paths from candidates`) }
@@ -46,14 +54,20 @@ export async function readSnapshot(cwd: string, path: string, exclusions: readon
 }
 
 export class ReviewContext {
-  readonly snapshots = new Map<string, Snapshot>()
-  readonly baseline = new Map<string, Snapshot>()
+  private readonly recordedSnapshots = new Map<string, Snapshot>()
+  get snapshots(): ReadonlyMap<string, Snapshot> { return this.recordedSnapshots }
+  private readonly primarySnapshots = new Map<string, Snapshot>()
+  get baseline(): ReadonlyMap<string, Snapshot> { return this.primarySnapshots }
   readonly index: SourceIndex[]
   private readonly evidenceSymbols = new Map<string, SourceSymbol[]>()
   private readonly indexByPath: Map<string, SourceIndex>
   private constructor(readonly cwd: string, readonly packages: Package[], initial: Snapshot[], readonly adapters: readonly LanguageAdapter[], readonly exclusions: readonly string[]) {
-    for (const s of initial) { this.baseline.set(s.path, s); this.snapshots.set(s.id, s) }
-    this.index = buildIndex(initial, packages, adapters)
+    for (const source of initial) {
+      const snapshot = Object.freeze({ ...source })
+      this.primarySnapshots.set(snapshot.path, snapshot)
+      this.recordedSnapshots.set(snapshot.id, snapshot)
+    }
+    this.index = buildIndex([...this.baseline.values()], packages, adapters)
     this.indexByPath = new Map(this.index.map(item => [item.path, item]))
   }
 
@@ -96,9 +110,52 @@ export class ReviewContext {
   }
 
   private registerRead(read: Snapshot): Snapshot {
-    const snapshot = { ...read, id: `${read.id}:read-${randomUUID()}` }
-    this.snapshots.set(snapshot.id, snapshot)
+    const snapshot = Object.freeze({ ...read, id: `${read.id}:read-${randomUUID()}` })
+    this.recordedSnapshots.set(snapshot.id, snapshot)
     return snapshot
+  }
+
+  private decodeSavedSnapshots(values: readonly unknown[]): Snapshot[] {
+    let snapshots: Snapshot[]
+    try { snapshots = snapshotSchema.array().parse(values) }
+    catch { throw new SnapshotIntegrityError() }
+    const ids = new Set<string>()
+    for (const snapshot of snapshots) {
+      if (!snapshot.id || ids.has(snapshot.id) || (snapshot.kind === 'text' && hash(snapshot.text) !== snapshot.sha256)) throw new SnapshotIntegrityError()
+      ids.add(snapshot.id)
+      const existing = this.recordedSnapshots.get(snapshot.id)
+      if (existing && !isDeepStrictEqual(existing, snapshot)) throw new SnapshotIntegrityError()
+    }
+    return snapshots
+  }
+
+  /** A changed or missing source is a cache miss; malformed saved evidence is an error. */
+  async matchesSavedSnapshots(values: readonly unknown[]): Promise<boolean> {
+    const snapshots = this.decodeSavedSnapshots(values)
+    for (const snapshot of snapshots) {
+      let current: Snapshot
+      try { current = await this.currentSnapshot(snapshot.path) }
+      catch (cause) { if ((cause as NodeJS.ErrnoException).code === 'ENOENT') return false; throw cause }
+      if (current.kind !== snapshot.kind || current.sha256 !== snapshot.sha256) return false
+    }
+    return true
+  }
+
+  /** Stage immutable source facts for synchronous business checks; reject without leaking them. */
+  adoptSnapshots(values: readonly unknown[], validate: () => true): void {
+    const snapshots = this.decodeSavedSnapshots(values)
+    for (const snapshot of snapshots) if (!this.recordedSnapshots.has(snapshot.id)) this.assertContextPath(snapshot.path)
+    const staged: string[] = []
+    try {
+      for (const snapshot of snapshots) if (!this.recordedSnapshots.has(snapshot.id)) {
+        this.recordedSnapshots.set(snapshot.id, Object.freeze({ ...snapshot }))
+        staged.push(snapshot.id)
+      }
+      if (validate() !== true) throw new Error('Snapshot validation must explicitly accept synchronously')
+    } catch (cause) {
+      for (const id of staged) { this.recordedSnapshots.delete(id); this.evidenceSymbols.delete(id) }
+      throw cause
+    }
   }
 
   async contractReferences() {
