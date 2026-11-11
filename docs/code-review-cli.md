@@ -192,6 +192,17 @@ If the full initial source set does not fit the input budget, the planner receiv
 catalog/navigation and entry contracts with an explicit unread-file list; nothing
 is silently truncated or treated as read.
 
+Planning continuation accumulates source snapshots; it is not a batch-planning
+protocol. Its final accepted call must account for every primary text file with
+the supplied sources. A source set that cannot fit together can therefore exhaust
+the input budget during continuation. The final project summary also uses one
+bounded call; task checkpoints do not remove that capacity limit.
+
+Input budgets do not cap process memory. Source preparation reads and indexes the
+selected corpus before model calls. Repair hashes files sequentially within each
+active task, but each hash still buffers a whole file. There is no streaming hash
+or process-wide byte budget; large files and corpora require available memory.
+
 For M modules and A selected angles the host creates exactly M × A analysis tasks.
 Each task has one module and one angle; all calls share the concurrency gate.
 Workers receive their module's complete primary sources and contracts and can
