@@ -8,6 +8,8 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- Identify changed resume configuration in review progress without restoring old defaults.
+
 - Retain structured call failure certainty, stop repair dispatch after interrupted
   file preparation, and drain fixture releases before cleaning temporary resources.
 

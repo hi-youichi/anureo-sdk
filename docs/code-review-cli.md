@@ -81,6 +81,12 @@ bun run review ../another-project --backend-config-digest codex-review-config-v1
 
 ## Failure recovery
 
+Current CLI options remain authoritative on resume. The progress log names changed
+configuration fields or workflow revision; incompatible checkpoints are re-executed
+under the declared recovery policy. Old credentials or omitted options are not loaded
+from the source run.
+
+
 Reviews run through `workflow()` and save a run manifest, accepted planning
 checkpoint and validated per-task results with complete source evidence. After a
 failure or process exit, `--resume` reads those checkpoints even when `report.json`

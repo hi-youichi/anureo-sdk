@@ -134,9 +134,13 @@ export async function reviewDesign(options: DesignOptions): Promise<DesignReport
   if (options.backendConfigDigest !== undefined && !options.backendConfigDigest.trim()) throw new HarnessSdkError('INVALID_PARAMS')
   let resumeFrom: { directory: string; runId: string } | undefined
   let legacy: DesignReport | null = null
+  let sourceIdentity: { input?: unknown; revision?: unknown } | undefined
   if (options.resumeFrom) {
     try {
-      await readFile(join(options.resumeFrom, 'run.json'), 'utf8')
+      const manifest = await readFile(join(options.resumeFrom, 'run.json'), 'utf8')
+      // Diagnostic metadata only. The workflow independently validates all source
+      // records before this identity is used in the body; it never authorizes reuse.
+      try { sourceIdentity = JSON.parse(manifest)?.identity } catch {}
       resumeFrom = { directory: dirname(resolve(options.resumeFrom)), runId: basename(options.resumeFrom) }
     } catch (cause) {
       if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause
@@ -157,6 +161,17 @@ export async function reviewDesign(options: DesignOptions): Promise<DesignReport
     directory: dirname(resolve(options.outputDir)), runId: basename(options.outputDir), resumeFrom,
   }, run => {
     options.progress?.(`workflow start: ${run.runId}`)
+    if (sourceIdentity) {
+      const previous = sourceIdentity.input
+      const changed = previous && typeof previous === 'object' && !Array.isArray(previous)
+        ? [...new Set([...Object.keys(previous), ...Object.keys(input)])].sort()
+          .filter(key => !isDeepStrictEqual((previous as Record<string, unknown>)[key], (input as Record<string, unknown>)[key]))
+        : ['input']
+      if (sourceIdentity.revision !== reviewWorkflowRevision) changed.push('workflowRevision')
+      if (changed.length) options.progress?.(`Resume configuration changed: ${changed.join(', ')}. Current options apply; incompatible checkpoints will be re-executed.`)
+    } else if (legacy && legacy.backendConfigDigest !== options.backendConfigDigest) {
+      options.progress?.('Resume configuration changed: backendConfigDigest. Legacy results will not be reused.')
+    }
     return reviewDesignRun(options, run, options.backendConfigDigest && legacy?.backendConfigDigest === options.backendConfigDigest ? legacy : null)
   })
   if (output.status === 'incomplete') output.result.complete = false

@@ -757,3 +757,22 @@ test('a 73-of-100 code review resumes 27 tasks without a final report or another
   expect(retried).toEqual(interrupted.tasks.filter(task => task.status !== 'completed').map(task => task.task.id).sort())
   expect(await readFile(join(source.outputDir, 'run.json'), 'utf8')).toBe(originalManifest)
 }, 30000)
+
+
+test('resume progress identifies changed configuration without restoring old defaults', async () => {
+  const cwd = await fixture()
+  const first = await backend()
+  const source = await options(cwd, first.client, { contextRounds: 1 })
+  await reviewDesign(source)
+  const messages: string[] = []
+  const next = await backend()
+  const resumed = await reviewDesign(await options(cwd, next.client, { contextRounds: 2,
+    resumeFrom: source.outputDir, outputDir: `${source.outputDir}-different-config`, progress: message => messages.push(message),
+  }))
+  expect(resumed.complete).toBe(true)
+  expect(resumed.plan.budgets.contextRounds).toBe(2)
+  expect(resumed.calls.reusedTasks).toBe(0)
+  expect(messages.some(message => message.includes('Resume configuration changed: contextRounds.'))).toBe(true)
+  expect(next.calls.filter(call => call.task === 'design-planning')).toHaveLength(1)
+  expect(next.calls.filter(call => call.task === 'design-analysis')).toHaveLength(4)
+})
