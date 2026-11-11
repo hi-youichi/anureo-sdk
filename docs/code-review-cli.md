@@ -247,6 +247,9 @@ history from the accepted module/angle catalog. Each `planning/<call-id>.json`
 retains the complete proposal, its source snapshot IDs and validation result;
 `acceptedCallId` identifies the accepted response. Failed planning leaves coverage
 unestablished and displays the unaccepted proposal for diagnosis.
+JSON artifact writes remove their own temporary file on a handled write or rename
+failure, on a best-effort basis. Cleanup failure preserves the storage error. Forced
+process termination can leave temporary files; they are not committed checkpoints.
 
 During active calls, stderr emits a heartbeat every 15 seconds with finished,
 running and queued call counts and elapsed time for each running stage.
@@ -254,7 +257,10 @@ running and queued call counts and elapsed time for each running stage.
 duration and completed/failed outcome. Duration covers invocation and response
 persistence, not a provider-only measurement. A completed invocation may still
 produce a proposal rejected by host validation. These records do not infer token
-usage, costs or remote cancellation.
+usage, costs or remote cancellation. Call error artifacts retain the existing
+`error` text plus `code`, `outcomeUnknown`, `fatal`, and `cleanupErrorCount`.
+A null code or outcome means it was not supplied; null is distinct from a known
+false outcome. Arbitrary error details are not copied.
 The default review/fix/workflow artifact roots, legacy review roots, resume directory and current output directory
 are excluded from discovery and contextual reads. For repeated custom output
 locations, use an ignored artifact parent to keep earlier runs outside the target
@@ -264,7 +270,7 @@ Review does not execute target code, run tests or apply changes. Model tasks are
 instructed to analyze the supplied sources without commands or tools. Review
 calls request a read-only Codex sandbox with approvals disabled; the explicit fix
 command requests workspace-write. Coverage and evidence checks do not establish that the model's design conclusions are
-correct. Real-model quality acceptance remains unfinished.
+correct. Findings still require human judgment.
 
 Exit status is `0` for a complete review, `1` for an error or coverage gap, and
 `130` for a handled interrupt. Findings and pending risks do not themselves make
@@ -277,11 +283,13 @@ resources; it does not prove that a remote operation was cancelled.
 `fix` is a separate, explicit source-editing command. It reads the unified
 `report.json` and selects fresh, independently accepted findings classified as
 `readability` with the `local_refactor` decision, owned by a completed module
-containing exactly one primary file and supported by unambiguous target evidence. Duplicate aliases, stale or
-unverified candidates, structural/behavior changes and findings owned by multi-file
-modules remain in `skipped` with reasons. Root groups choose a fresh accepted
-representative before a fresh pending finding, so a pending alias does not hide
-an accepted candidate. Only completed tasks supply root-group members.
+containing exactly one primary file and supported by unambiguous target evidence.
+For each root group, repair selects one independently eligible member, preferring
+the statistical representative when eligible. A pending or structural representative
+cannot exclude an accepted local readability repair. Each selected member retains
+its own evidence and write scope. Duplicate candidates, stale or unverified findings,
+structural/behavior changes and findings owned by multi-file modules remain in
+`skipped` with reasons. Only completed tasks supply root-group members.
 Verification aliases refer only to findings in the same task; the final summary
 handles cross-task root-cause grouping after all task results are available.
 This keeps per-task checkpoints independent of completion order and earlier
@@ -317,8 +325,12 @@ Related source and generated files can be grouped in project configuration:
 ```
 
 The host validates regular in-project targets and rejects symlink targets or
-parents before starting model work. It records drift from report hashes, then
-requires the model to recheck current source and contracts. The host compares
+parents before starting model work. It rejects pre-existing drift from report
+hashes before creating any model session. Later edits within the same repair write
+group remain available to subsequent findings, which recheck current source and
+contracts. Dispatch checks stopping again after file preparation, immediately before
+starting the agent; tasks stopped during preparation persist as `not_started`.
+The host compares
 owned-file hashes with reported `changed` / `already_satisfied` / `deferred`
 outcomes. `changedFiles` lists observed changes within the owned paths;
 `changesKnown=false` means the final change set could not be confirmed. Markdown
@@ -338,21 +350,3 @@ per-finding records, results and JSON/Markdown reports.
 The workspace aliases `bun run review:readability` and `bun run fix:readability`
 call the same review engine with `--dimension D12` and the fix subcommand. The old executables and
 their test files have moved out of `examples/` into `packages/code-review`.
-
-
-Repair checks the selected report hashes against the current files before any model
-session starts and rejects pre-existing drift. Later edits within the same repair
-write group remain available to subsequent findings. Root groups choose one member
-that independently meets every repair eligibility condition; a pending or structural
-summary representative cannot exclude an accepted local readability repair.
-
-JSON artifact writes remove their own temporary file on a handled write or rename
-failure, on a best-effort basis. Cleanup failure preserves the storage error. Forced
-process termination can leave temporary files; they are not committed checkpoints.
-
-
-Call error artifacts retain the existing `error` text plus `code`, `outcomeUnknown`,
-`fatal`, and `cleanupErrorCount`. A null code or outcome means it was not supplied;
-null is distinct from a known false outcome. Arbitrary error details are not copied.
-Repair dispatch checks stopping again after file preparation, immediately before
-starting the agent session; tasks stopped during preparation persist as `not_started`.
