@@ -36,7 +36,7 @@ test("an expired interaction cancels itself through its timer", async () => {
   expect(published.at(-1)).toMatchObject({ interactionId: "i1", outcome: "expired" });
 });
 
-test("resolved records are evicted only past the bounded replay guard", async () => {
+test("resolving many sequential interactions leaves no pending requests", async () => {
   const { registry } = harness({ maxPending: 1, timeoutMs: 60_000 });
   for (let index = 0; index < 1_026; index++) {
     const interactionId = `i${index}`;
@@ -47,7 +47,7 @@ test("resolved records are evicted only past the bounded replay guard", async ()
   expect(registry.pendingCount).toBe(0);
 });
 
-test("external resolution settles waiters without a published outcome", async () => {
+test("external resolution rejects the local waiter and publishes the peer outcome", async () => {
   const { registry, published } = harness();
   const observed = registry.begin(approval("i1"), async () => {});
   await registry.resolveExternally({ interactionId: "unknown", outcome: "responded" });

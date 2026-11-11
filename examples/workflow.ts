@@ -22,16 +22,16 @@ async function calculate(client: Client, inputs: readonly number[]) {
     value => ask(`square ${value}`),
     text => Number(text),
   )
-  const squares = results.map((value, index) => {
+  const squaredDoubles = results.map((value, index) => {
     if (value === null) throw new Error(`Calculation failed for input ${inputs[index]}`)
     return value
   })
   const [sum, max] = await parallel([
-    () => ask(`sum ${squares.join(',')}`),
-    () => ask(`max ${squares.join(',')}`),
+    () => ask(`sum ${squaredDoubles.join(',')}`),
+    () => ask(`max ${squaredDoubles.join(',')}`),
   ])
   if (sum === null || max === null) throw new Error('Summary calculation failed')
-  return { squares, sum: Number(sum), max: Number(max) }
+  return { squares: squaredDoubles, sum: Number(sum), max: Number(max) }
 }
 
 // Requires a configured, authenticated Codex CLI on PATH.

@@ -1,10 +1,13 @@
 # @anureo/protocol
 
-AHP v1 is being revised in place. The target remains the root entry,
-`@anureo/protocol/schema`, and `schema/v1/ahp.schema.json`; there will be one
-maintained lifecycle contract. The workspace schema and generated types now use the revised contract; local
-adapter and packaging validation have passed. These are not the published
-0.2.0 wire semantics. See the
+AHP v1 is being revised in place. The revised contract is provided through the
+root entry `@anureo/protocol`, the schema subpath `@anureo/protocol/schema`, and
+the schema file `schema/v1/ahp.schema.json`. There will be one maintained
+lifecycle contract.
+
+The workspace schema and generated types now use the revised contract; local
+adapter and packaging validation have passed. The revised wire semantics differ
+from those of the published 0.2.0 release. See the
 [design](../../docs/native-harness-lifecycle.md) and the
 [v1 amendment](../../spec/ahp-v1.md#native-lifecycle-amendment).
 
@@ -66,9 +69,12 @@ assertRequest('input/submit', {
 
 Initialization results also require `protocolContract: "native-lifecycle"`.
 A missing or mismatched discriminator is rejected before business dispatch,
-even when both peers negotiate major 1. Submission identity does not allocate an
-execution; `submission/bound` reports the actual association. The SDK keeps that
-identity internal and returns a Turn directly from `await session.submit()`.
+even when both peers negotiate major 1.
+
+Submission identity does not allocate an execution. The `submission/bound` event
+reports the association between a submission (`submissionId`) and an execution
+(`turnId`). The SDK keeps the submission identity internal.
+The expression `await session.submit()` returns a Turn directly.
 
 ## Privacy projections
 

@@ -1,4 +1,4 @@
-import type { Client, Input, Session } from '@anureo/sdk';
+import type { Client, Input, Session, Turn } from '@anureo/sdk';
 export type NativeScenario = 'overlap' | 'close-active' | 'observer-cancel';
 export interface NativeFixture {
   client: Client;
@@ -11,6 +11,17 @@ export interface NativeFixture {
 }
 export type NativeFixtureFactory = (scenario: NativeScenario) => Promise<NativeFixture>;
 export interface NativeConformanceReport { passed: boolean; results: Array<{ scenario: NativeScenario; passed: boolean; error?: string }> }
+
+async function assertObservationClosed(turn: Turn): Promise<void> {
+  try {
+    await turn.result({ timeoutMs: 3000 });
+  } catch (cause) {
+    if (cause && typeof cause === 'object' && 'code' in cause && cause.code === 'OBSERVATION_CLOSED') return;
+    throw cause;
+  }
+  throw new Error('FALSE_TERMINAL');
+}
+
 /** Uses the public root client and resources. The fixture owns only external native behavior. */
 export async function runNativeConformance(factory: NativeFixtureFactory, scenarios: readonly NativeScenario[] = ['overlap', 'close-active', 'observer-cancel']): Promise<NativeConformanceReport> {
   const results: NativeConformanceReport['results'] = [];
@@ -19,9 +30,12 @@ export async function runNativeConformance(factory: NativeFixtureFactory, scenar
     try {
       fixture = await factory(scenario);
       const first = fixture.session.submit({ input: fixture.first }, { timeoutMs: 3000 });
+      // Register rejection handlers early to avoid unhandled rejections while awaiting release or other work.
+      // Later awaits still use the original submission promises, so failures reach the outer catch.
       void first.catch(() => {});
       if (scenario === 'overlap') {
         const second = fixture.session.submit({ input: fixture.second }, { timeoutMs: 3000 });
+        // Apply the same early rejection handling to the second submission.
         void second.catch(() => {});
         await fixture.release?.();
         const [a, b] = await Promise.all([first, second]);
@@ -33,15 +47,17 @@ export async function runNativeConformance(factory: NativeFixtureFactory, scenar
         const turn = await first;
         const result = await fixture.session.close({ timeoutMs: 3000 });
         if (!result.observationClosed) throw new Error('OBSERVATION_NOT_CLOSED');
-        try { await turn.result({ timeoutMs: 3000 }); throw new Error('FALSE_TERMINAL'); }
-        catch (cause) { if (!(cause && typeof cause === 'object' && 'code' in cause && cause.code === 'OBSERVATION_CLOSED')) throw cause; }
+        await assertObservationClosed(turn);
       } else {
-        const a = await first, b = a.observe();
-        await a.dispose(); const second = fixture.session.submit({ input: fixture.second }, { timeoutMs: 3000 });
-        void second.catch(() => {});
+        const firstTurn = await first;
+        const siblingObserver = firstTurn.observe();
+        await firstTurn.dispose();
+        const secondSubmission = fixture.session.submit({ input: fixture.second }, { timeoutMs: 3000 });
+        // As above, handle rejection during release; awaiting the original second promise still propagates it.
+        void secondSubmission.catch(() => {});
         await fixture.release?.();
-        await second;
-        if ((await b.result({ timeoutMs: 3000 })).status !== 'completed') throw new Error('SIBLING_OBSERVER_CANCELLED');
+        await secondSubmission;
+        if ((await siblingObserver.result({ timeoutMs: 3000 })).status !== 'completed') throw new Error('SIBLING_OBSERVER_CANCELLED');
       }
     } catch (cause) { failure = cause && typeof cause === 'object' && 'code' in cause ? String(cause.code) : 'CONFORMANCE_FAILED'; }
     finally {

@@ -22,7 +22,18 @@ test('mapper reset forgets tracked state without breaking later updates', async 
   const client=await createClient({adapter:createScriptedAdapter(),identity:binding})
   const sink=await client.openSession({requestId:'open',mode:'new',binding,cwd:process.cwd()})
   const state: SessionState = { binding, capabilities: {}, capabilityRevision: 1, status: 'ready', activeTurnIds: [], config: {} }
-  const mapper = new AcpUpdateMapper(sink, () => 'turn-1', () => state, data => { state.metadata = { title: data.sessionTitle as string | null } }, false)
+  const getActiveTurnId = () => 'turn-1'
+  const getSessionState = () => state
+  const applySessionMetadata = (data: Record<string, unknown>) => {
+    state.metadata = { title: data.sessionTitle as string | null }
+  }
+  const mapper = new AcpUpdateMapper(
+    sink,
+    getActiveTurnId,
+    getSessionState,
+    applySessionMetadata,
+    false,
+  )
   await mapper.update({ sessionUpdate: 'session_info_update', title: 'Before' })
   mapper.reset()
   await mapper.update({ sessionUpdate: 'session_info_update', title: 'After' })
@@ -35,13 +46,31 @@ test('ACP idle metadata patches preserve absent titles and explicitly clear, wit
   const client=await createClient({adapter:createScriptedAdapter(),identity:binding})
   const sink=await client.openSession({requestId:'open',mode:'new',binding,cwd:process.cwd()})
   const state: SessionState = { binding, capabilities: {}, capabilityRevision: 1, status: 'ready', activeTurnIds: [], config: {} }
-  const mapper = new AcpUpdateMapper(sink, () => undefined, () => state, data => { state.metadata = { title: data.sessionTitle as string | null } }, false)
+  const getActiveTurnId = () => undefined
+  const getSessionState = () => state
+  const applySessionMetadata = (data: Record<string, unknown>) => {
+    state.metadata = { title: data.sessionTitle as string | null }
+  }
+  const mapper = new AcpUpdateMapper(
+    sink,
+    getActiveTurnId,
+    getSessionState,
+    applySessionMetadata,
+    false,
+  )
   const reader = sink.events()[Symbol.asyncIterator]()
+  // An initial patch without a title emits no metadata event.
   await mapper.update({ sessionUpdate: 'session_info_update', updatedAt: 'now' })
+
+  // Setting the title emits once; repeating it emits no duplicate event.
   await mapper.update({ sessionUpdate: 'session_info_update', title: 'Generated' })
   await mapper.update({ sessionUpdate: 'session_info_update', title: 'Generated' })
+
+  // A later patch without a title preserves the existing value.
   await mapper.update({ sessionUpdate: 'session_info_update', updatedAt: 'later' })
   expect(state.metadata?.title).toBe('Generated')
+
+  // An explicit null clears the title and emits a metadata event.
   await mapper.update({ sessionUpdate: 'session_info_update', title: null })
   try {
     expect((await reader.next()).value).toMatchObject({ type: 'session/metadata', payload: { title: 'Generated' } })

@@ -7,10 +7,13 @@ test('official ACP transport preserves explicit native turn correlation and earl
   const client = await createClient({ adapter: createAcpAdapter({ command: process.execPath, args: [executable, '--native-lifecycle'] }), identity: { adapterId: 'acp', runtimeConfigId: 'native' } });
   try {
     const session = await client.sessions.create({ cwd: process.cwd() });
-    const first = session.submit({ input: 'hold' }), second = session.submit({ input: 'join' });
-    const [a, b] = await Promise.all([first, second]);
-    expect(a.id).toBe('actual-acp'); expect(b.id).toBe(a.id);
-    expect((await a.result()).text).toBe('correlated ACP result'); expect((await b.result()).text).toBe('correlated ACP result');
+    const holdSubmission = session.submit({ input: 'hold' });
+    const joinSubmission = session.submit({ input: 'join' });
+    const [holdTurn, joinTurn] = await Promise.all([holdSubmission, joinSubmission]);
+    expect(holdTurn.id).toBe('actual-acp');
+    expect(joinTurn.id).toBe(holdTurn.id);
+    expect((await holdTurn.result()).text).toBe('correlated ACP result');
+    expect((await joinTurn.result()).text).toBe('correlated ACP result');
     expect(await session.close()).toMatchObject({ executionStopped: 'unconfirmed' });
   } finally { await client.dispose(); }
 });

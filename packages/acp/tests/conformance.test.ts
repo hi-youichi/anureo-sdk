@@ -7,7 +7,16 @@ test('vanilla ACP and negotiated ACP extensions pass the same public SDK conform
   const executable = resolve(import.meta.dirname, './fixtures/fake-acp.mjs');
   for (const extended of [false, true]) {
     const report = await runConformance((scenario) => ({
-      adapter: createAcpAdapter({ command: process.execPath, args: [executable, '--scenario', scenario, ...(extended ? ['--extensions'] : [])], ...(scenario === 'backpressure' ? { maxFrameBytes: 1024 } : {}) }),
+      adapter: createAcpAdapter({
+        command: process.execPath,
+        args: [
+          executable,
+          '--scenario',
+          scenario,
+          ...(extended ? ['--extensions'] : []),
+        ],
+        ...(scenario === 'backpressure' ? { maxFrameBytes: 1024 } : {}),
+      }),
       openParams: { requestId: 'open', mode: 'new', binding: { sessionId: 's', adapterId: 'acp', runtimeConfigId: 'conformance' }, cwd: process.cwd() },
       expectedText: 'Hello conformance',
     }), { timeoutMs: 3000 });

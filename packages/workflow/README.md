@@ -45,6 +45,11 @@ export async function reviewFiles(client: Client, files: readonly string[], cwd:
 }
 ```
 
+In this example, `pipeline` and `parallel` convert internal `agent` rejections to
+`null`; `pipeline` also skips the affected item's remaining stages. The two
+explicit checks then throw summary errors for `null` results, so those errors do
+not preserve the original agent failure classification.
+
 Import `reviewFiles` from another TS file and call it with a Client. There is no
 workflow registration, source-string execution, ambient context, or runtime setup.
 

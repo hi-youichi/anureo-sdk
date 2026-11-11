@@ -61,8 +61,15 @@ submission identities internally. An optional native acceptance receipt is usefu
 progress evidence, but it is not required before returning an associated Turn.
 Local queue/write success alone is not native acceptance.
 
-`Input` accepts a string or input blocks. `delivery` defaults to `native`;
-`afterTurn` requires declared native support. Exact steer requires
+`Input` accepts a string or input blocks. `SubmitOptions.delivery` accepts `native`
+(the default) or `afterTurn`. Using `delivery: 'afterTurn'` requires
+`session.capabilities.input?.delivery` to include `afterTurn`:
+
+```typescript
+const next = await session.submit({ input: 'Run the follow-up checks.', delivery: 'afterTurn' })
+```
+
+Exact steer requires
 `session.capabilities.input?.steer?.atomicMatch`. An unsupported or stale target
 rejects; steer does not create a Turn or silently fall back to session input.
 

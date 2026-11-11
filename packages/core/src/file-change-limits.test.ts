@@ -3,19 +3,43 @@ import { validateDefinition, type Item, type InteractionRequested } from '@anure
 import { SecretRedactor } from './secrets'
 import { boundFileChangeItem, FILE_CHANGE_TEXT_LIMIT } from './file-change-limits'
 
-const item = (): Extract<Item, { type: 'toolCall' }> => ({ id: 'edit', type: 'toolCall', kind: 'fileChange', title: 'secret', input: { patch: 'secret' }, output: 'secret', raw: { patch: 'secret' }, locations: [{ path: 'secret' }], fileChanges: [{ path: 'secret.ts', oldPath: 'secret.old', operation: 'modify', completeness: 'complete', materials: [{ format: 'unified', patch: '@@ -1 +1 @@\n-secret\n+secret\n' }, { format: 'text', scope: 'fragment', oldText: 'secret', newText: 'secret' }] }] })
+const makeFileChangeItem = (): Extract<Item, { type: 'toolCall' }> => ({
+  id: 'edit',
+  type: 'toolCall',
+  kind: 'fileChange',
+  title: 'secret',
+  input: { patch: 'secret' },
+  output: 'secret',
+  raw: { patch: 'secret' },
+  locations: [{ path: 'secret' }],
+  fileChanges: [{
+    path: 'secret.ts',
+    oldPath: 'secret.old',
+    operation: 'modify',
+    completeness: 'complete',
+    materials: [{
+      format: 'unified',
+      patch: '@@ -1 +1 @@\n-secret\n+secret\n',
+    }, {
+      format: 'text',
+      scope: 'fragment',
+      oldText: 'secret',
+      newText: 'secret',
+    }],
+  }],
+})
 
 test('new material and every snapshot/history path use marked-secret filtering', () => {
   const filter = new SecretRedactor()
   filter.rememberResponse({ kind: 'userInput', interactionId: 'request', questions: [{ id: 'key', prompt: 'Key', secret: true }] } as InteractionRequested, { kind: 'userInput', answers: { key: 'secret' } })
-  expect(JSON.stringify(filter.item(item()))).not.toContain('secret')
-  const delta = filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'patch', value: item() as unknown as import('@anureo/protocol').JsonValue } })
+  expect(JSON.stringify(filter.item(makeFileChangeItem()))).not.toContain('secret')
+  const delta = filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'patch', value: makeFileChangeItem() as unknown as import('@anureo/protocol').JsonValue } })
   expect(JSON.stringify(delta)).not.toContain('secret')
-  expect(JSON.stringify(filter.history({ items: [{ turnId: 'turn', item: item() }], snapshotToken: 'token' }))).not.toContain('secret')
+  expect(JSON.stringify(filter.history({ items: [{ turnId: 'turn', item: makeFileChangeItem() }], snapshotToken: 'token' }))).not.toContain('secret')
 })
 
 test('a shared UTF-8 budget includes canonical source and raw/input/output mirrors', () => {
-  const source = item(); const text = '🙂'.repeat(80000)
+  const source = makeFileChangeItem(); const text = '🙂'.repeat(80000)
   source.fileChanges![0]!.materials = [{ format: 'unified', patch: text }]
   source.input = { patch: text }; source.output = text; source.raw = { patch: text }
   const result = boundFileChangeItem(source)
@@ -28,7 +52,7 @@ test('a shared UTF-8 budget includes canonical source and raw/input/output mirro
 })
 
 test('the fifty-material limit spans all files and never leaves exact stats after truncation', () => {
-  const source = item()
+  const source = makeFileChangeItem()
   source.fileChanges = [0, 1].map(index => ({ path: `${index}.ts`, operation: 'modify', completeness: 'complete', stats: { added: 60, removed: 0, accuracy: 'exact' }, materials: Array.from({ length: 30 }, () => ({ format: 'text', scope: 'fragment', oldText: '', newText: 'new\n' })) }))
   const result = boundFileChangeItem(source)
   if (result.type !== 'toolCall') throw Error('unexpected item')
@@ -40,7 +64,7 @@ test('the fifty-material limit spans all files and never leaves exact stats afte
 
 test('malformed Item-shaped patch snapshots fail before returning a retained event', () => {
   const filter = new SecretRedactor()
-  const source = item()
+  const source = makeFileChangeItem()
   const huge = 'x'.repeat(300000)
   source.input = { patch: huge }; source.output = huge; source.raw = { patch: huge }
   const value = { ...source, fileChanges: [{ ...source.fileChanges![0], operation: 'unsupported' }] }
@@ -51,7 +75,7 @@ test('malformed Item-shaped patch snapshots fail before returning a retained eve
 })
 
 test('independently truncated replacement sides degrade to metadata-only material', () => {
-  const source = item()
+  const source = makeFileChangeItem()
   source.fileChanges![0]!.materials = [{ format: 'text', scope: 'fragment', oldText: 'old\nline\n', newText: 'y'.repeat(300000) }]
   const result = boundFileChangeItem(source)
   if (result.type !== 'toolCall') throw Error('unexpected item')
@@ -63,13 +87,33 @@ test('independently truncated replacement sides degrade to metadata-only materia
 
 test('started, completed, full delta and history all apply the same source budget', () => {
   const filter = new SecretRedactor()
-  const source = item()
+  const source = makeFileChangeItem()
   const huge = 'x'.repeat(300000)
   source.fileChanges![0]!.materials = [{ format: 'unified', patch: huge }]
   source.input = { patch: huge }; source.output = huge; source.raw = { patch: huge }
-  const retained = [filter.event({ type: 'item/started', payload: { item: source } }), filter.event({ type: 'item/completed', payload: { item: source } }), filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'patch', value: source as unknown as import('@anureo/protocol').JsonValue } }), filter.history({ snapshotToken: 'token', items: [{ turnId: 'turn', item: source }] })]
-  for (const event of retained) {
-    expect(new TextEncoder().encode(JSON.stringify(event)).byteLength).toBeLessThan(FILE_CHANGE_TEXT_LIMIT + 3000)
-    expect(JSON.stringify(event)).toContain('tooLarge')
+  const retained = [
+    {
+      name: 'started',
+      value: filter.event({ type: 'item/started', payload: { item: source } }),
+    },
+    {
+      name: 'completed',
+      value: filter.event({ type: 'item/completed', payload: { item: source } }),
+    },
+    {
+      name: 'full delta',
+      value: filter.event({
+        type: 'item/delta',
+        payload: { itemId: 'edit', kind: 'patch', value: source as unknown as import('@anureo/protocol').JsonValue },
+      }),
+    },
+    {
+      name: 'history',
+      value: filter.history({ snapshotToken: 'token', items: [{ turnId: 'turn', item: source }] }),
+    },
+  ]
+  for (const { name, value } of retained) {
+    expect(new TextEncoder().encode(JSON.stringify(value)).byteLength, name).toBeLessThan(FILE_CHANGE_TEXT_LIMIT + 3000)
+    expect(JSON.stringify(value), name).toContain('tooLarge')
   }
 })

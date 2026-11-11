@@ -14,20 +14,23 @@ export interface ExecutionObservation {
 /** One observer of a stable native execution. Disposal never interrupts execution. */
 export class Turn {
   private disposed = false;
-  private readonly controller = new AbortController();
+  private readonly observationController = new AbortController();
   constructor(private readonly execution: ExecutionObservation) {}
   get id(): string { return this.execution.id; }
   events(options: EventSubscriptionOptions = {}): AsyncIterable<AhpEvent> {
-    return this.execution.events.subscribe({ ...options, signal: options.signal ? AbortSignal.any([options.signal, this.controller.signal]) : this.controller.signal });
+    return this.execution.events.subscribe({ ...options, signal: this.observationSignal(options.signal) });
   }
   result(wait: RequestOptions = {}): Promise<TurnResult> {
     if (this.disposed) return Promise.reject(new HarnessSdkError('TURN_DISPOSED'));
-    return waitForRequest(() => this.execution.result, { ...wait, signal: wait.signal ? AbortSignal.any([wait.signal, this.controller.signal]) : this.controller.signal });
+    return waitForRequest(() => this.execution.result, { ...wait, signal: this.observationSignal(wait.signal) });
   }
   steer(options: { input: Input }, wait?: RequestOptions): Promise<void> { this.assertOpen(); return this.execution.steer(options.input, wait); }
   interrupt(wait?: RequestOptions): Promise<void> { this.assertOpen(); return this.execution.interrupt(wait); }
+  private observationSignal(signal?: AbortSignal): AbortSignal {
+    return signal ? AbortSignal.any([signal, this.observationController.signal]) : this.observationController.signal;
+  }
   private assertOpen(): void { if (this.disposed) throw new HarnessSdkError('TURN_DISPOSED'); }
   observe(): Turn { this.assertOpen(); return new Turn(this.execution); }
-  async dispose(): Promise<void> { this.disposed = true; this.controller.abort(); }
+  async dispose(): Promise<void> { this.disposed = true; this.observationController.abort(); }
 }
 

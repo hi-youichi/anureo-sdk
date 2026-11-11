@@ -11,7 +11,7 @@ export interface ClaudeQueryScript {
 export class ScriptedClaudeQuery implements AsyncIterable<JsonObject> {
   readonly calls: Array<{ method: string; value?: JsonValue }> = [];
   private readonly queue = new BoundedEventQueue<JsonObject>();
-  private closed = false;
+  private closeCalled = false;
   constructor(private readonly script: ClaudeQueryScript) { for (const message of script.messages) this.queue.push(structuredClone(message)); }
   [Symbol.asyncIterator](): AsyncIterator<JsonObject> { return this.queue[Symbol.asyncIterator](); }
   async streamInput(stream: AsyncIterable<JsonValue>): Promise<void> {
@@ -24,6 +24,6 @@ export class ScriptedClaudeQuery implements AsyncIterable<JsonObject> {
   async rewindFiles(id: string): Promise<{ canRewind: boolean; error?: string }> { this.calls.push({ method: "rewindFiles", value: id }); return this.script.canRewind ? { canRewind: true } : { canRewind: false, error: "No checkpoint" }; }
   async supportedModels() { return this.script.models ?? [{ value: "fake-model", displayName: "Fake", description: "Fixture" }]; }
   finish(): void { this.queue.end(); }
-  close(): void { if (!this.closed) { this.closed = true; this.calls.push({ method: "close" }); this.queue.end(); } }
+  close(): void { if (!this.closeCalled) { this.closeCalled = true; this.calls.push({ method: "close" }); this.queue.end(); } }
 }
 export function createFakeClaudeQuery(script: ClaudeQueryScript): ScriptedClaudeQuery { return new ScriptedClaudeQuery(script); }

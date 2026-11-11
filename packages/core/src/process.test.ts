@@ -70,8 +70,13 @@ test('owned dispose is idempotent and escalates after grace timeout', async () =
 });
 
 test('owned dispose terminates a child process tree', async () => {
-  const code = 'const {spawn}=require("node:child_process");const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore"});console.log(child.pid);setInterval(()=>{},1000)';
-  const child = await spawnHarnessProcess({ command: process.execPath, args: ['-e', code], shutdownTimeoutMs: 50 });
+  const processTreeScript = `
+    const { spawn } = require("node:child_process");
+    const descendant = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    console.log(descendant.pid);
+    setInterval(() => {}, 1000)
+  `;
+  const child = await spawnHarnessProcess({ command: process.execPath, args: ['-e', processTreeScript], shutdownTimeoutMs: 50 });
   const descendant = Number(await firstLine(child.stdout)); assert.ok(descendant > 0);
   await child.dispose();
   for (let i = 0; i < 100; i++) {
@@ -104,7 +109,7 @@ test('abruptly exited children retain their original PID for safe cleanup', asyn
   }
 });
 
-test('posix termination retries a transient EPERM and settles once the group is gone', async () => {
+test('posix dispose rejects after retrying EPERM while the child remains alive', async () => {
   const child = await spawnHarnessProcess({ command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], shutdownTimeoutMs: 200 });
   const killDescriptor = Object.getOwnPropertyDescriptor(process, 'kill');
   const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
@@ -117,6 +122,7 @@ test('posix termination retries a transient EPERM and settles once the group is 
       if (signal === 'SIGTERM' && ++termAttempts === 1) {
         const error = new Error('transient group signal') as NodeJS.ErrnoException; error.code = 'EPERM'; throw error;
       }
+      // Reporting a missing group does not terminate the child; dispose still waits for its exit.
       const error = new Error('group gone') as NodeJS.ErrnoException; error.code = 'ESRCH'; throw error;
     }
     return (realKill as (pid: number, signal?: NodeJS.Signals | number) => void)(pid, signal);
@@ -134,12 +140,13 @@ test('posix termination retries a transient EPERM and settles once the group is 
   }
 });
 
-test('posix termination swallows ESRCH when the group already exited', async () => {
+test('posix dispose rejects when group signaling reports ESRCH while the child remains alive', async () => {
   const child = await spawnHarnessProcess({ command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], shutdownTimeoutMs: 200 });
   const killDescriptor = Object.getOwnPropertyDescriptor(process, 'kill');
   const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
   const realKill = process.kill;
   const mockKill = ((pid: number, signal?: NodeJS.Signals | number) => {
+    // Reporting a missing group does not terminate the child; dispose still waits for its exit.
     if (pid < 0) { const error = new Error('group gone') as NodeJS.ErrnoException; error.code = 'ESRCH'; throw error; }
     return (realKill as (pid: number, signal?: NodeJS.Signals | number) => void)(pid, signal);
   }) as typeof process.kill;
@@ -154,7 +161,7 @@ test('posix termination swallows ESRCH when the group already exited', async () 
   }
 });
 
-test('an unspawnable executable surfaces its native error code without leaking spawn arguments', async () => {
+test('missing executables, NUL arguments, and excessive timeouts report HARNESS_UNAVAILABLE', async () => {
   await assert.rejects(spawnHarnessProcess({ command: 'definitely-not-a-real-executable-xyz' }), (error: unknown) =>
     error instanceof ProcessPortError && error.code === 'HARNESS_UNAVAILABLE');
   await assert.rejects(spawnHarnessProcess({ command: 'valid', args: ['bad\0arg'] }), (error: unknown) =>

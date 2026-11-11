@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:anureo:ahp:v1",
-  "title": "Anureo Harness Protocol v2",
-  "description": "Anureo Harness Protocol v2: native admission, submission identities and independent execution observations.",
+  "title": "Anureo Harness Protocol v1",
+  "description": "Anureo Harness Protocol v1, revised in place for native admission, submission identities and independent execution observations. The schema identifier urn:anureo:ahp:v1 and InitializeResult.protocolVersion (1) refer to the same protocol major; protocolContract \"native-lifecycle\" identifies the revised contract.",
   "$defs": {
     "JsonValue": {
       "anyOf": [
@@ -1159,6 +1159,7 @@
       "additionalProperties": false
     },
     "InputSubmitResult": {
+      "description": "Acknowledges dispatch (SubmissionDispatch) or confirmed native acceptance (SubmissionAcceptance) of a submission. Only the started and joined acceptance branches carry an execution turnId; queued and accepted carry no turnId and report execution association separately through submission/bound. submission/status reports admission progress, submission/bound reports the execution association, and turn/started reports the execution lifecycle. These are independent observations; the result does not specify their order relative to the response or confirm execution completion.",
       "oneOf": [
         {
           "$ref": "#/$defs/SubmissionDispatch"
@@ -2478,6 +2479,7 @@
       "additionalProperties": true
     },
     "TurnStartedEvent": {
+      "description": "Reports that an execution identified by turnId has started. Submission acceptance and submission/bound are separate observations; associating another submission with an existing execution does not start another execution.",
       "type": "object",
       "properties": {
         "type": {
@@ -2586,6 +2588,7 @@
               "minLength": 1
             },
             "kind": {
+              "description": "Selects how the SDK accumulates a provisional result: text appends payload.text to agentMessage.text; reasoningSummary appends payload.text to reasoning.summary; output appends payload.text to toolCall.output; patch replaces the retained Item with a complete snapshot from payload.value. Text deltas for other Item types leave the retained result unchanged. item/completed supplies the authoritative final snapshot.",
               "enum": [
                 "text",
                 "reasoningSummary",
@@ -2594,9 +2597,11 @@
               ]
             },
             "text": {
+              "description": "Text chunk used by text, reasoningSummary and output. The SDK appends to the existing string, starting from an empty string when the target summary or output is absent or non-string. An empty chunk adds no characters. If text is absent, these kinds leave the retained result unchanged; value is not a fallback. For patch, text is ignored even when value is also present.",
               "type": "string"
             },
             "value": {
+              "description": "For patch, the SDK recognizes an object with a type discriminator as a complete Item snapshot: it must validate as Item and match the existing Item's id and type. It replaces the whole retained snapshot, including accumulated text; fields omitted from the replacement are not inherited. This is not an RFC 6902 operation array or a merge patch. Absent value or other JSON values have no built-in result update rule. For text, reasoningSummary and output, value is ignored even when text is also present. These application rules do not narrow this field's JsonValue schema.",
               "$ref": "#/$defs/JsonValue"
             }
           },
@@ -4111,8 +4116,10 @@
       "additionalProperties": true
     },
     "SubmissionAcceptance": {
+      "description": "Confirms native acceptance: accepted is true in every branch, while disposition describes the evidence available about how the input was admitted. Receipt, when present, carries native acknowledgement or correlation details in an opaque JSON object; its fields do not by themselves establish an execution turnId. A receipt is required for queued and optional for started, joined and accepted. Acceptance does not confirm execution completion.",
       "oneOf": [
         {
+          "description": "Confirms that the submission started an execution, identified by the required turnId. The response may arrive after execution lifecycle events.",
           "type": "object",
           "properties": {
             "submissionId": {
@@ -4142,6 +4149,7 @@
           "additionalProperties": false
         },
         {
+          "description": "Confirms that the submission joined an existing execution identified by the required turnId. Joining does not produce a new execution start.",
           "type": "object",
           "properties": {
             "submissionId": {
@@ -4171,6 +4179,7 @@
           "additionalProperties": false
         },
         {
+          "description": "Confirms native queue admission, with a required receipt. This branch carries no turnId and does not confirm that execution has started.",
           "type": "object",
           "properties": {
             "submissionId": {
@@ -4196,6 +4205,7 @@
           "additionalProperties": false
         },
         {
+          "description": "Confirms native acceptance without classifying the input as started, joined or queued. This branch carries no turnId; execution association is reported separately through submission/bound.",
           "type": "object",
           "properties": {
             "submissionId": {
@@ -4222,6 +4232,7 @@
       ]
     },
     "SubmissionBound": {
+      "description": "Reports the confirmed association of submissionId with the actual execution turnId. Multiple submissions may refer to the same execution. Binding is separate from admission status and turn/started; it does not create an execution or imply that the execution is still running when the association is reported.",
       "type": "object",
       "properties": {
         "submissionId": {
@@ -4256,6 +4267,7 @@
       "additionalProperties": true
     },
     "SubmissionDispatch": {
+      "description": "Confirms only that the submission was handed off for native processing, such as by a local input queue or transport write. It carries neither accepted nor turnId and does not confirm native acceptance or execution start. Execution association can be observed through submission/bound even when no native acceptance receipt is available.",
       "type": "object",
       "properties": {
         "submissionId": {
@@ -4273,6 +4285,7 @@
       "additionalProperties": false
     },
     "SubmissionStatus": {
+      "description": "Admission progress for submissionId, separate from execution association (submission/bound) and execution lifecycle (turn/started and turn/completed). submitted and dispatched do not confirm native acceptance; accepted reports acceptance without distinguishing started from joined, and queued reports queue admission. rejected reports rejection; unknown reports an unconfirmed outcome. The enum does not define a required transition sequence or require every status to be emitted.",
       "type": "object",
       "properties": {
         "submissionId": {
@@ -4293,6 +4306,7 @@
           "$ref": "#/$defs/HarnessError"
         },
         "receipt": {
+          "description": "Optional native acknowledgement or correlation details, as in SubmissionAcceptance. This opaque object does not establish an execution identity or completion by itself.",
           "$ref": "#/$defs/JsonObject"
         }
       },

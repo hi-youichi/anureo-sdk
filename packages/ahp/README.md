@@ -1,13 +1,14 @@
 # @anureo/adapter-ahp
 
-Adapter connecting the Anureo SDK to **external harnesses that speak AHP themselves** — over stdio or WebSocket. Use the anureo SDK to connect any harness, including one built on anureo: this package is the wire-level client for third-party ACP-style hosts that implement the same protocol the SDK is built on.
+Adapter connecting the Anureo SDK to **external harnesses that implement AHP** over stdio or WebSocket. These harnesses can themselves be built with the Anureo SDK.
 
 > Part of the [Anureo SDK workspace](../../README.md). Install with `npm install @anureo/adapter-ahp`.
 
 ## Usage
 
-This is the revised workspace API, not the published 0.2.0 API. Root migration and local
-validation are complete.
+The examples below use the revised workspace API, which differs from the published
+0.2.0 API. The protocol major remains 1, but external peers must upgrade together
+and reject mismatched lifecycle capabilities during initialization.
 
 ```typescript
 import { createClient } from '@anureo/sdk'
@@ -63,6 +64,7 @@ bun test tests
 ## AHP v1 lifecycle revision
 
 The lifecycle design updates AHP v1 and package root entries in place.
-The root implementation and tests use the revised lifecycle; parallel versioned
-entries have been removed. Local conformance and clean-install checks have passed. External peers must upgrade together and reject mismatched lifecycle capabilities during initialization, even though the protocol major remains 1.
+Root migration and local validation are complete: the root implementation and tests
+use the revised lifecycle, and parallel versioned entries have been removed.
+Local conformance and clean-install checks have passed.
 See the [design and implementation plan](../../docs/native-harness-lifecycle.md).

@@ -9,31 +9,97 @@ const missingSteer = process.argv.includes('--missing-steer');
 const invalidExtension = process.argv.includes('--bad-extension');
 const authRequired = process.argv.includes('--auth-required');
 const scenario = process.argv[process.argv.indexOf('--scenario') + 1] && process.argv.includes('--scenario') ? process.argv[process.argv.indexOf('--scenario') + 1] : undefined;
-const pending = new Map(); const prompts = new Map(); const sessions = new Map(); const configs = new Map(); let nextId = 0; let clientCapabilities = {};
+// Outbound client request ID -> { resolve, reject } callbacks.
+const pendingClientRequests = new Map();
+// Session ID -> inbound session/prompt request ID held by the 'wait' command.
+const waitingPromptIdsBySession = new Map();
+// Session ID -> ordered history entries shaped as { turnId, item }.
+const historyBySession = new Map();
+// Session ID -> mutable configuration shaped as { modes, configOptions }.
+const configsBySession = new Map();
+// Shared sequence for outbound requests, new/forked sessions, and fallback turn IDs.
+let nextId = 0;
+let clientCapabilities = {};
 const send = (frame) => process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', ...frame })}\n`);
-const request = (method, params) => new Promise((resolve, reject) => { const id = `agent:${++nextId}`; pending.set(id, { resolve, reject }); send({ id, method, params }); });
+const request = (method, params) => new Promise((resolve, reject) => { const id = `agent:${++nextId}`; pendingClientRequests.set(id, { resolve, reject }); send({ id, method, params }); });
 const update = (sessionId, update) => send({ method: 'session/update', params: { sessionId, update } });
 const config = () => ({ modes: { currentModeId: 'code', availableModes: [{ id: 'code', name: 'Code' }, { id: 'plan', name: 'Plan' }] }, configOptions: [{ id: 'model-id', category: 'model', name: 'Model', type: 'select', currentValue: 'fake-model', options: [{ value: 'fake-model', name: 'Fake' }, { value: 'second-model', name: 'Second' }] }, { id: 'enabled', name: 'Enabled', type: 'boolean', currentValue: false }] });
-const configFor = (id) => { if (!configs.has(id)) configs.set(id, config()); return configs.get(id); };
+const configFor = (id) => { if (!configsBySession.has(id)) configsBySession.set(id, config()); return configsBySession.get(id); };
 async function handle(frame) {
-  if (!frame.method && pending.has(frame.id)) { const wait = pending.get(frame.id); pending.delete(frame.id); frame.error ? wait.reject(frame.error) : wait.resolve(frame.result); return; }
+  if (!frame.method && pendingClientRequests.has(frame.id)) { const wait = pendingClientRequests.get(frame.id); pendingClientRequests.delete(frame.id); frame.error ? wait.reject(frame.error) : wait.resolve(frame.result); return; }
   const p = frame.params ?? {}; const respond = (result) => { if ('id' in frame) send({ id: frame.id, result }); };
   if (frame.method === 'initialize') {
-    if (nativeLifecycle) { respond({ protocolVersion: 1, agentInfo: { name: 'correlated-agent', version: '1' }, agentCapabilities: { promptCapabilities: {}, sessionCapabilities: { close: {} } }, _meta: { ahp: { version: 2, turnCorrelation: true } } }); return; }
+    if (nativeLifecycle) {
+      respond({
+        protocolVersion: 1,
+        agentInfo: { name: 'correlated-agent', version: '1' },
+        agentCapabilities: {
+          promptCapabilities: {},
+          sessionCapabilities: { close: {} },
+        },
+        _meta: { ahp: { version: 2, turnCorrelation: true } },
+      });
+      return;
+    }
     clientCapabilities = p.clientCapabilities ?? {};
-    respond({ protocolVersion: badVersion ? 99 : 1, agentInfo: { name: 'vanilla-fake-acp', version: '1.0.0' }, agentCapabilities: { loadSession: true, promptCapabilities: { image: true, embeddedContext: true }, mcpCapabilities: { http: true }, sessionCapabilities: { ...(noResume ? {} : { resume: {} }), close: {} } }, ...(extensions ? { _meta: { ahp: { version: invalidExtension ? 2 : 1, methods: { fork: '_ahp/session/fork', revert: '_ahp/session/revert', steer: missingSteer ? '_ahp/missing/steer' : '_ahp/turn/steer', history: '_ahp/history/read', goalSet: '_ahp/goal/set', goalClear: '_ahp/goal/clear', compact: '_ahp/compact/start', review: '_ahp/review/start' }, fork: ['before', 'through'], revert: ['conversation', 'files', 'both'], subagents: true, clientRequests: { userInput: '_ahp/user_input', dynamicTool: '_ahp/dynamic_tool' } } } } : {}) }); return;
+    let extensionMetadata;
+    if (extensions) {
+      const extensionMethods = {
+        fork: '_ahp/session/fork',
+        revert: '_ahp/session/revert',
+        steer: missingSteer ? '_ahp/missing/steer' : '_ahp/turn/steer',
+        history: '_ahp/history/read',
+        goalSet: '_ahp/goal/set',
+        goalClear: '_ahp/goal/clear',
+        compact: '_ahp/compact/start',
+        review: '_ahp/review/start',
+      };
+      extensionMetadata = {
+        ahp: {
+          version: invalidExtension ? 2 : 1,
+          methods: extensionMethods,
+          fork: ['before', 'through'],
+          revert: ['conversation', 'files', 'both'],
+          subagents: true,
+          clientRequests: {
+            userInput: '_ahp/user_input',
+            dynamicTool: '_ahp/dynamic_tool',
+          },
+        },
+      };
+    }
+    respond({
+      protocolVersion: badVersion ? 99 : 1,
+      agentInfo: { name: 'vanilla-fake-acp', version: '1.0.0' },
+      agentCapabilities: {
+        loadSession: true,
+        promptCapabilities: { image: true, embeddedContext: true },
+        mcpCapabilities: { http: true },
+        sessionCapabilities: {
+          ...(noResume ? {} : { resume: {} }),
+          close: {},
+        },
+      },
+      ...(extensions ? { _meta: extensionMetadata } : {}),
+    });
+    return;
   }
-  if (frame.method === 'session/new') { if (authRequired) { send({ id: frame.id, error: { code: -32000, message: 'Authentication required' } }); return; } const id = `native-${++nextId}`; sessions.set(id, []); respond({ sessionId: id, ...configFor(id) }); return; }
+  if (frame.method === 'session/new') { if (authRequired) { send({ id: frame.id, error: { code: -32000, message: 'Authentication required' } }); return; } const id = `native-${++nextId}`; historyBySession.set(id, []); respond({ sessionId: id, ...configFor(id) }); return; }
   if (frame.method === 'session/resume' || frame.method === 'session/load') {
     if (scenario === 'titles') {
       update(p.sessionId, { sessionUpdate: 'session_info_update', title: `Restored via ${frame.method}` });
       update(p.sessionId, { sessionUpdate: 'session_info_update', updatedAt: '2026-10-28T00:00:00Z' });
     }
-    if (frame.method === 'session/load') update(p.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'history-message', content: { type: 'text', text: 'loaded snapshot' } }); respond(configFor(p.sessionId)); return; }
+    if (frame.method === 'session/load') {
+      update(p.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'history-message', content: { type: 'text', text: 'loaded snapshot' } });
+    }
+    respond(configFor(p.sessionId));
+    return;
+  }
   if (frame.method === 'session/close') { respond({}); return; }
   if (frame.method === 'session/set_mode') { configFor(p.sessionId).modes.currentModeId = p.modeId; update(p.sessionId, { sessionUpdate: 'current_mode_update', currentModeId: p.modeId }); respond({}); return; }
   if (frame.method === 'session/set_config_option') { const data = configFor(p.sessionId); const option = data.configOptions.find((option) => option.id === p.configId); if (option) option.currentValue = p.value; respond({ configOptions: data.configOptions }); return; }
-  if (frame.method === 'session/cancel') { const promptId = prompts.get(p.sessionId); if (promptId !== undefined) { send({ id: promptId, result: { stopReason: 'cancelled' } }); prompts.delete(p.sessionId); } return; }
+  if (frame.method === 'session/cancel') { const promptId = waitingPromptIdsBySession.get(p.sessionId); if (promptId !== undefined) { send({ id: promptId, result: { stopReason: 'cancelled' } }); waitingPromptIdsBySession.delete(p.sessionId); } return; }
   if (frame.method === 'session/prompt') {
     if (nativeLifecycle) {
       const submissionId = p._meta?.ahp?.submissionId, joined = nativeHeld.has(p.sessionId);
@@ -51,7 +117,7 @@ async function handle(frame) {
     if (scenario) command = { approval: 'permission', userInput: 'userInput', dynamicTool: 'dynamicTool', elicitation: 'elicitation', interrupt: 'wait', steer: 'wait', disconnect: 'disconnect' }[scenario] ?? command;
     if (scenario === 'backpressure') { update(p.sessionId, { sessionUpdate: 'future_update', content: 'x'.repeat(4096) }); respond({ stopReason: 'end_turn' }); return; }
     if (command === 'disconnect') { process.exit(1); }
-    if (command === 'wait') { prompts.set(p.sessionId, frame.id); return; }
+    if (command === 'wait') { waitingPromptIdsBySession.set(p.sessionId, frame.id); return; }
     if (command === 'capabilities') {
       update(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: JSON.stringify(clientCapabilities) } });
     } else if (command === 'permission') {
@@ -92,15 +158,37 @@ async function handle(frame) {
       update(p.sessionId, { sessionUpdate: 'future_update', safe: 'retained', token: 'redact-me' });
       if (scenario === 'unknown-item') update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId: 'future-tool', title: 'Future', kind: 'future_kind', status: 'completed', rawInput: { safe: true } });
       const nativeTurnId = p._meta?.ahp?.turnId ?? `native-turn-${++nextId}`;
-      sessions.get(p.sessionId)?.push({ turnId: nativeTurnId, item: { id: 'agent_message_chunk:reused', type: 'agentMessage', text: `Hello ${command}`, phase: 'final' } });
+      historyBySession.get(p.sessionId)?.push({ turnId: nativeTurnId, item: { id: 'agent_message_chunk:reused', type: 'agentMessage', text: `Hello ${command}`, phase: 'final' } });
     }
     respond({ stopReason: 'end_turn' }); return;
   }
   if (extensions && frame.method.startsWith('_ahp/')) {
-    if (frame.method === '_ahp/session/fork') { const sessionId = `fork-${++nextId}`; const source = sessions.get(p.sessionId) ?? []; const at = source.findIndex((item) => item.turnId === p.boundary.turnId); sessions.set(sessionId, source.slice(0, at < 0 ? 0 : p.boundary.relation === 'before' ? at : at + 1)); respond({ sessionId, ...config() }); return; }
+    if (frame.method === '_ahp/session/fork') {
+      const sessionId = `fork-${++nextId}`;
+      const source = historyBySession.get(p.sessionId) ?? [];
+      const boundaryIndex = source.findIndex((item) => item.turnId === p.boundary.turnId);
+      let historyEndIndex;
+      if (boundaryIndex < 0) {
+        historyEndIndex = 0;
+      } else {
+        historyEndIndex = p.boundary.relation === 'before' ? boundaryIndex : boundaryIndex + 1;
+      }
+      historyBySession.set(sessionId, source.slice(0, historyEndIndex));
+      respond({ sessionId, ...config() });
+      return;
+    }
     if (frame.method === '_ahp/turn/steer') { respond({ turnId: p.expectedTurnId, accepted: true }); return; }
-    if (frame.method === '_ahp/session/revert') { const source = sessions.get(p.sessionId) ?? []; const at = source.findIndex((item) => item.turnId === p.boundary.turnId); if (at >= 0 && p.scope !== 'files') source.splice(p.boundary.relation === 'before' ? at : at + 1); respond({ appliedScope: p.scope, boundary: p.boundary }); return; }
-    if (frame.method === '_ahp/history/read') { respond({ items: sessions.get(p.sessionId) ?? [], snapshotToken: 'native-snapshot', source: { provider: 'acp', value: p.sessionId } }); return; }
+    if (frame.method === '_ahp/session/revert') {
+      const source = historyBySession.get(p.sessionId) ?? [];
+      const boundaryIndex = source.findIndex((item) => item.turnId === p.boundary.turnId);
+      if (boundaryIndex >= 0 && p.scope !== 'files') {
+        const historyEndIndex = p.boundary.relation === 'before' ? boundaryIndex : boundaryIndex + 1;
+        source.splice(historyEndIndex);
+      }
+      respond({ appliedScope: p.scope, boundary: p.boundary });
+      return;
+    }
+    if (frame.method === '_ahp/history/read') { respond({ items: historyBySession.get(p.sessionId) ?? [], snapshotToken: 'native-snapshot', source: { provider: 'acp', value: p.sessionId } }); return; }
     if (frame.method === '_ahp/goal/set') { respond({ goal: p.goal, status: 'active' }); return; }
     if (frame.method === '_ahp/goal/clear') { respond({ goal: null, status: 'cleared' }); return; }
     if (frame.method === '_ahp/compact/start') { respond({ maintenanceId: 'compact', status: 'completed' }); return; }

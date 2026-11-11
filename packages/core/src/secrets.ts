@@ -1,7 +1,15 @@
 import { boundFileChangeItem } from "./file-change-limits";
-import type { Capabilities, AhpEventPayload, AhpMethod, AhpResultMap, GoalState, HistoryPage, InputBlock, InteractionRequested, InteractionResponse, Item, JsonObject, JsonSchema, JsonValue, SessionState } from "@anureo/protocol";
+import type { Capabilities, AhpEventPayload, AhpMethod, AhpResultMap, FileChange, GoalState, HistoryPage, InputBlock, InteractionRequested, InteractionResponse, Item, JsonObject, JsonSchema, JsonValue, SessionState, ToolCallItem } from "@anureo/protocol";
 import { assertDefinition } from "@anureo/protocol";
 import { HarnessSdkError } from "./errors";
+
+function isJsonObject(value: JsonValue | undefined): value is JsonObject {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isJsonSchema(value: JsonValue | undefined): value is JsonSchema {
+  return typeof value === "boolean" || isJsonObject(value);
+}
 
 /** Session-local marked answers only. Values never persist and unmarked chat text is not inferred. */
 export class SecretRedactor {
@@ -28,30 +36,77 @@ export class SecretRedactor {
     if (request.kind === "elicitation" && response.kind === "elicitation" && response.content && request.schema !== undefined) this.fromSchema(request.schema, response.content, request.schema);
     if (request.kind === "dynamicTool" && response.kind === "dynamicTool" && request.schema !== undefined) this.fromSchema(request.schema, response as unknown as JsonValue, request.schema);
   }
+  private resolveLocalReference(reference: string, root: JsonSchema): JsonValue | undefined {
+    let target: JsonValue | undefined = root;
+    for (const token of reference.slice(2).split("/")) {
+      const key = token.replace(/~1/g, "/").replace(/~0/g, "~");
+      target = isJsonObject(target) ? target[key] : undefined;
+    }
+    return target;
+  }
   private fromSchema(schema: JsonSchema, value: JsonValue | undefined, root: JsonSchema, depth = 0): void {
     if (depth > 32 || typeof schema !== "object" || !schema || value === undefined) return;
-    if (schema.writeOnly === true || schema.secret === true) { this.remember(value); return; }
+    if (schema.writeOnly === true || schema.secret === true) {
+      this.remember(value);
+      return;
+    }
     if (typeof schema.$ref === "string" && schema.$ref.startsWith("#/") && typeof root === "object") {
-      let target: JsonValue | undefined = root;
-      for (const token of schema.$ref.slice(2).split("/")) { const key = token.replace(/~1/g, "/").replace(/~0/g, "~"); target = target && typeof target === "object" && !Array.isArray(target) ? target[key] : undefined; }
-      if (typeof target === "boolean" || (target && typeof target === "object" && !Array.isArray(target))) this.fromSchema(target, value, root, depth + 1);
+      const target = this.resolveLocalReference(schema.$ref, root);
+      if (isJsonSchema(target)) {
+        this.fromSchema(target, value, root, depth + 1);
+      }
     }
-    if (value && typeof value === "object" && !Array.isArray(value)) {
+    // Referenced schemas are visited first; sibling keywords still apply below.
+    if (isJsonObject(value)) {
       const properties = schema.properties;
-      if (properties && typeof properties === "object" && !Array.isArray(properties)) for (const [key, child] of Object.entries(properties)) if (typeof child === "boolean" || (child && typeof child === "object" && !Array.isArray(child))) this.fromSchema(child, value[key], root, depth + 1);
-      if (schema.additionalProperties && typeof schema.additionalProperties === "object" && !Array.isArray(schema.additionalProperties)) for (const [key, child] of Object.entries(value)) if (!properties || typeof properties !== "object" || !Object.hasOwn(properties, key)) this.fromSchema(schema.additionalProperties, child, root, depth + 1);
+      if (isJsonObject(properties)) {
+        for (const [key, child] of Object.entries(properties)) {
+          if (isJsonSchema(child)) {
+            this.fromSchema(child, value[key], root, depth + 1);
+          }
+        }
+      }
+      if (
+        schema.additionalProperties &&
+        typeof schema.additionalProperties === "object" &&
+        !Array.isArray(schema.additionalProperties)
+      ) {
+        for (const [key, child] of Object.entries(value)) {
+          if (!properties || typeof properties !== "object" || !Object.hasOwn(properties, key)) {
+            this.fromSchema(schema.additionalProperties, child, root, depth + 1);
+          }
+        }
+      }
     }
-    if (Array.isArray(value) && schema.items && (typeof schema.items === "boolean" || (typeof schema.items === "object" && !Array.isArray(schema.items)))) for (const child of value) this.fromSchema(schema.items, child, root, depth + 1);
-    for (const key of ["allOf", "anyOf", "oneOf"] as const) if (Array.isArray(schema[key])) for (const branch of schema[key]) if (typeof branch === "boolean" || (branch && typeof branch === "object" && !Array.isArray(branch))) this.fromSchema(branch, value, root, depth + 1);
+    if (
+      Array.isArray(value) && schema.items &&
+      (typeof schema.items === "boolean" || (typeof schema.items === "object" && !Array.isArray(schema.items)))
+    ) {
+      for (const child of value) {
+        this.fromSchema(schema.items, child, root, depth + 1);
+      }
+    }
+    for (const key of ["allOf", "anyOf", "oneOf"] as const) {
+      if (Array.isArray(schema[key])) {
+        for (const branch of schema[key]) {
+          if (isJsonSchema(branch)) {
+            this.fromSchema(branch, value, root, depth + 1);
+          }
+        }
+      }
+    }
   }
   private scan(value: string, final: boolean): { text: string; pending: string } {
-    const values = [...this.values].sort((a, b) => b.length - a.length); const output: string[] = [];
+    const secretsByDescendingLength = [...this.values].sort((a, b) => b.length - a.length);
+    const output: string[] = [];
     for (let offset = 0; offset < value.length;) {
-      const candidates = values.filter((secret) => secret[0] === value[offset]);
-      const secret = candidates.find((entry) => value.startsWith(entry, offset));
-      if (secret) { output.push("[redacted]"); offset += secret.length; continue; }
-      const remaining = value.slice(offset);
-      if (!final && candidates.some((entry) => entry.startsWith(remaining))) return { text: output.join(""), pending: remaining };
+      const candidates = secretsByDescendingLength.filter((secret) => secret[0] === value[offset]);
+      // Prefer the longest complete match, even if a longer secret is still incomplete.
+      const completeMatch = candidates.find((entry) => value.startsWith(entry, offset));
+      if (completeMatch) { output.push("[redacted]"); offset += completeMatch.length; continue; }
+      const unprocessedSuffix = value.slice(offset);
+      // Hold a possible secret prefix only when no complete match exists; final scans emit it.
+      if (!final && candidates.some((entry) => entry.startsWith(unprocessedSuffix))) return { text: output.join(""), pending: unprocessedSuffix };
       output.push(value[offset]!); offset++;
     }
     return { text: output.join(""), pending: "" };
@@ -107,13 +162,50 @@ export class SecretRedactor {
     if (block.type === "file") return { ...block, uri: this.text(block.uri), ...(block.name ? { name: this.text(block.name) } : {}) };
     return { ...block, ...(block.url ? { url: this.text(block.url) } : {}), ...(block.data ? { data: this.text(block.data) } : {}) };
   }
+  private toolImage(item: ToolCallItem): Pick<ToolCallItem, "image"> {
+    return item.image ? {
+      image: {
+        ...item.image,
+        ...(item.image.path ? { path: this.text(item.image.path) } : {}),
+        ...(item.image.revisedPrompt ? { revisedPrompt: this.text(item.image.revisedPrompt) } : {}),
+      },
+    } : {};
+  }
+  private fileChange(change: FileChange): FileChange {
+    return {
+      ...change,
+      path: this.text(change.path),
+      ...(change.oldPath !== undefined ? { oldPath: this.text(change.oldPath) } : {}),
+      materials: change.materials.map((material) => {
+        if (material.format === "unified") return { ...material, patch: this.text(material.patch) };
+        if (material.format === "text") return {
+          ...material,
+          oldText: material.oldText === null ? null : this.text(material.oldText),
+          newText: this.text(material.newText),
+        };
+        return material;
+      }),
+    };
+  }
   item(item: Item): Item {
     if (item.extensions) item = { ...item, extensions: this.json(item.extensions) as JsonObject };
     switch (item.type) {
       case "agentMessage": return { ...item, text: this.text(item.text) };
       case "userMessage": return { ...item, content: item.content.map((block) => this.input(block)) };
       case "reasoning": return { ...item, ...(item.text ? { text: this.text(item.text) } : {}), ...(item.summary ? { summary: this.text(item.summary) } : {}) };
-      case "toolCall": return boundFileChangeItem({ ...item, ...(item.image ? { image: { ...item.image, ...(item.image.path ? { path: this.text(item.image.path) } : {}), ...(item.image.revisedPrompt ? { revisedPrompt: this.text(item.image.revisedPrompt) } : {}) } } : {}), ...(item.fileChanges !== undefined ? { fileChanges: item.fileChanges.map(change => ({ ...change, path: this.text(change.path), ...(change.oldPath !== undefined ? { oldPath: this.text(change.oldPath) } : {}), materials: change.materials.map(material => material.format === "unified" ? { ...material, patch: this.text(material.patch) } : material.format === "text" ? { ...material, oldText: material.oldText === null ? null : this.text(material.oldText), newText: this.text(material.newText) } : material) })) } : {}), title: this.text(item.title), ...(item.input !== undefined ? { input: this.json(item.input) } : {}), ...(item.output !== undefined ? { output: this.json(item.output) } : {}), ...(item.raw !== undefined ? { raw: this.json(item.raw) } : {}), ...(item.locations ? { locations: item.locations.map((location) => ({ ...location, path: this.text(location.path) })) } : {}) });
+      case "toolCall": {
+        const redactedItem: ToolCallItem = {
+          ...item,
+          ...this.toolImage(item),
+          ...(item.fileChanges !== undefined ? { fileChanges: item.fileChanges.map((change) => this.fileChange(change)) } : {}),
+          title: this.text(item.title),
+          ...(item.input !== undefined ? { input: this.json(item.input) } : {}),
+          ...(item.output !== undefined ? { output: this.json(item.output) } : {}),
+          ...(item.raw !== undefined ? { raw: this.json(item.raw) } : {}),
+          ...(item.locations ? { locations: item.locations.map((location) => ({ ...location, path: this.text(location.path) })) } : {}),
+        };
+        return boundFileChangeItem(redactedItem);
+      }
       case "plan": return { ...item, steps: item.steps.map((step) => ({ ...step, text: this.text(step.text) })) };
       case "subagent": return { ...item, ...(item.name ? { name: this.text(item.name) } : {}), ...(item.task ? { task: this.text(item.task) } : {}) };
       case "review": return { ...item, ...(item.text ? { text: this.text(item.text) } : {}) };

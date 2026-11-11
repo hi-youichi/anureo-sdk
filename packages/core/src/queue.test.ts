@@ -32,13 +32,22 @@ test("an awaited reader receives the reserved failure before completion", async 
 });
 
 test("detach releases ownership without closing the producer", async () => {
-  const queue = new BoundedEventQueue<number>(); const reader = queue[Symbol.asyncIterator]();
+  const queue = new BoundedEventQueue<number>();
+  const reader = queue[Symbol.asyncIterator]();
   expect(() => queue[Symbol.asyncIterator]()).toThrow("EVENT_STREAM_ALREADY_OWNED");
-  const pending = reader.next(); await reader.return?.(); expect((await pending).done).toBe(true);
-  queue.push(3); const next = queue[Symbol.asyncIterator](); expect((await next.next()).value).toBe(3); await next.return?.();
+
+  const pendingRead = reader.next();
+  await reader.return?.();
+  expect((await pendingRead).done).toBe(true);
+
+  queue.push(3);
+
+  const replacementReader = queue[Symbol.asyncIterator]();
+  expect((await replacementReader.next()).value).toBe(3);
+  await replacementReader.return?.();
 });
 
-test("frame and byte limits reject oversized input; bounded writers end on close", async () => {
+test("oversized frames and excess waiting writers are rejected; closing rejects pending writers", async () => {
   const queue = new BoundedEventQueue<string>({ maxEvents: 1, maxBytes: 20, maxFrameBytes: 10, maxWaitingWriters: 1 });
   expect(() => queue.push("x".repeat(30))).toThrow("FRAME_TOO_LARGE");
   queue.push("first"); const pending = queue.write("second");

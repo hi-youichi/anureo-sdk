@@ -3,6 +3,9 @@ import type { z } from 'zod'
 import { prepareOutputSchema } from './output-schema'
 import { isDroppedOutcome, isStartupBlockException } from './agent-outcome'
 
+// Do not impose the SDK's short observation timeout on model execution.
+const LONG_OBSERVATION_TIMEOUT_MS = 0x7fffffff
+
 export interface AgentOptions<S extends z.ZodObject = z.ZodObject> {
   client: Client
   cwd: string
@@ -10,6 +13,11 @@ export interface AgentOptions<S extends z.ZodObject = z.ZodObject> {
   instructions?: string
   schema?: S
 }
+
+type AgentOutcome =
+  | { status: 'completed'; value: string | Record<string, unknown> }
+  | { status: 'dropped'; error: { code: string; outcomeUnknown: boolean } }
+  | { status: 'failed'; error: HarnessSdkError }
 
 export function agent(prompt: string, options: AgentOptions<never> & { schema?: undefined }): Promise<string | null>
 export function agent<S extends z.ZodObject>(prompt: string, options: AgentOptions<S> & { schema: S }): Promise<z.output<S> | null>
@@ -21,18 +29,15 @@ export async function agent(prompt: string, options: AgentOptions): Promise<stri
   const session = await client.sessions.create({ cwd, ...(model !== undefined ? { model } : {}), ...(instructions !== undefined ? { instructions } : {}) })
     .catch(cause => { if (isStartupBlockException(cause)) return null; throw cause })
   if (!session) return null // A failed open never hands session ownership to this call.
-  let value: string | Record<string, unknown> | null = null
-  let failure: HarnessSdkError | undefined
-  let droppedError: { code: string; outcomeUnknown: boolean } | undefined
+  let outcome: AgentOutcome
   try {
     if (output && !session.capabilities.turn?.outputSchema) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Backend does not support outputSchema')
-    // Do not impose the SDK's short observation timeout on model execution.
-    const turn = await session.submit({ input: prompt, ...(output ? { outputSchema: output.schema } : {}) }, { timeoutMs: 0x7fffffff })
-    const result = await turn.result({ timeoutMs: 0x7fffffff })
+    const turn = await session.submit({ input: prompt, ...(output ? { outputSchema: output.schema } : {}) }, { timeoutMs: LONG_OBSERVATION_TIMEOUT_MS })
+    const result = await turn.result({ timeoutMs: LONG_OBSERVATION_TIMEOUT_MS })
     if (result.status === 'completed') {
-      value = output ? await output.parse(result.text) : result.text
+      outcome = { status: 'completed', value: output ? await output.parse(result.text) : result.text }
     } else if (result.error && isDroppedOutcome(result.error, result.status)) {
-      droppedError = { code: result.error.code, outcomeUnknown: result.error.outcomeUnknown }
+      outcome = { status: 'dropped', error: { code: result.error.code, outcomeUnknown: result.error.outcomeUnknown } }
     } else if (result.error) {
       const { code, message, retryable, outcomeUnknown, details } = result.error
       throw new HarnessSdkError(code, message, retryable, outcomeUnknown, details)
@@ -40,8 +45,8 @@ export async function agent(prompt: string, options: AgentOptions): Promise<stri
       throw new HarnessSdkError('AGENT_INTERRUPTED')
     }
   } catch (cause) {
-    if (isStartupBlockException(cause)) droppedError = { code: cause.code, outcomeUnknown: cause.outcomeUnknown }
-    else failure = sdkError(cause, 'AGENT_FAILED', true)
+    if (isStartupBlockException(cause)) outcome = { status: 'dropped', error: { code: cause.code, outcomeUnknown: cause.outcomeUnknown } }
+    else outcome = { status: 'failed', error: sdkError(cause, 'AGENT_FAILED', true) }
   }
 
   // Closing observation does not prove the backend execution stopped. Never retry input.
@@ -50,11 +55,17 @@ export async function agent(prompt: string, options: AgentOptions): Promise<stri
   try { await session.dispose() } catch (cause) { cleanupErrors.add(sdkError(cause, 'RESOURCE_RELEASE_FAILED', true)) }
   if (cleanupErrors.size) {
     const errors = [...cleanupErrors].map(error => ({ code: error.code, outcomeUnknown: error.outcomeUnknown }))
-    if (failure) throw new HarnessSdkError(failure.code, failure.message, failure.retryable, failure.outcomeUnknown,
-      { ...failure.details, cleanupErrors: errors })
+    if (outcome.status === 'failed') {
+      const failure = outcome.error
+      throw new HarnessSdkError(failure.code, failure.message, failure.retryable, failure.outcomeUnknown,
+        { ...failure.details, cleanupErrors: errors })
+    }
     throw new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'Agent session cleanup failed', false,
-      errors.some(error => error.outcomeUnknown), { errors, ...(droppedError ? { droppedError } : {}) })
+      errors.some(error => error.outcomeUnknown), { errors, ...(outcome.status === 'dropped' ? { droppedError: outcome.error } : {}) })
   }
-  if (failure) throw failure
-  return value
+  switch (outcome.status) {
+    case 'completed': return outcome.value
+    case 'dropped': return null
+    case 'failed': throw outcome.error
+  }
 }

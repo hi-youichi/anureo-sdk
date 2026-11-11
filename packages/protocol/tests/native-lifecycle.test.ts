@@ -14,16 +14,42 @@ test('revised v1 requires the lifecycle discriminator in both handshake directio
   expect(validateRequest('initialize', { ...params, protocolContract: 'old' })).toBe(false);
   expect(validateResult('initialize', { ...result, protocolContract: 'old' })).toBe(false);
 });
-test('input submission does not allocate an execution and receipts need native evidence fields', () => {
+test('input submission does not allocate an execution', () => {
   expect(isAhpMethod('turn/start')).toBe(false);
   expect(validateRequest('input/submit', input)).toBe(true);
   expect(validateRequest('input/submit', { ...input, turnId: 'fake-execution' })).toBe(false);
-  expect(validateResult('input/submit', { submissionId: 'input', disposition: 'dispatched' })).toBe(true);
-  expect(validateResult('input/submit', { accepted: true, submissionId: 'input', disposition: 'queued', receipt: { nativeId: 'q' } })).toBe(true);
-  expect(validateResult('input/submit', { accepted: true, submissionId: 'input', disposition: 'queued' })).toBe(false);
-  expect(validateResult('input/submit', { accepted: true, submissionId: 'input', disposition: 'started' })).toBe(false);
-  expect(validateResult('input/submit', { accepted: true, submissionId: 'input', disposition: 'joined', turnId: 'actual' })).toBe(true);
+});
+test('session/close rejects a result containing only closed: true', () => {
   expect(validateResult('session/close', { closed: true })).toBe(false);
+});
+test.each([
+  {
+    name: 'dispatched without accepted or an execution identifier',
+    result: { submissionId: 'input', disposition: 'dispatched' },
+    expected: true,
+  },
+  {
+    name: 'queued with a native receipt',
+    result: { accepted: true, submissionId: 'input', disposition: 'queued', receipt: { nativeId: 'q' } },
+    expected: true,
+  },
+  {
+    name: 'queued without a receipt',
+    result: { accepted: true, submissionId: 'input', disposition: 'queued' },
+    expected: false,
+  },
+  {
+    name: 'started without an execution identifier',
+    result: { accepted: true, submissionId: 'input', disposition: 'started' },
+    expected: false,
+  },
+  {
+    name: 'joined with an execution identifier',
+    result: { accepted: true, submissionId: 'input', disposition: 'joined', turnId: 'actual' },
+    expected: true,
+  },
+])('input/submit result: $name', ({ result, expected }) => {
+  expect(validateResult('input/submit', result)).toBe(expected);
 });
 test('submission notifications retain complete source envelopes and scoped items require executions', () => {
   const source = { sessionId: 's', streamId: 'stream', seq: 1, timestamp: new Date().toISOString() };

@@ -51,6 +51,9 @@ test('a failed item skips its remaining stages while other items continue', asyn
     async value => { if (value === 1) throw failure; await gate; return value },
     value => { finalItems.push(value); completed(); return value },
   ).then(values => { settled = true; return values })
+  // Give the failed item's rejection handling a chance to advance before checking
+  // that the sibling blocked on gate keeps the pipeline pending. These two yields
+  // provide bounded scheduling progress, without guaranteeing failure handling is complete.
   await Promise.resolve()
   await Promise.resolve()
   expect(settled).toBe(false)

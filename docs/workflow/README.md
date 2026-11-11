@@ -373,8 +373,9 @@ const results = await pipeline(
 The second stage runs only for `a.ts`. It receives the first stage's result along
 with the original filename and input position.
 
-Stages can call [agent()](#agent) or ordinary application code. Actual model
-concurrency is governed separately by the Claude Code host's agent gate.
+Stages can call [agent()](#agent) or ordinary application code. In the reference
+Claude Code host, actual model concurrency is governed separately by its agent
+gate. The Anureo primitive itself does not provide a shared agent gate.
 Use [parallel()](#parallel) followed by another operation when that operation
 needs all prior results together.
 
@@ -384,7 +385,7 @@ needs all prior results together.
 | --- | --- |
 | Direct import, independent item chains, awaited stage results, input order, and empty input with valid stages | Implemented. |
 | Stage-to-stage type checking and final result type inference | Implemented as Anureo TypeScript conveniences. |
-| Three stage arguments and awaited inputs | Implemented. The original input entry remains available even when it is a Promise. |
+| Stage callback arguments (`prevResult`, `originalItem`, `index`) and awaited inputs | Implemented. The original input entry remains available even when it is a Promise. |
 | Convert item failures to `null` and await all item chains | Implemented with `Promise.allSettled()`. |
 | Stop an item's remaining stages when input or a result is `null` | Implemented. Other falsy values continue normally. |
 | Zero stages | Implemented in the types and runtime. |

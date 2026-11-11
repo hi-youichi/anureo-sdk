@@ -21,12 +21,15 @@ export function string(value: unknown): string | undefined { return typeof value
 export class CodexJsonlClient {
   private nextId = 1
   private readonly pending = new Map<number | string, { resolve(value: unknown): void; reject(cause: unknown): void; timer: ReturnType<typeof setTimeout> }>()
+  // Rejects new requests and writes; already queued writes are not cancelled.
   private closed = false
+  // Shares the explicit process-disposal task across dispose() calls.
   private disposing?: Promise<void>
   private writeTail: Promise<void> = Promise.resolve()
-  private serverRequests = 0
+  private activeServerRequestHandlers = 0
   private readonly maxFrameBytes: number
   private readonly decoder = new TextDecoder('utf-8', { fatal: true })
+  /** Tracks stdout reading and its failure-handling chain; excludes stderr, interaction handlers and process disposal. */
   readonly finished: Promise<void>
   constructor(readonly process: HarnessProcess, private readonly handlers: JsonlHandlers, private readonly options: JsonlOptions = {}) {
     this.maxFrameBytes = options.maxFrameBytes ?? 8 * 1024 * 1024
@@ -43,9 +46,10 @@ export class CodexJsonlClient {
     if (this.closed) return Promise.reject(new HarnessSdkError('CONNECTION_CLOSED', 'Codex connection is closed', false, true))
     const encoded = JSON.stringify(message) + '\n'
     if (new TextEncoder().encode(encoded).byteLength > this.maxFrameBytes) return Promise.reject(new HarnessSdkError('FRAME_TOO_LARGE'))
-    const task = this.writeTail.then(() => this.process.write(encoded))
-    this.writeTail = task.catch(() => {})
-    return task
+    const writeTask = this.writeTail.then(() => this.process.write(encoded))
+    // Recover the queue for later writes; the returned writeTask still propagates this write's failure.
+    this.writeTail = writeTask.catch(() => {})
+    return writeTask
   }
   notify(method: string, params?: NativeRecord): Promise<void> { return this.write({ method, ...(params ? { params } : {}) }) }
   request<T = unknown>(method: string, params: NativeRecord = {}): Promise<T> {
@@ -88,13 +92,31 @@ export class CodexJsonlClient {
     if (typeof message.method === 'string') {
       if (id === undefined) { await this.handlers.notification(message.method, record(message.params)); return }
       if (typeof id !== 'number' && typeof id !== 'string') throw new HarnessSdkError('PROTOCOL_ERROR')
-      if (++this.serverRequests > (this.options.maxServerRequests ?? 32)) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED', 'Too many native interactions', false, true)
-      let answered = false
-      const reply = async (result: unknown) => { if (answered) throw new HarnessSdkError('INTERACTION_ALREADY_RESOLVED'); answered = true; await this.write({ id, result }) }
-      const reject = async (code: number, text: string) => { if (answered) return; answered = true; await this.write({ id, error: { code, message: text } }) }
+      if (++this.activeServerRequestHandlers > (this.options.maxServerRequests ?? 32)) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED', 'Too many native interactions', false, true)
+      // Claim response ownership before writing, even if the write later fails.
+      let responseClaimed = false
+      const reply = async (result: unknown) => {
+        if (responseClaimed) {
+          throw new HarnessSdkError('INTERACTION_ALREADY_RESOLVED')
+        }
+        responseClaimed = true
+        await this.write({ id, result })
+      }
+      const reject = async (code: number, text: string) => {
+        if (responseClaimed) {
+          return
+        }
+        responseClaimed = true
+        await this.write({ id, error: { code, message: text } })
+      }
       // Do not block stdout on a user answer: responses and interrupt notifications must still drain.
       void this.handlers.request({ id, method: message.method, params: record(message.params) }, reply, reject)
-        .catch(() => reject(-32603, 'Interaction unavailable')).catch(() => {}).finally(() => { this.serverRequests-- })
+        .catch(() => reject(-32603, 'Interaction unavailable'))
+        .catch(() => {})
+        .finally(() => {
+          // Release the slot after the handler and any fallback rejection settle, not on reply.
+          this.activeServerRequestHandlers--
+        })
       return
     }
     if (typeof id !== 'number' && typeof id !== 'string') throw new HarnessSdkError('PROTOCOL_ERROR')
@@ -105,6 +127,7 @@ export class CodexJsonlClient {
     else if (Object.hasOwn(message, 'result')) waiting.resolve(message.result)
     else waiting.reject(new HarnessSdkError('PROTOCOL_ERROR'))
   }
+  // Closes the client, rejects pending requests and notifies failure; process disposal belongs to dispose().
   private async fail(cause: HarnessSdkError): Promise<void> {
     if (this.closed) return
     this.closed = true
@@ -112,6 +135,7 @@ export class CodexJsonlClient {
     this.pending.clear()
     await this.handlers.failure(cause)
   }
+  // Closes the client and awaits process.dispose(), without awaiting finished or notifying failure.
   dispose(): Promise<void> {
     return this.disposing ??= (async () => {
       this.closed = true

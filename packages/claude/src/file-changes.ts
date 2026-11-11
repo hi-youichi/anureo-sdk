@@ -1,6 +1,23 @@
 import type { FileChange, Item } from '@anureo/protocol'
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 
+type StructuredPatchHunk = Record<string, unknown> & {
+  oldStart: number
+  oldLines: number
+  newStart: number
+  newLines: number
+  lines: string[]
+}
+
+function isPatchLine(line: unknown): line is string {
+  return typeof line === 'string' && /^[ +\\-]/.test(line)
+}
+
+function isStructuredPatchHunk(hunk: Record<string, unknown>): hunk is StructuredPatchHunk {
+  const hasValidRange = ['oldStart', 'oldLines', 'newStart', 'newLines'].every(key => Number.isInteger(hunk[key]) && (hunk[key] as number) >= 0)
+  return hasValidRange && Array.isArray(hunk.lines) && hunk.lines.every(isPatchLine)
+}
+
 /** Tool inputs prove fragments, never whole-file creation or fragment line positions. */
 export function claudeFileChanges(name: string, input: unknown, result?: unknown): FileChange[] | undefined {
   if (!['Edit', 'MultiEdit', 'Write'].includes(name)) return undefined
@@ -12,9 +29,8 @@ export function claudeFileChanges(name: string, input: unknown, result?: unknown
   // Pinned Claude SDK FileEditOutput / FileWriteOutput carry typed hunk arrays.
   if (Array.isArray(output.structuredPatch) && output.structuredPatch.length) {
     const hunks = output.structuredPatch.map(record)
-    const valid = hunks.every(hunk => ['oldStart', 'oldLines', 'newStart', 'newLines'].every(key => Number.isInteger(hunk[key]) && (hunk[key] as number) >= 0) && Array.isArray(hunk.lines) && hunk.lines.every(line => typeof line === 'string' && /^[ +\\-]/.test(line)))
-    if (valid) {
-      const patch = hunks.map(hunk => `@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@\n${(hunk.lines as string[]).join('\n')}\n`).join('')
+    if (hunks.every(isStructuredPatchHunk)) {
+      const patch = hunks.map(hunk => `@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@\n${hunk.lines.join('\n')}\n`).join('')
       return [{ path, operation: output.type === 'create' ? 'add' : 'modify', materials: [{ format: 'unified', patch }], completeness: 'complete' }]
     }
   }
@@ -34,5 +50,19 @@ export function claudeFileChanges(name: string, input: unknown, result?: unknown
 
 export function completeClaudeTool(previous: Extract<Item, { type: 'toolCall' }>, block: Record<string, unknown>): Item {
   const fileChanges = claudeFileChanges(previous.nativeType ?? previous.title, previous.input, block.structuredContent ?? block.content)
-  return { ...previous, status: previous.status === 'declined' || previous.status === 'interrupted' ? previous.status : block.is_error ? 'failed' : 'completed', output: block.content as import('@anureo/protocol').JsonValue, ...(fileChanges !== undefined ? { fileChanges } : {}) }
+  const previousFields = { ...previous }
+  let status: typeof previous.status
+  if (previous.status === 'declined' || previous.status === 'interrupted') {
+    status = previous.status
+  } else if (block.is_error) {
+    status = 'failed'
+  } else {
+    status = 'completed'
+  }
+  return {
+    ...previousFields,
+    status,
+    output: block.content as import('@anureo/protocol').JsonValue,
+    ...(fileChanges !== undefined ? { fileChanges } : {}),
+  }
 }

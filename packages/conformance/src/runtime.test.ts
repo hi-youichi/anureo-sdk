@@ -98,8 +98,13 @@ test("detaching an event reader does not interrupt execution or replay old event
   await again.return?.(); await runtime.dispose();
 });
 
+const approvalInteraction = {
+  request: { interactionId: "approval", kind: "approval", options: [{ id: "yes", label: "Allow once" }, { id: "no", label: "Deny" }] },
+  response: { kind: "approval", optionId: "yes" },
+} satisfies { request: InteractionRequested; response: InteractionResponse };
+
 const interactions: Array<{ request: InteractionRequested; response: InteractionResponse }> = [
-  { request: { interactionId: "approval", kind: "approval", options: [{ id: "yes", label: "Allow once" }, { id: "no", label: "Deny" }] }, response: { kind: "approval", optionId: "yes" } },
+  approvalInteraction,
   { request: { interactionId: "input", kind: "userInput", questions: [{ id: "q", prompt: "Answer?", secret: true }] }, response: { kind: "userInput", answers: { q: "sensitive" } } },
   { request: { interactionId: "elicitation", kind: "elicitation", mode: "form", schema: { type: "object", required: ["name"] } }, response: { kind: "elicitation", action: "accept", content: { name: "A" } } },
   { request: { interactionId: "dynamic", kind: "dynamicTool", toolName: "test", arguments: {} }, response: { kind: "dynamicTool", content: [{ type: "text", text: "result" }] } },
@@ -117,17 +122,17 @@ for (const entry of interactions) test(`interaction ${entry.request.kind} waits 
 
 test("invalid interaction answers keep pending; racing valid replies invoke native once", async () => {
   const { runtime, session, sink } = await setup(); let release!: () => void; let calls = 0;
-  const pending = sink.requestInteraction(interactions[0].request, async () => { calls++; await new Promise<void>((resolve) => { release = resolve; }); });
+  const pending = sink.requestInteraction(approvalInteraction.request, async () => { calls++; await new Promise<void>((resolve) => { release = resolve; }); });
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
-  await expect(session.request("interaction/respond", { requestId: "invalid", sessionId: "s", interactionId: "approval", response: { kind: "approval", optionId: "invented" } })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
-  const first = session.request("interaction/respond", { requestId: "first", sessionId: "s", interactionId: "approval", response: interactions[0].response });
-  await expect(session.request("interaction/respond", { requestId: "second", sessionId: "s", interactionId: "approval", response: { kind: "approval", optionId: "no" } })).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
+  await expect(session.request("interaction/respond", { requestId: "invalid", sessionId: "s", interactionId: approvalInteraction.request.interactionId, response: { kind: "approval", optionId: "invented" } })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
+  const first = session.request("interaction/respond", { requestId: "first", sessionId: "s", interactionId: approvalInteraction.request.interactionId, response: approvalInteraction.response });
+  await expect(session.request("interaction/respond", { requestId: "second", sessionId: "s", interactionId: approvalInteraction.request.interactionId, response: { kind: "approval", optionId: "no" } })).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
   expect(calls).toBe(1); release(); await first; await pending; await reader.return?.(); await runtime.dispose();
 });
 
 test("timeout cancels a pending native interaction rather than approving it", async () => {
   const { runtime, session, sink } = await setup({}, { interactionTimeoutMs: 15 }); let response: InteractionResponse | null | undefined;
-  const pending = sink.requestInteraction(interactions[0].request, async (value) => { response = value; });
+  const pending = sink.requestInteraction(approvalInteraction.request, async (value) => { response = value; });
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
   await expect(pending).rejects.toMatchObject({ code: "INTERACTION_CANCELLED" });
   expect(response).toBe(null); expect((await nextType(reader, "interaction/resolved")).payload).toMatchObject({ outcome: "expired" });
@@ -136,10 +141,10 @@ test("timeout cancels a pending native interaction rather than approving it", as
 
 test("native response loss is unknown and not automatically retried", async () => {
   const { runtime, session, sink } = await setup(); let calls = 0;
-  const pending = sink.requestInteraction(interactions[0].request, async () => { calls++; throw new HarnessSdkError("RESULT_UNKNOWN", "private", false, true); });
+  const pending = sink.requestInteraction(approvalInteraction.request, async () => { calls++; throw new HarnessSdkError("RESULT_UNKNOWN", "private", false, true); });
   void pending.catch(() => {});
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
-  const params = { requestId: "response", sessionId: "s", interactionId: "approval", response: interactions[0].response };
+  const params = { requestId: "response", sessionId: "s", interactionId: approvalInteraction.request.interactionId, response: approvalInteraction.response };
   await expect(session.request("interaction/respond", params)).rejects.toMatchObject({ outcomeUnknown: true }); await expect(pending).rejects.toMatchObject({ outcomeUnknown: true });
   expect((await nextType(reader, "interaction/resolved")).payload).toMatchObject({ outcome: "unknown" });
   await expect(session.request("interaction/respond", params)).rejects.toMatchObject({ outcomeUnknown: true }); expect(calls).toBe(1);
@@ -175,13 +180,13 @@ test("runtime disposal preserves backend stop failure after cleaning every owner
 
 test("remote resolved events retire the registry without submitting another native response", async () => {
   const { runtime, session, sink } = await setup({}, { interactionTimeoutMs: 20 }); let calls = 0;
-  const pending = sink.requestInteraction(interactions[0].request, async () => { calls++; }); void pending.catch(() => {});
+  const pending = sink.requestInteraction(approvalInteraction.request, async () => { calls++; }); void pending.catch(() => {});
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
-  await sink.resolveInteraction({ interactionId: "approval", outcome: "expired" });
-  await sink.resolveInteraction({ interactionId: "approval", outcome: "expired" });
+  await sink.resolveInteraction({ interactionId: approvalInteraction.request.interactionId, outcome: "expired" });
+  await sink.resolveInteraction({ interactionId: approvalInteraction.request.interactionId, outcome: "expired" });
   await expect(pending).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
   expect((await nextType(reader, "interaction/resolved")).payload).toMatchObject({ outcome: "expired" });
-  await expect(session.request("interaction/respond", { requestId: "late", sessionId: "s", interactionId: "approval", response: interactions[0].response })).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
+  await expect(session.request("interaction/respond", { requestId: "late", sessionId: "s", interactionId: approvalInteraction.request.interactionId, response: approvalInteraction.response })).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
   await new Promise((resolve) => setTimeout(resolve, 25)); expect(calls).toBe(0);
   await reader.return?.(); await runtime.dispose();
 });
@@ -214,7 +219,7 @@ test("a backend failing during open cannot be returned as a successfully opened 
 test("an omitted client interaction capability fails closed at the SDK boundary", async () => {
   const adapter = createScriptedAdapter(); const runtime = await createClient({ adapter, identity: OPEN.binding });
   await runtime.openSession(OPEN); let response: InteractionResponse | null | undefined;
-  await expect(adapter.sinks.get("s")!.requestInteraction(interactions[0].request, async (value) => { response = value; })).rejects.toMatchObject({ code: "INTERACTION_UNSUPPORTED" });
+  await expect(adapter.sinks.get("s")!.requestInteraction(approvalInteraction.request, async (value) => { response = value; })).rejects.toMatchObject({ code: "INTERACTION_UNSUPPORTED" });
   expect(response).toBeNull(); await runtime.dispose();
 });
 
@@ -258,13 +263,27 @@ test("accepted compaction does not impose a universal Core busy scheduler", asyn
 });
 
 test("an in-flight fork does not add a universal Core mutation lock", async () => {
-  let entered!:()=>void,release!:()=>void;
-  const opening=new Promise<void>(resolve=>{entered=resolve}),hold=new Promise<void>(resolve=>{release=resolve});
-  const {runtime,session}=await setup({onOpen:async params=>{if(params.mode==='fork'){entered();await hold;}}});
-  const original=await session.submit({ input:'boundary' });await original.result();
-  const branch=runtime.sessions.fork(session.reference,{boundary:{turnId:original.id,relation:'through'}});
-  await opening;const during=await session.submit({ input:'during fork' });expect((await during.result()).status).toBe('completed');
-  release();await branch;await runtime.dispose();
+  let notifyForkEntered!: () => void;
+  let releaseFork!: () => void;
+  const forkEntered = new Promise<void>(resolve => { notifyForkEntered = resolve; });
+  const allowForkToFinish = new Promise<void>(resolve => { releaseFork = resolve; });
+  const { runtime, session } = await setup({ onOpen: async params => {
+    if (params.mode === 'fork') {
+      notifyForkEntered();
+      await allowForkToFinish;
+    }
+  } });
+  const original = await session.submit({ input: 'boundary' });
+  await original.result();
+  const branch = runtime.sessions.fork(session.reference, { boundary: { turnId: original.id, relation: 'through' } });
+
+  await forkEntered;
+  const during = await session.submit({ input: 'during fork' });
+  expect((await during.result()).status).toBe('completed');
+
+  releaseFork();
+  await branch;
+  await runtime.dispose();
 });
 
 test("a compact completion snapshot before acknowledgement cannot leave the session stuck busy", async () => {
@@ -295,7 +314,8 @@ test("privacy metadata ports run before native submission and project restored a
 
 test("successful configuration, goal results and state displays redact marked content while preserving protocol identity", async () => {
   const secret = "SUCCESS_RESULT_PRIVATE";
-  const marked = { content: secret, status: "ready", scope: "session", schemaType: "string", identifier: "model", revision: 1 };
+  // Deliberately mark values matching protocol enums, identifiers and version numbers to verify redaction follows field semantics.
+  const secretAnswersIncludingProtocolValues = { content: secret, status: "ready", scope: "session", schemaType: "string", identifier: "model", revision: 1 };
   const capabilities = { ...structuredClone(FAKE_CAPABILITIES), config: { options: [{ id: "model", scope: "session" as const, title: secret, value: secret, schema: { type: "string", title: secret, description: secret, default: secret, examples: [secret], enum: ["model", "string"], $defs: { choice: { type: "string", description: secret } }, properties: { title: { type: "string", description: secret } } } }] } };
   const activeGoal: GoalState = { goal: { text: secret, numericAnswer: 1 }, status: "active" };
   const clearedGoal: GoalState = { goal: { echo: secret }, status: "cleared" };
@@ -308,9 +328,9 @@ test("successful configuration, goal results and state displays redact marked co
   } });
   nativeState = { binding: structuredClone(session.binding), status: "ready", activeTurnIds: [], config: { model: secret, numericAnswer: 1 }, model: "model", capabilityRevision: 1, capabilities, goal: { goal: { text: secret }, status: "active" } };
   const reader = session.events()[Symbol.asyncIterator]();
-  const pending = sink.requestInteraction({ interactionId: "result-secret", kind: "userInput", questions: Object.keys(marked).map((id) => ({ id, prompt: id, secret: true })) }, async () => {});
+  const pending = sink.requestInteraction({ interactionId: "result-secret", kind: "userInput", questions: Object.keys(secretAnswersIncludingProtocolValues).map((id) => ({ id, prompt: id, secret: true })) }, async () => {});
   await nextType(reader, "interaction/requested");
-  await session.request("interaction/respond", { requestId: "mark", sessionId: "s", interactionId: "result-secret", response: { kind: "userInput", answers: marked } }); await pending;
+  await session.request("interaction/respond", { requestId: "mark", sessionId: "s", interactionId: "result-secret", response: { kind: "userInput", answers: secretAnswersIncludingProtocolValues } }); await pending;
   const configured = await session.request("session/config/set", { requestId: "configure", sessionId: "s", patch: { model: "model" } });
   expect(configured).toMatchObject({ binding: { sessionId: "s", adapterId: "fake", runtimeConfigId: "r" }, status: "ready", activeTurnIds: [], capabilityRevision: 1, model: "model", config: { model: "[redacted]", numericAnswer: "[redacted]" }, goal: { goal: { text: "[redacted]" }, status: "active" } });
   expect(configured.capabilities.config!.options[0]).toEqual({ ...capabilities.config.options[0], title: "[redacted]", value: "[redacted]", schema: { type: "string", title: "[redacted]", description: "[redacted]", default: "[redacted]", examples: ["[redacted]"], enum: ["model", "string"], $defs: { choice: { type: "string", description: "[redacted]" } }, properties: { title: { type: "string", description: "[redacted]" } } } });

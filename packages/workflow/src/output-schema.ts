@@ -63,9 +63,16 @@ function checkJsonSchema(root: JsonObject): void {
       if (typeof lower === 'number' && typeof upper === 'number' && lower > upper) invalid('unsatisfiableBounds')
     }
     if (type === 'number' || type === 'integer') {
-      const lower = Math.max(typeof schema.minimum === 'number' ? schema.minimum : -Infinity, typeof schema.exclusiveMinimum === 'number' ? schema.exclusiveMinimum : -Infinity)
-      const upper = Math.min(typeof schema.maximum === 'number' ? schema.maximum : Infinity, typeof schema.exclusiveMaximum === 'number' ? schema.exclusiveMaximum : Infinity)
-      if (lower > upper || (lower === upper && (schema.exclusiveMinimum === lower || schema.exclusiveMaximum === upper))) invalid('unsatisfiableBounds')
+      const minimum = typeof schema.minimum === 'number' ? schema.minimum : -Infinity
+      const exclusiveMinimum = typeof schema.exclusiveMinimum === 'number' ? schema.exclusiveMinimum : -Infinity
+      const lower = Math.max(minimum, exclusiveMinimum)
+      const maximum = typeof schema.maximum === 'number' ? schema.maximum : Infinity
+      const exclusiveMaximum = typeof schema.exclusiveMaximum === 'number' ? schema.exclusiveMaximum : Infinity
+      const upper = Math.min(maximum, exclusiveMaximum)
+      const boundsCrossed = lower > upper
+      const equalBoundsExcludeValue = lower === upper
+        && (schema.exclusiveMinimum === lower || schema.exclusiveMaximum === upper)
+      if (boundsCrossed || equalBoundsExcludeValue) invalid('unsatisfiableBounds')
     }
     for (const key of ['properties', 'patternProperties', 'definitions', '$defs', 'dependentSchemas']) {
       const children = schema[key]

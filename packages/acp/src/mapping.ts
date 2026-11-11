@@ -34,14 +34,22 @@ function selectValues(value: unknown): string[] {
 }
 export function configuration(data: Record<string, unknown>): { options: ConfigOption[]; values: JsonObject; keys: Map<string, Record<string, unknown>> } {
   const options: ConfigOption[] = [], values: JsonObject = {}, keys = new Map<string, Record<string, unknown>>();
+  function registerOption(descriptor: ConfigOption, nativeOption: Record<string, unknown>): void {
+    options.push(descriptor);
+    keys.set(descriptor.id, nativeOption);
+    if (descriptor.value !== undefined) values[descriptor.id] = descriptor.value;
+  }
   for (const item of Array.isArray(data.configOptions) ? data.configOptions : []) {
     const option = record(item); if (typeof option.id !== 'string') continue;
     const id = option.id; const current = option.currentValue;
     if (option.type !== 'boolean' && option.type !== 'select') continue;
     const schema: JsonObject = option.type === 'boolean' ? { type: 'boolean' } : { type: 'string', enum: selectValues(option.options) };
     const descriptor: ConfigOption = { id, title: typeof option.name === 'string' ? option.name : id, scope: 'session', schema, ...(typeof current === 'string' || typeof current === 'boolean' ? { value: current } : {}) };
-    options.push(descriptor); keys.set(id, option); if (descriptor.value !== undefined) values[id] = descriptor.value;
-    if (option.category === 'model' && id !== 'model') { options.push({ ...descriptor, id: 'model' }); keys.set('model', option); if (descriptor.value !== undefined) values.model = descriptor.value; }
+    registerOption(descriptor, option);
+    if (option.category === 'model' && id !== 'model') {
+      // The model alias still maps to the original native option.
+      registerOption({ ...descriptor, id: 'model' }, option);
+    }
   }
   const modes = record(data.modes);
   if (Array.isArray(modes.availableModes)) {
@@ -61,13 +69,25 @@ export class AcpUpdateMapper {
   private compaction = new Map<string, string>();
   constructor(private readonly sink: SessionEventSink, private readonly getTurn: () => string | undefined, private readonly state: () => SessionState, private readonly setState: (data: Record<string, unknown>) => void, private readonly subagents: boolean) {}
   reset(): void { this.items.clear(); this.ended.clear(); this.compaction.clear(); this.serial = 0; }
-  private async upsert(item: Item, terminal = false): Promise<void> {
-    const turnId = this.getTurn(); if (!turnId) return;
-    const old = this.items.get(item.id); this.items.set(item.id, item);
+  private async upsert(item: Item, isCompletion = false): Promise<void> {
+    const turnId = this.getTurn();
+    if (!turnId) return;
+
+    const previousItem = this.items.get(item.id);
+    // Always update the cache; ended items no longer emit events.
+    this.items.set(item.id, item);
     if (this.ended.has(item.id)) return;
-    if (!old) await this.sink.emit({ type: 'item/started', payload: { item } }, { turnId });
-    else if (!terminal) await this.sink.emit({ type: 'item/delta', payload: { itemId: item.id, kind: 'patch', value: safe(item) } }, { turnId });
-    if (terminal) { this.ended.add(item.id); await this.sink.emit({ type: 'item/completed', payload: { item } }, { turnId }); }
+
+    if (!previousItem) {
+      // A first update that is already complete still emits started before completed.
+      await this.sink.emit({ type: 'item/started', payload: { item } }, { turnId });
+    } else if (!isCompletion) {
+      await this.sink.emit({ type: 'item/delta', payload: { itemId: item.id, kind: 'patch', value: safe(item) } }, { turnId });
+    }
+    if (isCompletion) {
+      this.ended.add(item.id);
+      await this.sink.emit({ type: 'item/completed', payload: { item } }, { turnId });
+    }
   }
   async complete(): Promise<void> {
     for (const item of this.items.values()) if (!this.ended.has(item.id)) await this.upsert({ ...item, status: item.status === 'running' ? 'completed' : item.status }, true);
@@ -120,15 +140,34 @@ export class AcpUpdateMapper {
       return;
     }
     if (kind === 'tool_call' || kind === 'tool_call_update') {
-      const id = String(update.toolCallId); const old = this.items.get(id);
+      const id = String(update.toolCallId);
+      const previousItem = this.items.get(id);
+      const previousToolCall = previousItem?.type === 'toolCall' ? previousItem : undefined;
       const kindMap: Record<string, 'command' | 'fileChange' | 'web' | 'other'> = { execute: 'command', edit: 'fileChange', delete: 'fileChange', move: 'fileChange', fetch: 'web' };
-      const status = update.status === 'failed' ? 'failed' : update.status === 'completed' ? 'completed' : update.status === undefined && old?.type === 'toolCall' ? old.status ?? 'running' : 'running';
-      const item: Item = {
-        ...(old?.type === 'toolCall' ? old : { id, type: 'toolCall', kind: 'other', title: 'ACP tool' }),
+      let status: Item['status'] = 'running';
+      if (update.status === 'failed') {
+        status = 'failed';
+      } else if (update.status === 'completed') {
+        status = 'completed';
+      } else if (update.status === undefined && previousToolCall) {
+        status = previousToolCall.status ?? 'running';
+      }
+      const baseItem: Item = {
+        ...(previousToolCall ?? { id, type: 'toolCall', kind: 'other', title: 'ACP tool' }),
         ...(typeof update.title === 'string' ? { title: update.title } : {}), ...(typeof update.kind === 'string' ? { kind: kindMap[update.kind] ?? 'other', nativeType: update.kind } : {}), status,
         ...(update.content !== undefined ? { fileChanges: acpFileChanges(update.content) } : {}),
         ...(update.rawInput !== undefined ? { input: safe(update.rawInput) } : {}),
-        ...(update.rawOutput !== undefined ? { output: safe(update.rawOutput) } : update.content !== undefined ? { output: safe(update.content) } : {}),
+      };
+      let outputPatch: { output?: JsonValue } = {};
+      // Any defined rawOutput, including null, takes precedence over content.
+      if (update.rawOutput !== undefined) {
+        outputPatch = { output: safe(update.rawOutput) };
+      } else if (update.content !== undefined) {
+        outputPatch = { output: safe(update.content) };
+      }
+      const item: Item = {
+        ...baseItem,
+        ...outputPatch,
         ...(Array.isArray(update.locations) ? { locations: update.locations.flatMap((location) => { const value = record(location); return typeof value.path === 'string' ? [{ path: value.path, ...(typeof value.line === 'number' ? { line: value.line } : {}) }] : []; }) } : {}),
       };
       await this.upsert(item, status !== 'running'); return;

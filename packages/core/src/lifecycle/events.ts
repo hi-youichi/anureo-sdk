@@ -24,9 +24,9 @@ export class EventHub<T> {
     let cancelled = false;
     const detach = () => {
       this.subscribers.delete(subscription);
-      options.signal?.removeEventListener('abort', abort);
+      options.signal?.removeEventListener('abort', cancelSubscription);
     };
-    const abort = () => {
+    const cancelSubscription = () => {
       cancelled = true;
       detach();
       queue.end();
@@ -34,10 +34,10 @@ export class EventHub<T> {
     };
     const subscription: Subscription<T> = { queue, accepts, detach };
     if (this.ended) queue.end(this.failure);
-    else if (options.signal?.aborted) abort();
+    else if (options.signal?.aborted) cancelSubscription();
     else {
       this.subscribers.add(subscription);
-      options.signal?.addEventListener('abort', abort, { once: true });
+      options.signal?.addEventListener('abort', cancelSubscription, { once: true });
     }
     return {
       [Symbol.asyncIterator]() { return this; },
@@ -49,8 +49,8 @@ export class EventHub<T> {
           return result;
         } catch (cause) { detach(); queue.end(cause); throw cause; }
       },
-      async return() { abort(); return { done: true, value: undefined }; },
-      async throw(cause) { abort(); throw cause; },
+      async return() { cancelSubscription(); return { done: true, value: undefined }; },
+      async throw(cause) { cancelSubscription(); throw cause; },
     };
   }
 

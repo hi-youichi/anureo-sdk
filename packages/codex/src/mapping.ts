@@ -24,6 +24,17 @@ export function itemStatus(value: unknown, completed: boolean): 'running'|'compl
     default: return completed ? 'completed' : 'running'
   }
 }
+
+function subagentState(value: string): 'running' | 'completed' | 'failed' | 'interrupted' {
+  switch (value) {
+    case 'completed': return 'completed'
+    case 'errored': case 'failed': return 'failed'
+    case 'closed': case 'interrupted': return 'interrupted'
+    // Unlike itemStatus, declined and cancelled also remain running here.
+    default: return 'running'
+  }
+}
+
 /** Native notifications/history entries carry lifecycle times outside the item. */
 export function mapItems(value: unknown, completed: boolean, history = false, timing: { startedAtMs?: unknown } = {}): Item[] {
   const raw = record(value); const id = string(raw.id)
@@ -32,7 +43,14 @@ export function mapItems(value: unknown, completed: boolean, history = false, ti
   const startedAtMs = timing.startedAtMs ?? raw.startedAtMs
   const date = typeof startedAtMs === 'number' && startedAtMs >= 0 ? new Date(startedAtMs) : undefined
   const startedAt = date && Number.isFinite(date.getTime()) ? date.toISOString() : undefined
-  const common = { id, ...(!history || raw.status !== undefined ? { status } : {}), ...(startedAt !== undefined ? { startedAt } : {}), ...(typeof raw.durationMs === 'number' ? { durationMs: raw.durationMs } : {}) }
+  // History entries may omit status when the native item has none.
+  const includeStatus = !history || raw.status !== undefined
+  const common = {
+    id,
+    ...(includeStatus ? { status } : {}),
+    ...(startedAt !== undefined ? { startedAt } : {}),
+    ...(typeof raw.durationMs === 'number' ? { durationMs: raw.durationMs } : {}),
+  }
   switch (raw.type) {
     case 'userMessage': return [{ ...common, type: 'userMessage', content: (Array.isArray(raw.content) ? raw.content : []).map(value => {
       const block = record(value)
@@ -48,9 +66,10 @@ export function mapItems(value: unknown, completed: boolean, history = false, ti
       const ids = Array.isArray(raw.receiverThreadIds) ? raw.receiverThreadIds.filter((v): v is string => typeof v === 'string') : []
       const states = record(raw.agentsStates)
       return (ids.length ? ids : Object.keys(states)).map(subagentId => {
-        const state = record(states[subagentId]); const nativeState = string(state.status) ?? string(state.state) ?? status
-        const normalized = nativeState === 'completed' ? 'completed' : nativeState === 'errored' || nativeState === 'failed' ? 'failed' : nativeState === 'closed' || nativeState === 'interrupted' ? 'interrupted' : 'running'
-        return { ...common, id: `${id}:${subagentId}`, parentItemId: id, type: 'subagent', subagentId, state: normalized, ...(typeof raw.prompt === 'string' ? { task: raw.prompt } : {}) }
+        const state = record(states[subagentId])
+        const nativeState = string(state.status) ?? string(state.state) ?? status
+        const normalizedState = subagentState(nativeState)
+        return { ...common, id: `${id}:${subagentId}`, parentItemId: id, type: 'subagent', subagentId, state: normalizedState, ...(typeof raw.prompt === 'string' ? { task: raw.prompt } : {}) }
       })
     }
     case 'enteredReviewMode': case 'exitedReviewMode': return [{ ...common, type: 'review', state: raw.type === 'enteredReviewMode' ? 'entered' : 'exited', text: string(raw.review) ?? '' }]
@@ -63,9 +82,24 @@ export function mapItems(value: unknown, completed: boolean, history = false, ti
     case 'webSearch': return [{ ...common, type: 'toolCall', kind: 'web', title: string(raw.query) ?? 'Web search', input: safe(raw.action), output: safe(raw.results) }]
     case 'imageGeneration': case 'imageView': {
       const generated = raw.type === 'imageGeneration'
-      const data = generated && !string(raw.fileId) ? string(raw.result) : undefined
-      return [{ ...common, type: 'toolCall', kind: 'image', nativeType: raw.type, title: 'Image', input: safe(raw.prompt),
-        image: { kind: generated ? 'generated' : 'view', ...(data ? { data, mimeType: 'image/png' } : {}), ...(string(raw.fileId) ? { fileId: string(raw.fileId)! } : {}), ...(string(raw.savedPath ?? raw.path) ? { path: string(raw.savedPath ?? raw.path)! } : {}), ...(string(raw.revisedPrompt) ? { revisedPrompt: string(raw.revisedPrompt)! } : {}) },
+      const fileId = string(raw.fileId)
+      const imagePath = string(raw.savedPath ?? raw.path)
+      const revisedPrompt = string(raw.revisedPrompt)
+      const data = generated && !fileId ? string(raw.result) : undefined
+      return [{
+        ...common,
+        type: 'toolCall',
+        kind: 'image',
+        nativeType: raw.type,
+        title: 'Image',
+        input: safe(raw.prompt),
+        image: {
+          kind: generated ? 'generated' : 'view',
+          ...(data ? { data, mimeType: 'image/png' } : {}),
+          ...(fileId ? { fileId } : {}),
+          ...(imagePath ? { path: imagePath } : {}),
+          ...(revisedPrompt ? { revisedPrompt } : {}),
+        },
         ...(raw.failure ? { output: safe({ failure: raw.failure }) } : {}),
       }]
     }

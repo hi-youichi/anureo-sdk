@@ -20,9 +20,21 @@ export function claudeTurnError(result: SDKResultMessage, assistantError?: SDKAs
   }
   const rawStatus = result.subtype === 'success' ? result.api_error_status : undefined
   const status = typeof rawStatus === 'number' && Number.isInteger(rawStatus) && rawStatus >= 100 && rawStatus <= 599 ? rawStatus : undefined
-  const code = assistantError && Object.hasOwn(categories, assistantError) && categories[assistantError]
-    || (status === 401 ? 'AUTH_REQUIRED' : status === 403 ? 'AUTH_FORBIDDEN' : status === 429 ? 'RATE_LIMITED'
-      : status !== undefined && status >= 500 ? 'NATIVE_SERVICE_UNAVAILABLE' : 'CLAUDE_TURN_FAILED')
+  const nativeCategoryCode = assistantError && Object.hasOwn(categories, assistantError) && categories[assistantError]
+  let code: string
+  if (nativeCategoryCode) {
+    code = nativeCategoryCode
+  } else if (status === 401) {
+    code = 'AUTH_REQUIRED'
+  } else if (status === 403) {
+    code = 'AUTH_FORBIDDEN'
+  } else if (status === 429) {
+    code = 'RATE_LIMITED'
+  } else if (status !== undefined && status >= 500) {
+    code = 'NATIVE_SERVICE_UNAVAILABLE'
+  } else {
+    code = 'CLAUDE_TURN_FAILED'
+  }
   return { code, message: 'Claude model request failed', retryable: code === 'RATE_LIMITED' || code === 'NATIVE_SERVICE_UNAVAILABLE', outcomeUnknown: false,
     ...(status !== undefined ? { details: { httpStatusCode: status } } : {}) }
 }

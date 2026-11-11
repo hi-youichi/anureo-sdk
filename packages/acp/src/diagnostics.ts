@@ -6,8 +6,8 @@
  * attached to failures so a startup crash stays diagnosable.
  */
 
-const LINE_LIMIT = 8 * 1024;
-const TOTAL_LIMIT = 32 * 1024;
+const LINE_CODE_UNIT_LIMIT = 8 * 1024;
+const TOTAL_CODE_UNIT_LIMIT = 32 * 1024;
 
 const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\b(sk-[A-Za-z0-9_-]{8,})/g, 'sk-[redacted]'],
@@ -17,44 +17,47 @@ const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
 ];
 
 export function redactLine(line: string): string {
-  let value = line.length > LINE_LIMIT ? `${line.slice(0, LINE_LIMIT)}…` : line;
+  let value = line.length > LINE_CODE_UNIT_LIMIT ? `${line.slice(0, LINE_CODE_UNIT_LIMIT)}…` : line;
   for (const [pattern, replacement] of REDACTIONS) value = value.replace(pattern, replacement);
   return value;
 }
 
-/** FIFO ring of already-redacted lines with a hard byte budget. */
+/**
+ * FIFO ring of already-redacted lines, bounded by line count and UTF-16 code units.
+ * The total counts each line's length plus one code unit for a separator.
+ */
 export class StderrTail {
   private readonly lines: string[] = [];
-  private bytes = 0;
+  private retainedCodeUnits = 0;
   private partial = '';
   constructor(
-    private readonly limit: number,
+    private readonly maxLines: number,
     private readonly onLine?: (line: string) => void,
   ) {}
 
   push(line: string): void {
-    if (this.limit <= 0) return;
+    if (this.maxLines <= 0) return;
     const redacted = redactLine(line);
     try { this.onLine?.(redacted); } catch { /* a consumer callback must not break draining */ }
-    this.bytes += redacted.length + 1;
+    this.retainedCodeUnits += redacted.length + 1;
     this.lines.push(redacted);
-    while (this.lines.length > this.limit || this.bytes > TOTAL_LIMIT) {
+    while (this.lines.length > this.maxLines || this.retainedCodeUnits > TOTAL_CODE_UNIT_LIMIT) {
       const dropped = this.lines.shift();
       if (dropped === undefined) break;
-      this.bytes -= dropped.length + 1;
+      this.retainedCodeUnits -= dropped.length + 1;
     }
   }
 
   /** Accepts arbitrary chunks, buffering the trailing partial line. */
   write(chunk: string): void {
-    if (this.limit <= 0) return;
+    if (this.maxLines <= 0) return;
     this.partial += chunk;
     for (let index = this.partial.indexOf('\n'); index >= 0; index = this.partial.indexOf('\n')) {
       this.push(this.partial.slice(0, index));
       this.partial = this.partial.slice(index + 1);
     }
     // A child that never emits a newline must not grow the buffer without bound.
-    if (this.partial.length > LINE_LIMIT) {
+    if (this.partial.length > LINE_CODE_UNIT_LIMIT) {
       this.push(this.partial);
       this.partial = '';
     }

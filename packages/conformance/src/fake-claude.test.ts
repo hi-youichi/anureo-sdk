@@ -17,8 +17,19 @@ test('scripted query records every control surface without touching the event qu
     { method: 'interrupt' },
     { method: 'rewindFiles', value: 'native-turn' },
   ])
+})
+
+test('supportedModels returns the default model list', async () => {
+  const query = createFakeClaudeQuery({ messages: [], canRewind: true })
   expect(await query.supportedModels()).toEqual([{ value: 'fake-model', displayName: 'Fake', description: 'Fixture' }])
-  expect(await createFakeClaudeQuery({ messages: [], models: [{ value: 'pinned', displayName: 'Pinned', description: '' }] }).supportedModels()).toEqual([{ value: 'pinned', displayName: 'Pinned', description: '' }])
+})
+
+test('supportedModels returns the configured model list', async () => {
+  const configuredQuery = createFakeClaudeQuery({
+    messages: [],
+    models: [{ value: 'pinned', displayName: 'Pinned', description: '' }],
+  })
+  expect(await configuredQuery.supportedModels()).toEqual([{ value: 'pinned', displayName: 'Pinned', description: '' }])
 })
 
 test('rewind without checkpoint capability reports an explicit native denial', async () => {

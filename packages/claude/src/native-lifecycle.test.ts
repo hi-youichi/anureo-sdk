@@ -33,7 +33,18 @@ async function fixture() {
   const session = await client.sessions.create({ cwd: process.cwd() });
   const events: AhpEvent[] = [];
   const reader = session.events()[Symbol.asyncIterator]();
-  const reading = (async () => { try { for (;;) { const next = await reader.next(); if (next.done) break; events.push(next.value); } } catch {} })();
+  const eventCollectionTask = (async () => {
+    try {
+      for (;;) {
+        const next = await reader.next();
+        if (next.done) break;
+        events.push(next.value);
+      }
+    } catch {
+      // session.close() can end this stream with OBSERVATION_CLOSED.
+      // Ignore all read errors in this assertion collector so awaiting it cannot block client cleanup.
+    }
+  })();
   const send = (message: Record<string, unknown>) => output.write(message as unknown as SDKMessage);
   const assistant = (ids: string[] | undefined, text: string, id = 'native-message') => send({
     type: 'assistant', parent_tool_use_id: null, ...(ids ? { user_message_uuids: ids, user_message_uuid: ids.at(-1) } : {}),
@@ -48,7 +59,11 @@ async function fixture() {
     async received(count: number) { while (inputs.length < count) await new Promise<void>(resolve => waiters.push(resolve)); },
     setInterruptReceipt(receipt: typeof interruptReceipt) { interruptReceipt = receipt; },
     get interruptCalls() { return interruptCalls; },
-    async dispose() { await reader.return?.(); await reading; await client.dispose(); },
+    async dispose() {
+      await reader.return?.();
+      await eventCollectionTask;
+      await client.dispose();
+    },
   };
 }
 const observe = (promise: Promise<Turn>) => { void promise.catch(() => {}); return promise; };
@@ -56,19 +71,33 @@ const observe = (promise: Promise<Turn>) => { void promise.catch(() => {}); retu
 test('mid-run UUID changes and a multi-input result bind independent observations to one real execution', async () => {
   const f = await fixture();
   try {
-    const first = observe(f.session.submit({ input: 'first' })); await f.received(1);
-    const one = f.inputs[0]!.uuid!; await f.assistant([one], 'working'); const a = await first;
-    const second = observe(f.session.submit({ input: 'focus' })); await f.received(2);
-    const two = f.inputs[1]!.uuid!; await f.assistant([two], 'updated'); const b = await second;
-    expect(b.id).toBe(a.id); expect(a.id).not.toBe(one); expect(a.id).not.toBe(two);
-    await f.result([one, two]); const [ra, rb] = await Promise.all([a.result(), b.result()]);
-    expect(ra).toEqual(rb); expect(ra.usage).toMatchObject({ input: 7, output: 9 });
+    const firstBinding = observe(f.session.submit({ input: 'first' }));
+    await f.received(1);
+    const firstInputUuid = f.inputs[0]!.uuid!;
+
+    await f.assistant([firstInputUuid], 'working');
+    const firstObservation = await firstBinding;
+
+    const secondBinding = observe(f.session.submit({ input: 'focus' }));
+    await f.received(2);
+    const secondInputUuid = f.inputs[1]!.uuid!;
+
+    await f.assistant([secondInputUuid], 'updated');
+    const secondObservation = await secondBinding;
+
+    expect(secondObservation.id).toBe(firstObservation.id);
+    expect(firstObservation.id).not.toBe(firstInputUuid);
+    expect(firstObservation.id).not.toBe(secondInputUuid);
+    await f.result([firstInputUuid, secondInputUuid]);
+    const [firstResult, secondResult] = await Promise.all([firstObservation.result(), secondObservation.result()]);
+    expect(firstResult).toEqual(secondResult);
+    expect(firstResult.usage).toMatchObject({ input: 7, output: 9 });
     expect(f.events.filter(e => e.type === 'turn/started')).toHaveLength(1);
     expect(f.events.filter(e => e.type === 'turn/completed')).toHaveLength(1);
     expect(f.events.filter(e => e.type === 'submission/bound')).toHaveLength(2);
     expect(f.inputs.map(input => input.priority)).toEqual(['next', 'next']);
-    await expect(a.steer({ input: 'exact' })).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
-    await expect(a.interrupt()).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
+    await expect(firstObservation.steer({ input: 'exact' })).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
+    await expect(firstObservation.interrupt()).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
   } finally { await f.dispose(); }
 });
 

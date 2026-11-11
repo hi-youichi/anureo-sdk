@@ -31,11 +31,16 @@ export interface SubmitOptions {
   outputSchema?: AhpRequestMap['input/submit']['outputSchema'];
 }
 interface SubmissionRecord {
-  completion: ReturnType<typeof deferred<ExecutionObservation>>;
+  // Resolves when bound to an execution, before that execution necessarily ends.
+  executionBinding: ReturnType<typeof deferred<ExecutionObservation>>;
   createdSeq: number;
   requestId?: string;
   target?: Execution;
-  failed: boolean;
+  // False also includes submissions whose outcome is still unknown.
+  definitivelyRejected: boolean;
+  // Set on a dispatch response, rejection before dispatch, or after dispatch
+  // failure status publication (skipped if observation is closed). Gates record
+  // reclamation; binding alone does not acknowledge dispatch.
   acknowledged: boolean;
 }
 interface Execution extends ExecutionObservation {
@@ -43,7 +48,7 @@ interface Execution extends ExecutionObservation {
   completion: ReturnType<typeof deferred<TurnResult>>;
   started: boolean;
   terminal: boolean;
-  items: Map<string, boolean>;
+  items: Map<string, 'started' | 'completed'>;
   terminalSeq?: number;
 }
 function invalidWait(wait?: RequestOptions): boolean { return wait?.timeoutMs !== undefined && (!Number.isFinite(wait.timeoutMs) || wait.timeoutMs <= 0 || wait.timeoutMs > 0x7fffffff); }
@@ -125,7 +130,7 @@ export class Session implements SessionEventSink {
         // A new input cannot need an already-ended execution. Older unbound
         // inputs may still receive a late association and pin that snapshot.
         const pinned = [...this.submissions.values()].some(submission =>
-          !submission.failed && !submission.target && submission.createdSeq < value.terminalSeq!);
+          !submission.definitivelyRejected && !submission.target && submission.createdSeq < value.terminalSeq!);
         if (pinned) continue;
         this.totalBytes -= value.accumulator.size;
         this.executions.delete(key);
@@ -168,60 +173,66 @@ export class Session implements SessionEventSink {
     } catch { void this.fail(new HarnessSdkError('PROTOCOL_ERROR')); return false; }
     void this.emit(payload, scope).catch(() => {}); return true;
   }
-  private publish(payload: AhpEventPayload, scope: EventScope): void {
+  private publish(rawPayload: AhpEventPayload, scope: EventScope): void {
     if (this.closed) return;
-    const turnId = scope.turnId ?? (payload.type === 'turn/started' || payload.type === 'turn/completed' ? payload.payload.turnId : undefined);
-    if ((payload.type === 'turn/started' || payload.type === 'turn/completed') && scope.turnId && scope.turnId !== payload.payload.turnId) throw new HarnessSdkError('PROTOCOL_ERROR', 'Conflicting execution identities');
-    if (payload.type === 'extension' && !supportsExtension(this.capabilities, payload.payload.name, payload.payload.version)) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
-    const itemId = payload.type === 'item/delta' ? payload.payload.itemId : payload.type === 'item/started' || payload.type === 'item/completed' ? payload.payload.item.id : undefined;
+    const turnId = scope.turnId ?? (rawPayload.type === 'turn/started' || rawPayload.type === 'turn/completed' ? rawPayload.payload.turnId : undefined);
+    if ((rawPayload.type === 'turn/started' || rawPayload.type === 'turn/completed') && scope.turnId && scope.turnId !== rawPayload.payload.turnId) throw new HarnessSdkError('PROTOCOL_ERROR', 'Conflicting execution identities');
+    if (rawPayload.type === 'extension' && !supportsExtension(this.capabilities, rawPayload.payload.name, rawPayload.payload.version)) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
+    const itemId = rawPayload.type === 'item/delta' ? rawPayload.payload.itemId : rawPayload.type === 'item/started' || rawPayload.type === 'item/completed' ? rawPayload.payload.item.id : undefined;
     if (scope.itemId && itemId && scope.itemId !== itemId) throw new HarnessSdkError('PROTOCOL_ERROR', 'Conflicting item identities');
     let execution: Execution | undefined;
     // Validate shape before updating lifecycle bookkeeping.
-    assertEvent({ ...scope, sessionId: this.id, streamId: this.streamId, seq: this.seq + 1, timestamp: new Date().toISOString(), ...payload });
-    if (payload.type === 'submission/bound') {
-      const submission = this.submissions.get(payload.payload.submissionId);
+    assertEvent({ ...scope, sessionId: this.id, streamId: this.streamId, seq: this.seq + 1, timestamp: new Date().toISOString(), ...rawPayload });
+    let processedPayload = rawPayload;
+    if (rawPayload.type === 'submission/bound') {
+      const submission = this.submissions.get(rawPayload.payload.submissionId);
       if (!submission) throw new HarnessSdkError('PROTOCOL_ERROR', 'Unknown submission binding');
-      this.bindRecord(submission, payload.payload.turnId);
-    } else if (payload.type === 'submission/status') {
-      const submission = this.submissions.get(payload.payload.submissionId);
+      this.bindRecord(submission, rawPayload.payload.turnId);
+    } else if (rawPayload.type === 'submission/status') {
+      const submission = this.submissions.get(rawPayload.payload.submissionId);
       if (!submission) throw new HarnessSdkError('PROTOCOL_ERROR', 'Unknown submission status');
-      if (payload.payload.status === 'rejected' || payload.payload.status === 'unknown') {
-        submission.failed = payload.payload.status === 'rejected';
-        const error = payload.payload.error;
-        submission.completion.reject(error ? new HarnessSdkError(error.code, error.code, error.retryable, error.outcomeUnknown) : new HarnessSdkError('SUBMISSION_REJECTED'));
+      if (rawPayload.payload.status === 'rejected' || rawPayload.payload.status === 'unknown') {
+        submission.definitivelyRejected = rawPayload.payload.status === 'rejected';
+        const error = rawPayload.payload.error;
+        submission.executionBinding.reject(error ? new HarnessSdkError(error.code, error.code, error.retryable, error.outcomeUnknown) : new HarnessSdkError('SUBMISSION_REJECTED'));
       }
-      payload = { ...payload, payload: { ...payload.payload,
-        ...(payload.payload.receipt ? { receipt: this.secrets.json(publicValue(payload.payload.receipt)) as typeof payload.payload.receipt } : {}),
-        ...(payload.payload.error ? { error: { ...payload.payload.error, message: this.secrets.text(payload.payload.error.message),
-          ...(payload.payload.error.details ? { details: this.secrets.json(publicValue(payload.payload.error.details)) as typeof payload.payload.error.details } : {}) } } : {}) } };
-    } else if (payload.type === 'session/metadata') {
-      this.state.metadata = { ...this.state.metadata, ...structuredClone(payload.payload) };
-    } else if (payload.type === 'session/state') {
-      for (const key of ['sessionId', 'adapterId', 'runtimeConfigId'] as const) if (payload.payload.binding[key] !== this.binding[key]) throw new HarnessSdkError('SESSION_BINDING_MISMATCH');
-      this.state = { ...structuredClone(payload.payload), ...((this.state.metadata || payload.payload.metadata) ? { metadata: { ...this.state.metadata, ...payload.payload.metadata } } : {}) }; this.updateStatus(); payload = { type: 'session/state', payload: this.state };
+      processedPayload = { ...rawPayload, payload: { ...rawPayload.payload,
+        ...(rawPayload.payload.receipt ? { receipt: this.secrets.json(publicValue(rawPayload.payload.receipt)) as typeof rawPayload.payload.receipt } : {}),
+        ...(rawPayload.payload.error ? { error: { ...rawPayload.payload.error, message: this.secrets.text(rawPayload.payload.error.message),
+          ...(rawPayload.payload.error.details ? { details: this.secrets.json(publicValue(rawPayload.payload.error.details)) as typeof rawPayload.payload.error.details } : {}) } } : {}) } };
+    } else if (rawPayload.type === 'session/metadata') {
+      this.state.metadata = { ...this.state.metadata, ...structuredClone(rawPayload.payload) };
+    } else if (rawPayload.type === 'session/state') {
+      for (const key of ['sessionId', 'adapterId', 'runtimeConfigId'] as const) if (rawPayload.payload.binding[key] !== this.binding[key]) throw new HarnessSdkError('SESSION_BINDING_MISMATCH');
+      this.state = { ...structuredClone(rawPayload.payload), ...((this.state.metadata || rawPayload.payload.metadata) ? { metadata: { ...this.state.metadata, ...rawPayload.payload.metadata } } : {}) };
+      this.updateStatus();
+      processedPayload = { type: 'session/state', payload: this.state };
     } else if (turnId) {
       execution = this.context(turnId);
-      if (payload.type === 'turn/started') { if (execution.started || execution.terminal) return; execution.started = true; }
-      if (payload.type === 'turn/completed') { if (execution.terminal) return; if (!execution.started) throw new HarnessSdkError('PROTOCOL_ERROR', 'Turn ended without start'); }
-      if (payload.type.startsWith('item/')) {
+      if (rawPayload.type === 'turn/started') { if (execution.started || execution.terminal) return; execution.started = true; }
+      if (rawPayload.type === 'turn/completed') { if (execution.terminal) return; if (!execution.started) throw new HarnessSdkError('PROTOCOL_ERROR', 'Turn ended without start'); }
+      if (rawPayload.type.startsWith('item/')) {
         if (!execution.started || execution.terminal) throw new HarnessSdkError('PROTOCOL_ERROR', 'Item outside execution');
-        const itemId = payload.type === 'item/delta' ? payload.payload.itemId : payload.type === 'item/started' || payload.type === 'item/completed' ? payload.payload.item.id : undefined;
+        const itemId = rawPayload.type === 'item/delta' ? rawPayload.payload.itemId : rawPayload.type === 'item/started' || rawPayload.type === 'item/completed' ? rawPayload.payload.item.id : undefined;
         if (itemId) {
-          const previous = execution.items.get(itemId);
-          if (payload.type === 'item/started' && previous !== undefined || payload.type === 'item/delta' && previous !== false) throw new HarnessSdkError('PROTOCOL_ERROR', 'Invalid item lifecycle');
-          if (payload.type === 'item/completed' && previous === true) return;
-          if (payload.type !== 'item/delta') execution.items.set(itemId, payload.type === 'item/completed');
+          const previousState = execution.items.get(itemId);
+          if (
+            (rawPayload.type === 'item/started' && previousState !== undefined) ||
+            (rawPayload.type === 'item/delta' && previousState !== 'started')
+          ) throw new HarnessSdkError('PROTOCOL_ERROR', 'Invalid item lifecycle');
+          if (rawPayload.type === 'item/completed' && previousState === 'completed') return;
+          if (rawPayload.type !== 'item/delta') execution.items.set(itemId, rawPayload.type === 'item/completed' ? 'completed' : 'started');
         }
       }
     }
     // Privacy projection preserves protocol identities while redacting content.
-    payload = this.secrets.event(payload, turnId);
-    const event: AhpEvent = { ...scope, ...(turnId ? { turnId } : {}), sessionId: this.id, streamId: this.streamId, seq: ++this.seq, timestamp: (this.options.runtime?.now ?? (() => new Date().toISOString()))(), ...payload };
+    const publicPayload = this.secrets.event(processedPayload, turnId);
+    const event: AhpEvent = { ...scope, ...(turnId ? { turnId } : {}), sessionId: this.id, streamId: this.streamId, seq: ++this.seq, timestamp: (this.options.runtime?.now ?? (() => new Date().toISOString()))(), ...publicPayload };
     assertEvent(event);
     if (execution) {
       const previous = execution.accumulator.size; execution.accumulator.accept(event); this.totalBytes += execution.accumulator.size - previous;
       if (this.totalBytes > positive(this.options.limits?.maxResultBytes, 16 * 1024 * 1024)) throw new HarnessSdkError('RESULT_BUDGET_EXCEEDED');
-      if (payload.type === 'turn/completed') { execution.terminal = true; execution.terminalSeq = this.seq; execution.completion.resolve(execution.accumulator.finish(payload.payload)); }
+      if (publicPayload.type === 'turn/completed') { execution.terminal = true; execution.terminalSeq = this.seq; execution.completion.resolve(execution.accumulator.finish(publicPayload.payload)); }
       execution.events.publish(event); if (execution.terminal) execution.events.end();
     }
     this.updateStatus(); this.hub.publish(event);
@@ -232,24 +243,24 @@ export class Session implements SessionEventSink {
   }
   private bindRecord(record: SubmissionRecord, turnId: string): void {
     if (record.target && record.target.id !== turnId) throw new HarnessSdkError('PROTOCOL_ERROR', 'Submission rebound');
-    if (record.failed) throw new HarnessSdkError('PROTOCOL_ERROR', 'Rejected submission bound');
+    if (record.definitivelyRejected) throw new HarnessSdkError('PROTOCOL_ERROR', 'Rejected submission bound');
     record.target ??= this.context(turnId);
-    record.completion.resolve(record.target);
+    record.executionBinding.resolve(record.target);
   }
   private rejectSubmission(record: SubmissionRecord, cause: unknown, acknowledged = true): void {
-    record.failed = !sdkError(cause).outcomeUnknown;
+    record.definitivelyRejected = !sdkError(cause).outcomeUnknown;
     record.acknowledged ||= acknowledged;
-    record.completion.reject(cause);
+    record.executionBinding.reject(cause);
   }
   private record(id: string): SubmissionRecord {
     const existing = this.submissions.get(id);
     if (existing) return existing;
     const limit = positive(this.options.limits?.maxSubmissions, 1024);
     if (this.submissions.size >= limit) {
-      for (const [key, value] of this.submissions) if (value.acknowledged && (value.failed || value.target?.terminal)) { this.submissions.delete(key); break; }
+      for (const [key, value] of this.submissions) if (value.acknowledged && (value.definitivelyRejected || value.target?.terminal)) { this.submissions.delete(key); break; }
     }
     if (this.submissions.size >= limit) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED', 'Submission limit exceeded');
-    const record: SubmissionRecord = { completion: deferred<ExecutionObservation>(), createdSeq: this.seq, failed: false, acknowledged: false };
+    const record: SubmissionRecord = { executionBinding: deferred<ExecutionObservation>(), createdSeq: this.seq, definitivelyRejected: false, acknowledged: false };
     this.submissions.set(id, record);
     return record;
   }
@@ -276,7 +287,7 @@ export class Session implements SessionEventSink {
       // until their status event is published.
       this.rejectSubmission(record, cause, !record.requestId);
     });
-    return waitForRequest(async () => new Turn(await record.completion.promise), wait, this.options.runtime?.requestTimeoutMs);
+    return waitForRequest(async () => new Turn(await record.executionBinding.promise), wait, this.options.runtime?.requestTimeoutMs);
   }
   interrupt(options: { cancelQueued?: boolean } = {}, wait?: RequestOptions): Promise<AhpResultMap['session/interrupt']> {
     return this.request('session/interrupt', { ...this.requestIdentity(), ...options }, wait);
@@ -340,9 +351,10 @@ export class Session implements SessionEventSink {
       if (method === 'goal/set' || method === 'goal/clear') this.state.goal = structuredClone(result as AhpResultMap['goal/set']);
       assertResult(method, result); return immutable(result) as AhpResultMap[M];
     };
-    const operation = Promise.race([Promise.resolve().then(run), this.ended.promise]);
-    const entry = { fingerprint, result: operation, settled: false }; this.requests.set(key, entry);
-    void operation.then(async result => {
+    const requestOutcome = Promise.race([Promise.resolve().then(run), this.ended.promise]);
+    const entry = { fingerprint, result: requestOutcome, settled: false };
+    this.requests.set(key, entry);
+    const onRequestSucceeded = async (result: AhpResultMap[M]): Promise<void> => {
       entry.settled = true;
       if (method === 'input/submit' || method === 'review/start' || method === 'turn/steer') {
         const response = result as AhpResultMap['input/submit'] | AhpResultMap['turn/steer'];
@@ -359,7 +371,8 @@ export class Session implements SessionEventSink {
           ...('receipt' in response && response.receipt ? { receipt: response.receipt } : {}),
         } });
       }
-    }, async cause => {
+    };
+    const onRequestFailed = async (cause: unknown): Promise<void> => {
       entry.settled = true;
       const error = sdkError(cause);
       if (error.outcomeUnknown && method !== 'history/read' && method !== 'turn/interrupt' && method !== 'session/interrupt') { this.recovering = true; this.updateStatus(); }
@@ -368,8 +381,12 @@ export class Session implements SessionEventSink {
         if (record && !this.closed) await this.emit({ type: 'submission/status', payload: { submissionId: id, status: error.outcomeUnknown ? 'unknown' : 'rejected', error: { code: error.code, message: error.code, retryable: error.retryable, outcomeUnknown: error.outcomeUnknown } } });
         if (record) this.rejectSubmission(record, error);
       }
-    }).catch(cause => { void this.fail(cause); });
-    return operation;
+    };
+    // The cached/returned outcome races the backend result against observation closure.
+    // It does not wait for binding or status publication; bookkeeping failures go to fail.
+    const outcomeBookkeeping = requestOutcome.then(onRequestSucceeded, onRequestFailed);
+    void outcomeBookkeeping.catch(cause => { void this.fail(cause); });
+    return requestOutcome;
   }
   async requestInteraction(request: InteractionRequested, responder: NativeInteractionResponder): Promise<InteractionResponse> {
     if (this.closed) { await responder(null, 'session_closed'); throw new HarnessSdkError('SESSION_CLOSED'); }
@@ -388,17 +405,19 @@ export class Session implements SessionEventSink {
     return result;
   }
   resolveInteraction(result: AhpResultMap['interaction/respond']): Promise<void> { return this.interactions.resolveExternally(result); }
-  private end(cause: unknown): void {
+  // Closes local observation, rejects pending waiters, and aborts handler signals.
+  // Callers own native close and backend disposal.
+  private endObservation(cause: unknown): void {
     this.observationFailure ??= cause;
     this.closed = true; this.updateStatus(); this.ended.reject(cause);
-    for (const value of this.submissions.values()) value.completion.reject(cause);
+    for (const value of this.submissions.values()) value.executionBinding.reject(cause);
     for (const execution of this.executions.values()) if (!execution.terminal) { execution.completion.reject(cause); execution.events.end(cause); }
     for (const controller of this.handlers.values()) controller.abort(); this.handlers.clear();
     this.hub.end(cause);
   }
   async fail(cause: unknown): Promise<void> {
     if (this.closed) return;
-    this.end(new HarnessSdkError(sdkError(cause).code, 'Session observation failed', false, true, { source: 'sdk' }));
+    this.endObservation(new HarnessSdkError(sdkError(cause).code, 'Session observation failed', false, true, { source: 'sdk' }));
     await this.interactions.cancelAll('connection_lost');
     await this.disposeBackend().catch(() => {});
   }
@@ -417,7 +436,7 @@ export class Session implements SessionEventSink {
         const causes: unknown[] = [];
         try { await this.interactions.cancelAll('session_closed'); } catch (cause) { causes.push(cause); }
         try { await this.disposeBackend(); } catch (cause) { causes.push(cause); }
-        this.end(observationClosed(result.executionStopped === 'confirmed'));
+        this.endObservation(observationClosed(result.executionStopped === 'confirmed'));
         if (causes.length) throw combined(causes);
         return result;
       }, cause => {
@@ -432,7 +451,7 @@ export class Session implements SessionEventSink {
   private disposeBackend(): Promise<void> { return this.backendDisposal ??= this.backend?.dispose() ?? Promise.resolve(); }
   dispose(): Promise<void> {
     return this.disposal ??= (async () => {
-      const cause = observationClosed(); this.end(cause);
+      const cause = observationClosed(); this.endObservation(cause);
       await this.interactions.cancelAll('runtime_disposed');
       await this.disposeBackend();
     })();

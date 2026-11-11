@@ -6,8 +6,7 @@ Adapter connecting the Anureo SDK to the official [`@anthropic-ai/claude-agent-s
 
 ## Usage
 
-This shows the revised workspace API, not the published 0.2.0 API. Root migration and local
-validation are complete.
+This example uses the revised workspace API described under [Capabilities](#capabilities).
 
 ```typescript
 import { createClient } from '@anureo/sdk'
@@ -29,6 +28,9 @@ Initialization fails with `HARNESS_CONFIG_INVALID` unless one of `stateDir` (or 
 
 ## Capabilities
 
+The revised workspace API shown here differs from the published 0.2.0 API.
+The adapter pins `@anthropic-ai/claude-agent-sdk` to 0.3.265.
+
 What the adapter can offer depends on the options it was constructed with:
 
 | Condition | Unlocks |
@@ -43,11 +45,21 @@ result before reverting.
 
 The revised workspace exposes native input delivery (`native` → `next`,
 `afterTurn` → `later`) and **session-scoped** interrupt with pending-input receipts.
-Exact-turn steer and interrupt are not declared. It also supports `approval` / `userInput` / `elicitation` interactions, nested subagent events, MCP (stdio + http, with `form`/`url` elicitation), and `turn.outputSchema`. The fixed SDK is 0.3.265; multi-message
-correlation and interrupt mapping have dedicated fixture and transport coverage.
+Exact-turn steer and interrupt are not declared. It also supports `approval` / `userInput` / `elicitation` interactions, nested subagent events, MCP (stdio + http, with `form`/`url` elicitation), and `turn.outputSchema`.
+
+Validation covers two layers:
+
+- Injected Query fixtures exercise native input priority mapping, multi-message
+  correlation, and session interrupt mapping, including pending-input receipts.
+- Transport tests run the pinned official SDK against a simulated child executable
+  to check single-input correlation.
+
+Validation of native input priority, multi-message correlation, and interruption
+behavior with real Claude execution remains unconfirmed by these tests.
 
 Additional guidance uses another `await session.submit({ input, delivery: 'native' })`.
-It may join the same execution or reach a later one. See the
+It may join the same execution or reach a later one. Session input delivery is
+distinct from atomic exact-turn steering. See the
 [Claude example](../../docs/native-harness-lifecycle.md#42-claude追加会话指导与精确-steer-分开).
 
 ## Structured output
@@ -136,7 +148,4 @@ bun test src
 
 ## AHP v1 lifecycle revision
 
-The lifecycle design updates AHP v1 and package root entries in place.
-The root implementation and tests use the revised lifecycle; parallel versioned
-entries have been removed. Local conformance and clean-install checks have passed. Native input priority and multi-message correlation must be verified for the pinned SDK; session input delivery is distinct from atomic exact-turn steering.
 See the [design and implementation plan](../../docs/native-harness-lifecycle.md).

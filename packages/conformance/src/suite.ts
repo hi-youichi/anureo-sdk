@@ -39,42 +39,63 @@ function defaultAnswer(r: InteractionRequested): InteractionResponse {
 export async function runConformance(factory: ConformanceFactory, options: {timeoutMs?:number;scenarios?:readonly ConformanceScenario[]}={}):Promise<ConformanceReport>{
   const cases:ConformanceCaseResult[]=[];
   for(const scenario of options.scenarios??CONFORMANCE_SCENARIOS){
-    let client:Client|undefined,reader:AsyncIterator<AhpEvent>|undefined,reading:Promise<void>|undefined;
+    let client:Client|undefined,reader:AsyncIterator<AhpEvent>|undefined,eventReadTask:Promise<void>|undefined;
     try{
-      const f=await factory(scenario);
-      const handlers=Object.fromEntries(['approval','userInput','elicitation','dynamicTool'].map(kind=>[kind,async(r:InteractionRequested)=>(f.answer??defaultAnswer)(r)])) as InteractionHandlers;
-      client=await createClient({adapter:f.adapter,identity:f.openParams.binding,runtime:f.runtimeOptions,interactions:handlers});
-      const session=await client.openSession(f.openParams),sessionId=session.id,c=session.capabilities;
-      if(!applicable(scenario,c)){cases.push({scenario,status:'not-applicable'});continue;}
-      const events:AhpEvent[]=[];let sourceFailure:unknown;
+      const driver=await factory(scenario);
+      const handlers=Object.fromEntries(['approval','userInput','elicitation','dynamicTool'].map(kind=>[kind,async(r:InteractionRequested)=>(driver.answer??defaultAnswer)(r)])) as InteractionHandlers;
+      client=await createClient({adapter:driver.adapter,identity:driver.openParams.binding,runtime:driver.runtimeOptions,interactions:handlers});
+      const session=await client.openSession(driver.openParams),sessionId=session.id,capabilities=session.capabilities;
+      if(!applicable(scenario,capabilities)){cases.push({scenario,status:'not-applicable'});continue;}
+      const events:AhpEvent[]=[];
+      let eventReadFailure:unknown;
       reader=session.events()[Symbol.asyncIterator]();
-      reading=(async()=>{try{for(;;){const event=await reader!.next();if(event.done)return;events.push(event.value);if(events.length>10_000)throw new Error('Too many events without completion');}}catch(cause){sourceFailure=cause;}})();
-      const run=async()=>{
-        const pending=session.submit({input:'conformance'});void pending.catch(()=>{});
-        if(scenario==='interrupt'&&!c.input?.interrupt?.targets.includes('turn')){await Promise.resolve();await session.interrupt();}
-        const turn=await pending;
-        if(scenario==='steer')await turn.steer({input:'redirect'});
-        if(scenario==='interrupt'){
-          if(c.input?.interrupt?.targets.includes('turn'))await turn.interrupt();
-
+      eventReadTask=(async()=>{
+        try{
+          for(;;){
+            const event=await reader!.next();
+            if(event.done)return;
+            events.push(event.value);
+            if(events.length>10_000)throw new Error('Too many events without completion');
+          }
+        }catch(cause){
+          // Keep this task fulfilled; observation logic decides how to report the failure.
+          eventReadFailure=cause;
         }
-        await f.afterStart?.(session);
-        return {turn,result:await turn.result()};
+      })();
+      const executeScenarioTurn = async () => {
+        const pendingTurn = session.submit({input:'conformance'});
+        void pendingTurn.catch(() => {});
+        const supportsTurnInterrupt = scenario === 'interrupt' && capabilities.input?.interrupt?.targets.includes('turn') === true;
+        if (scenario === 'interrupt' && !supportsTurnInterrupt) {
+          // Yield one microtask before interrupting the session.
+          await Promise.resolve();
+          await session.interrupt();
+        }
+        const turn = await pendingTurn;
+        if (scenario === 'steer') await turn.steer({input:'redirect'});
+        if (scenario === 'interrupt' && supportsTurnInterrupt) {
+          await turn.interrupt();
+        }
+        await driver.afterStart?.(session);
+        return {turn, result: await turn.result()};
       };
       if(scenario==='disconnect'||scenario==='backpressure'){
-        let failed=false;try{await deadline(run(),options.timeoutMs??3000);}catch(cause){
+        let failed=false;try{await deadline(executeScenarioTurn(),options.timeoutMs??3000);}catch(cause){
           requireCondition(cause&&typeof cause==='object'&&'code'in cause,'Source failure must be typed');
           requireCondition((scenario==='disconnect'?['CONNECTION_CLOSED','ACP_CONNECTION_CLOSED','RPC_CONNECTION_CLOSED']:['BACKPRESSURE_EXCEEDED','FRAME_TOO_LARGE']).includes(String(cause.code)),`Unexpected observation error: ${String(cause.code)}`);failed=true;
         }
         requireCondition(failed,'Lost source must fail observation');
         requireCondition(!events.some(e=>e.type==='turn/completed'),'SDK must not fabricate native terminal');
       }else{
-        const {turn,result}=await deadline(Promise.race([run(),reading.then(()=>{throw sourceFailure??new Error('Source ended before result');})]),options.timeoutMs??3000);
+        function failWhenEventSourceEnds():never{
+          throw eventReadFailure??new Error('Source ended before result');
+        }
+        const {turn,result}=await deadline(Promise.race([executeScenarioTurn(),eventReadTask.then(failWhenEventSourceEnds)]),options.timeoutMs??3000);
         requireCondition(result.status===(scenario==='interrupt'?'interrupted':'completed'),'Unexpected native terminal');
         requireCondition(events.filter(e=>e.type==='turn/started').length===1,'Execution must start once');
         requireCondition(events.filter(e=>e.type==='turn/completed').length===1,'Execution must end once');
         if(['approval','userInput','elicitation','dynamicTool'].includes(scenario))requireCondition(events.some(e=>e.type==='interaction/requested')&&events.some(e=>e.type==='interaction/resolved'),'Interaction not exercised');
-        if(scenario==='lifecycle'||scenario==='immediate')requireCondition(result.text===(f.expectedText??'conformance'),'Authoritative final text missing');
+        if(scenario==='lifecycle'||scenario==='immediate')requireCondition(result.text===(driver.expectedText??'conformance'),'Authoritative final text missing');
         if(scenario==='unknown-item')requireCondition(result.items.some(item=>item.type==='toolCall'&&item.kind==='other'&&item.nativeType),'Unknown native item lost');
         if(scenario==='identity'){
           const other=await session.submit({input:'conformance'});await other.result();requireCondition(other.id!==turn.id,'Execution identity reused');
@@ -82,24 +103,39 @@ export async function runConformance(factory: ConformanceFactory, options: {time
         if(scenario==='history'){
           const page=await session.request('history/read',{sessionId,requestId:'history'});requireCondition(page.items.length&&page.items.every(item=>item.turnId&&item.item.id),'History identity missing');
         }
-        if(scenario==='fork')for(const relation of c.session!.fork!){
+        if(scenario==='fork')for(const relation of capabilities.session!.fork!){
           const fork=await client.sessions.fork(session.reference,{boundary:{turnId:turn.id,relation}});
           requireCondition(fork.id!==session.id&&fork.binding.adapterId===session.binding.adapterId,'Fork binding invalid');
-          if(c.session?.history){const page=await fork.request('history/read',{sessionId:fork.id,requestId:'fork-history'});requireCondition(relation==='before'?!page.items.some(i=>i.turnId===turn.id):page.items.some(i=>i.turnId===turn.id),'Fork boundary lost');}
+          if(capabilities.session?.history){const page=await fork.request('history/read',{sessionId:fork.id,requestId:'fork-history'});requireCondition(relation==='before'?!page.items.some(i=>i.turnId===turn.id):page.items.some(i=>i.turnId===turn.id),'Fork boundary lost');}
           await fork.close();
         }
         if(scenario==='revert'){
-          const scope=c.session!.revert![0]!;
+          const scope=capabilities.session!.revert![0]!;
           const result=await session.request('session/revert',{sessionId,requestId:'revert',scope,boundary:{turnId:turn.id,relation:'before'}});
           requireCondition(result.appliedScope===scope&&result.boundary.turnId===turn.id,'Revert scope mismatch');
-          if(scope!=='files'&&c.session?.history){const page=await session.request('history/read',{sessionId,requestId:'reverted-history'});requireCondition(!page.items.some(i=>i.turnId===turn.id),'Revert boundary retained');}
+          if(scope!=='files'&&capabilities.session?.history){const page=await session.request('history/read',{sessionId,requestId:'reverted-history'});requireCondition(!page.items.some(i=>i.turnId===turn.id),'Revert boundary retained');}
         }
       }
-      requireCondition(!sourceFailure||scenario==='disconnect'||scenario==='backpressure','Unexpected source failure');
+      requireCondition(!eventReadFailure||scenario==='disconnect'||scenario==='backpressure','Unexpected source failure');
       requireCondition(events.every((e,i)=>e.seq===events[0]!.seq+i&&e.sessionId===sessionId&&e.streamId===events[0]!.streamId),'Source sequence gap');
       cases.push({scenario,status:'passed'});
     }catch(cause){cases.push({scenario,status:'failed',message:cause instanceof Error?cause.message:'Conformance failed'});}
-    finally{await reader?.return?.();await reading;try{await client?.dispose();}catch{const entry=cases[cases.length-1];if(entry?.scenario===scenario){entry.status='failed';entry.message='RESOURCE_RELEASE_FAILED';}}}
+    finally {
+      await reader?.return?.();
+
+      await eventReadTask;
+
+      try {
+        await client?.dispose();
+      } catch {
+        // Release failure only overrides an already recorded result for this scenario.
+        const lastCaseResult = cases[cases.length - 1];
+        if (lastCaseResult?.scenario === scenario) {
+          lastCaseResult.status = 'failed';
+          lastCaseResult.message = 'RESOURCE_RELEASE_FAILED';
+        }
+      }
+    }
   }
   return {passed:cases.every(c=>c.status!=='failed'),cases};
 }

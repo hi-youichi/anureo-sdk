@@ -5,6 +5,17 @@ import type { SessionKey, SessionStore, SessionStoreEntry } from "@anthropic-ai/
 import { HarnessSdkError } from "@anureo/sdk";
 
 interface StoredSession { key: SessionKey; entries: SessionStoreEntry[]; mtime: number }
+
+function isLockOwnerDefinitelyAbsent(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
 /** Uses the official opaque SessionStore contract; never parses Claude's private transcript files. */
 export class FileSessionStore implements SessionStore {
   constructor(readonly directory: string) {}
@@ -18,16 +29,17 @@ export class FileSessionStore implements SessionStore {
   }
   async append(key: SessionKey, entries: SessionStoreEntry[]): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 }); const file = this.file(key); const lockPath = `${file}.lock`;
-    const expires = Date.now() + 10_000; let lock: Awaited<ReturnType<typeof open>> | undefined;
-    while (!lock) {
-      try { lock = await open(lockPath, "wx", 0o600); await lock.writeFile(String(process.pid)); }
+    const expires = Date.now() + 10_000; let lockHandle: Awaited<ReturnType<typeof open>> | undefined;
+    while (!lockHandle) {
+      try {
+        lockHandle = await open(lockPath, "wx", 0o600);
+        await lockHandle.writeFile(String(process.pid));
+      }
       catch (cause) {
         if ((cause as NodeJS.ErrnoException).code !== "EEXIST") throw cause;
         // A crashed writer's lock can be removed only after proving its process is absent.
         const pid = Number(await readFile(lockPath, "utf8").catch(() => ""));
-        let alive = true;
-        if (Number.isSafeInteger(pid) && pid > 0) { try { process.kill(pid, 0); } catch (error) { alive = (error as NodeJS.ErrnoException).code !== "ESRCH"; } }
-        if (!alive) { await rm(lockPath, { force: true }); continue; }
+        if (isLockOwnerDefinitelyAbsent(pid)) { await rm(lockPath, { force: true }); continue; }
         if (Date.now() >= expires) throw new HarnessSdkError("SESSION_STORE_BUSY");
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
@@ -35,17 +47,31 @@ export class FileSessionStore implements SessionStore {
     const temporary = `${file}.${randomUUID()}.tmp`;
     try {
       const stored = await this.read(file) ?? { key: structuredClone(key), entries: [], mtime: 0 };
-      const byId = new Map(stored.entries.flatMap((entry, index) => entry.uuid ? [[entry.uuid, index] as const] : []));
+      const entryIndexByUuid = new Map(stored.entries.flatMap((entry, index) => entry.uuid ? [[entry.uuid, index] as const] : []));
+      // Replace matching UUIDs in place; otherwise append, indexing new UUIDs for later entries in this batch.
       for (const entry of entries) {
-        const previous = entry.uuid ? byId.get(entry.uuid) : undefined;
-        if (previous !== undefined) stored.entries[previous] = structuredClone(entry);
-        else { if (entry.uuid) byId.set(entry.uuid, stored.entries.length); stored.entries.push(structuredClone(entry)); }
+        const existingIndex = entry.uuid ? entryIndexByUuid.get(entry.uuid) : undefined;
+        if (existingIndex !== undefined) {
+          stored.entries[existingIndex] = structuredClone(entry);
+        } else {
+          if (entry.uuid) entryIndexByUuid.set(entry.uuid, stored.entries.length);
+          stored.entries.push(structuredClone(entry));
+        }
       }
       stored.mtime = Math.max(Date.now(), stored.mtime + 1);
-      const target = await open(temporary, "wx", 0o600);
-      try { await target.writeFile(JSON.stringify(stored)); await target.sync(); } finally { await target.close(); }
+      const temporaryHandle = await open(temporary, "wx", 0o600);
+      try {
+        await temporaryHandle.writeFile(JSON.stringify(stored));
+        await temporaryHandle.sync();
+      } finally {
+        await temporaryHandle.close();
+      }
       await rename(temporary, file);
-    } finally { await rm(temporary, { force: true }); await lock.close(); await rm(lockPath, { force: true }); }
+    } finally {
+      await rm(temporary, { force: true });
+      await lockHandle.close();
+      await rm(lockPath, { force: true });
+    }
   }
   async load(key: SessionKey): Promise<SessionStoreEntry[] | null> { const value = await this.read(this.file(key)); return value ? structuredClone(value.entries) : null; }
   private async all(): Promise<StoredSession[]> {
@@ -63,7 +89,17 @@ export class FileSessionStore implements SessionStore {
   }
   async saveTurnMap(sessionId: string, turns: Record<string, string>): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 }); const path = this.turnMapPath(sessionId); const temporary = `${path}.${randomUUID()}.tmp`;
-    try { const file = await open(temporary, "wx", 0o600); try { await file.writeFile(JSON.stringify(turns)); await file.sync(); } finally { await file.close(); } await rename(temporary, path); }
-    finally { await rm(temporary, { force: true }); }
+    try {
+      const temporaryHandle = await open(temporary, "wx", 0o600);
+      try {
+        await temporaryHandle.writeFile(JSON.stringify(turns));
+        await temporaryHandle.sync();
+      } finally {
+        await temporaryHandle.close();
+      }
+      await rename(temporary, path);
+    } finally {
+      await rm(temporary, { force: true });
+    }
   }
 }

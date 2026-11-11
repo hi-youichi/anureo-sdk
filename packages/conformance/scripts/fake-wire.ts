@@ -3,6 +3,28 @@ import { readFileSync } from "node:fs";
 import type { NativeFixtureFrame, WireFlavor } from "../src/fixtures";
 
 interface WireMessage { id?: string | number; method?: string; params?: Record<string, unknown>; result?: unknown; error?: unknown }
+
+function createInitializeResult(flavor: Exclude<WireFlavor, "claude">) {
+  if (flavor === "codex") {
+    return {
+      userAgent: "codex/0.164.0",
+      platform: process.platform,
+    };
+  }
+  if (flavor === "acp") {
+    return {
+      protocolVersion: 1,
+      agentCapabilities: {},
+      agentInfo: { name: "vanilla-fake", version: "1" },
+    };
+  }
+  return {
+    protocolVersion: 1,
+    runtime: { name: "fake-ahp", version: "1", adapter: "reference" },
+    capabilities: {},
+  };
+}
+
 /** Script data lives outside workspace manifests. No process is started until called. */
 export async function runWireFake(flavor: Exclude<WireFlavor, "claude">): Promise<void> {
   const scriptPath = process.env.HARNESS_FIXTURE_SCRIPT;
@@ -20,13 +42,22 @@ export async function runWireFake(flavor: Exclude<WireFlavor, "claude">): Promis
   const iterator = lines[Symbol.asyncIterator]();
   // Arm the first input read before advertising readiness. This avoids racing cold
   // Bun module initialization with a parent that writes and immediately closes stdin.
-  let pending = iterator.next();
+  let pendingLineRead = iterator.next();
   if (process.env.HARNESS_FIXTURE_READY === "1") process.stderr.write("HARNESS_FIXTURE_READY\n");
   for (;;) {
-    const entry = await pending; if (entry.done) break; const line = entry.value;
-    pending = iterator.next();
+    const entry = await pendingLineRead;
+    if (entry.done) {
+      break;
+    }
+    const line = entry.value;
+    pendingLineRead = iterator.next();
     let request: WireMessage;
-    try { request = JSON.parse(line); } catch { send({ id: null, error: { code: -32700, message: "Parse error" } }); continue; }
+    try {
+      request = JSON.parse(line);
+    } catch {
+      send({ id: null, error: { code: -32700, message: "Parse error" } });
+      continue;
+    }
     const frame = frames[position];
     if (frame && (frame.waitForMethod === undefined || frame.waitForMethod === request.method)) {
       if (frame.expectedResponse && (request.id !== frame.expectedResponse.id || JSON.stringify(request.result) !== JSON.stringify(frame.expectedResponse.result))) { process.stderr.write("FIXTURE_RESPONSE_MISMATCH\n"); process.exitCode = 2; break; }
@@ -36,7 +67,7 @@ export async function runWireFake(flavor: Exclude<WireFlavor, "claude">): Promis
     }
     if (request.id === undefined || !request.method) continue;
     if (request.method === "initialize") {
-      send({ id: request.id, result: flavor === "codex" ? { userAgent: "codex/0.164.0", platform: process.platform } : flavor === "acp" ? { protocolVersion: 1, agentCapabilities: {}, agentInfo: { name: "vanilla-fake", version: "1" } } : { protocolVersion: 1, runtime: { name: "fake-ahp", version: "1", adapter: "reference" }, capabilities: {} } });
+      send({ id: request.id, result: createInitializeResult(flavor) });
     } else if (request.method === "session/new") send({ id: request.id, result: { sessionId: "fake-acp-session" } });
     else if (request.method === "session/prompt") {
       send({ method: "session/update", params: { sessionId: request.params?.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "fixture response" } } } });

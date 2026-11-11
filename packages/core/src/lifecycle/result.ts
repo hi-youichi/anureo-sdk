@@ -4,10 +4,36 @@ import type { TurnResult } from './types';
 import { immutable } from './value';
 
 type TextField = 'text' | 'summary' | 'output';
+// While buffered, snapshot keeps its original field value; chunks include that
+// prefix and all appended text. serializedBytes counts the materialized result.
+// An authoritative snapshot replaces the entry, discarding its buffered text.
 interface RetainedItem {
-  item: Item;
-  bytes: number;
-  text?: { field: TextField; chunks: string[]; lastCodeUnit?: number };
+  snapshot: Item;
+  serializedBytes: number;
+  bufferedText?: { field: TextField; chunks: string[]; lastCodeUnit?: number };
+}
+
+/** Change in the materialized item's JSON byte size; joining surrogates can reduce it. */
+function serializedTextAppendByteDelta(
+  field: TextField,
+  previous: unknown,
+  chunk: string,
+  lastCodeUnit: number | undefined,
+  hasBufferedText: boolean,
+): number {
+  const chunkContentBytes = Buffer.byteLength(JSON.stringify(chunk)) - 2; // Exclude string quotes.
+  let surrogatePairByteDelta = 0;
+  if (lastCodeUnit !== undefined && lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff && chunk.charCodeAt(0) >= 0xdc00 && chunk.charCodeAt(0) <= 0xdfff) {
+    // Replace two isolated JSON surrogate escapes (6 bytes each) with one UTF-8 pair (4 bytes).
+    surrogatePairByteDelta = 4 - 2 * 6;
+  }
+  let fieldStructureByteDelta = 0;
+  if (!hasBufferedText && typeof previous !== 'string') {
+    fieldStructureByteDelta = previous === undefined
+      ? Buffer.byteLength(JSON.stringify(field)) + 4 // Comma, colon and empty string quotes.
+      : 2 - Buffer.byteLength(JSON.stringify(previous)); // Replace the previous value with empty string quotes.
+  }
+  return chunkContentBytes + surrogatePairByteDelta + fieldStructureByteDelta;
 }
 
 /** Deltas update provisional items; authoritative snapshots always replace them. */
@@ -25,7 +51,7 @@ export class ResultAccumulator {
       if (event.type === 'item/completed') this.completed.add(event.payload.item.id);
     } else if (event.type === 'item/delta' && !this.completed.has(event.payload.itemId)) {
       const entry = this.items.get(event.payload.itemId);
-      const item = entry?.item;
+      const item = entry?.snapshot;
       const value = event.payload.value;
       if (event.payload.kind === 'patch' && value && typeof value === 'object' && !Array.isArray(value) && 'type' in value) {
         // The event/privacy boundary already validates Item-shaped patches.
@@ -41,35 +67,30 @@ export class ResultAccumulator {
     }
   }
   private append(entry: RetainedItem, field: TextField, previous: unknown, chunk: string): void {
-    const pending = entry.text;
+    const pending = entry.bufferedText;
     if (!chunk.length && (pending || typeof previous === 'string')) return;
     const prefix = typeof previous === 'string' ? previous : '';
     const last = pending ? pending.lastCodeUnit : prefix.charCodeAt(prefix.length - 1);
-    let added = Buffer.byteLength(JSON.stringify(chunk)) - 2;
-    // JSON escapes isolated surrogates (6 bytes each), but a joined pair is 4 UTF-8 bytes.
-    if (last !== undefined && last >= 0xd800 && last <= 0xdbff && chunk.charCodeAt(0) >= 0xdc00 && chunk.charCodeAt(0) <= 0xdfff) added -= 8;
-    if (!pending && typeof previous !== 'string') {
-      added += previous === undefined
-        ? Buffer.byteLength(JSON.stringify(field)) + 4 // comma, colon and empty string quotes
-        : 2 - Buffer.byteLength(JSON.stringify(previous));
-    }
-    if (this.bytes + added > this.maxBytes) throw new HarnessSdkError('RESULT_BUDGET_EXCEEDED');
-    const text = pending ?? { field, chunks: [prefix], lastCodeUnit: last };
-    text.chunks.push(chunk);
-    if (chunk.length) text.lastCodeUnit = chunk.charCodeAt(chunk.length - 1);
-    entry.text = text;
-    entry.bytes += added;
-    this.bytes += added;
+    const serializedByteDelta = serializedTextAppendByteDelta(field, previous, chunk, last, !!pending);
+    if (this.bytes + serializedByteDelta > this.maxBytes) throw new HarnessSdkError('RESULT_BUDGET_EXCEEDED');
+    const bufferedText = pending ?? { field, chunks: [prefix], lastCodeUnit: last };
+    bufferedText.chunks.push(chunk);
+    if (chunk.length) bufferedText.lastCodeUnit = chunk.charCodeAt(chunk.length - 1);
+    entry.bufferedText = bufferedText;
+    entry.serializedBytes += serializedByteDelta;
+    this.bytes += serializedByteDelta;
   }
   private put(item: Item): void {
     const size = Buffer.byteLength(JSON.stringify(item));
     const previous = this.items.get(item.id);
-    const bytes = this.bytes - (previous?.bytes ?? 0) + size;
+    const bytes = this.bytes - (previous?.serializedBytes ?? 0) + size;
     if (bytes > this.maxBytes || (!previous && this.items.size >= this.maxItems)) throw new HarnessSdkError('RESULT_BUDGET_EXCEEDED');
-    this.items.set(item.id, { item: structuredClone(item), bytes: size }); this.bytes = bytes;
+    this.items.set(item.id, { snapshot: structuredClone(item), serializedBytes: size }); this.bytes = bytes;
   }
   finish(payload: Extract<AhpEvent, { type: 'turn/completed' }>['payload']): TurnResult {
-    const items = [...this.items.values()].map(({ item, text }) => text ? { ...item, [text.field]: text.chunks.join('') } as Item : item);
+    const items = [...this.items.values()].map(({ snapshot, bufferedText }) => bufferedText
+      ? { ...snapshot, [bufferedText.field]: bufferedText.chunks.join('') } as Item
+      : snapshot);
     const text = items.filter((item): item is Extract<Item, { type: 'agentMessage' }> => item.type === 'agentMessage' && item.phase === 'final').map(item => item.text).join('\n');
     const usage = payload.usage?.scope === 'turn' ? payload.usage : this.usage;
     const common = { text, items, ...(usage ? { usage } : {}) };

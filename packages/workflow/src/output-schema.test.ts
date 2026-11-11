@@ -84,10 +84,14 @@ test('sync and async refinements and formats validate locally and sanitize custo
   const output = prepareOutputSchema(local)
   expect(await output.parse('{"count":3,"email":"me@example.com"}')).toEqual({ count: 3, email: 'me@example.com' })
   for (const count of [-1, 11]) {
-    try { await output.parse(JSON.stringify({ count, email: 'me@example.com' })); throw new Error('expected rejection') } catch (error) {
-      expect(error).toMatchObject({ code: 'AGENT_STRUCTURED_OUTPUT_INVALID', outcomeUnknown: false })
-      expect(JSON.stringify(error)).not.toContain('private-')
+    let failure: unknown
+    try {
+      await output.parse(JSON.stringify({ count, email: 'me@example.com' }))
+    } catch (error) {
+      failure = error
     }
+    expect(failure).toMatchObject({ code: 'AGENT_STRUCTURED_OUTPUT_INVALID', outcomeUnknown: false })
+    expect(JSON.stringify(failure)).not.toContain('private-')
   }
   await expect(output.parse('{"count":1,"email":"bad"}')).rejects.toMatchObject({ code: 'AGENT_STRUCTURED_OUTPUT_INVALID' })
   const throwing = prepareOutputSchema(z.object({ a: z.string() }).refine(async () => { throw new Error('private exception') }))
@@ -111,8 +115,12 @@ test('definite generated contradictions and external references are rejected', (
 
 test('user schema callbacks cannot expose their exception or claim execution uncertainty before submission', () => {
   const schema = z.object({ a: z.lazy(() => { throw new HarnessSdkError('PRIVATE_NATIVE_ERROR', 'private value', true, true) }) })
-  try { prepareOutputSchema(schema); throw new Error('expected rejection') } catch (cause) {
-    expect(cause).toMatchObject({ code: 'INVALID_PARAMS', retryable: false, outcomeUnknown: false })
-    expect(String(cause)).not.toContain('private value')
+  let failure: unknown
+  try {
+    prepareOutputSchema(schema)
+  } catch (cause) {
+    failure = cause
   }
+  expect(failure).toMatchObject({ code: 'INVALID_PARAMS', retryable: false, outcomeUnknown: false })
+  expect(String(failure)).not.toContain('private value')
 })

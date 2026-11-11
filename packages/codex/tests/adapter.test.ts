@@ -9,22 +9,65 @@ import { type AhpEvent, type InteractionResponse, type JsonObject } from '@anure
 import { createCodexAdapter, codexCapabilities, mapItems, mapUsage, resolveCodexProfile, type CodexAdapterOptions } from '../src'
 import { rejectionOf } from './test-helpers'
 
-const resources: Array<{dispose():Promise<void>}> = []; const dirs: string[] = []
-afterEach(async () => { await Promise.all(resources.splice(0).map(runtime => runtime.dispose())); await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))) })
-async function setup(mode = 'normal', version = '0.164.0', timeoutMs = 1000, config?: JsonObject, model?: string) {
+const resources: Array<{ dispose(): Promise<void> }> = []
+const dirs: string[] = []
+
+afterEach(async () => {
+  await Promise.all(resources.splice(0).map(resource => resource.dispose()))
+
+  // Remove working directories only after all process resources are disposed.
+  await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })))
+})
+
+type SetupOptions = {
+  scenario?: string
+  version?: string
+  timeoutMs?: number
+  config?: JsonObject
+  model?: string
+}
+
+async function setup({ scenario = 'normal', version = '0.164.0', timeoutMs = 1000, config, model }: SetupOptions = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), 'codex adapter ')); dirs.push(dir)
   const log = path.join(dir, 'calls.jsonl')
   // Bootstrap is not the operation under timeout test; Windows process startup may exceed 100ms.
-  const adapter = createCodexAdapter({ command: process.execPath, args: [fileURLToPath(new URL('./fake-app-server.mjs', import.meta.url))], version, env: { ...process.env, FAKE_SCENARIO: mode, FAKE_LOG_FILE: log }, timeoutMs: Math.max(1000, timeoutMs) })
+  const bootstrapTimeoutMs = Math.max(1000, timeoutMs)
+  const adapter = createCodexAdapter({ command: process.execPath, args: [fileURLToPath(new URL('./fake-app-server.mjs', import.meta.url))], version, env: { ...process.env, FAKE_SCENARIO: scenario, FAKE_LOG_FILE: log }, timeoutMs: bootstrapTimeoutMs })
   const runtime = await createClient({adapter,identity:{adapterId:'codex',runtimeConfigId:'codex-test'},interactions:{approval:undefined,userInput:undefined,elicitation:undefined,dynamicTool:undefined}}); resources.push(runtime)
   const session = await runtime.openSession({ requestId: 'open', mode: 'new', binding: { sessionId: 'session', adapterId: 'codex', runtimeConfigId: 'codex-test' }, cwd: dir, config, ...(model ? { model } : {}) })
   adapter.options.timeoutMs = timeoutMs
-  const events: AhpEvent[] = []; const listeners = new Set<() => void>()
-  const consume = (async () => { try { for await (const event of session.events()) { events.push(event); for (const listener of [...listeners]) listener() } } catch {} })()
+  const events: AhpEvent[] = []
+  const listeners = new Set<() => void>()
+  const consume = (async () => {
+    try {
+      for await (const event of session.events()) {
+        events.push(event)
+        for (const listener of [...listeners]) {
+          listener()
+        }
+      }
+    } catch {
+      // Ignore all collector failures, including stream closure during teardown.
+      // Unmet waitFor conditions still fail through the normal timeout.
+    }
+  })()
   const waitFor = (condition: () => boolean) => new Promise<void>((resolve, reject) => {
-    if (condition()) { resolve(); return }
-    const done = () => { if (condition()) { clearTimeout(timer); listeners.delete(done); resolve() } }
-    const timer = setTimeout(() => { listeners.delete(done); reject(new Error('Event timeout')) }, 2000); listeners.add(done)
+    if (condition()) {
+      resolve()
+      return
+    }
+    const done = () => {
+      if (condition()) {
+        clearTimeout(timer)
+        listeners.delete(done)
+        resolve()
+      }
+    }
+    const timer = setTimeout(() => {
+      listeners.delete(done)
+      reject(new Error('Event timeout'))
+    }, 2000)
+    listeners.add(done)
   })
   const calls = async () => (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { method?: string; params?: Record<string, unknown>; id?: string|number; result?: unknown; error?: unknown })
   return { adapter, runtime, session, events, waitFor, calls, consume, dir }
@@ -47,7 +90,7 @@ describe('Codex permission controls', () => {
   ] as const
   for (const version of ['0.148.0', '0.164.0']) for (const [mode, approvalPolicy, sandbox, type] of modes) {
     test(`${version} applies draft ${mode} to thread and subsequent turns`, async () => {
-      const s = await setup('normal', version, 1000, { permissionMode: mode })
+      const s = await setup({ version, config: { permissionMode: mode } })
       await s.session.submit(start)
       const calls = await s.calls()
       expect(codexCapabilities(version).config?.options.find(option => option.id === 'permissionMode')?.schema).toMatchObject({ enum: ['read-only', 'agent', 'agent-full-access'] })
@@ -56,7 +99,7 @@ describe('Codex permission controls', () => {
       expect(calls.find(call => call.method === 'turn/start')?.params).toMatchObject({ approvalPolicy, sandboxPolicy: { type } })
     })
     test(`${version} applies session ${mode} to native settings and the next turn`, async () => {
-      const s = await setup('normal', version)
+      const s = await setup({ version })
       const state = await s.session.request('session/config/set', { requestId: 'permissions', sessionId: 'session', patch: { permissionMode: mode } })
       expect(state.config.permissionMode).toBe(mode)
       await s.session.submit(start)
@@ -73,7 +116,7 @@ describe('Codex permission controls', () => {
 
 describe('Codex native lifecycle', () => {
   test('retains native start anchors through deltas, repeated starts, completion and reused IDs', async () => {
-    const s = await setup('timing')
+    const s = await setup({ scenario: 'timing' })
     for (const [turnId, startedAt] of [['native-turn-1', '2026-10-28T01:00:03.000Z'], ['native-turn-2', '2026-10-28T01:01:03.000Z']] as const) {
       await s.session.submit(start)
       await s.waitFor(() => s.events.some(event => event.turnId === turnId && event.type === 'item/delta' && event.payload.kind === 'patch'))
@@ -89,7 +132,7 @@ describe('Codex native lifecycle', () => {
   })
 
   test('reads start anchors from paginated native history entries', async () => {
-    const s = await setup('timing')
+    const s = await setup({ scenario: 'timing' })
     const first = await s.session.request('history/read', { requestId: 'timed-history', sessionId: 'session', limit: 1 })
     const second = await s.session.request('history/read', { requestId: 'timed-history-next', sessionId: 'session', cursor: first.nextCursor!, snapshotToken: first.snapshotToken })
     expect(first.items[0]?.item).toMatchObject({ id: 'reused', text: 'one', startedAt: '2026-10-28T01:00:03.000Z' })
@@ -125,7 +168,7 @@ describe('Codex native lifecycle', () => {
     expect(s.events.every((event, index) => event.seq === s.events[0]!.seq + index)).toBe(true)
   })
   test('steer uses the same native turn and explicit interrupt finishes it', async () => {
-    const s = await setup('hold'); await s.session.submit(start)
+    const s = await setup({ scenario: 'hold' }); await s.session.submit(start)
     expect(await rejectionOf(s.session.submit(start))).toMatchObject({ code: 'NATIVE_RPC_ERROR' })
     expect(await s.session.request('turn/steer', { submissionId: 'steer', requestId: 'steer', sessionId: 'session', expectedTurnId: 'native-turn-1', input: [{ type: 'text', text: 'adjust' }] })).toMatchObject({ turnId: 'native-turn-1', accepted: true })
     await s.session.request('turn/interrupt', { requestId: 'interrupt', sessionId: 'session', turnId: 'native-turn-1' })
@@ -138,31 +181,31 @@ describe('Codex native lifecycle', () => {
 
 describe('independent account readiness', () => {
   test('missing account blocks dispatch and exposes only an actionable auth error', async () => {
-    const s = await setup('auth-required')
+    const s = await setup({ scenario: 'auth-required' })
     expect(await s.adapter.readAuthStatus()).toBe('required')
     expect(await rejectionOf(s.session.submit(start))).toMatchObject({ code: 'AUTH_REQUIRED', outcomeUnknown: false })
     expect((await s.calls()).some(call => call.method === 'turn/start')).toBe(false)
     expect(s.events.some(event => event.type === 'turn/started')).toBe(false)
   })
   for (const mode of ['auth-unavailable', 'auth-not-required']) test(`${mode} does not invent a requirement for native authentication`, async () => {
-    const s = await setup(mode)
+    const s = await setup({ scenario: mode })
     expect(await s.adapter.readAuthStatus()).toBe(mode === 'auth-unavailable' ? 'unknown' : 'ready')
     await expect(s.session.submit(start)).resolves.toMatchObject({ id: 'native-turn-1' })
     expect((await s.calls()).filter(call => call.method === 'turn/start')).toHaveLength(1)
   })
   test('an account preflight timeout stays visible but cannot mark an undispatched turn unknown', async () => {
-    const s = await setup('auth-timeout', '0.164.0', 100)
+    const s = await setup({ scenario: 'auth-timeout', timeoutMs: 100 })
     expect(await rejectionOf(s.session.submit(start))).toMatchObject({ code: 'REQUEST_TIMEOUT', outcomeUnknown: false })
     expect((await s.calls()).some(call => call.method === 'turn/start')).toBe(false)
   })
   test('invalid account status is not treated as an anonymous provider', async () => {
-    const s = await setup('auth-malformed')
+    const s = await setup({ scenario: 'auth-malformed' })
     let failure: unknown; try { await s.session.submit(start) } catch (cause) { failure = cause }
     expect(failure).toMatchObject({ code: 'PROTOCOL_ERROR' })
     expect((await s.calls()).some(call => call.method === 'turn/start')).toBe(false)
   })
   test('a mid-turn native unauthorized failure remains an auth error without leaking provider details', async () => {
-    const s = await setup('auth-expired'); await s.session.submit(start)
+    const s = await setup({ scenario: 'auth-expired' }); await s.session.submit(start)
     await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
     const terminal = s.events.find(event => event.type === 'turn/completed')!
     expect(terminal.type === 'turn/completed' && terminal.payload.error).toMatchObject({ code: 'AUTH_REQUIRED', outcomeUnknown: false })
@@ -172,29 +215,61 @@ describe('independent account readiness', () => {
 })
 
 describe('native interactions', () => {
-  for (const [mode, response] of [
-    ['approval', { kind: 'approval', optionId: 'decline' }],
-    ['fileapproval', { kind: 'approval', optionId: 'decline' }],
-    ['permission', { kind: 'approval', optionId: 'decline' }],
-    ['questions', { kind: 'userInput', answers: { q: '0' } }],
-    ['elicitation', { kind: 'elicitation', action: 'cancel' }],
-    ['dynamic', { kind: 'dynamicTool', content: [{ type: 'text', text: 'tool output' }] }],
-  ] as Array<[string, InteractionResponse]>) test(`${mode} keeps native request id and structured response`, async () => {
-    const s = await setup(mode); await s.session.submit(start)
+  const cases: Array<{
+    scenario: string
+    response: InteractionResponse
+    nativeRequestId: string | number
+    expectedResult?: JsonObject
+  }> = [
+    {
+      scenario: 'approval',
+      response: { kind: 'approval', optionId: 'decline' },
+      nativeRequestId: 'server-request',
+      expectedResult: { decision: 'decline' },
+    },
+    {
+      scenario: 'fileapproval',
+      response: { kind: 'approval', optionId: 'decline' },
+      nativeRequestId: 'server-request',
+    },
+    {
+      scenario: 'permission',
+      response: { kind: 'approval', optionId: 'decline' },
+      nativeRequestId: 901,
+      expectedResult: { permissions: {}, scope: 'turn' },
+    },
+    {
+      scenario: 'questions',
+      response: { kind: 'userInput', answers: { q: '0' } },
+      nativeRequestId: 'server-request',
+      expectedResult: { answers: { q: { answers: ['A'] } } },
+    },
+    {
+      scenario: 'elicitation',
+      response: { kind: 'elicitation', action: 'cancel' },
+      nativeRequestId: 'server-request',
+    },
+    {
+      scenario: 'dynamic',
+      response: { kind: 'dynamicTool', content: [{ type: 'text', text: 'tool output' }] },
+      nativeRequestId: 'server-request',
+    },
+  ]
+  for (const { scenario, response, nativeRequestId, expectedResult } of cases) test(`${scenario} keeps native request id and structured response`, async () => {
+    const s = await setup({ scenario }); await s.session.submit(start)
     await s.waitFor(() => s.events.some(event => event.type === 'interaction/requested'))
     const request = s.events.find(event => event.type === 'interaction/requested')!
     if (request.type !== 'interaction/requested') throw new Error()
     await s.session.request('interaction/respond', { requestId: 'respond', sessionId: 'session', interactionId: request.payload.interactionId, response })
     await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
-    const calls = await s.calls(); const reply = calls.find(call => call.id === (mode === 'permission' ? 901 : 'server-request') && !call.method)
+    const calls = await s.calls()
+    const reply = calls.find(call => call.id === nativeRequestId && !call.method)
     expect(reply).toBeDefined()
     expect(s.events.filter(event => event.type === 'interaction/resolved')).toHaveLength(1)
-    if (mode === 'approval') expect(reply?.result).toEqual({ decision: 'decline' })
-    if (mode === 'permission') expect(reply?.result).toEqual({ permissions: {}, scope: 'turn' })
-    if (mode === 'questions') expect(reply?.result).toEqual({ answers: { q: { answers: ['A'] } } })
+    if (expectedResult !== undefined) expect(reply?.result).toEqual(expectedResult)
   })
   test('unknown native request receives method-not-found, never approval', async () => {
-    const s = await setup('unknown-request'); await s.session.submit(start)
+    const s = await setup({ scenario: 'unknown-request' }); await s.session.submit(start)
     await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
     const reply = (await s.calls()).find(call => call.id === 'server-request' && !call.method)
     expect(reply?.error).toEqual({ code: -32601, message: 'Unsupported native request' })
@@ -204,7 +279,7 @@ describe('native interactions', () => {
 
 describe('versioned controls and history', () => {
   test('retains the selected model in capability snapshots and subsequent configuration results', async () => {
-    const s = await setup('no-history', '0.164.0', 1000, {}, 'initial-model')
+    const s = await setup({ scenario: 'no-history', config: {}, model: 'initial-model' })
     expect(await rejectionOf(s.session.request('history/read', { requestId: 'history', sessionId: 'session' }))).toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' })
     await s.waitFor(() => s.events.some(event => event.type === 'session/state' && event.payload.capabilities.session?.history === false))
     expect(s.events.filter(event => event.type === 'session/state').every(event => event.type === 'session/state' && event.payload.model === 'initial-model')).toBe(true)
@@ -213,7 +288,7 @@ describe('versioned controls and history', () => {
     expect((await s.calls()).find(call => call.method === 'thread/start')?.params?.model).toBe('initial-model')
   })
   test('modern native history pages become a bounded stable snapshot', async () => {
-    const s = await setup('hold')
+    const s = await setup({ scenario: 'hold' })
     const one = await s.session.request('history/read', { requestId: 'h1', sessionId: 'session', limit: 1 })
     expect(one.items).toHaveLength(1); expect(one.nextCursor).toBeTruthy()
     const two = await s.session.request('history/read', { requestId: 'h2', sessionId: 'session', cursor: one.nextCursor!, snapshotToken: one.snapshotToken, limit: 1 })
@@ -222,7 +297,7 @@ describe('versioned controls and history', () => {
     expect(await rejectionOf(s.session.request('history/read', { requestId: 'badcursor', sessionId: 'session', cursor: 'bad' }))).toMatchObject({ code: 'CURSOR_INVALID' })
   })
   test('revokes an absent optional history method while keeping the new session usable for its first turn', async () => {
-    const s = await setup('no-history')
+    const s = await setup({ scenario: 'no-history' })
     let failure: unknown; try { await s.session.request('history/read', { requestId: 'history', sessionId: 'session' }) } catch (cause) { failure = cause }
     expect(failure).toMatchObject({ code: 'CAPABILITY_UNSUPPORTED', outcomeUnknown: false })
     expect(s.session.capabilities.session?.history).toBe(false)
@@ -233,7 +308,7 @@ describe('versioned controls and history', () => {
     expect((await s.calls()).filter(call => call.method === 'thread/items/list')).toHaveLength(1)
   })
   test('legacy revert calculates rollback only from authoritative native turns', async () => {
-    const s = await setup('hold', '0.148.0')
+    const s = await setup({ scenario: 'hold', version: '0.148.0' })
     expect(codexCapabilities('0.148.0').session?.fork).toEqual(['through'])
     await s.session.request('session/revert', { requestId: 'revert', sessionId: 'session', boundary: { turnId: 'canonical-old', nativeTurnId: 'native-turn-1', relation: 'before' }, scope: 'conversation' })
     const calls = await s.calls()
@@ -242,19 +317,19 @@ describe('versioned controls and history', () => {
     expect(await rejectionOf(s.session.request('session/revert', { requestId: 'bad-scope', sessionId: 'session', boundary: { turnId: 'canonical-old', relation: 'before' }, scope: 'both' }))).toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' })
   })
   test('modern revert timeout does not try rollback', async () => {
-    const s = await setup('timeout-revert', '0.164.0', 150)
+    const s = await setup({ scenario: 'timeout-revert', timeoutMs: 150 })
     expect(await rejectionOf(s.session.request('session/revert', { requestId: 'r', sessionId: 'session', boundary: { turnId: 'canonical-old', nativeTurnId: 'native-turn-1', relation: 'before' }, scope: 'conversation' }))).toMatchObject({ code: 'REQUEST_TIMEOUT', outcomeUnknown: true })
     expect((await s.calls()).some(call => call.method === 'thread/rollback')).toBe(false)
   })
   test('explicit method-not-found updates capability without a destructive probe', async () => {
-    const s = await setup('missing-optional')
+    const s = await setup({ scenario: 'missing-optional' })
     expect((await s.calls()).some(call => call.method === 'thread/revert')).toBe(false)
     expect(await rejectionOf(s.session.request('session/revert', { requestId: 'r', sessionId: 'session', boundary: { turnId: 'canonical-old', nativeTurnId: 'native-turn-1', relation: 'before' }, scope: 'conversation' }))).toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' })
     expect(s.session.capabilities.session?.revert).toEqual([])
     expect((await s.calls()).filter(call => call.method === 'thread/revert')).toHaveLength(1)
   })
   test('config, goals and compaction are native operations with maintenance completion', async () => {
-    const s = await setup('hold')
+    const s = await setup({ scenario: 'hold' })
     await s.session.request('session/config/set', { requestId: 'cfg', sessionId: 'session', patch: { model: 'test-model' } })
     expect(await s.session.request('goal/set', { requestId: 'goal', sessionId: 'session', goal: { objective: 'finish' } })).toEqual({ goal: { objective: 'finish', status: 'active' }, status: 'active' })
     expect(await s.session.request('goal/clear', { requestId: 'clear', sessionId: 'session' })).toEqual({ goal: null, status: 'cleared' })
@@ -284,7 +359,7 @@ test('mapping unknown items preserves safe payload and usage fields remain optio
 
 
 test('resume and fork use persisted native identities, and review has one turn', async () => {
-  const s = await setup('hold')
+  const s = await setup({ scenario: 'hold' })
   const binding = { sessionId: 'resumed', adapterId: 'codex', runtimeConfigId: 'codex-test', nativeRef: { provider: 'codex', value: 'native-thread' } }
   const resumed = await s.runtime.openSession({ requestId: 'resume', mode: 'resume', binding, cwd: s.dir })
   expect(resumed.binding.nativeRef?.value).toBe('native-thread')
@@ -317,7 +392,7 @@ test('maps every native content family without relying on titles', () => {
 
 
 test('model discovery is read-only and owns its short-lived process', async () => {
-  const s = await setup('hold'); expect(await s.adapter.listModels(s.dir)).toEqual([
+  const s = await setup({ scenario: 'hold' }); expect(await s.adapter.listModels(s.dir)).toEqual([
     { id: 'test-model', name: 'Test model' },
     { id: 'gpt-6.1-sol', name: 'GPT-6.1-Sol', isDefault: true, efforts: [{ id: 'low', description: 'Fast' }, { id: 'ultra', description: 'Deepest' }], defaultEffort: 'low', serviceTiers: ['standard', 'priority'] },
     { id: 'gpt-reserve', name: 'GPT-Reserve', hidden: true },
@@ -329,10 +404,10 @@ test('model discovery is read-only and owns its short-lived process', async () =
 
 
 test('read-only reconciliation requires explicit idle and exact terminal native turn evidence', async () => {
-  const s = await setup('hold'); expect(await s.adapter.inspectExecution(s.session.binding,'native-turn-1')).toEqual({stopped:true,status:'completed',turnId:'native-turn-1'});
+  const s = await setup({ scenario: 'hold' }); expect(await s.adapter.inspectExecution(s.session.binding,'native-turn-1')).toEqual({stopped:true,status:'completed',turnId:'native-turn-1'});
   expect(await s.adapter.inspectExecution(s.session.binding)).toEqual({stopped:false});
   expect(await s.adapter.inspectExecution(s.session.binding,'missing-turn')).toEqual({stopped:false});
-  for(const mode of ['not-loaded','still-active']){const other=await setup(mode);expect(await other.adapter.inspectExecution(other.session.binding,'native-turn-1')).toEqual({stopped:false});}
+  for(const mode of ['not-loaded','still-active']){const other=await setup({ scenario: mode });expect(await other.adapter.inspectExecution(other.session.binding,'native-turn-1')).toEqual({stopped:false});}
   expect((await s.calls()).filter(call=>call.method==='thread/resume')).toHaveLength(0);
 })
 
@@ -348,7 +423,7 @@ test('turn errors classify only native categories and HTTP status, never untrust
 
 
 test('file-change output arriving first stays a typed tool log and later snapshots retain source and diagnostics', async () => {
-  const s = await setup('file-change')
+  const s = await setup({ scenario: 'file-change' })
   await s.session.submit(start)
   await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
   const started = s.events.find(event => event.type === 'item/started' && event.payload.item.id === 'edit')
@@ -362,7 +437,7 @@ test('file-change output arriving first stays a typed tool log and later snapsho
 
 describe('Codex fast mode', () => {
   test('fastMode is a boolean session option mapped to the priority service tier and never sent as native config', async () => {
-    const s = await setup('normal', '0.164.0', 1000, { fastMode: true })
+    const s = await setup({ config: { fastMode: true } })
     await s.session.submit(start); await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
     const calls = await s.calls()
     expect(calls.find(call => call.method === 'thread/start')?.params).toMatchObject({ serviceTier: 'priority' })
@@ -373,7 +448,7 @@ describe('Codex fast mode', () => {
     expect(await rejectionOf(s.session.request('session/config/set', { requestId: 'bad', sessionId: 'session', patch: { fastMode: 'yes' } } as never))).toMatchObject({ code: 'INVALID_PARAMS' })
   })
   test('standard speed sends no tier before fast mode is configured', async () => {
-    const s = await setup('normal')
+    const s = await setup()
     await s.session.submit(start); await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
     expect((await s.calls()).find(call => call.method === 'turn/start')?.params).not.toHaveProperty('serviceTier')
   })
@@ -390,7 +465,7 @@ describe('Codex version profiles', () => {
     expect(resolveCodexProfile('0.165.0')).toMatchObject({ profile: { since: '0.164.0', settings: 'thread/settings/update' }, verified: false })
   })
   test('a newer unverified Codex still applies settings through the profile and reports itself once', async () => {
-    const s = await setup('normal', '0.165.0')
+    const s = await setup({ version: '0.165.0' })
     expect(await s.session.submit(start)).toMatchObject({ id: 'native-turn-1' })
     await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
     expect(s.events.filter(event => event.type === 'notice' && event.payload.code === 'CODEX_VERSION_UNVERIFIED')).toHaveLength(1)
@@ -401,7 +476,7 @@ describe('Codex version profiles', () => {
 
 
 test('native titles hydrate on open, ignore other threads, dedupe, and clear after turn completion', async () => {
-  const f = await setup('titles')
+  const f = await setup({ scenario: 'titles' })
   expect(f.session.snapshot.metadata).toEqual({title:'Restored title'})
   await f.session.submit(start)
   await f.waitFor(() => f.events.some(event => event.type === 'session/metadata' && event.payload.title === null))
@@ -418,18 +493,18 @@ test('rejectionOf surfaces the cause and rejects when an operation resolves inst
 
 describe('native error paths and edge boundaries', () => {
   test('steering requires the native turn map; a mismatched native steer is rejected', async () => {
-    const s = await setup('normal')
+    const s = await setup()
     await s.session.submit(start)
     await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
     expect(await rejectionOf(s.session.request('turn/steer', { submissionId: 'unmapped', requestId: 'unmapped', sessionId: 'session', expectedTurnId: 'never-started', input: [{ type: 'text', text: 'x' }] }))).toMatchObject({ code: 'TURN_MISMATCH' })
     expect(await rejectionOf(s.session.request('turn/interrupt', { requestId: 'unmapped-interrupt', sessionId: 'session', turnId: 'never-started' }))).toMatchObject({ code: 'TURN_MISMATCH' })
-    const mismatch = await setup('steer-mismatch')
+    const mismatch = await setup({ scenario: 'steer-mismatch' })
     await mismatch.session.submit(start)
     await mismatch.waitFor(() => mismatch.events.some(event => event.type === 'turn/started'))
     expect(await rejectionOf(mismatch.session.request('turn/steer', { submissionId: 'steer', requestId: 'steer', sessionId: 'session', expectedTurnId: 'native-turn-1', input: [{ type: 'text', text: 'x' }] }))).toMatchObject({ code: 'TURN_MISMATCH' })
   })
   test('history snapshots expire after a revert invalidates them', async () => {
-    const s = await setup('normal')
+    const s = await setup()
     await s.session.submit(start)
     await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
     const page = await s.session.request('history/read', { requestId: 'h1', sessionId: 'session' })
@@ -438,7 +513,7 @@ describe('native error paths and edge boundaries', () => {
     expect(await rejectionOf(s.session.request('history/read', { requestId: 'h2', sessionId: 'session', snapshotToken: page.snapshotToken }))).toMatchObject({ code: 'CURSOR_EXPIRED' })
   })
   test('a compact acknowledgement does not fabricate native completion', async () => {
-    const s = await setup('compact-hang', '0.164.0', 300)
+    const s = await setup({ scenario: 'compact-hang', timeoutMs: 300 })
     expect(await s.session.request('compact/start',{requestId:'compact',sessionId:'session'})).toMatchObject({status:'accepted'});
     expect(s.events.some(event=>event.type==='turn/completed'||event.type==='notice'&&event.payload.code==='CONTEXT_COMPACTED')).toBe(false)
   })
@@ -449,14 +524,14 @@ describe('native error paths and edge boundaries', () => {
     await expect(runtime.openSession({ requestId: 'open', mode: 'new', binding: { sessionId: 'doomed', adapterId: 'codex', runtimeConfigId: 'codex-test' }, cwd: dir })).rejects.toMatchObject({ code: 'NATIVE_RPC_ERROR' })
   })
   test('native error notifications surface as error-severity notices', async () => {
-    const s = await setup('error-notice')
+    const s = await setup({ scenario: 'error-notice' })
     await s.session.submit(start)
     await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
     const notice = s.events.find(event => event.type === 'notice' && event.payload.severity === 'error')
     expect(notice?.payload).toMatchObject({ code: 'NATIVE_NOTIFICATION' })
   })
   test('policy-rule approval options map to native execpolicy amendments', async () => {
-    const s = await setup('policy')
+    const s = await setup({ scenario: 'policy' })
     await s.session.submit(start)
     await s.waitFor(() => s.events.some(event => event.type === 'interaction/requested'))
     const request = s.events.find(event => event.type === 'interaction/requested')!
@@ -472,7 +547,7 @@ describe('native error paths and edge boundaries', () => {
     expect(reply?.result).toEqual({ decision: { acceptWithExecpolicyAmendment: { rule: 'trust' } } })
   })
   test('paged native turn lists drive through-boundary reverts', async () => {
-    const s = await setup('turns-paged', '0.164.0')
+    const s = await setup({ scenario: 'turns-paged' })
     await s.session.submit(start)
     await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
     await s.session.request('session/revert', { requestId: 'revert', sessionId: 'session', boundary: { turnId: 'native-turn-1', nativeTurnId: 'native-turn-1', relation: 'through' }, scope: 'conversation' })
@@ -483,7 +558,7 @@ describe('native error paths and edge boundaries', () => {
     expect(calls.some(call => call.method === 'thread/revert')).toBe(true)
   })
   test('repeating native model cursors fail closed', async () => {
-    const s = await setup('model-loop')
+    const s = await setup({ scenario: 'model-loop' })
     expect(await rejectionOf(s.adapter.listModels(s.dir))).toMatchObject({ code: 'PROTOCOL_ERROR' })
   })
 })

@@ -12,6 +12,9 @@ test('Claude edits are fragments without invented positions, with partial repeat
 test('Write input alone cannot prove new-file creation; structured result is preferred', () => {
   expect(claudeFileChanges('Write', { file_path: 'a', content: 'contents' })).toMatchObject([{ operation: 'unknown', completeness: 'partial', materials: [{ format: 'unavailable' }] }])
   expect(claudeFileChanges('Write', { file_path: 'a', content: 'contents' }, { oldText: '', newText: 'contents' })).toMatchObject([{ operation: 'modify', materials: [{ oldText: '' }] }])
+})
+
+test('running Claude tools fail when is_error is true and complete when it is absent', () => {
   const previous = { id: 'edit', type: 'toolCall' as const, kind: 'fileChange' as const, title: 'Edit', nativeType: 'Edit', input: { file_path: 'a', old_string: 'old', new_string: 'new' }, status: 'running' as const }
   expect(completeClaudeTool(previous, { is_error: true, content: 'failed' })).toMatchObject({ status: 'failed' })
   expect(completeClaudeTool(previous, { content: 'ok' })).toMatchObject({ status: 'completed' })

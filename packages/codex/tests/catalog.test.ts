@@ -22,14 +22,23 @@ test('directory refresh reuses one process/handshake and never opens a thread or
     expect(calls.filter(call => call.method === 'model/list')).toHaveLength(2)
     expect(calls.some(call => /^(thread|turn)\//.test(call.method))).toBe(false)
     expect(phases.map(event => [event.phase, event.outcome])).toEqual([['spawn', 'started'], ['spawn', 'success'], ['handshake', 'started'], ['handshake', 'success']])
-  } finally { await session.dispose(); await session.dispose(); rmSync(root, { recursive: true, force: true }) }
+  } finally {
+    await session.dispose()
+    // Intentionally dispose again to verify repeated disposal completes safely.
+    await session.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
   expect((await children[0]!.exited).code).not.toBeUndefined()
 })
 
 test('cancellation at spawn completion disposes the just-created process', async () => {
   const abort = new AbortController(); let child: HarnessProcess | undefined
   const session = createCodexCatalogSession({ command: process.execPath, args: [fileURLToPath(new URL('./fake-app-server.mjs', import.meta.url))],
-    processFactory: async options => { child = await spawnHarnessProcess(options); abort.abort(); return child } })
+    processFactory: async options => {
+      child = await spawnHarnessProcess(options)
+      abort.abort() // Cancel after creation, before handing the process to the session.
+      return child
+    } })
   try {
     await expect(session.prepare({ signal: abort.signal })).rejects.toMatchObject({ code: 'RPC_ABORTED' })
     expect(child).toBeDefined()

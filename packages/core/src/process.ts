@@ -23,7 +23,11 @@ export interface HarnessProcess {
   readonly exited: Promise<ProcessExit>;
   write(chunk: string | Uint8Array): Promise<void>;
   closeInput(): Promise<void>;
-  /** Idempotent: terminate an owned process tree, detach an externally owned process. */
+  /**
+   * Idempotent: terminate an owned process tree; otherwise unref without waiting for exit.
+   * Always destroys local stdin/stdout/stderr streams, regardless of ownership or
+   * termination success. Drain buffered output before disposal.
+   */
   dispose(): Promise<void>;
 }
 
@@ -40,9 +44,13 @@ export class ProcessPortError extends Error {
   }
 }
 
-function exists(pid: number): boolean {
+function processOrGroupExists(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
+function processGroupExists(processGroupId: number): boolean {
+  return processOrGroupExists(-processGroupId);
 }
 
 function signalGroup(pid: number, signal: NodeJS.Signals): void {
@@ -72,7 +80,7 @@ async function windowsKillTree(pid: number, force: boolean): Promise<void> {
     killer.once('error', reject);
     killer.once('exit', (code) => {
       // taskkill reports a nonzero result if the process exited during the call.
-      if (code === 0 || !exists(pid)) resolve();
+      if (code === 0 || !processOrGroupExists(pid)) resolve();
       else reject(new ProcessPortError('PROCESS_DISPOSE_FAILED', 'Unable to terminate harness process tree'));
     });
   });
@@ -99,8 +107,8 @@ async function terminateTree(child: ChildProcessWithoutNullStreams, pid: number,
   // Children holding inherited pipes must not keep either the stream or SDK alive.
   await signalGroupWithExitRace(pid, 'SIGTERM');
   const deadline = Date.now() + timeoutMs;
-  while (exists(-pid) && Date.now() < deadline) await delay(10);
-  if (exists(-pid)) await signalGroupWithExitRace(pid, 'SIGKILL');
+  while (processGroupExists(pid) && Date.now() < deadline) await delay(10);
+  if (processGroupExists(pid)) await signalGroupWithExitRace(pid, 'SIGKILL');
 }
 
 /** Node's child_process implementation is also supported by Bun; no shell parsing is involved. */

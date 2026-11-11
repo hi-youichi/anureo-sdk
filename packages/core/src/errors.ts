@@ -12,7 +12,16 @@ export class HarnessSdkError extends Error {
 export function sdkError(cause: unknown, fallback = "HARNESS_ERROR", outcomeUnknown = false): HarnessSdkError {
   if (cause instanceof HarnessSdkError) return cause;
   if (cause && typeof cause === "object" && "code" in cause && typeof cause.code === "string" && /^[A-Z][A-Z0-9_]{0,80}$/.test(cause.code)) {
-    return new HarnessSdkError(cause.code, cause.code, "retryable" in cause && cause.retryable === true, "outcomeUnknown" in cause ? cause.outcomeUnknown === true : outcomeUnknown);
+    const code = cause.code;
+    const message = cause.code;
+    const retryable = "retryable" in cause && cause.retryable === true;
+    const resolvedOutcomeUnknown = "outcomeUnknown" in cause ? cause.outcomeUnknown === true : outcomeUnknown;
+    return new HarnessSdkError(
+      code,
+      message,
+      retryable,
+      resolvedOutcomeUnknown,
+    );
   }
   // Do not include raw backend errors: they may contain credentials or private answers.
   return new HarnessSdkError(fallback, fallback, false, outcomeUnknown);

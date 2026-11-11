@@ -13,19 +13,54 @@ async function fixture(args: string[] = [], options: Partial<AcpAdapterOptions> 
   let session: Session = await runtime.openSession({ requestId: 'open', mode: 'new', binding: { sessionId: 's', adapterId: 'acp', runtimeConfigId: 'fixture' }, cwd: process.cwd() });
   const events: AhpEvent[] = [];
   let response: ((request: InteractionRequested) => InteractionResponse) | undefined;
-  let consumedError: unknown;
-  const consume = (value: Session) => (async () => {
-    try { for await (const event of value.events()) { events.push(event); if (event.type === 'interaction/requested' && response) await value.request('interaction/respond', { requestId: `answer-${event.payload.interactionId}`, sessionId: 's', interactionId: event.payload.interactionId, response: response(event.payload) }); } }
-    catch (error) { consumedError = error; }
-  })();
+  let eventPumpError: unknown;
+  async function consume(observedSession: Session) {
+    try {
+      for await (const event of observedSession.events()) {
+        events.push(event);
+        if (event.type === 'interaction/requested' && response) {
+          await observedSession.request('interaction/respond', {
+            requestId: `answer-${event.payload.interactionId}`,
+            sessionId: 's',
+            interactionId: event.payload.interactionId,
+            response: response(event.payload),
+          });
+        }
+      }
+    } catch (error) {
+      eventPumpError = error;
+    }
+  }
   const pumps = [consume(session)];
   let counter = 0;
-  const until = async (predicate: () => boolean) => { for (let i = 0; i < 500; i++) { if (predicate()) return; if (consumedError) throw consumedError; await new Promise((resolve) => setTimeout(resolve, 2)); } throw Error('Timed out awaiting ACP fixture'); };
+  const until = async (predicate: () => boolean) => {
+    for (let i = 0; i < 500; i++) {
+      if (predicate()) return;
+      // Event pump errors propagate through this polling loop.
+      if (eventPumpError) throw eventPumpError;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    throw Error('Timed out awaiting ACP fixture');
+  };
   return {
     adapter, runtime, initialized, events, get session() { return session; }, until,
     respondWith(handler: (request: InteractionRequested) => InteractionResponse) { response = handler; },
     async start(text: string) { return (await session.submit({input:text})).id; },
-    async finished(id: string) { await until(() => events.some((event) => event.type === 'turn/completed' && event.payload.turnId === id)); const interactionIds = new Set(events.filter((event) => event.turnId === id && event.type === 'interaction/requested').map((event) => event.type === 'interaction/requested' ? event.payload.interactionId : '')); return events.filter((event) => event.turnId === id || (event.type === 'interaction/resolved' && interactionIds.has(event.payload.interactionId))); },
+    async finished(turnId: string) {
+      await until(() => events.some((event) => event.type === 'turn/completed' && event.payload.turnId === turnId));
+
+      const turnInteractionIds = new Set<string>();
+      for (const event of events) {
+        if (event.turnId === turnId && event.type === 'interaction/requested') {
+          turnInteractionIds.add(event.payload.interactionId);
+        }
+      }
+
+      // Resolved events are associated with the turn through their interactionId.
+      return events.filter((event) => event.turnId === turnId || (
+        event.type === 'interaction/resolved' && turnInteractionIds.has(event.payload.interactionId)
+      ));
+    },
     async resume() { const binding = session.binding; await session.close(); session = await runtime.openSession({ requestId: 'resume', mode: 'resume', binding, cwd: process.cwd() }); pumps.push(consume(session)); },
     async close() { await runtime.dispose(); await Promise.all(pumps); },
   };
@@ -156,11 +191,11 @@ test('explicit versioned extension exposes optional semantics and structured sub
   } finally { await f.close(); }
 });
 
-test('unknown native requests are rejected and source loss produces an explicit failed observation', async () => {
+test('unknown native requests are rejected and source loss rejects submission with unknown outcome and emits no terminal turn event', async () => {
   const f = await fixture(); try {
     const ordinary = await f.finished(await f.start('unknown-request')); expect(ordinary.find((event) => event.type === 'turn/completed')?.payload).toMatchObject({ status: 'completed' });
-    const before=f.events.length;await expect(f.session.submit({input:'disconnect'})).rejects.toMatchObject({code:'ACP_CONNECTION_CLOSED',outcomeUnknown:true});
-    expect(f.events.slice(before).some(event=>event.type==='turn/completed')).toBe(false);
+    const eventCountBeforeDisconnect=f.events.length;await expect(f.session.submit({input:'disconnect'})).rejects.toMatchObject({code:'ACP_CONNECTION_CLOSED',outcomeUnknown:true});
+    expect(f.events.slice(eventCountBeforeDisconnect).some(event=>event.type==='turn/completed')).toBe(false);
   } finally { await f.close(); }
 });
 

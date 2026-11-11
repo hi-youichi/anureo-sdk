@@ -34,10 +34,21 @@ test('synchronous failure does not prevent later callbacks from starting', async
 test('a failed callback becomes null and the batch still waits for its pending sibling', async () => {
   let finish!: (value: string) => void
   let completed = false
-  const sibling = new Promise<string>(resolve => { finish = resolve }).then(value => { completed = true; return value })
+  const sibling = new Promise<string>(resolve => {
+    finish = resolve
+  }).then(value => {
+    completed = true
+    return value
+  })
   const failure = new Error('failed')
   let settled = false
-  const result = parallel([() => Promise.reject(failure), () => sibling]).then(values => { settled = true; return values })
+  const result = parallel([
+    () => Promise.reject(failure),
+    () => sibling,
+  ]).then(values => {
+    settled = true
+    return values
+  })
   await Promise.resolve()
   await Promise.resolve()
   expect(settled).toBe(false)

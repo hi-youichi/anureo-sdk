@@ -4,10 +4,16 @@ import { createCodexAdapter } from '@anureo/adapter-codex'
 // Real-backend greeting example: submit one hello prompt to the local Codex CLI
 // and print the assistant reply as it streams in.
 // Requires the Codex CLI on PATH (override with CODEX_BIN) and an authenticated OpenAI account.
-const client = await createClient({identity:{adapterId:"codex",runtimeConfigId:"local"},adapter:createCodexAdapter({
-  command: process.env.CODEX_BIN ?? 'codex',
-  timeoutMs: 60_000,
-})})
+const client = await createClient({
+  identity: {
+    adapterId: 'codex',
+    runtimeConfigId: 'local',
+  },
+  adapter: createCodexAdapter({
+    command: process.env.CODEX_BIN ?? 'codex',
+    timeoutMs: 60_000,
+  }),
+})
 try {
   const session = await client.sessions.create({cwd:process.cwd()})
 
@@ -29,6 +35,8 @@ try {
     }
     throw new Error('Event stream ended without a terminal event')
   })()
+  // Handle early rejection now; awaiting the original consume below propagates it
+  // only if turn.result() succeeds. If turn.result() rejects, that await is skipped.
   void consume.catch(() => {})
 
   const turn = await session.submit({input:'こんにちは！用一句话打个招呼。'})

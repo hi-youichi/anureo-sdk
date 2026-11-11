@@ -103,7 +103,100 @@ export type AhpRpcSuccess = { "jsonrpc": "2.0"; "id": RpcId; "result": (GoalStat
 export type AhpRpcFailure = { "jsonrpc": "2.0"; "id": (RpcId) | (null); "error": RpcError };
 export type AhpRpcResponse = (AhpRpcSuccess) | (AhpRpcFailure);
 export type InitializedNotification = { "jsonrpc": "2.0"; "method": "initialized"; "params"?: {  } };
-export type AhpEventNotification = ({ "jsonrpc": "2.0"; "method": "session/state"; "params": (SourceEnvelope) & (SessionStateEvent) }) | ({ "jsonrpc": "2.0"; "method": "session/metadata"; "params": (SourceEnvelope) & (SessionMetadataEvent) }) | ({ "jsonrpc": "2.0"; "method": "turn/started"; "params": (SourceEnvelope) & (TurnStartedEvent) }) | ({ "jsonrpc": "2.0"; "method": "turn/completed"; "params": (SourceEnvelope) & (TurnCompletedEvent) }) | ({ "jsonrpc": "2.0"; "method": "item/started"; "params": (SourceEnvelope) & (ItemStartedEvent) & ({ "turnId": string }) }) | ({ "jsonrpc": "2.0"; "method": "item/delta"; "params": (SourceEnvelope) & (ItemDeltaEvent) & ({ "turnId": string }) }) | ({ "jsonrpc": "2.0"; "method": "item/completed"; "params": (SourceEnvelope) & (ItemCompletedEvent) & ({ "turnId": string }) }) | ({ "jsonrpc": "2.0"; "method": "usage/updated"; "params": (SourceEnvelope) & (UsageUpdatedEvent) }) | ({ "jsonrpc": "2.0"; "method": "interaction/requested"; "params": (SourceEnvelope) & (InteractionRequestedEvent) }) | ({ "jsonrpc": "2.0"; "method": "interaction/resolved"; "params": (SourceEnvelope) & (InteractionResolvedEvent) }) | ({ "jsonrpc": "2.0"; "method": "notice"; "params": (SourceEnvelope) & (NoticeEvent) }) | ({ "jsonrpc": "2.0"; "method": "extension"; "params": (SourceEnvelope) & (ExtensionEvent) }) | ({ "jsonrpc": "2.0"; "method": "submission/bound"; "params": (SourceEnvelope) & (SubmissionBoundEvent) }) | ({ "jsonrpc": "2.0"; "method": "submission/status"; "params": (SourceEnvelope) & (SubmissionStatusEvent) });
+export type AhpEventNotification =
+  ({
+    "jsonrpc": "2.0";
+    "method": "session/state";
+    "params": (SourceEnvelope)
+      & (SessionStateEvent)
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "session/metadata";
+    "params": (SourceEnvelope)
+      & (SessionMetadataEvent)
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "turn/started";
+    "params": (SourceEnvelope)
+      & (TurnStartedEvent)
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "turn/completed";
+    "params": (SourceEnvelope)
+      & (TurnCompletedEvent)
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "item/started";
+    "params": (SourceEnvelope)
+      & (ItemStartedEvent)
+      & ({
+        "turnId": string
+      })
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "item/delta";
+    "params": (SourceEnvelope)
+      & (ItemDeltaEvent)
+      & ({
+        "turnId": string
+      })
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "item/completed";
+    "params": (SourceEnvelope)
+      & (ItemCompletedEvent)
+      & ({
+        "turnId": string
+      })
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "usage/updated";
+    "params": (SourceEnvelope)
+      & (UsageUpdatedEvent)
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "interaction/requested";
+    "params": (SourceEnvelope)
+      & (InteractionRequestedEvent)
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "interaction/resolved";
+    "params": (SourceEnvelope)
+      & (InteractionResolvedEvent)
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "notice";
+    "params": (SourceEnvelope)
+      & (NoticeEvent)
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "extension";
+    "params": (SourceEnvelope)
+      & (ExtensionEvent)
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "submission/bound";
+    "params": (SourceEnvelope)
+      & (SubmissionBoundEvent)
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "submission/status";
+    "params": (SourceEnvelope)
+      & (SubmissionStatusEvent)
+  });
 export type AhpRpcNotification = (InitializedNotification) | (AhpEventNotification);
 export type AhpRpcMessage = (AhpRpcRequest) | (AhpRpcResponse) | (AhpRpcNotification);
 export type FileChangeMaterial = ({ "format": "unified"; "patch": string }) | ({ "format": "text"; "scope": "file" | "fragment"; "oldText": (string) | (null); "newText": string; "oldStartLine"?: number; "newStartLine"?: number }) | ({ "format": "unavailable"; "reason": "notProvided" | "binary" | "tooLarge" | "unsupported" });

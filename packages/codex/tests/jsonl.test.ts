@@ -1,18 +1,36 @@
 import { describe, expect, test } from 'bun:test'
 import { PassThrough } from 'node:stream'
 import { CodexJsonlClient } from '../src/jsonl'
+import type { JsonlHandlers } from '../src/jsonl'
 import type { HarnessProcess } from '@anureo/sdk/process'
-function fixture(options: { maxFrameBytes?: number; timeoutMs?: number; maxPending?: number } = {}) {
+function fixture(
+  options: { maxFrameBytes?: number; timeoutMs?: number; maxPending?: number } = {},
+  request: JsonlHandlers['request'] = async (_request, reply) => { await reply({ accepted: true }) },
+) {
   const stdout = new PassThrough(), stderr = new PassThrough()
   const writes: string[] = [], diagnostics: string[] = [], failures: unknown[] = []
-  const process: HarnessProcess = { pid: 1, owned: true, stdout, stderr, exited: new Promise(() => {}), async write(chunk) { writes.push(String(chunk)) }, async closeInput() {}, async dispose() { stdout.end(); stderr.end() } }
-  const client = new CodexJsonlClient(process, { notification: async () => {}, request: async (_request, reply) => { await reply({ accepted: true }) }, failure: async cause => { failures.push(cause) }, diagnostic: code => diagnostics.push(code) }, options)
-  return { client, stdout, stderr, writes, diagnostics, failures }
+  let resolveFirstWrite!: () => void
+  const firstWrite = new Promise<void>(resolve => { resolveFirstWrite = resolve })
+  const process: HarnessProcess = {
+    pid: 1,
+    owned: true,
+    stdout,
+    stderr,
+    exited: new Promise(() => {}),
+    async write(chunk) {
+      writes.push(String(chunk))
+      resolveFirstWrite()
+    },
+    async closeInput() {},
+    async dispose() { stdout.end(); stderr.end() },
+  }
+  const client = new CodexJsonlClient(process, { notification: async () => {}, request, failure: async cause => { failures.push(cause) }, diagnostic: code => diagnostics.push(code) }, options)
+  return { client, stdout, stderr, writes, diagnostics, failures, waitForWrite: () => firstWrite }
 }
 describe('native JSONL transport', () => {
   test('correlates integer responses and drains split UTF8 and final response before EOF', async () => {
     const f = fixture(); const request = f.client.request('test')
-    await new Promise(resolve => setTimeout(resolve, 0)); const id = JSON.parse(f.writes[0]!).id
+    await f.waitForWrite(); const id = JSON.parse(f.writes[0]!).id
     const bytes = Buffer.from(JSON.stringify({ id, result: { text: '日本語' } }) + '\n')
     f.stdout.write(bytes.subarray(0, bytes.length - 6)); f.stdout.end(bytes.subarray(bytes.length - 6))
     expect(await request).toEqual({ text: '日本語' }); await f.client.finished; await f.client.dispose()
@@ -20,7 +38,7 @@ describe('native JSONL transport', () => {
   test('preserves string server request id and never exposes raw stderr', async () => {
     const f = fixture(); f.stderr.write('Bearer PRIVATE_AUTH https://auth.test/?token=secret')
     f.stdout.write(JSON.stringify({ id: 'native-string', method: 'permission', params: {} }) + '\n')
-    await new Promise(resolve => setTimeout(resolve, 10))
+    await f.waitForWrite()
     expect(JSON.parse(f.writes[0]!)).toEqual({ id: 'native-string', result: { accepted: true } })
     expect(f.diagnostics).toEqual(['CODEX_STDERR']); expect(JSON.stringify(f.diagnostics)).not.toContain('PRIVATE_AUTH'); await f.client.dispose()
   })
@@ -47,33 +65,21 @@ describe('native JSONL transport', () => {
     await f.client.dispose()
   })
   test('server request rejections answer with a native RPC error reply', async () => {
-    const stdout = new PassThrough(), stderr = new PassThrough()
-    const writes: string[] = []
-    const process: HarnessProcess = { pid: 1, owned: true, stdout, stderr, exited: new Promise(() => {}), async write(chunk) { writes.push(String(chunk)) }, async closeInput() {}, async dispose() { stdout.end(); stderr.end() } }
-    const client = new CodexJsonlClient(process, {
-      notification: async () => {},
-      request: async (_request, _reply, reject) => { await reject(-32603, 'denied') },
-      failure: async () => {},
-      diagnostic: () => {},
-    })
-    stdout.write(JSON.stringify({ id: 'native-1', method: 'permission', params: {} }) + '\n')
-    await new Promise((resolve) => setTimeout(resolve, 5))
-    expect(JSON.parse(writes[0]!)).toEqual({ id: 'native-1', error: { code: -32603, message: 'denied' } })
-    await client.dispose()
+    const f = fixture({}, async (_request, _reply, reject) => { await reject(-32603, 'denied') })
+    f.stdout.write(JSON.stringify({ id: 'native-1', method: 'permission', params: {} }) + '\n')
+    await f.waitForWrite()
+    expect(JSON.parse(f.writes[0]!)).toEqual({ id: 'native-1', error: { code: -32603, message: 'denied' } })
+    await f.client.dispose()
+    expect(f.stdout.writableEnded).toBe(true)
+    expect(f.stderr.writableEnded).toBe(true)
   })
   test('a throwing native handler replies with an interaction-unavailable error', async () => {
-    const stdout = new PassThrough(), stderr = new PassThrough()
-    const writes: string[] = []
-    const process: HarnessProcess = { pid: 1, owned: true, stdout, stderr, exited: new Promise(() => {}), async write(chunk) { writes.push(String(chunk)) }, async closeInput() {}, async dispose() { stdout.end(); stderr.end() } }
-    const client = new CodexJsonlClient(process, {
-      notification: async () => {},
-      request: async () => { throw new Error('handler crashed') },
-      failure: async () => {},
-      diagnostic: () => {},
-    })
-    stdout.write(JSON.stringify({ id: 'native-2', method: 'permission', params: {} }) + '\n')
-    await new Promise((resolve) => setTimeout(resolve, 5))
-    expect(JSON.parse(writes[0]!)).toEqual({ id: 'native-2', error: { code: -32603, message: 'Interaction unavailable' } })
-    await client.dispose()
+    const f = fixture({}, async () => { throw new Error('handler crashed') })
+    f.stdout.write(JSON.stringify({ id: 'native-2', method: 'permission', params: {} }) + '\n')
+    await f.waitForWrite()
+    expect(JSON.parse(f.writes[0]!)).toEqual({ id: 'native-2', error: { code: -32603, message: 'Interaction unavailable' } })
+    await f.client.dispose()
+    expect(f.stdout.writableEnded).toBe(true)
+    expect(f.stderr.writableEnded).toBe(true)
   })
 })

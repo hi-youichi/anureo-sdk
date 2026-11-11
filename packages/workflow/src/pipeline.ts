@@ -1,5 +1,9 @@
+// Prepending Input aligns each stage's index with the previous stage's output.
+type PreviousStageOutput<Input, Outputs extends readonly unknown[], K> =
+  K extends '0' ? Input : [Input, ...Outputs][K & keyof [Input, ...Outputs]]
+
 type Stages<Input, Outputs extends readonly unknown[]> = {
-  [K in keyof Outputs]: Stage<K extends '0' ? Input : [Input, ...Outputs][K & keyof [Input, ...Outputs]], Input, Outputs[K]>
+  [K in keyof Outputs]: Stage<PreviousStageOutput<Input, Outputs, K>, Input, Outputs[K]>
 }
 type Last<Outputs extends readonly unknown[]> = Outputs extends readonly [...unknown[], infer Output] ? Awaited<Output> : never
 type Stage<Previous, Input, Output> = (value: Exclude<Awaited<Previous>, null>, originalItem: Input, index: number) => Output

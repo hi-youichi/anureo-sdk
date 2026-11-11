@@ -11,6 +11,26 @@ export function codexFileChanges(changes: unknown): FileChange[] {
     const operation = kind.type ?? change.kind
     const movePath = typeof kind.move_path === 'string' ? kind.move_path : undefined
     const patch = typeof change.diff === 'string' ? change.diff : undefined
-    return [{ path: movePath ?? change.path, ...(movePath ? { oldPath: change.path } : {}), operation: movePath ? 'rename' : operation === 'add' ? 'add' : operation === 'delete' ? 'delete' : operation === 'update' ? 'modify' : 'unknown', materials: patch !== undefined ? [{ format: 'unified', patch }] : [{ format: 'unavailable', reason: 'notProvided' }], completeness: patch !== undefined ? 'complete' : 'partial' } satisfies FileChange]
+    let normalizedOperation: FileChange['operation']
+    if (movePath) {
+      normalizedOperation = 'rename'
+    } else if (operation === 'add') {
+      normalizedOperation = 'add'
+    } else if (operation === 'delete') {
+      normalizedOperation = 'delete'
+    } else if (operation === 'update') {
+      normalizedOperation = 'modify'
+    } else {
+      normalizedOperation = 'unknown'
+    }
+    return [{
+      path: movePath ?? change.path,
+      ...(movePath ? { oldPath: change.path } : {}),
+      operation: normalizedOperation,
+      materials: patch !== undefined
+        ? [{ format: 'unified', patch }]
+        : [{ format: 'unavailable', reason: 'notProvided' }],
+      completeness: patch !== undefined ? 'complete' : 'partial',
+    } satisfies FileChange]
   })
 }

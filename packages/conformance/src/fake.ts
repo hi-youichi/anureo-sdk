@@ -13,7 +13,12 @@ import type { ConformanceFactory, ConformanceScenario } from "./suite";
 export interface FakeCall { method: SessionMethod; params: AhpRequestMap[SessionMethod] }
 export interface FakeAdapterOptions {
   capabilities?: Capabilities;
-  /** Hook can publish events, pause a response, or throw exactly at a chosen dispatch point. */
+  /**
+   * Hook can publish events, pause a response, or throw at a chosen dispatch point.
+   * Return undefined to continue with the default implementation. Returning a result
+   * bypasses the default implementation; the hook is responsible for all required
+   * events and side effects for that call. Thrown errors propagate to the caller.
+   */
   execute?: (call: FakeCall, sink: SessionEventSink) => Promise<AhpResultMap[SessionMethod] | undefined>;
   onOpen?: (params: SessionOpenParams, sink: SessionEventSink) => Promise<void>;
 }
@@ -85,9 +90,11 @@ export class ScriptedBackendSession implements BackendSession {
         await this.emit({ type: "turn/completed", payload: { turnId: turnId, status: "completed" } });
         result = { submissionId: start.submissionId, turnId, accepted: true, disposition: "started" }; break;
       }
-      case "turn/steer":
-        await this.emit({ type: "turn/completed", payload: { turnId: (params as AhpRequestMap["turn/steer"]).expectedTurnId, status: "completed" } });
-        result = { submissionId: (params as AhpRequestMap["turn/steer"]).submissionId, turnId: (params as AhpRequestMap["turn/steer"]).expectedTurnId, accepted: true }; break;
+      case "turn/steer": {
+        const request = params as AhpRequestMap["turn/steer"];
+        await this.emit({ type: "turn/completed", payload: { turnId: request.expectedTurnId, status: "completed" } });
+        result = { submissionId: request.submissionId, turnId: request.expectedTurnId, accepted: true }; break;
+      }
       case "turn/interrupt": {
         const id = (params as AhpRequestMap["turn/interrupt"]).turnId;
         await this.emit({ type: "turn/completed", payload: { turnId: id, status: "interrupted" } }); result = { accepted: true, turnId: id }; break;
@@ -132,15 +139,16 @@ export function createScriptedConformanceFactory(capabilities?: Capabilities): C
 
         return { submissionId, accepted: true, disposition: "started", turnId };
       }
-      const interaction: Record<string, Parameters<SessionEventSink["requestInteraction"]>[0]> = {
+      const interactionsByScenario: Partial<Record<ConformanceScenario, Parameters<SessionEventSink["requestInteraction"]>[0]>> = {
         approval: { interactionId: "conformance-approval", kind: "approval", turnId, options: [{ id: "deny", label: "Deny", semantic: "deny" }] },
         userInput: { interactionId: "conformance-input", kind: "userInput", turnId, questions: [{ id: "q", prompt: "Value" }] },
         elicitation: { interactionId: "conformance-elicitation", kind: "elicitation", turnId, mode: "form" },
         dynamicTool: { interactionId: "conformance-tool", kind: "dynamicTool", turnId, toolName: "conformance", arguments: {} },
       };
-      if (interaction[scenario] || scenario === "unknown-item") {
+      const interaction = interactionsByScenario[scenario];
+      if (interaction || scenario === "unknown-item") {
         await sink.emit({ type: "turn/started", payload: { turnId } });
-        if (interaction[scenario]) await sink.requestInteraction(interaction[scenario], async () => {});
+        if (interaction) await sink.requestInteraction(interaction, async () => {});
         else await sink.emit({ type: "item/completed", payload: { item: { id: "unknown", type: "toolCall", kind: "other", title: "Unknown", nativeType: "futureNativeType", raw: { safe: "value" } } } }, { turnId });
         await sink.emit({ type: "turn/completed", payload: { turnId, status: "completed" } });
         return { submissionId, accepted: true, disposition: "started", turnId };

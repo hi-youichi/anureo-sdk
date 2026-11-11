@@ -53,12 +53,15 @@ the failed field and requires recovery when true.
 | `connect` | Provide an official `acp.Stream` factory for remote transports or deterministic wire tests |
 | `fs` (`AcpFileSystemPort`) | Host-implemented read/write text-file callbacks |
 | `terminal` (`AcpTerminalPort`) | Host-implemented terminal lifecycle callbacks |
-| `requestTimeoutMs`, `maxFrameBytes` | Bound each request and every line (default 8 MiB; oversized frames fail with `BACKPRESSURE_EXCEEDED`) |
+| `requestTimeoutMs` | Timeout in milliseconds for ACP requests other than `session/prompt` (default 30,000; DSH preset 120,000) |
+| `maxFrameBytes` | Maximum bytes per incoming or outgoing stdio line (default 8 MiB; oversized frames fail with `BACKPRESSURE_EXCEEDED`) |
 | `onLoadSnapshot` | Receive `session/load` snapshot updates separately from the realtime event stream |
-| `stderrTailLines`, `onStderr` | Retain a bounded, redacted stderr tail for diagnostics (default 200 lines; `0` disables) |
+| `stderrTailLines`, `onStderr` | Set the retained stderr line limit (default 200) and receive redacted lines; `0` disables capture and callbacks |
 | `autoRespondPermission` | Answer `session/request_permission` without an AHP interaction; undecided or unoffered kinds fall back to the human path |
 
-ACP JSON-RPC error codes map to typed SDK errors (`-32601` → `CAPABILITY_UNSUPPORTED`, `-32602` → `INVALID_PARAMS`, `-32000` → `AUTH_REQUIRED`, `-32002` → `RESOURCE_NOT_FOUND`); a dropped connection surfaces as `ACP_CONNECTION_CLOSED` with `outcomeUnknown`, never as a silent success. Agent stderr is never forwarded raw: the adapter keeps at most 200 redacted lines (`sk-…`, bearer tokens, `key=value` secrets, URL credentials) and attaches that tail to startup and disconnect failures as `details.diagnostics.stderrTail`.
+ACP JSON-RPC error codes map to typed SDK errors (`-32601` → `CAPABILITY_UNSUPPORTED`, `-32602` → `INVALID_PARAMS`, `-32000` → `AUTH_REQUIRED`, `-32002` → `RESOURCE_NOT_FOUND`); a dropped connection surfaces as `ACP_CONNECTION_CLOSED` with `outcomeUnknown`, never as a silent success.
+
+For spawned agents, stderr is never forwarded raw: the adapter redacts `sk-…`, bearer tokens, `key=value` secrets, and URL credentials. `stderrTailLines` controls the retained line limit (default 200; `0` disables capture and `onStderr` callbacks). The retained tail is also limited to 32,768 UTF-16 code units, counting each redacted line's length plus one for a separator, so fewer lines may be retained. The adapter attaches that tail to startup and disconnect failures as `details.diagnostics.stderrTail`.
 
 `session/prompt` stop reasons map explicitly: `end_turn` and `cancelled` keep their existing meaning, `max_tokens` / `max_turn_requests` complete the turn with an `ACP_STOP_MAX_TOKENS` / `ACP_STOP_MAX_TURN_REQUESTS` notice, `refusal` fails it, and any unclassified reason fails closed with `ACP_STOP_UNKNOWN`. A backend that stops for an unknown reason is never reported as clean success.
 

@@ -9,8 +9,6 @@ import { createClaudeAdapter, type ClaudeAdapterOptions, type ClaudeQuery, type 
 import { FileSessionStore } from "./store";
 import { runConformance, type ConformanceScenario } from "@anureo/conformance";
 import { randomUUID } from "node:crypto";
-import { createClient as createNativeClient } from '@anureo/sdk';
-import { createClaudeAdapter as createNativeClaudeAdapter } from './index';
 import { fileURLToPath } from "node:url";
 
 class FakeQuery implements ClaudeQuery {
@@ -20,7 +18,21 @@ class FakeQuery implements ClaudeQuery {
   closed = false;
   rewindAllowed = true;
   constructor(readonly options: Options, prompt: string | AsyncIterable<SDKUserMessage>, onInput: (input: SDKUserMessage, query: FakeQuery) => Promise<void>) {
-    if (typeof prompt !== "string") void (async () => { try { for await (const input of prompt) { if (this.closed) return; this.current = input; this.calls.push({ method: "input", value: input }); await onInput(input, this); } } catch (cause) { this.output.end(cause); } })();
+    if (typeof prompt !== "string") {
+      const consumeInputs = async () => {
+        try {
+          for await (const input of prompt) {
+            if (this.closed) return;
+            this.current = input;
+            this.calls.push({ method: "input", value: input });
+            await onInput(input, this);
+          }
+        } catch (cause) {
+          this.output.end(cause);
+        }
+      };
+      void consumeInputs();
+    }
   }
   emit(value: Record<string, unknown>): Promise<void> { return this.output.write(value as unknown as SDKMessage); }
   [Symbol.asyncIterator]() { return this.output[Symbol.asyncIterator](); }
@@ -50,7 +62,7 @@ test('native lifecycle sends overlapping inputs into the SDK channel and binds r
     if (index === 1) await gate;
     await stream.result(`final-${index}`);
   });
-  const client = await createNativeClient({ adapter: createNativeClaudeAdapter({ queryFactory: fake.queryFactory }), identity: { adapterId: 'claude', runtimeConfigId: 'native' } });
+  const client = await createClient({ adapter: createClaudeAdapter({ queryFactory: fake.queryFactory }), identity: { adapterId: 'claude', runtimeConfigId: 'native' } });
   try {
     const session = await client.sessions.create({ cwd: process.cwd() });
     const one = session.submit({ input: 'one' }), first = await one;
@@ -66,7 +78,7 @@ test('native lifecycle sends overlapping inputs into the SDK channel and binds r
 
 test('native close retains both close and iterator release failures without repeating either release', async () => {
   const fake = factory(); let closes = 0, returns = 0;
-  const client = await createNativeClient({ adapter: createNativeClaudeAdapter({ queryFactory: fake.queryFactory }), identity: { adapterId: 'claude', runtimeConfigId: 'release-errors' } });
+  const client = await createClient({ adapter: createClaudeAdapter({ queryFactory: fake.queryFactory }), identity: { adapterId: 'claude', runtimeConfigId: 'release-errors' } });
   const session = await client.sessions.create({ cwd: process.cwd() });
   const query = fake.queries[0]!, original = query.close.bind(query);
   query.close = () => { closes++; original(); throw new Error('private close failure'); };
@@ -77,10 +89,20 @@ test('native close retains both close and iterator release failures without repe
 });
 const OPEN: SessionOpenParams = { requestId: "open", mode: "new", binding: { sessionId: "s", adapterId: "claude", runtimeConfigId: "r" }, cwd: "/tmp", model: "fake-model" };
 const readers = new WeakMap<Session, AsyncIterator<AhpEvent>>();
-const runs = new WeakMap<Session, Map<string, Promise<import('@anureo/sdk').Turn>>>();
-function readerFor(session: Session) { let reader = readers.get(session); if (!reader) { reader = session.events()[Symbol.asyncIterator](); readers.set(session, reader); } return reader; }
-const ids = new WeakMap<Session, Map<string, string>>();
-function known(session: Session, alias: string): string { const id = ids.get(session)?.get(alias); if(!id)throw new Error(`Execution ${alias} is not bound`); return id; }
+function readerFor(session: Session) {
+  let reader = readers.get(session);
+  if (!reader) {
+    reader = session.events()[Symbol.asyncIterator]();
+    readers.set(session, reader);
+  }
+  return reader;
+}
+const turnIdsByAlias = new WeakMap<Session, Map<string, string>>();
+function requireBoundTurnId(session: Session, alias: string): string {
+  const turnId = turnIdsByAlias.get(session)?.get(alias);
+  if (!turnId) throw new Error(`Execution ${alias} is not bound`);
+  return turnId;
+}
 async function setup(options: ClaudeAdapterOptions = {}, onInput?: (input: SDKUserMessage, query: FakeQuery) => Promise<void>) {
   const fake = factory(onInput); const adapter = createClaudeAdapter({ ...options, queryFactory: fake.queryFactory });
   const runtime = await createClient({adapter, identity: OPEN.binding, interactions: {approval:undefined,userInput:undefined,elicitation:undefined,dynamicTool:undefined}});
@@ -95,15 +117,27 @@ async function collect(session: Session, answer?: (request: InteractionRequested
       if(event.type==='turn/completed')return events;
     }
     throw new Error('Event limit');
-  } finally { await reader.return?.(); readers.delete(session);readerFor(session); }
+  } finally {
+    // Cancel this collection's subscription before replacing it.
+    await reader.return?.();
+    // Evict the closed reader so readerFor creates a fresh subscription.
+    readers.delete(session);
+    // Subscribe before the next submission can emit events, even if collection failed.
+    readerFor(session);
+  }
 }
-async function run(session: Session, alias: string) {
+async function submitAndYield(session: Session, alias: string) {
   readerFor(session);
-  const pending=session.submit({ input:'conformance' });void pending.catch(()=>{});
-  const current=runs.get(session)??new Map();current.set(alias,pending);runs.set(session,current);
-  void pending.then(turn=>{const map=ids.get(session)??new Map();map.set(alias,turn.id);ids.set(session,map);}).catch(()=>{});
-  // Dispatch while the pre-installed reader can service native interaction callbacks.
-  await new Promise(resolve=>setImmediate(resolve));
+  const pending = session.submit({ input: 'conformance' });
+  void pending.catch(() => {});
+  void pending.then(turn => {
+    const sessionTurnIds = turnIdsByAlias.get(session) ?? new Map();
+    sessionTurnIds.set(alias, turn.id);
+    turnIdsByAlias.set(session, sessionTurnIds);
+  }).catch(() => {});
+  // Yield for dispatch without explicitly waiting for turn binding or completion.
+  // The pre-installed reader lets collect service native interaction callbacks next.
+  await new Promise(resolve => setImmediate(resolve));
 }
 
 test("Claude streams partial text and authoritative final output with native UUID and exact provided usage", async () => {
@@ -113,8 +147,8 @@ test("Claude streams partial text and authoritative final output with native UUI
     await stream.emit({ type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } } });
     await stream.text("authority", "message"); await stream.result("authority");
   });
-  await run(session, "t"); const events = await collect(session);
-  expect(events.find((event) => event.type === "turn/started")?.payload).toMatchObject({ turnId: known(session,"t") });
+  await submitAndYield(session, "t"); const events = await collect(session);
+  expect(events.find((event) => event.type === "turn/started")?.payload).toMatchObject({ turnId: requireBoundTurnId(session,"t") });
   expect(events.filter((event) => event.type === "item/completed").map((event) => event.payload.item)).toMatchObject([{ type: "agentMessage", text: "authority", phase: "final" }]);
   expect(events.find((event) => event.type === "usage/updated")?.payload).toMatchObject({ provider: "claude", scope: "turn", input: 7, output: 9, cacheRead: 2, cacheWrite: 1 });
   expect(queries[0]!.options.env?.ANTHROPIC_API_KEY).toBeUndefined(); expect(queries[0]!.options.settingSources).toEqual([]);
@@ -135,16 +169,16 @@ test("native tool results, task/hook lifecycle, compaction and unknown blocks re
     await stream.emit({ type: "assistant", uuid: "unknown", parent_tool_use_id: null, message: { id: "future", content: [{ type: "futureContent", safeField: "preserved" }] } });
     await stream.result();
   });
-  await run(session, "t"); const events = await collect(session); const completed = events.filter((event) => event.type === "item/completed").map((event) => event.payload.item);
+  await submitAndYield(session, "t"); const events = await collect(session); const completed = events.filter((event) => event.type === "item/completed").map((event) => event.payload.item);
   expect(completed).toEqual(expect.arrayContaining([expect.objectContaining({ type: "toolCall", kind: "command", output: "done" }), expect.objectContaining({ type: "subagent", subagentId: "child", state: "completed" }), expect.objectContaining({ type: "hook", name: "PreToolUse", status: "completed" }), expect.objectContaining({ type: "compaction", trigger: "auto" }), expect.objectContaining({ type: "toolCall", kind: "other", nativeType: "futureContent" })]));
   expect(JSON.stringify(events)).not.toContain("PRIVATE"); await runtime.dispose();
 });
 
 test("steer never appends Claude input; interrupt preserves the current turn identity", async () => {
-  const { runtime, session, queries } = await setup({}, async (_,stream) => {await stream.text("working");}); await run(session, "t");
-  await expect(session.request("turn/steer", { requestId: "steer", sessionId: "s", submissionId:"steer-input", expectedTurnId: known(session,"t"), input: [{ type: "text", text: "do not enqueue" }] })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
+  const { runtime, session, queries } = await setup({}, async (_,stream) => {await stream.text("working");}); await submitAndYield(session, "t");
+  await expect(session.request("turn/steer", { requestId: "steer", sessionId: "s", submissionId:"steer-input", expectedTurnId: requireBoundTurnId(session,"t"), input: [{ type: "text", text: "do not enqueue" }] })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
   await session.interrupt(); const events = await collect(session);
-  expect(events.at(-1)?.payload).toMatchObject({ turnId: known(session,"t"), status: "interrupted" }); expect(queries[0]!.calls.filter((call) => call.method === "input")).toHaveLength(1); await runtime.dispose();
+  expect(events.at(-1)?.payload).toMatchObject({ turnId: requireBoundTurnId(session,"t"), status: "interrupted" }); expect(queries[0]!.calls.filter((call) => call.method === "input")).toHaveLength(1); await runtime.dispose();
 });
 
 test("canUseTool requests approval and only selected options enter the native callback", async () => {
@@ -153,7 +187,7 @@ test("canUseTool requests approval and only selected options enter the native ca
     permission = await stream.options.canUseTool!("Bash", { command: "fixture" }, { signal: new AbortController().signal, toolUseID: "approval", requestId: "native-approval" });
     await stream.result();
   });
-  await run(session, "t"); const events = await collect(session, () => ({ kind: "approval", optionId: "deny" }));
+  await submitAndYield(session, "t"); const events = await collect(session, () => ({ kind: "approval", optionId: "deny" }));
   expect(permission).toMatchObject({ behavior: "deny" }); expect(events.some((event) => event.type === "interaction/resolved" && event.payload.outcome === "responded")).toBe(true); await runtime.dispose();
 });
 
@@ -164,7 +198,7 @@ test("AskUserQuestion and URL elicitation use typed interactions with private UR
     native.push(await stream.options.onElicitation!({ serverName: "mcp", message: "Authenticate", mode: "url", url: "https://example.com/auth?token=PRIVATE" }, { signal: new AbortController().signal, requestId: "url" }));
     await stream.result();
   });
-  await run(session, "t"); const events = await collect(session, (request) => request.kind === "userInput" ? { kind: "userInput", answers: { q0: "A" } } : { kind: "elicitation", action: "cancel" });
+  await submitAndYield(session, "t"); const events = await collect(session, (request) => request.kind === "userInput" ? { kind: "userInput", answers: { q0: "A" } } : { kind: "elicitation", action: "cancel" });
   expect(native[0]).toMatchObject({ behavior: "allow", updatedInput: { answers: { Choose: "A" } } }); expect(native[1]).toMatchObject({ action: "cancel" });
   expect(events.find((event) => event.type === "interaction/requested" && event.payload.kind === "elicitation")?.payload).toMatchObject({ privatePayloadAvailable: true }); await runtime.dispose();
 });
@@ -176,7 +210,7 @@ test("form elicitation projects scalar answers; unrepresentable values cancel na
     await stream.result();
   });
   try {
-    await run(good.session, "t");
+    await submitAndYield(good.session, "t");
     const events = await collect(good.session, () => ({ kind: "elicitation", action: "accept", content: { name: "Ada", count: 2, enabled: true, tags: ["a", "b"] } }));
     expect(native[0]).toMatchObject({ action: "accept", content: { name: "Ada", count: 2, enabled: true, tags: ["a", "b"] } });
     expect(events.filter((event) => event.type === "interaction/resolved" && event.payload.outcome === "responded")).toHaveLength(1);
@@ -186,7 +220,7 @@ test("form elicitation projects scalar answers; unrepresentable values cancel na
     await stream.result();
   });
   try {
-    await run(bad.session, "t");
+    await submitAndYield(bad.session, "t");
     const reader = readerFor(bad.session);
     let interactionId = "";
     while (true) {
@@ -212,7 +246,7 @@ test("unmapped system notices surface as typed warnings without private content"
     await stream.emit({ type: "system", subtype: "future_system" });
     await stream.result();
   });
-  await run(session, "t"); const events = await collect(session);
+  await submitAndYield(session, "t"); const events = await collect(session);
   const notices = events.filter((event) => event.type === "notice").map((event) => event.payload);
   expect(notices.map((notice) => notice.code)).toEqual(["CLAUDE_TASK_STARTED", "CLAUDE_HOOK_RESPONSE", "CLAUDE_RATE_LIMIT_RETRY", "CLAUDE_FUTURE_SYSTEM"]);
   expect(notices.map((notice) => notice.severity)).toEqual(["info", "info", "warning", "info"]);
@@ -269,21 +303,21 @@ function historyApi() {
 test("resume, before/through fork, paged history and conversation revert preserve verified native boundaries", async () => {
   const history = historyApi();
   const { runtime, session, queries } = await setup({ sessionStore: new InMemorySessionStore(), getSessionMessages: history.getSessionMessages, forkSession: history.forkSession }, async (input, stream) => { history.append(input); await stream.text("conformance"); await stream.result(); });
-  await run(session, "t1"); const first = await collect(session); const firstStart = first.find((event) => event.type === "turn/started")!;
-  await run(session, "t2"); await collect(session);
+  await submitAndYield(session, "t1"); const first = await collect(session); const firstStart = first.find((event) => event.type === "turn/started")!;
+  await submitAndYield(session, "t2"); await collect(session);
   const page1 = await session.request("history/read", { requestId: "history", sessionId: "s", limit: 1 });
   expect(page1.items).toHaveLength(1); expect(page1.nextCursor).toBe("1");
   const page2 = await session.request("history/read", { requestId: "history2", sessionId: "s", cursor: page1.nextCursor!, snapshotToken: page1.snapshotToken, limit: 10 });
-  expect(page2.items.some((entry) => entry.turnId === known(session,"t2"))).toBe(true);
-  const before = await runtime.openSession({ ...OPEN, requestId: "before", mode: "fork", binding: { ...session.binding, sessionId: "before" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: known(session,"t1"), relation: "before", nativeTurnId: firstStart.type === "turn/started" ? firstStart.payload.nativeTurnId : undefined } } });
+  expect(page2.items.some((entry) => entry.turnId === requireBoundTurnId(session,"t2"))).toBe(true);
+  const before = await runtime.openSession({ ...OPEN, requestId: "before", mode: "fork", binding: { ...session.binding, sessionId: "before" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: requireBoundTurnId(session,"t1"), relation: "before", nativeTurnId: firstStart.type === "turn/started" ? firstStart.payload.nativeTurnId : undefined } } });
   expect((await before.request("history/read", { requestId: "before-history", sessionId: "before" })).items).toHaveLength(0); await before.close();
-  const through = await runtime.openSession({ ...OPEN, requestId: "through", mode: "fork", binding: { ...session.binding, sessionId: "through" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: known(session,"t1"), relation: "through" } } });
+  const through = await runtime.openSession({ ...OPEN, requestId: "through", mode: "fork", binding: { ...session.binding, sessionId: "through" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: requireBoundTurnId(session,"t1"), relation: "through" } } });
   const forkHistory = await through.request("history/read", { requestId: "through-history", sessionId: "through" });
-  expect(forkHistory.items.some((entry) => entry.turnId === known(session,"t1"))).toBe(true); expect(forkHistory.items.some((entry) => entry.turnId === known(session,"t2"))).toBe(false); await through.close();
+  expect(forkHistory.items.some((entry) => entry.turnId === requireBoundTurnId(session,"t1"))).toBe(true); expect(forkHistory.items.some((entry) => entry.turnId === requireBoundTurnId(session,"t2"))).toBe(false); await through.close();
   const oldRef = session.binding.nativeRef!.value;
-  const reverted = await session.request("session/revert", { requestId: "revert", sessionId: "s", scope: "conversation", boundary: { turnId: known(session,"t2"), relation: "before" } });
+  const reverted = await session.request("session/revert", { requestId: "revert", sessionId: "s", scope: "conversation", boundary: { turnId: requireBoundTurnId(session,"t2"), relation: "before" } });
   expect(reverted.nativeRef!.value).not.toBe(oldRef); expect(session.binding.nativeRef).toEqual(reverted.nativeRef);
-  expect((await session.request("history/read", { requestId: "after-revert", sessionId: "s" })).items.some((entry) => entry.turnId === known(session,"t2"))).toBe(false);
+  expect((await session.request("history/read", { requestId: "after-revert", sessionId: "s" })).items.some((entry) => entry.turnId === requireBoundTurnId(session,"t2"))).toBe(false);
   const currentBinding = structuredClone(session.binding); await session.close();
   const resumed = await runtime.openSession({ ...OPEN, requestId: "resume", mode: "resume", binding: currentBinding });
   expect(queries.at(-1)!.options.resume).toBe(currentBinding.nativeRef!.value); await resumed.close(); await runtime.dispose();
@@ -306,7 +340,7 @@ test("history items reuse live streamed ids and the session settles to ready aft
     await stream.emit({ type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "hello" } } });
     await stream.text("hello", "msg_api"); await stream.result("hello");
   });
-  await run(session, "t"); const events = await collect(session);
+  await submitAndYield(session, "t"); const events = await collect(session);
   const live = events.flatMap((event) => event.type === "item/started" ? [event.payload.item.id] : []);
   expect(live).toEqual(["msg_api:0", "msg_api:1"]);
   expect(session.snapshot.status).toBe('ready');
@@ -320,7 +354,7 @@ test("effort is a session option passed at start and applied live", async () => 
   const init = { capabilities: adapter.capabilities };
   expect(init.capabilities.config?.options.find((option) => option.id === "effort")).toMatchObject({ scope: "session", schema: { enum: ["low", "medium", "high", "xhigh", "max"], default: "high" } });
   const session = await runtime.openSession({ ...OPEN, config: { effort: "low" } });
-  await run(session, "t"); await collect(session);
+  await submitAndYield(session, "t"); await collect(session);
   expect(fake.queries[0]!.options.effort).toBe("low");
   await session.request("session/config/set", { requestId: "effort", sessionId: "s", patch: { effort: "max" } });
   expect(fake.queries[0]!.calls).toContainEqual({ method: "flags", value: { effortLevel: "max" } });
@@ -337,7 +371,7 @@ test("fast mode is a session option sent as flag settings, switched live, and re
   const init = { capabilities: adapter.capabilities };
   expect(init.capabilities.config?.options.find((option) => option.id === "fastMode")).toMatchObject({ scope: "session", schema: { type: "boolean", default: false } });
   const session = await runtime.openSession({ ...OPEN, config: { fastMode: true } });
-  await run(session, "t"); const events = await collect(session);
+  await submitAndYield(session, "t"); const events = await collect(session);
   expect(fake.queries[0]!.options.settings).toEqual({ fastMode: true });
   expect(session.snapshot.fastMode).toEqual({ state: "off", reason: "extra_usage_disabled" });
   await session.request("session/config/set", { requestId: "fast", sessionId: "s", patch: { fastMode: false } });
@@ -349,12 +383,12 @@ test("fast mode is a session option sent as flag settings, switched live, and re
 test("file rollback requires a checkpoint and scope=both reports partial effects on native fork failure", async () => {
   const history = historyApi();
   const fixture = await setup({ sessionStore: new InMemorySessionStore(), enableFileCheckpointing: true, getSessionMessages: history.getSessionMessages, forkSession: async () => { throw new Error("Native fork failed"); } }, async (input, stream) => { history.append(input); await stream.text("conformance"); await stream.result(); });
-  await run(fixture.session, "t1"); await collect(fixture.session); await run(fixture.session, "t2"); await collect(fixture.session);
+  await submitAndYield(fixture.session, "t1"); await collect(fixture.session); await submitAndYield(fixture.session, "t2"); await collect(fixture.session);
   fixture.queries[0]!.rewindAllowed = false;
-  await expect(fixture.session.request("session/revert", { requestId: "no-checkpoint", sessionId: "s", scope: "files", boundary: { turnId: known(fixture.session,"t2"), relation: "before" } })).rejects.toMatchObject({ code: "CHECKPOINT_UNAVAILABLE" });
+  await expect(fixture.session.request("session/revert", { requestId: "no-checkpoint", sessionId: "s", scope: "files", boundary: { turnId: requireBoundTurnId(fixture.session,"t2"), relation: "before" } })).rejects.toMatchObject({ code: "CHECKPOINT_UNAVAILABLE" });
   expect(fixture.queries[0]!.calls.filter((call) => call.method === "rewind")).toHaveLength(0);
   fixture.queries[0]!.rewindAllowed = true;
-  await expect(fixture.session.request("session/revert", { requestId: "partial", sessionId: "s", scope: "both", boundary: { turnId: known(fixture.session,"t2"), relation: "before" } })).rejects.toMatchObject({ code: "REVERT_PARTIAL", outcomeUnknown: true, details: { appliedScope: "files" } });
+  await expect(fixture.session.request("session/revert", { requestId: "partial", sessionId: "s", scope: "both", boundary: { turnId: requireBoundTurnId(fixture.session,"t2"), relation: "before" } })).rejects.toMatchObject({ code: "REVERT_PARTIAL", outcomeUnknown: true, details: { appliedScope: "files" } });
   expect(fixture.queries[0]!.calls.filter((call) => call.method === "rewind")).toHaveLength(1); await fixture.runtime.dispose();
 });
 
@@ -379,7 +413,7 @@ test("the real pinned SDK drives an external fake executable through the native 
   const directory = await mkdtemp(join(tmpdir(), "claude sdk actual "));
   const runtime = await createClient({identity:OPEN.binding,adapter:createClaudeAdapter({ command: fileURLToPath(new URL("../tests/fixtures/fake-claude.mjs", import.meta.url)), executableRuntime: "node", stateDir: join(directory, "state") })});
   try {
-    const session = await runtime.openSession({ ...OPEN, cwd: directory }); await run(session, "t"); const events = await collect(session);
+    const session = await runtime.openSession({ ...OPEN, cwd: directory }); await submitAndYield(session, "t"); const events = await collect(session);
     expect(events.find((event) => event.type === "item/completed" && event.payload.item.type === "agentMessage")?.payload).toMatchObject({ item: { text: "external executable probe passed", phase: "final" } });
     expect(events.at(-1)?.payload).toMatchObject({ status: "completed" });
   } finally { await runtime.dispose(); await rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); }
@@ -387,7 +421,7 @@ test("the real pinned SDK drives an external fake executable through the native 
 
 test('native lifecycle also correlates through the pinned official SDK and an actual child executable', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'claude native actual '));
-  const client = await createNativeClient({ adapter: createNativeClaudeAdapter({ command: fileURLToPath(new URL('../tests/fixtures/fake-claude.mjs', import.meta.url)), executableRuntime: 'node', stateDir: join(directory, 'state') }), identity: { adapterId: 'claude', runtimeConfigId: 'native' } });
+  const client = await createClient({ adapter: createClaudeAdapter({ command: fileURLToPath(new URL('../tests/fixtures/fake-claude.mjs', import.meta.url)), executableRuntime: 'node', stateDir: join(directory, 'state') }), identity: { adapterId: 'claude', runtimeConfigId: 'native' } });
   try {
     const session = await client.sessions.create({ cwd: directory });
     const turn = await session.submit({ input: 'probe' }, { timeoutMs: 3000 });
@@ -417,7 +451,7 @@ test("streamed edit inputs become full source snapshots and typed native results
     await stream.emit({ type: "user", tool_use_result: { filePath: "index.ts", structuredPatch: [{ oldStart: 57, oldLines: 1, newStart: 57, newLines: 1, lines: ["-old", "+new"] }] }, message: { content: [{ type: "tool_result", tool_use_id: "edit", content: "File updated" }] } });
     await stream.result();
   });
-  await run(session, "t"); const events = await collect(session);
+  await submitAndYield(session, "t"); const events = await collect(session);
   expect(events.find(event => event.type === "item/delta" && event.payload.itemId === "edit")).toMatchObject({ payload: { kind: "patch", value: { fileChanges: [{ materials: [{ scope: "fragment" }] }] } } });
   expect(events.find(event => event.type === "item/completed" && event.payload.item.id === "edit")).toMatchObject({ payload: { item: { status: "completed", fileChanges: [{ completeness: "complete", materials: [{ format: "unified", patch: "@@ -57,1 +57,1 @@\n-old\n+new\n" }] }] } } });
   await runtime.dispose();
@@ -428,7 +462,7 @@ test("an interrupted turn cannot leave an unresolved file edit running or count 
     await stream.emit({ type: "assistant", parent_tool_use_id: null, message: { id: "message", content: [{ type: "tool_use", id: "edit", name: "Write", input: { file_path: "index.ts", content: "attempt" } }] } });
     await stream.emit({ type: "result", subtype: "success", result: "", stop_reason: "interrupted", usage: {} });
   });
-  await run(session, "t"); const events = await collect(session);
+  await submitAndYield(session, "t"); const events = await collect(session);
   expect(events.find(event => event.type === "item/completed" && event.payload.item.id === "edit")).toMatchObject({ payload: { item: { status: "interrupted", fileChanges: [{ operation: "unknown" }] } } });
   await runtime.dispose();
 });
@@ -441,7 +475,7 @@ test("explicit edit approval denial remains declined after an error tool result"
     await stream.emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "edit", content: "Denied", is_error: true }] } });
     await stream.result();
   });
-  await run(session, "t"); const events = await collect(session, () => ({ kind: "approval", optionId: "deny" }));
+  await submitAndYield(session, "t"); const events = await collect(session, () => ({ kind: "approval", optionId: "deny" }));
   expect(events.find(event => event.type === "item/completed" && event.payload.item.id === "edit")).toMatchObject({ payload: { item: { status: "declined" } } });
   await runtime.dispose();
 });

@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import { catalogPhase, type CatalogProbeEvent } from './diagnostics'
 
-test('diagnostics contain only safe codes and monotonic durations; callback errors are isolated', async () => {
+test('diagnostics contain only safe codes and non-negative durations; callback errors are isolated', async () => {
   const events: CatalogProbeEvent[] = []
   await expect(catalogPhase({ onPhase: event => { events.push(event); throw new Error('observer') } }, 'handshake', async () => {
     throw Object.assign(new Error('https://provider.test/?token=private'), { code: 'PRIVATE_TOKEN' })

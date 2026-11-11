@@ -11,7 +11,7 @@ async function generate(version: 'v1'): Promise<void> {
 const source = await readFile(path.join(root, `schema/${version}/ahp.schema.json`), 'utf8')
 const document = JSON.parse(source) as { $defs: Record<string, Schema>; 'x-methods': Record<string, [string, string]> }
 function literal(value: unknown): string { return JSON.stringify(value) }
-function emit(value: Schema): string {
+function emit(value: Schema, indentation?: string): string {
   if (value === true) return 'unknown'
   if (value === false) return 'never'
   if (typeof value.$ref === 'string') {
@@ -21,26 +21,34 @@ function emit(value: Schema): string {
   }
   if ('const' in value) return literal(value.const)
   if (Array.isArray(value.enum)) return value.enum.map(literal).join(' | ')
-  if (!value.type && Array.isArray(value.oneOf)) return value.oneOf.map(v => `(${emit(v as Schema)})`).join(' | ')
-  if (!value.type && Array.isArray(value.anyOf)) return value.anyOf.map(v => `(${emit(v as Schema)})`).join(' | ')
-  if (!value.type && Array.isArray(value.allOf)) return value.allOf.map(v => `(${emit(v as Schema)})`).join(' & ')
+  const unionSeparator = indentation === undefined ? ' | ' : `\n${indentation}| `
+  const intersectionSeparator = indentation === undefined ? ' & ' : `\n${indentation}& `
+  if (!value.type && Array.isArray(value.oneOf)) return value.oneOf.map(v => `(${emit(v as Schema, indentation)})`).join(unionSeparator)
+  if (!value.type && Array.isArray(value.anyOf)) return value.anyOf.map(v => `(${emit(v as Schema, indentation)})`).join(unionSeparator)
+  if (!value.type && Array.isArray(value.allOf)) return value.allOf.map(v => `(${emit(v as Schema, indentation)})`).join(intersectionSeparator)
   switch (value.type) {
     case 'string': return 'string'
     case 'integer': case 'number': return 'number'
     case 'boolean': return 'boolean'
     case 'null': return 'null'
-    case 'array': return `Array<${emit(value.items as Schema)}>`
+    case 'array': return `Array<${emit(value.items as Schema, indentation)}>`
     case 'object': {
       const required = new Set((value.required ?? []) as string[])
       const properties = (value.properties ?? {}) as Record<string, Schema>
-      const fields = Object.entries(properties).map(([key, prop]) => `${literal(key)}${required.has(key) ? '' : '?'}: ${emit(prop)}`)
-      if (typeof value.additionalProperties === 'object') fields.push(`[key: string]: ${emit(value.additionalProperties as Schema)}`)
+      const nestedIndentation = indentation === undefined ? undefined : `${indentation}    `
+      const fields = Object.entries(properties).map(([key, prop]) => `${literal(key)}${required.has(key) ? '' : '?'}: ${emit(prop, nestedIndentation)}`)
+      if (typeof value.additionalProperties === 'object') fields.push(`[key: string]: ${emit(value.additionalProperties as Schema, nestedIndentation)}`)
+      if (indentation !== undefined) return `{\n${indentation}  ${fields.join(`;\n${indentation}  `)}\n${indentation}}`
       return `{ ${fields.join('; ')} }`
     }
     default: throw new Error(`Unsupported schema: ${JSON.stringify(value).slice(0, 180)}`)
   }
 }
-const aliases = Object.entries(document.$defs).map(([name, schema]) => `export type ${name} = ${emit(schema)};`)
+const aliases = Object.entries(document.$defs).map(([name, schema]) => {
+  // Keep notification methods and the required item turnId intersections visible.
+  if (name === 'AhpEventNotification') return `export type ${name} =\n  ${emit(schema, '  ')};`
+  return `export type ${name} = ${emit(schema)};`
+})
 const methods = Object.entries(document['x-methods'])
 const lines = [
   `// Generated from schema/${version}/ahp.schema.json. Run bun run generate; do not edit.`,

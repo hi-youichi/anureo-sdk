@@ -45,24 +45,21 @@ test('each call chooses its backend explicitly without shared configuration', as
 })
 
 test('native association and acceptance do not replace terminal evidence', async () => {
-  let start!: () => void
-  const started = new Promise<void>(resolve => { start = resolve })
-  let finish!: () => Promise<void>
+  const { promise: terminalEmitterReady, resolve: resolveTerminalEmitter } = Promise.withResolvers<() => Promise<void>>()
   const { client, adapter } = await fixture({ execute: async (call, sink) => {
     if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
     const turnId = randomUUID()
     await sink.emit({ type: 'turn/started', payload: { turnId } })
     await sink.bindSubmission(call.params.submissionId, turnId)
-    finish = () => complete(sink, turnId, 'actual terminal text')
-    start()
+    resolveTerminalEmitter(() => complete(sink, turnId, 'actual terminal text'))
     return { submissionId: call.params.submissionId, accepted: true, disposition: 'started', turnId }
   } })
   let settled = false
   const result = agent('wait for native work', { client, cwd: process.cwd() }).then(text => { settled = true; return text })
-  await started
+  const emitTerminal = await terminalEmitterReady
   expect(settled).toBe(false)
   expect(adapter.calls.some(call => call.method === 'session/close')).toBe(false)
-  await finish()
+  await emitTerminal()
   expect(await result).toBe('actual terminal text')
 })
 
@@ -152,7 +149,10 @@ test('cleanup failure cannot hide the primary uncertain execution failure', asyn
   expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
 })
 
-async function terminalFixture(status: 'failed' | 'interrupted' | 'completed', error?: HarnessError, text = 'partial') {
+async function terminalFixture(
+  status: 'failed' | 'interrupted' | 'completed',
+  { error, text = 'partial' }: { error?: HarnessError; text?: string } = {},
+) {
   return fixture({ execute: async (call, sink) => {
     if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
     const turnId = randomUUID()
@@ -166,7 +166,7 @@ async function terminalFixture(status: 'failed' | 'interrupted' | 'completed', e
 
 test('Zod schema is converted for submission and returns typed data through composition', async () => {
   const schema = z.object({ count: z.number() })
-  const { client, adapter } = await terminalFixture('completed', undefined, '{"count":3}')
+  const { client, adapter } = await terminalFixture('completed', { text: '{"count":3}' })
   const options = { client, cwd: process.cwd(), schema }
   const results = await pipeline(['a', 'b'], prompt => agent(prompt, options), value => value.count * 2)
   expect(results).toEqual([6, 6])
@@ -189,7 +189,7 @@ test('schema preflight rejects before opening, while absent backend support rele
 
 test.each(['AUTH_REQUIRED', 'AUTH_FORBIDDEN', 'USAGE_LIMIT_EXCEEDED', 'RATE_LIMITED', 'NATIVE_SERVICE_UNAVAILABLE'])('only terminal %s becomes null', async code => {
   const error = { code, message: 'native api error', retryable: true, outcomeUnknown: false }
-  const { client, adapter } = await terminalFixture('failed', error)
+  const { client, adapter } = await terminalFixture('failed', { error })
   expect(await agent('failed terminal', { client, cwd: '.' })).toBeNull()
   expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
   for (const stage of ['open', 'submit']) {
@@ -201,13 +201,13 @@ test.each(['AUTH_REQUIRED', 'AUTH_FORBIDDEN', 'USAGE_LIMIT_EXCEEDED', 'RATE_LIMI
 })
 
 test.each(['NATIVE_TURN_FAILED', 'CLAUDE_TURN_FAILED', 'NATIVE_REQUEST_INVALID', 'CLAUDE_STRUCTURED_OUTPUT_RETRIES_EXCEEDED', 'CLAUDE_MAX_TURNS_EXCEEDED'])('terminal %s still rejects', async code => {
-  const { client } = await terminalFixture('failed', { code, message: 'failure', retryable: false, outcomeUnknown: false })
+  const { client } = await terminalFixture('failed', { error: { code, message: 'failure', retryable: false, outcomeUnknown: false } })
   await expect(agent('fail', { client, cwd: '.' })).rejects.toMatchObject({ code })
 })
 
 test('uncertainty overrides API and skip classifications, and generic interruptions never become null', async () => {
   for (const status of ['failed', 'interrupted'] as const) {
-    const { client } = await terminalFixture(status, { code: 'RATE_LIMITED', message: 'unknown', retryable: false, outcomeUnknown: true, details: { workflowDisposition: 'skipped' } })
+    const { client } = await terminalFixture(status, { error: { code: 'RATE_LIMITED', message: 'unknown', retryable: false, outcomeUnknown: true, details: { workflowDisposition: 'skipped' } } })
     await expect(agent('unknown', { client, cwd: '.' })).rejects.toMatchObject({ code: 'RATE_LIMITED', outcomeUnknown: true })
   }
   const { client } = await terminalFixture('interrupted')
@@ -215,13 +215,13 @@ test('uncertainty overrides API and skip classifications, and generic interrupti
 })
 
 test('explicit skip metadata survives terminal-before-reply and startup denial requires its dedicated code', async () => {
-  const skipped = await terminalFixture('interrupted', { code: 'USER_SKIPPED', message: 'skipped', retryable: false, outcomeUnknown: false, details: { workflowDisposition: 'skipped' } })
+  const skipped = await terminalFixture('interrupted', { error: { code: 'USER_SKIPPED', message: 'skipped', retryable: false, outcomeUnknown: false, details: { workflowDisposition: 'skipped' } } })
   expect(await agent('skip', { client: skipped.client, cwd: '.' })).toBeNull()
   expect([...skipped.adapter.backends.values()][0]?.disposeCount).toBe(1)
   const blocked = await fixture({ onOpen: async () => { throw new HarnessSdkError('AGENT_STARTUP_BLOCKED', 'blocked', false, false, { workflowDisposition: 'startup_blocked' }) } })
   expect(await agent('blocked', { client: blocked.client, cwd: '.' })).toBeNull()
   expect(blocked.adapter.calls).toHaveLength(0)
-  const denied = await terminalFixture('failed', { code: 'PERMISSION_DENIED', message: 'denied', retryable: false, outcomeUnknown: false, details: { workflowDisposition: 'startup_blocked' } })
+  const denied = await terminalFixture('failed', { error: { code: 'PERMISSION_DENIED', message: 'denied', retryable: false, outcomeUnknown: false, details: { workflowDisposition: 'startup_blocked' } } })
   await expect(agent('denied', { client: denied.client, cwd: '.' })).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
 })
 
@@ -239,7 +239,7 @@ test('a null candidate cannot hide cleanup failure', async () => {
 })
 
 test.each(['', 'bad JSON', '{}', '{"count":"3"}'])('invalid structured terminal %j rejects, cleans up and never replays', async text => {
-  const { client, adapter } = await terminalFixture('completed', undefined, text)
+  const { client, adapter } = await terminalFixture('completed', { text })
   await expect(agent('structured', { client, cwd: '.', schema: z.object({ count: z.number() }) })).rejects.toMatchObject({ outcomeUnknown: false, retryable: false })
   expect(adapter.calls.filter(call => call.method === 'input/submit')).toHaveLength(1)
   expect(adapter.calls.some(call => call.method === 'session/interrupt' || call.method === 'turn/interrupt')).toBe(false)
@@ -247,7 +247,7 @@ test.each(['', 'bad JSON', '{}', '{"count":"3"}'])('invalid structured terminal 
 })
 
 test('empty text and multiple final text items retain SDK aggregation', async () => {
-  const empty = await terminalFixture('completed', undefined, '')
+  const empty = await terminalFixture('completed', { text: '' })
   expect(await agent('empty', { client: empty.client, cwd: '.' })).toBe('')
   const { client } = await fixture({ execute: async (call, sink) => {
     if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined

@@ -239,16 +239,19 @@ export class CodexNativeAdapter implements HarnessAdapter {
 export function createCodexAdapter(options: CodexAdapterOptions): CodexNativeAdapter { return new CodexNativeAdapter(options) }
 
 class CodexBackendSession implements BackendSession {
-  private readonly nativeSubmissions = new Set<string>()
-  private readonly nativeReceipts = new Map<string, string>()
+  // Submissions await execution evidence before binding; responses may supply a native turn ID receipt.
+  // Observed turns or matching userMessage items allow binding and pending-state cleanup.
+  // Definite failure removes the awaiting ID; outcomeUnknown retains it for later evidence.
+  private readonly awaitingTurnSubmissionIds = new Set<string>()
+  private readonly receiptTurnIdBySubmissionId = new Map<string, string>()
   private readonly nativeUsage = new Map<string, Usage>()
   private readonly nativePlans = new Map<string, Item>()
   binding: SessionBinding
   readonly capabilities: Capabilities
   private client!: CodexJsonlClient
   private threadId = ''
-  private turnMap = new Map<string, string>()
-  private nativeMap = new Map<string, string>()
+  private canonicalTurnIdByNativeId = new Map<string, string>()
+  private nativeTurnIdByCanonicalId = new Map<string, string>()
   private started = new Set<string>()
   private items = new Set<string>()
   private executionOutput = new Map<string, string>()
@@ -266,8 +269,11 @@ class CodexBackendSession implements BackendSession {
     this.state = { binding: this.binding, status: 'ready', activeTurnIds: [], config: params.config ?? {}, capabilities: this.capabilities, capabilityRevision: 1, ...(model ? { model } : {}) }
   }
   attach(client: CodexJsonlClient): void { this.client = client }
-  resolveNativeTurn(canonical: string): string | undefined { return this.nativeMap.get(canonical) }
-  importTurnMap(source: CodexBackendSession): void { this.turnMap = new Map(source.turnMap); this.nativeMap = new Map(source.nativeMap) }
+  resolveNativeTurn(canonical: string): string | undefined { return this.nativeTurnIdByCanonicalId.get(canonical) }
+  importTurnMap(source: CodexBackendSession): void {
+    this.canonicalTurnIdByNativeId = new Map(source.canonicalTurnIdByNativeId)
+    this.nativeTurnIdByCanonicalId = new Map(source.nativeTurnIdByCanonicalId)
+  }
   async open(): Promise<void> {
     const config: NativeRecord = { ...(this.params.config ?? {}) }
     const mode = config.permissionMode ?? (PERMISSION_MODES.includes(this.params.permissionMode as typeof PERMISSION_MODES[number]) ? this.params.permissionMode : undefined)
@@ -300,27 +306,33 @@ class CodexBackendSession implements BackendSession {
     if (this.state.metadata) await this.sink.emit({ type: 'session/metadata', payload: this.state.metadata })
   }
   private nativeTurn(canonical: string, provided?: string, missing = 'BOUNDARY_NATIVE_ID_REQUIRED'): string {
-    const native = provided ?? this.nativeMap.get(canonical)
+    const native = provided ?? this.nativeTurnIdByCanonicalId.get(canonical)
     if (!native) throw new HarnessSdkError(missing, 'Native turn identity is not known')
     return native
   }
-  private canonicalTurn(native: string): string {
-    this.nativeMap.set(native, native); this.turnMap.set(native, native); return native
+  private registerNativeTurnIdentity(native: string): string {
+    // The adapter currently uses the same ID for native and canonical turn identities.
+    this.nativeTurnIdByCanonicalId.set(native, native)
+    this.canonicalTurnIdByNativeId.set(native, native)
+    return native
   }
   private async ensureStarted(nativeId: string): Promise<string> {
-    const turnId = this.canonicalTurn(nativeId)
+    const turnId = this.registerNativeTurnIdentity(nativeId)
     if (!this.started.has(turnId)) { this.started.add(turnId); await this.sink.emit({ type: 'turn/started', payload: { turnId, nativeTurnId: nativeId } }, { turnId }); this.state.activeTurnIds.push(turnId); this.state.status = 'running' }
-    for (const [submissionId, receipt] of this.nativeReceipts) if (receipt === nativeId) {
-      await this.sink.bindSubmission(submissionId, turnId); this.nativeReceipts.delete(submissionId); this.nativeSubmissions.delete(submissionId)
+    for (const [submissionId, receiptTurnId] of this.receiptTurnIdBySubmissionId) if (receiptTurnId === nativeId) {
+      await this.sink.bindSubmission(submissionId, turnId)
+      this.receiptTurnIdBySubmissionId.delete(submissionId)
+      this.awaitingTurnSubmissionIds.delete(submissionId)
     }
     return turnId
   }
-  private scope(params: NativeRecord): string | undefined { const native = string(params.turnId); return native ? this.canonicalTurn(native) : undefined }
+  private scope(params: NativeRecord): string | undefined { const native = string(params.turnId); return native ? this.registerNativeTurnIdentity(native) : undefined }
   private async submitInput(method: 'input/submit' | 'review/start', params: import('@anureo/protocol').InputSubmitParams | import('@anureo/protocol').ReviewStartParams): Promise<import('@anureo/protocol').SubmissionAcceptance> {
-    if (this.nativeSubmissions.size >= (this.options.maxPending ?? 128)) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED')
-    if (this.nativeSubmissions.has(params.submissionId)) throw new HarnessSdkError('SUBMISSION_ID_CONFLICT')
+    if (this.awaitingTurnSubmissionIds.size >= (this.options.maxPending ?? 128)) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED')
+    if (this.awaitingTurnSubmissionIds.has(params.submissionId)) throw new HarnessSdkError('SUBMISSION_ID_CONFLICT')
     if (!this.native.verified && !this.unverifiedNoticed) { this.unverifiedNoticed = true; await this.sink.emit({ type: 'notice', payload: { severity: 'warning', code: 'CODEX_VERSION_UNVERIFIED', message: `Codex ${this.native.profile.since}+ behaviour is used for this version; it has not been verified against the native schema.` } }); }
-    this.nativeSubmissions.add(params.submissionId)
+    this.awaitingTurnSubmissionIds.add(params.submissionId)
+    // Distinguish joining an already observed turn from a turn first observed during this submission.
     const previousTurns = new Set(this.started)
     try {
       let value: NativeRecord
@@ -329,21 +341,43 @@ class CodexBackendSession implements BackendSession {
         if (start.delivery !== 'native') throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
         if (await readAccountStatus(this.client) === 'required') throw new HarnessSdkError('AUTH_REQUIRED')
         const permissions = permissionSettings(this.state.config.permissionMode)
-        value = record(await this.client.request('turn/start', { ...Object.fromEntries(Object.entries(this.state.config).filter(([key]) => this.capabilities.turn?.overrides?.includes(key))), ...(permissions ? { approvalPolicy: permissions.approvalPolicy, sandboxPolicy: permissions.sandboxPolicy } : {}), ...('fastMode' in this.state.config ? { serviceTier: serviceTierFor(this.state.config.fastMode) } : {}), ...start.overrides, threadId: this.threadId, input: nativeInput(start.input), clientUserMessageId: params.submissionId, ...(start.outputSchema !== undefined ? { outputSchema: start.outputSchema } : {}) }))
+        const sessionOverrides = Object.fromEntries(
+          Object.entries(this.state.config).filter(([key]) => this.capabilities.turn?.overrides?.includes(key)),
+        )
+        const permissionOverrides = permissions
+          ? { approvalPolicy: permissions.approvalPolicy, sandboxPolicy: permissions.sandboxPolicy }
+          : {}
+        const serviceTierOverride = 'fastMode' in this.state.config
+          ? { serviceTier: serviceTierFor(this.state.config.fastMode) }
+          : {}
+        const turnStartParams = {
+          ...sessionOverrides,
+          ...permissionOverrides,
+          ...serviceTierOverride,
+          ...start.overrides,
+          threadId: this.threadId,
+          input: nativeInput(start.input),
+          clientUserMessageId: params.submissionId,
+          ...(start.outputSchema !== undefined ? { outputSchema: start.outputSchema } : {}),
+        }
+        value = record(await this.client.request('turn/start', turnStartParams))
       } else value = record(await this.optional('review/start', { threadId: this.threadId, target: (params as import('@anureo/protocol').ReviewStartParams).target, delivery: 'inline' }, () => { this.capabilities.review = false }))
       const id = string(record(value.turn).id)
       if (!id) throw new HarnessSdkError('PROTOCOL_ERROR')
       // A turn/start response can contain a submission id; only observed execution facts bind it.
       if (this.started.has(id)) {
         await this.sink.bindSubmission(params.submissionId, id)
-        this.nativeSubmissions.delete(params.submissionId)
+        this.awaitingTurnSubmissionIds.delete(params.submissionId)
         return previousTurns.has(id)
           ? { submissionId: params.submissionId, accepted: true, disposition: 'joined', turnId: id }
           : { submissionId: params.submissionId, accepted: true, disposition: 'accepted', receipt: { nativeSubmissionId: id } }
       }
-      if (this.nativeSubmissions.has(params.submissionId)) this.nativeReceipts.set(params.submissionId, id)
+      if (this.awaitingTurnSubmissionIds.has(params.submissionId)) this.receiptTurnIdBySubmissionId.set(params.submissionId, id)
       return { submissionId: params.submissionId, accepted: true, disposition: 'accepted', receipt: { nativeSubmissionId: id } }
-    } catch (cause) { if (!sdkError(cause).outcomeUnknown) this.nativeSubmissions.delete(params.submissionId); throw cause }
+    } catch (cause) {
+      if (!sdkError(cause).outcomeUnknown) this.awaitingTurnSubmissionIds.delete(params.submissionId)
+      throw cause
+    }
   }
   private async optional<T>(method: string, params: NativeRecord, disable: () => void): Promise<T> {
     try { return await this.client.request<T>(method, params) }
@@ -451,13 +485,13 @@ class CodexBackendSession implements BackendSession {
         do {
           const page = record(await this.optional('thread/items/list', { threadId: this.threadId, sortDirection: 'asc', limit: 200, ...(cursor ? { cursor } : {}) }, () => { this.capabilities.session!.history = false }))
           if (!Array.isArray(page.data)) throw new HarnessSdkError('PROTOCOL_ERROR')
-          for (const entry of page.data) { const native = record(entry); const nativeTurnId = string(native.turnId); if (!nativeTurnId) throw new HarnessSdkError('PROTOCOL_ERROR'); for (const item of mapItems(native.item, true, true, { startedAtMs: native.startedAtMs })) items.push({ turnId: this.turnMap.get(nativeTurnId) ?? nativeTurnId, nativeTurnId, nativeItemId: string(record(native.item).id), item }) }
+          for (const entry of page.data) { const native = record(entry); const nativeTurnId = string(native.turnId); if (!nativeTurnId) throw new HarnessSdkError('PROTOCOL_ERROR'); for (const item of mapItems(native.item, true, true, { startedAtMs: native.startedAtMs })) items.push({ turnId: this.canonicalTurnIdByNativeId.get(nativeTurnId) ?? nativeTurnId, nativeTurnId, nativeItemId: string(record(native.item).id), item }) }
           if (items.length > (this.options.maxHistoryItems ?? 10000)) throw new HarnessSdkError('HISTORY_LIMIT_EXCEEDED')
           cursor = string(page.nextCursor)
         } while (cursor)
       } else for (const turn of await this.turns()) {
         const nativeTurnId = string(turn.id); if (!nativeTurnId || !Array.isArray(turn.items)) continue
-        for (const native of turn.items) for (const item of mapItems(native, true, true)) items.push({ turnId: this.turnMap.get(nativeTurnId) ?? nativeTurnId, nativeTurnId, nativeItemId: string(record(native).id), item })
+        for (const native of turn.items) for (const item of mapItems(native, true, true)) items.push({ turnId: this.canonicalTurnIdByNativeId.get(nativeTurnId) ?? nativeTurnId, nativeTurnId, nativeItemId: string(record(native).id), item })
       }
       token = randomUUID(); this.history.set(token, items)
       if (this.history.size > 8) this.history.delete(this.history.keys().next().value!)
@@ -470,9 +504,11 @@ class CodexBackendSession implements BackendSession {
     if (typeof params.threadId === 'string' && this.threadId && params.threadId !== this.threadId) return
     if (method === 'item/started' || method === 'item/completed') {
       const item = record(params.item), submissionId = string(item.clientId), native = string(params.turnId)
-      if (item.type === 'userMessage' && submissionId && native && this.nativeSubmissions.has(submissionId)) {
+      if (item.type === 'userMessage' && submissionId && native && this.awaitingTurnSubmissionIds.has(submissionId)) {
         const actual = await this.ensureStarted(native)
-        await this.sink.bindSubmission(submissionId, actual); this.nativeSubmissions.delete(submissionId); this.nativeReceipts.delete(submissionId)
+        await this.sink.bindSubmission(submissionId, actual)
+        this.awaitingTurnSubmissionIds.delete(submissionId)
+        this.receiptTurnIdBySubmissionId.delete(submissionId)
       }
     }
     if (method === 'thread/started') return
@@ -632,17 +668,23 @@ async function readCodexModels(client: CodexJsonlClient): Promise<CodexModel[]> 
 
 /** Dedicated read-only directory owner; no thread or turn is ever created here. */
 export function createCodexCatalogSession(options: CodexAdapterOptions) {
-  let client: CodexJsonlClient | undefined, pending: Promise<void> | undefined, closing: Promise<void> | undefined, disposing: Promise<void> | undefined
+  let client: CodexJsonlClient | undefined
+  let preparationInFlight: Promise<void> | undefined
+  let connectionCloseInFlight: Promise<void> | undefined
+  let disposalInFlight: Promise<void> | undefined
   const closeConnection = (): Promise<void> => {
-    if (closing) return closing
-    const current = client; client = undefined
-    return closing = (current?.dispose() ?? Promise.resolve()).finally(() => { closing = undefined })
+    if (connectionCloseInFlight) return connectionCloseInFlight
+    const current = client
+    client = undefined
+    return connectionCloseInFlight = (current?.dispose() ?? Promise.resolve()).finally(() => { connectionCloseInFlight = undefined })
   }
-  const dispose = (): Promise<void> => disposing ??= (async () => {
+  // Release resources for this preparation; later calls may prepare a new connection.
+  // Close the current connection, wait for preparation, then close any connection it created.
+  const dispose = (): Promise<void> => disposalInFlight ??= (async () => {
     await closeConnection()
-    await pending?.catch(() => {})
+    await preparationInFlight?.catch(() => {})
     await closeConnection()
-  })().finally(() => { disposing = undefined })
+  })().finally(() => { disposalInFlight = undefined })
   const guarded = async <T>(context: CatalogProbeOptions, work: () => Promise<T>): Promise<T> => {
     const abort = () => { void dispose().catch(() => {}) }
     if (context.signal?.aborted) throw new HarnessSdkError('RPC_ABORTED')
@@ -650,22 +692,29 @@ export function createCodexCatalogSession(options: CodexAdapterOptions) {
     try { return await work() } finally { context.signal?.removeEventListener('abort', abort) }
   }
   const prepare = (context: CatalogProbeOptions = {}): Promise<void> => guarded(context, async () => {
-    await disposing; await closing
-    if (pending) { await pending; return }
+    await disposalInFlight
+    await connectionCloseInFlight
+    if (preparationInFlight) { await preparationInFlight; return }
     if (client) return
     let spawned: HarnessProcess | undefined
-    await (pending ??= (async () => {
+    await (preparationInFlight ??= (async () => {
       await catalogPhase(context, 'spawn', async () => { spawned = await (options.processFactory ?? spawnHarnessProcess)({ command: options.command, args: options.args ?? ['app-server'], cwd: options.cwd, env: options.env }) })
       const child = spawned!
       if (context.signal?.aborted) { await child.dispose(); throw new HarnessSdkError('RPC_ABORTED') }
       const connected = new CodexJsonlClient(child, { notification: async () => {}, request: async (_request, _reply, reject) => { await reject(-32601, 'Catalog queries are non-interactive') }, failure: async () => {}, diagnostic: options.diagnostic }, { ...options, timeoutMs: context.timeoutMs ?? 10_000 })
       client = connected
-      void connected.finished.then(() => { if (client === connected) { client = undefined; closing = connected.dispose().finally(() => { closing = undefined }); void closing.catch(() => {}) } })
+      void connected.finished.then(() => {
+        if (client === connected) {
+          client = undefined
+          connectionCloseInFlight = connected.dispose().finally(() => { connectionCloseInFlight = undefined })
+          void connectionCloseInFlight.catch(() => {})
+        }
+      })
       await catalogPhase(context, 'handshake', async () => {
         await connected.request('initialize', { clientInfo: { name: 'anureo-catalog', version: '1' }, capabilities: { experimentalApi: true } })
         await connected.notify('initialized')
       })
-    })().catch(async cause => { await closeConnection(); await spawned?.dispose(); throw cause }).finally(() => { pending = undefined }))
+    })().catch(async cause => { await closeConnection(); await spawned?.dispose(); throw cause }).finally(() => { preparationInFlight = undefined }))
   })
   return {
     prepare,

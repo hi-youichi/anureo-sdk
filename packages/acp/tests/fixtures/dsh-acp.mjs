@@ -14,16 +14,16 @@ const unsupportedNode = flag('--unsupported-node');
 const send = (frame) => process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', ...frame })}\n`);
 const update = (sessionId, update) => send({ method: 'session/update', params: { sessionId, update } });
 
-const pendingPrompts = new Map();
+const promptResponseIdsBySession = new Map();
 let nextId = 0;
-const pendingRequests = new Map();
+const pendingAgentRequestsById = new Map();
 const request = (method, params) => new Promise((resolve, reject) => {
   const id = `agent:${++nextId}`;
-  pendingRequests.set(id, { resolve, reject });
+  pendingAgentRequestsById.set(id, { resolve, reject });
   send({ id, method, params });
 });
 
-const configOptions = () => [
+const createDefaultConfigOptions = () => [
   {
     id: 'model', name: 'Model', category: 'model', type: 'select',
     currentValue: 'deepseek-official/deepseek-v4-flash',
@@ -51,9 +51,9 @@ const lines = createInterface({ input: process.stdin });
 lines.on('line', (line) => { void handle(JSON.parse(line)); });
 
 async function handle(frame) {
-  if (!frame.method && pendingRequests.has(frame.id)) {
-    const wait = pendingRequests.get(frame.id);
-    pendingRequests.delete(frame.id);
+  if (!frame.method && pendingAgentRequestsById.has(frame.id)) {
+    const wait = pendingAgentRequestsById.get(frame.id);
+    pendingAgentRequestsById.delete(frame.id);
     frame.error ? wait.reject(frame.error) : wait.resolve(frame.result);
     return;
   }
@@ -75,14 +75,14 @@ async function handle(frame) {
   }
   if (frame.method === 'authenticate') { respond({}); return; }
   if (frame.method === 'session/new' || frame.method === 'session/resume') {
-    respond({ sessionId: params.sessionId ?? `dsh-${++nextId}`, configOptions: configOptions() });
+    respond({ sessionId: params.sessionId ?? `dsh-${++nextId}`, configOptions: createDefaultConfigOptions() });
     return;
   }
   if (frame.method === 'session/list') { respond({ sessions: [] }); return; }
   if (frame.method === 'session/close') { respond({}); return; }
   if (frame.method === 'session/set_config_option') {
-    const options = configOptions();
-    const option = options.find((entry) => entry.id === params.configId);
+    const responseConfigOptions = createDefaultConfigOptions();
+    const option = responseConfigOptions.find((entry) => entry.id === params.configId);
     if (option) {
       const accepted = option.options.flatMap((entry) => entry.options ?? [entry]).map((entry) => entry.value);
       if (params.configId === 'model' && !accepted.includes(params.value)) {
@@ -91,13 +91,15 @@ async function handle(frame) {
       }
       option.currentValue = params.value;
     }
-    respond({ configOptions: options });
+    respond({ configOptions: responseConfigOptions });
     return;
   }
   if (frame.method === 'session/cancel') {
-    const promptId = pendingPrompts.get(params.sessionId);
+    const promptId = promptResponseIdsBySession.get(params.sessionId);
     if (promptId !== undefined) {
-      pendingPrompts.delete(params.sessionId);
+      // Only send the prompt's cancellation result; the permission request and
+      // the prompt handler awaiting it remain active.
+      promptResponseIdsBySession.delete(params.sessionId);
       send({ id: promptId, result: { stopReason: 'cancelled' } });
     }
     return;
@@ -110,7 +112,7 @@ async function handle(frame) {
     }
     update(params.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'answer', content: { type: 'text', text: 'pong' } });
     if (permission) {
-      pendingPrompts.set(params.sessionId, frame.id);
+      promptResponseIdsBySession.set(params.sessionId, frame.id);
       const response = await request('session/request_permission', {
         sessionId: params.sessionId,
         toolCall: { toolCallId: 'call-1', title: 'Run tests', kind: 'execute', rawInput: { command: 'bun test' } },
@@ -119,7 +121,7 @@ async function handle(frame) {
           { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
         ],
       });
-      pendingPrompts.delete(params.sessionId);
+      promptResponseIdsBySession.delete(params.sessionId);
       update(params.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'answer', content: { type: 'text', text: ` ${response.outcome.outcome}` } });
     }
     respond({ stopReason });

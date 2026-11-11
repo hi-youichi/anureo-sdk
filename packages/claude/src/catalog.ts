@@ -7,19 +7,41 @@ import { createClaudeAdapter, type ClaudeAdapterOptions, type ClaudeQuery } from
 export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
   const adapter = createClaudeAdapter(options)
   let stream: ClaudeQuery | undefined, input: BoundedEventQueue<SDKUserMessage> | undefined
-  let initial: Awaited<ReturnType<Query['supportedModels']>> | undefined
+  let pendingHandshakeModels: Awaited<ReturnType<Query['supportedModels']>> | undefined
   let preparing: Promise<void> | undefined, disposing: Promise<void> | undefined
-  const closeConnection = async () => { const current = stream; stream = undefined; initial = undefined; input?.end(); input = undefined; current?.close(); await (current as (ClaudeQuery & Partial<Pick<Query, 'return'>>) | undefined)?.return?.() }
+  const closeConnection = async () => {
+    const current = stream
+    stream = undefined
+    pendingHandshakeModels = undefined
+    input?.end()
+    input = undefined
+    current?.close()
+    await (current as (ClaudeQuery & Partial<Pick<Query, 'return'>>) | undefined)?.return?.()
+  }
   const dispose = (): Promise<void> => disposing ??= (async () => {
     await closeConnection()
     await preparing?.catch(() => {})
+    // Preparation may establish a connection while dispose waits for it to finish.
     await closeConnection()
   })().finally(() => { disposing = undefined })
   const guarded = async <T>(context: CatalogProbeOptions, work: () => Promise<T>): Promise<T> => {
-    const abort = () => { void dispose().catch(() => {}) }
-    if (context.signal?.aborted) throw new HarnessSdkError('RPC_ABORTED')
-    context.signal?.addEventListener('abort', abort, { once: true })
-    try { return await work() } catch (cause) { await dispose(); throw cause } finally { context.signal?.removeEventListener('abort', abort) }
+    const disposeOnAbort = () => {
+      // Cancellation reaches in-flight work by disposing its resources; cleanup errors are ignored here.
+      void dispose().catch(() => {})
+    }
+    if (context.signal?.aborted) {
+      throw new HarnessSdkError('RPC_ABORTED')
+    }
+    context.signal?.addEventListener('abort', disposeOnAbort, { once: true })
+    try {
+      return await work()
+    } catch (cause) {
+      // Await cleanup before rethrowing; a disposal failure takes precedence over cause.
+      await dispose()
+      throw cause
+    } finally {
+      context.signal?.removeEventListener('abort', disposeOnAbort)
+    }
   }
   const prepare = (context: CatalogProbeOptions = {}): Promise<void> => guarded(context, async () => {
     await disposing
@@ -28,7 +50,7 @@ export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
     await (preparing ??= (async () => {
       input = new BoundedEventQueue<SDKUserMessage>()
       await catalogPhase(context, 'spawn', async () => { stream = (options.queryFactory ?? query)({ prompt: input!, options: { ...adapter.queryOptions(process.cwd()), persistSession: false, sessionStore: undefined, enableFileCheckpointing: false, mcpServers: {}, settingSources: [] } }) })
-      initial = await catalogPhase(context, 'handshake', () => stream!.supportedModels())
+      pendingHandshakeModels = await catalogPhase(context, 'handshake', () => stream!.supportedModels())
     })().catch(async cause => { await closeConnection(); throw cause }).finally(() => { preparing = undefined }))
   })
   return {
@@ -37,12 +59,19 @@ export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
       return guarded(context, async () => {
         await prepare(context)
         return catalogPhase(context, 'models', async () => {
-          if (initial) { const models = initial; initial = undefined; return models }
+          if (pendingHandshakeModels) {
+            const models = pendingHandshakeModels
+            pendingHandshakeModels = undefined
+            return models
+          }
           const current = stream as ClaudeQuery & Partial<Pick<Query, 'reinitialize'>>
           if (current.reinitialize) return (await current.reinitialize()).models
           // Older SDKs/fixtures can only refresh by establishing a new directory Query.
-          await dispose(); await prepare(context)
-          const models = initial!; initial = undefined; return models
+          await dispose()
+          await prepare(context)
+          const models = pendingHandshakeModels!
+          pendingHandshakeModels = undefined
+          return models
         })
       })
     },

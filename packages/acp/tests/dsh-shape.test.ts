@@ -17,8 +17,16 @@ async function fixture(args: string[] = [], options: Partial<AcpAdapterOptions> 
   const runtime = await createClient({ adapter, identity: { adapterId: 'dsh-acp', runtimeConfigId: 'fixture' }, interactions: { approval: undefined, userInput: undefined, elicitation: undefined, dynamicTool: undefined } });
   const session: Session = await runtime.sessions.create({ cwd: process.cwd() });
   const events: AhpEvent[] = [];
-  // Disposal closes the observation; that is the expected end of the pump, not a test failure.
-  const pump = (async () => { try { for await (const event of session.events()) events.push(event); } catch { /* observation closed on dispose */ } })();
+  const pump = (async () => {
+    try {
+      for await (const event of session.events()) {
+        events.push(event);
+      }
+    } catch {
+      // Disposal is expected to close the observation, but this fixture
+      // unconditionally ignores all event-stream errors.
+    }
+  })();
   const until = async (predicate: () => boolean) => {
     for (let index = 0; index < 500; index++) { if (predicate()) return; await new Promise((done) => setTimeout(done, 2)); }
     throw new Error('Timed out awaiting the DSH fixture');

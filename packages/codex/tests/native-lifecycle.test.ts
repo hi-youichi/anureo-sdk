@@ -5,7 +5,18 @@ import { createCodexAdapter } from '../src';
 import { runNativeConformance } from '@anureo/conformance';
 const executable = fileURLToPath(new URL('./native-lifecycle-fixture.mjs', import.meta.url));
 async function fixture(version = '0.164.0') {
-  const client = await createClient({ adapter: createCodexAdapter({ command: process.execPath, args: [executable], version, timeoutMs: 1000 }), identity: { adapterId: 'codex', runtimeConfigId: 'native' } });
+  const client = await createClient({
+    adapter: createCodexAdapter({
+      command: process.execPath,
+      args: [executable],
+      version,
+      timeoutMs: 1000
+    }),
+    identity: {
+      adapterId: 'codex',
+      runtimeConfigId: 'native'
+    }
+  });
   const session = await client.sessions.create({ cwd: process.cwd() });
   return { client, session };
 }
@@ -35,11 +46,15 @@ for (const version of ['0.148.0', '0.164.0']) test(`${version}: Codex revised v1
 test('review acknowledgement alone never fabricates a started execution', async () => {
   const f = await fixture();
   try {
-    const review = f.session.review({ target: { type: 'uncommittedChanges' } });
-    let bound = false; void review.then(() => { bound = true; });
-    await new Promise(resolve => setTimeout(resolve, 5)); expect(bound).toBe(false);
+    const pendingReview = f.session.review({ target: { type: 'uncommittedChanges' } });
+    let reviewResolved = false;
+    void pendingReview.then(() => { reviewResolved = true; });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    expect(reviewResolved).toBe(false);
+    // The fixture emits the pending review's started/completed events before replying to thread/items/list.
     await f.session.request('history/read', { requestId: 'observe-review', sessionId: f.session.id });
-    const actual = await review; expect(actual.id).toBe('actual-review');
-    expect((await actual.result()).status).toBe('interrupted');
+    const reviewTurn = await pendingReview;
+    expect(reviewTurn.id).toBe('actual-review');
+    expect((await reviewTurn.result()).status).toBe('interrupted');
   } finally { await f.client.dispose(); }
 });

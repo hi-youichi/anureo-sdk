@@ -24,8 +24,17 @@ test('execution limits and generic runtime failures cannot be reclassified by an
     error_max_turns: 'CLAUDE_MAX_TURNS_EXCEEDED', error_max_budget_usd: 'CLAUDE_MAX_BUDGET_EXCEEDED',
     error_max_structured_output_retries: 'CLAUDE_STRUCTURED_OUTPUT_RETRIES_EXCEEDED', error_during_execution: 'CLAUDE_TURN_FAILED',
   })) expect(claudeTurnError(result({ subtype }), 'rate_limit')).toMatchObject({ code, outcomeUnknown: false })
+})
+
+test('non-error results do not produce a turn error', () => {
   expect(claudeTurnError(result({ is_error: false }), 'rate_limit')).toBeUndefined()
+})
+
+test('runtime failures use the API classification when terminal_reason is api_error', () => {
   expect(claudeTurnError(result({ subtype: 'error_during_execution', terminal_reason: 'api_error' }), 'rate_limit')).toMatchObject({ code: 'RATE_LIMITED' })
+})
+
+test('unknown categories and prototype property names fall back to CLAUDE_TURN_FAILED', () => {
   expect(claudeTurnError(result(), 'future_category' as SDKAssistantMessageError)).toMatchObject({ code: 'CLAUDE_TURN_FAILED' })
   expect(claudeTurnError(result(), 'constructor' as SDKAssistantMessageError)).toMatchObject({ code: 'CLAUDE_TURN_FAILED' })
   expect(claudeTurnError(result({ subtype: '__proto__' }))).toMatchObject({ code: 'CLAUDE_TURN_FAILED' })

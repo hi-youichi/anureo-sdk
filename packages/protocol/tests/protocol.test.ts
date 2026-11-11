@@ -64,7 +64,13 @@ describe('schema and generation', () => {
     const generated = new URL('../src/generated/types.ts', import.meta.url)
     const before = readFileSync(generated, 'utf8')
     const check = spawnSync(process.execPath, [fileURLToPath(new URL('../scripts/generate.ts', import.meta.url)), '--check'])
-    expect(check.status).toBe(0)
+    const checkDiagnostics = [
+      `error: ${check.error ?? 'none'}`,
+      `signal: ${check.signal ?? 'none'}`,
+      `stdout:\n${check.stdout?.toString() ?? ''}`,
+      `stderr:\n${check.stderr?.toString() ?? ''}`,
+    ].join('\n')
+    expect(check.status, checkDiagnostics).toBe(0)
     expect(readFileSync(generated, 'utf8')).toBe(before)
   })
   test('rejects missing target, empty identifiers, invalid scope and implicit resume', () => {
@@ -185,8 +191,16 @@ describe('JSON-RPC wire', () => {
 
 
 test('public interaction preserves secret classification booleans without exposing secret values', () => {
-  const request: InteractionRequested = {interactionId:'secret-question',kind:'userInput',questions:[{id:'q',prompt:'Credential',secret:true}],privatePayload:{secret:'actual-credential'}};
-  const safe=publicInteraction(request);expect(safe.kind==='userInput' && safe.questions[0]?.secret).toBe(true);expect(validateDefinition('InteractionRequested',safe)).toBe(true);expect(JSON.stringify(safe)).not.toContain('actual-credential');
+  const request: InteractionRequested = {
+    interactionId: 'secret-question',
+    kind: 'userInput',
+    questions: [{ id: 'q', prompt: 'Credential', secret: true }],
+    privatePayload: { secret: 'actual-credential' },
+  }
+  const safe = publicInteraction(request)
+  expect(safe.kind === 'userInput' && safe.questions[0]?.secret).toBe(true)
+  expect(validateDefinition('InteractionRequested', safe)).toBe(true)
+  expect(JSON.stringify(safe)).not.toContain('actual-credential')
 })
 
 test('result assertions, public values and broken schemas fail closed', () => {
@@ -198,10 +212,42 @@ test('result assertions, public values and broken schemas fail closed', () => {
 test('file-change source material is optional and validates every discriminated variant', () => {
   const item = { id: 'edit', type: 'toolCall', kind: 'fileChange', title: 'File changes' }
   expect(validateDefinition('Item', item)).toBe(true)
-  const valid = { ...item, fileChanges: [{ path: 'index.ts', operation: 'modify', completeness: 'complete', materials: [{ format: 'unified', patch: '@@ -57 +57 @@\n-old\n+new\n' }, { format: 'text', scope: 'fragment', oldText: '', newText: 'new', oldStartLine: 1 }, { format: 'unavailable', reason: 'binary' }] }] }
+  const validTextMaterial = {
+    format: 'text',
+    scope: 'fragment',
+    oldText: '',
+    newText: 'new',
+    oldStartLine: 1,
+  }
+  const validFileChange = {
+    path: 'index.ts',
+    operation: 'modify',
+    completeness: 'complete',
+    materials: [
+      { format: 'unified', patch: '@@ -57 +57 @@\n-old\n+new\n' },
+      validTextMaterial,
+      { format: 'unavailable', reason: 'binary' },
+    ],
+  }
+  const valid = { ...item, fileChanges: [validFileChange] }
   expect(validateDefinition('Item', valid)).toBe(true)
-  expect(validateDefinition('Item', { ...valid, fileChanges: [{ ...valid.fileChanges[0], materials: [{ format: 'text', scope: 'fragment', oldText: null, newText: '', oldStartLine: 0 }] }] })).toBe(false)
+  // Preserve the compound case: only oldStartLine violates the text material schema.
+  const textMaterialWithZeroOldStartLine = {
+    ...validTextMaterial,
+    oldText: null,
+    newText: '',
+    oldStartLine: 0,
+  }
+  const itemWithZeroOldStartLine = {
+    ...valid,
+    fileChanges: [{ ...validFileChange, materials: [textMaterialWithZeroOldStartLine] }],
+  }
+  expect(validateDefinition('Item', itemWithZeroOldStartLine)).toBe(false)
   expect(validateDefinition('Item', { ...valid, fileChanges: [{ ...valid.fileChanges[0], materials: [{ format: 'unified', oldText: 'wrong' }] }] })).toBe(false)
+
+  expect(validateDefinition('FileChangeMaterial', { ...validTextMaterial, oldText: null })).toBe(true)
+  expect(validateDefinition('FileChangeMaterial', { ...validTextMaterial, newText: '' })).toBe(true)
+  expect(validateDefinition('FileChangeMaterial', { ...validTextMaterial, oldStartLine: 0 })).toBe(false)
 })
 
 

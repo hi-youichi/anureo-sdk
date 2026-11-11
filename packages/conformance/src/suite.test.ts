@@ -13,8 +13,30 @@ test("undeclared optional abilities are not applicable, but a declared broken ca
   const base = createScriptedConformanceFactory({});
   const report = await runConformance(base, { scenarios: ["fork", "steer"] });
   expect(report.cases.every((entry) => entry.status === "not-applicable")).toBe(true);
-  const broken = await runConformance(() => ({ adapter: createScriptedAdapter({ capabilities: { input: { delivery: ["native"] }, session: { fork: ["before"], history: true } }, onOpen: async (params) => { if (params.mode === "fork") throw new Error("Fork not implemented"); } }), openParams: { requestId: "open", mode: "new", cwd: "/tmp", binding: { sessionId: "s", adapterId: "fake", runtimeConfigId: "r" } } }), { scenarios: ["fork"] });
-  expect(broken.passed).toBe(false); expect(broken.cases[0]).toMatchObject({ scenario: "fork", status: "failed" });
+  const brokenForkReport = await runConformance(
+    () => ({
+      adapter: createScriptedAdapter({
+        capabilities: {
+          input: { delivery: ["native"] },
+          session: { fork: ["before"], history: true },
+        },
+        onOpen: async (params) => {
+          if (params.mode === "fork") {
+            throw new Error("Fork not implemented");
+          }
+        },
+      }),
+      openParams: {
+        requestId: "open",
+        mode: "new",
+        cwd: "/tmp",
+        binding: { sessionId: "s", adapterId: "fake", runtimeConfigId: "r" },
+      },
+    }),
+    { scenarios: ["fork"] },
+  );
+  expect(brokenForkReport.passed).toBe(false);
+  expect(brokenForkReport.cases[0]).toMatchObject({ scenario: "fork", status: "failed" });
 });
 test("a source that never emits a terminal event fails the case instead of hanging", async () => {
   const report = await runConformance(() => ({

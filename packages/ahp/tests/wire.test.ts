@@ -17,8 +17,19 @@ test('throwing diagnostics cannot prevent AHP transport cleanup', async () => {
 test('concurrent AHP closes share cleanup and retain both release failures', async () => {
   const incoming = new BoundedEventQueue<string>();
   let closed = 0, notified = 0;
-  const wire = new AhpWire({ messages: incoming, send: async () => {}, close: async () => { closed++; incoming.end(); throw new Error('private transport failure'); } });
-  wire.onClose = async () => { notified++; throw new Error('private close handler failure'); };
+  const wire = new AhpWire({
+    messages: incoming,
+    send: async () => {},
+    close: async () => {
+      closed++;
+      incoming.end();
+      throw new Error('private transport failure');
+    },
+  });
+  wire.onClose = async () => {
+    notified++;
+    throw new Error('private close handler failure');
+  };
   const pending = wire.request('test', {});
   const rejected = pending.catch(cause => cause as unknown);
   const first = wire.close(), second = wire.close();
@@ -34,12 +45,12 @@ test('concurrent AHP closes share cleanup and retain both release failures', asy
 test('a background protocol failure still cleans up and exposes release errors on close', async () => {
   const incoming = new BoundedEventQueue<string>();
   let closed = 0;
-  let notify!: () => void;
-  const notified = new Promise<void>(resolve => { notify = resolve; });
+  let signalCloseHandlerInvoked!: () => void;
+  const closeHandlerInvoked = new Promise<void>(resolve => { signalCloseHandlerInvoked = resolve; });
   const wire = new AhpWire({ messages: incoming, send: async () => {}, close: async () => { closed++; incoming.end(); } });
-  wire.onClose = () => { notify(); throw new Error('private callback failure'); };
+  wire.onClose = () => { signalCloseHandlerInvoked(); throw new Error('private callback failure'); };
   incoming.push('invalid json');
-  await notified;
+  await closeHandlerInvoked;
   await expect(wire.close()).rejects.toMatchObject({ code: 'RESOURCE_RELEASE_FAILED', details: { errors: [{ code: 'AHP_CLOSE_HANDLER_FAILED' }] } });
   expect(closed).toBe(1);
 });

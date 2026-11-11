@@ -21,7 +21,7 @@ test('directory Query stays resident, reinitializes models and receives no promp
     await Promise.all([session.prepare(), session.prepare()])
     expect((await session.listModels())[0]?.value).toBe('initial')
     expect((await session.listModels())[0]?.value).toBe('updated')
-    expect([queries, handshakes, refreshed, inputs]).toEqual([1, 1, 1, 0])
+    expect({ queries, handshakes, refreshed, inputs }).toEqual({ queries: 1, handshakes: 1, refreshed: 1, inputs: 0 })
     expect(settings).toMatchObject({ persistSession: false, enableFileCheckpointing: false, mcpServers: {}, settingSources: [] })
     expect(settings?.sessionStore).toBeUndefined()
   } finally { await session.dispose(); await session.dispose() }
@@ -62,11 +62,26 @@ test('older SDKs without reinitialize rebuild a fresh directory Query to refresh
 })
 
 test('an aborted probe disposes the live directory connection', async () => {
-  const controller = new AbortController(); const rejectors: Array<() => void> = []
-  const session = createClaudeCatalogSession({ queryFactory: ({ prompt }) => {
-    void (async () => { for await (const _input of prompt as AsyncIterable<SDKUserMessage>) {} })().catch(() => {})
-    return { supportedModels: () => new Promise((_resolve, reject) => { rejectors.push(() => reject(new Error('probe closed'))) }), close: () => { for (const reject of rejectors) reject() } } as unknown as ClaudeQuery
-  } })
+  const controller = new AbortController()
+  const pendingProbeRejectors: Array<() => void> = []
+  const session = createClaudeCatalogSession({
+    queryFactory: ({ prompt }) => {
+      void (async () => { for await (const _input of prompt as AsyncIterable<SDKUserMessage>) {} })().catch(() => {})
+      // Keep probes pending until close rejects them, making connection closure observable.
+      return {
+        supportedModels: () => {
+          return new Promise((_resolve, reject) => {
+            pendingProbeRejectors.push(() => reject(new Error('probe closed')))
+          })
+        },
+        close: () => {
+          for (const rejectPendingProbe of pendingProbeRejectors) {
+            rejectPendingProbe()
+          }
+        },
+      } as unknown as ClaudeQuery
+    },
+  })
   try {
     const pending = session.listModels({ signal: controller.signal })
     await new Promise((resolve) => setTimeout(resolve, 10))

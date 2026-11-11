@@ -45,6 +45,19 @@ type FileReview = {
   result: Outcome<FileAnalysis>
 }
 type PackageReview = { package: Package; files: FileReview[]; result: Outcome<Synthesis> }
+type PackageSynthesisInput = {
+  package: Pick<Package, 'path' | 'name'>
+  coverage: ReturnType<typeof coverage>
+  files: Array<FileReview & { findingIds: string[] }>
+}
+type ProjectSynthesisInput = {
+  coverage: ReturnType<typeof coverage>
+  packages: Array<{
+    package: Pick<Package, 'path' | 'name'>
+    coverage: ReturnType<typeof coverage>
+    result: Outcome<Synthesis>
+  }>
+}
 type ReviewOptions = {
   client: Client
   cwd: string
@@ -182,7 +195,7 @@ export async function reviewProject(options: ReviewOptions) {
 
   async function reviewFile(path: string): Promise<FileReview> {
     let sha256: string | null = null
-    let result: Outcome<FileAnalysis>
+    let analysisResult: Outcome<FileAnalysis>
     progress(`file start: ${path}`)
     try {
       const source = await snapshot(cwd, path)
@@ -200,15 +213,18 @@ export async function reviewProject(options: ReviewOptions) {
       if (value === null) throw new Error('Agent returned no result')
       validateEvidence(value, source.lines)
       if ((await snapshot(cwd, path)).sha256 !== sha256) throw new Error('Source changed during review')
-      result = { ok: true, value }
-    } catch (error) { result = { ok: false, error: errorText(error) } }
-    const review = { path, sha256, result }
+      analysisResult = { ok: true, value }
+    } catch (error) { analysisResult = { ok: false, error: errorText(error) } }
+    const review = { path, sha256, result: analysisResult }
+    // Persistence errors escape reviewFile and are converted to null by parallel.
     await saveJson(join(outputDir, 'files', `${path}.json`), review)
-    progress(`file end: ${path} (${result.ok ? result.value.status : 'failed'})`)
+    progress(`file end: ${path} (${analysisResult.ok ? analysisResult.value.status : 'failed'})`)
     return review
   }
 
-  async function synthesize(task: 'package-review' | 'project-review', input: unknown, ids: Set<string>): Promise<Outcome<Synthesis>> {
+  async function synthesize(task: 'package-review', input: PackageSynthesisInput, ids: Set<string>): Promise<Outcome<Synthesis>>
+  async function synthesize(task: 'project-review', input: ProjectSynthesisInput, ids: Set<string>): Promise<Outcome<Synthesis>>
+  async function synthesize(task: 'package-review' | 'project-review', input: PackageSynthesisInput | ProjectSynthesisInput, ids: Set<string>): Promise<Outcome<Synthesis>> {
     try {
       const value = await gated(() => agent(JSON.stringify({
         task, input,
@@ -232,6 +248,8 @@ export async function reviewProject(options: ReviewOptions) {
     packages,
     async pkg => {
       const files = await parallel(pkg.files.map(path => () => gated(() => reviewFile(path))))
+      // Analysis failures already have a FileReview; null represents an uncaught task error,
+      // such as a persistence failure.
       return { pkg, files: files.map((file, index): FileReview => file ?? {
         path: pkg.files[index]!, sha256: null,
         result: { ok: false, error: 'File task failed before persisting its result' },

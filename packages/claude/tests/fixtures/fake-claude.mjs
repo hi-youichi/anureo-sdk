@@ -4,11 +4,19 @@ import { createInterface } from 'node:readline';
 import { appendFileSync } from 'node:fs';
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const schemaProbe = process.env.FAKE_SCHEMA_PROBE === '1';
-const nativeArg = (flag) => { const index = process.argv.indexOf(flag); return index >= 0 ? process.argv[index + 1] : process.argv.find(arg => arg.startsWith(`${flag}=`))?.slice(flag.length + 1); };
+// Configuring a catalog log also enables dynamic catalog probe responses.
+const catalogProbe = Boolean(process.env.FAKE_CATALOG_LOG);
+const nativeArg = (flag) => {
+  const index = process.argv.indexOf(flag);
+  if (index >= 0) {
+    return process.argv[index + 1];
+  }
+  return process.argv.find(arg => arg.startsWith(`${flag}=`))?.slice(flag.length + 1);
+};
 const sessionId = schemaProbe ? nativeArg('--session-id') ?? nativeArg('--resume') ?? '00000000-0000-4000-8000-000000000001' : '00000000-0000-4000-8000-000000000001';
 const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
 const input = createInterface({ input: process.stdin });
-let catalogRevision = 0;
+let catalogResponseRevision = 0;
 let outputSchema;
 for await (const line of input) {
   if (!line.trim()) continue;
@@ -19,7 +27,7 @@ for await (const line of input) {
       outputSchema = frame.request.jsonSchema;
       if (process.env.FAKE_SCHEMA_LOG) appendFileSync(process.env.FAKE_SCHEMA_LOG, JSON.stringify({ sessionId, resume: nativeArg('--resume'), schema: outputSchema }) + '\n');
     }
-    const models = process.env.FAKE_CATALOG_LOG ? [{ value: `catalog-${++catalogRevision}`, displayName: 'Fixture', description: '' }] : [];
+    const models = catalogProbe ? [{ value: `catalog-${++catalogResponseRevision}`, displayName: 'Fixture', description: '' }] : [];
     send({ type: 'control_response', response: { subtype: 'success', request_id: frame.request_id, response: {
       commands: [], models, output_style: 'default', available_output_styles: ['default'],
     } } });

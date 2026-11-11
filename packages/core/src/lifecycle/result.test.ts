@@ -22,7 +22,17 @@ test('streamed text keeps exact serialized byte budgets across escapes and split
   const accumulator = new ResultAccumulator(1024 * 1024, 10);
   const item: Item = { id: 'answer', type: 'agentMessage', phase: 'final', text: '' };
   accumulator.accept(event({ type: 'item/started', payload: { item } }));
-  for (const text of ['quote"\\\n\t\0', '日本語', '\ud83d', '', '\ude00', '\ud800', 'a', '\udc00', '🦊']) {
+  for (const text of [
+    'quote"\\\n\t\0',
+    '日本語',
+    '\ud83d', // Paired across an empty delta.
+    '',
+    '\ude00',
+    '\ud800', // Unpaired high surrogate.
+    'a',
+    '\udc00', // Unpaired low surrogate.
+    '🦊',
+  ]) {
     accumulator.accept(event({ type: 'item/delta', payload: { itemId: item.id, kind: 'text', text } }));
     item.text += text;
     expect(accumulator.size).toBe(bytes(item));

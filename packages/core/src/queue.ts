@@ -2,18 +2,18 @@ import { HarnessSdkError } from "./errors";
 
 export interface QueueLimits { maxEvents?: number; maxBytes?: number; maxFrameBytes?: number; maxWaitingWriters?: number; maxControlEvents?: number }
 type Entry<T> = { value: T; bytes: number };
-type Waiter<T> = { reader: symbol; resolve: (value: IteratorResult<T>) => void; reject: (cause: unknown) => void };
+type Waiter<T> = { readerToken: symbol; resolve: (value: IteratorResult<T>) => void; reject: (cause: unknown) => void };
 
 /** A single-active-reader queue. Returning an iterator detaches; it does not cancel its producer. */
 export class BoundedEventQueue<T> implements AsyncIterable<T> {
   private readonly entries: Entry<T>[] = [];
   private bytes = 0;
-  private reader?: symbol;
+  private activeReaderToken?: symbol;
   private waiting?: Waiter<T>;
   private controls: T[] = [];
   private ended = false;
   private failure?: unknown;
-  private writers = new Set<() => void>();
+  private waitingWriterResumes = new Set<() => void>();
   readonly limits: Required<QueueLimits>;
 
   constructor(limits: QueueLimits = {}, private readonly sizeOf: (value: T) => number = (value) => new TextEncoder().encode(JSON.stringify(value)).byteLength) {
@@ -22,8 +22,9 @@ export class BoundedEventQueue<T> implements AsyncIterable<T> {
   }
 
   get bufferedEvents(): number { return this.entries.length + this.controls.length; }
+  /** Bytes occupied by buffered regular events only; excludes control events. */
   get bufferedBytes(): number { return this.bytes; }
-  private wakeWriters(): void { for (const wake of this.writers) wake(); this.writers.clear(); }
+  private resumeWaitingWriters(): void { for (const resume of this.waitingWriterResumes) resume(); this.waitingWriterResumes.clear(); }
   private assertOpen(): void { if (this.ended) throw this.failure ?? new HarnessSdkError("STREAM_CLOSED"); }
   private checkedSize(value: T): number {
     const bytes = this.sizeOf(value);
@@ -44,18 +45,27 @@ export class BoundedEventQueue<T> implements AsyncIterable<T> {
     this.entries.push({ value, bytes }); this.bytes += bytes;
   }
 
-  /** For producers which await the sink. The number of suspended writers is bounded too. */
+  /**
+   * For producers which await the sink. The number of suspended writers is bounded too.
+   * accepted runs synchronously after push succeeds; it does not signal consumption.
+   */
   async write(value: T, accepted?: () => void): Promise<void> {
     const bytes = this.checkedSize(value);
+    // Resuming notifies all waiting writers to recheck capacity; it reserves no slot.
     while (!this.waiting && (this.entries.length >= this.limits.maxEvents || this.bytes + bytes > this.limits.maxBytes)) {
       this.assertOpen();
-      if (this.writers.size >= this.limits.maxWaitingWriters) throw new HarnessSdkError("BACKPRESSURE_EXCEEDED");
-      await new Promise<void>((resolve) => this.writers.add(resolve));
+      if (this.waitingWriterResumes.size >= this.limits.maxWaitingWriters) throw new HarnessSdkError("BACKPRESSURE_EXCEEDED");
+      await new Promise<void>((resolve) => this.waitingWriterResumes.add(resolve));
     }
     this.push(value); accepted?.();
   }
 
-  /** Reserved for a final failure event, even if the regular queue is full. */
+  /**
+   * Adds a control event even when the regular queue is full. Each event still
+   * obeys maxFrameBytes and maxBytes; buffered controls have a separate
+   * maxControlEvents limit and do not contribute to bufferedBytes.
+   * Buffered regular events are delivered before buffered control events.
+   */
   pushControl(value: T): void {
     this.assertOpen(); this.checkedSize(value);
     if (this.waiting) { const waiter = this.waiting; this.waiting = undefined; waiter.resolve({ done: false, value }); }
@@ -68,31 +78,35 @@ export class BoundedEventQueue<T> implements AsyncIterable<T> {
     if (this.ended) return;
     this.pushControl(value); this.end();
   }
+  /** Closes the producer and settles any pending read, retaining reader ownership. */
   end(cause?: unknown): void {
     if (this.ended) return;
-    this.ended = true; this.failure = cause; this.wakeWriters();
+    this.ended = true; this.failure = cause; this.resumeWaitingWriters();
     if (this.waiting) { const waiter = this.waiting; this.waiting = undefined; cause ? waiter.reject(cause) : waiter.resolve({ done: true, value: undefined }); }
   }
 
   [Symbol.asyncIterator](): AsyncIterator<T> {
-    if (this.reader) throw new HarnessSdkError("EVENT_STREAM_ALREADY_OWNED");
-    const reader = Symbol("reader"); this.reader = reader;
+    if (this.activeReaderToken) throw new HarnessSdkError("EVENT_STREAM_ALREADY_OWNED");
+    const readerToken = Symbol("reader");
+    this.activeReaderToken = readerToken;
     let detached = false;
+    // Releases this iterator's ownership and completes its pending read without closing the producer.
     const detach = (): IteratorResult<T> => {
       detached = true;
-      if (this.reader === reader) this.reader = undefined;
-      if (this.waiting?.reader === reader) { const waiter = this.waiting; this.waiting = undefined; waiter.resolve({ done: true, value: undefined }); }
+      if (this.activeReaderToken === readerToken) this.activeReaderToken = undefined;
+      if (this.waiting?.readerToken === readerToken) { const waiter = this.waiting; this.waiting = undefined; waiter.resolve({ done: true, value: undefined }); }
       return { done: true, value: undefined };
     };
     return {
       next: () => {
         if (detached) return Promise.resolve({ done: true, value: undefined });
         const entry = this.entries.shift();
-        if (entry) { this.bytes -= entry.bytes; this.wakeWriters(); return Promise.resolve({ done: false, value: entry.value }); }
+        if (entry) { this.bytes -= entry.bytes; this.resumeWaitingWriters(); return Promise.resolve({ done: false, value: entry.value }); }
         if (this.controls.length) return Promise.resolve({ done: false, value: this.controls.shift()! });
+        // After end, next releases ownership only once both buffers are drained.
         if (this.ended) { detach(); return this.failure ? Promise.reject(this.failure) : Promise.resolve({ done: true, value: undefined }); }
         if (this.waiting) return Promise.reject(new HarnessSdkError("CONCURRENT_EVENT_READ"));
-        return new Promise<IteratorResult<T>>((resolve, reject) => { this.waiting = { reader, resolve, reject }; this.wakeWriters(); });
+        return new Promise<IteratorResult<T>>((resolve, reject) => { this.waiting = { readerToken, resolve, reject }; this.resumeWaitingWriters(); });
       },
       return: async () => detach(),
       throw: async (cause) => { detach(); throw cause; },

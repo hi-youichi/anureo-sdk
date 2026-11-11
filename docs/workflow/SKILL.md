@@ -207,7 +207,9 @@ Actual execution remains subject to backend capacity and limits.
 Choose a workload limit in the host application. A simple approach is to process
 bounded batches; use a shared application scheduler when several workflows must
 share the same capacity limit. Batch boundaries introduce a barrier, so choose
-them deliberately. Neither primitive's array size is a model-concurrency setting.
+them deliberately. For either primitive, the array size determines how many task
+chains the call starts; it does not configure the backend's model-concurrency
+limit, and each chain may start nested work.
 
 All sessions using the same `cwd` can access the same files. Before parallel
 mutations, give each job exclusive file ownership or have the application create

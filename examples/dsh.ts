@@ -66,16 +66,16 @@ try {
   // Consume events before submitting input so the bounded queue never fills up.
   // Only agent messages are the answer; reasoning chunks stream as their own items
   // and stay out of stdout so the demo output is the reply alone.
-  const answerItems = new Set<string>()
-  let streamed = false
-  const stream = (async () => {
+  const answerItemIds = new Set<string>()
+  let hasWrittenAnswerText = false
+  const eventConsumptionTask = (async () => {
     for await (const event of session.events()) {
       if (event.type === 'item/started') {
-        if (event.payload.item.type === 'agentMessage') answerItems.add(event.payload.item.id)
+        if (event.payload.item.type === 'agentMessage') answerItemIds.add(event.payload.item.id)
         if (event.payload.item.type === 'toolCall') process.stdout.write(`\n[tool] ${event.payload.item.title}\n`)
       }
-      if (event.type === 'item/delta' && event.payload.kind === 'text' && event.payload.text && answerItems.has(event.payload.itemId)) {
-        process.stdout.write(event.payload.text); streamed = true
+      if (event.type === 'item/delta' && event.payload.kind === 'text' && event.payload.text && answerItemIds.has(event.payload.itemId)) {
+        process.stdout.write(event.payload.text); hasWrittenAnswerText = true
       }
       if (event.type === 'notice') {
         process.stderr.write(`[${event.payload.severity}] ${event.payload.code}: ${event.payload.message}\n`)
@@ -84,12 +84,14 @@ try {
     }
     throw new Error('Event stream ended without a terminal event')
   })()
-  void stream.catch(() => {})
+  // Event consumption may fail before submit returns, so observe rejection now.
+  // The later await on the original task still propagates its error.
+  void eventConsumptionTask.catch(() => {})
 
   const turn = await session.submit({ input: process.env.ANUREO_DSH_PROMPT ?? 'In one sentence: what are you, and what can you do?' })
-  await stream
+  await eventConsumptionTask
   const result = await turn.result()
-  if (!streamed) process.stdout.write(result.text)
+  if (!hasWrittenAnswerText) process.stdout.write(result.text)
   process.stdout.write(`\n[turn] ${result.status}\n`)
 
   // DSH may report an error as `end_turn`; trust the AHP terminal status, not the stream end.

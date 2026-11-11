@@ -431,7 +431,10 @@ export class ClaudeBackendSession implements BackendSession {
     const index = typeof event.index === "number" ? event.index : 0;
     const id = `${active.streamMessageId ?? active.userUuid}:${index}`;
     if (type === "content_block_start") {
-      const block = record(event.content_block); const item = this.blockItem(block, str(block.id) ?? id, true);
+      const block = record(event.content_block);
+      const blockId = str(block.id) ?? id;
+      const status = this.active?.stoppedTools.get(blockId) ?? "running";
+      const item = this.blockItem(block, blockId, status);
       active.output.set(item.id, item); await this.sink.emit({ type: "item/started", payload: { item } }, { turnId: active.id });
     } else if (type === "content_block_delta") {
       const delta = record(event.delta); const previous = active.output.get(id);
@@ -441,8 +444,7 @@ export class ClaudeBackendSession implements BackendSession {
       await this.sink.emit({ type: "item/delta", payload: { itemId: id, kind: previous.type === "reasoning" ? "reasoningSummary" : "text", text } }, { turnId: active.id });
     }
   }
-  private blockItem(block: Record<string, unknown>, id: string, running: boolean): Item {
-    const status = this.active?.stoppedTools.get(id) ?? (running ? "running" as const : "completed" as const);
+  private blockItem(block: Record<string, unknown>, id: string, status: NonNullable<Item["status"]>): Item {
     if (block.type === "text") return { id, type: "agentMessage", text: str(block.text) ?? "", phase: "commentary", status };
     if (block.type === "thinking") return { id, type: "reasoning", text: str(block.thinking) ?? "", status };
     if (block.type === "tool_use") {
@@ -451,11 +453,29 @@ export class ClaudeBackendSession implements BackendSession {
     }
     return { id, type: "toolCall", kind: "other", title: "Unknown Claude content", nativeType: str(block.type) ?? "unknown", raw: safe(block), status };
   }
+  private resolveCompleteBlockId(block: Record<string, unknown>, messageId: string, active: ActiveTurn): string {
+    const nativeBlockId = str(block.id);
+    if (nativeBlockId) return nativeBlockId;
+
+    // Only text and thinking reuse unfinished stream items, in Map insertion order.
+    const existingStreamItem = [...active.output.values()].find((item) => {
+      if (!item.id.startsWith(`${messageId}:`) || item.status === "completed") return false;
+      if (block.type === "text") return item.type === "agentMessage";
+      if (block.type === "thinking") return item.type === "reasoning";
+      return false;
+    });
+    if (existingStreamItem) return existingStreamItem.id;
+
+    const fallbackId = `${messageId}:${active.blockIndex++}`;
+    return fallbackId;
+  }
   private async completeBlock(block: Record<string, unknown>, messageId: string, subagent: boolean): Promise<void> {
     const active = this.active!;
-    let id = str(block.id);
-    if (!id) id = [...active.output.values()].find((item) => item.id.startsWith(`${messageId}:`) && item.status !== "completed" && (block.type === "text" ? item.type === "agentMessage" : block.type === "thinking" ? item.type === "reasoning" : false))?.id ?? `${messageId}:${active.blockIndex++}`;
-    const previous = active.output.get(id); const item = this.blockItem(block, id, block.type === "text" || block.type === "tool_use");
+    const id = this.resolveCompleteBlockId(block, messageId, active);
+    const previous = active.output.get(id);
+    const running = block.type === "text" || block.type === "tool_use";
+    const status = this.active?.stoppedTools.get(id) ?? (running ? "running" : "completed");
+    const item = this.blockItem(block, id, status);
     if (subagent) item.extensions = { ...(item.extensions ?? {}), nativeParentTool: "subagent" };
     active.output.set(id, item);
     if (!previous) await this.sink.emit({ type: "item/started", payload: { item: { ...item, status: "running" } } }, { turnId: active.id });
@@ -474,8 +494,10 @@ export class ClaudeBackendSession implements BackendSession {
     if (!turnId) return { behavior: "deny", message: "No active AHP turn" };
     const interactionId = details.toolUseID;
     const rawQuestions = Array.isArray(input.questions) ? input.questions.map(record) : [];
-    const questionMode = toolName === "AskUserQuestion" && rawQuestions.length > 0 && rawQuestions.every((question) => typeof question.question === "string");
-    const request: InteractionRequested = questionMode ? { interactionId, kind: "userInput", turnId, itemId: details.toolUseID, questions: rawQuestions.map((question, index) => ({ id: `q${index}`, prompt: str(question.question)!, ...(Array.isArray(question.options) ? { options: question.options.map((option) => ({ id: str(record(option).label) ?? String(option), label: str(record(option).label) ?? String(option) })) } : {}), ...(question.secret === true ? { secret: true } : {}) })) } : { interactionId, kind: "approval", turnId, itemId: details.toolUseID, title: details.title ?? toolName, input: safe(input), options: [{ id: "allow-once", label: "Allow once", semantic: "allowOnce" }, ...(details.suggestions?.some((entry) => entry.destination === "session") ? [{ id: "allow-session", label: "Allow for this session", semantic: "allowSession" as const }] : []), { id: "deny", label: "Deny", semantic: "deny" }] };
+    const isUserQuestionRequest = toolName === "AskUserQuestion" && rawQuestions.length > 0 && rawQuestions.every((question) => typeof question.question === "string");
+    const request = isUserQuestionRequest
+      ? this.createUserQuestionRequest(interactionId, turnId, details.toolUseID, rawQuestions)
+      : this.createToolApprovalRequest(interactionId, turnId, toolName, input, details);
     return new Promise<PermissionResult>((resolve) => {
       let answered = false; const finish = (result: PermissionResult) => { if (!answered) { answered = true; details.signal.removeEventListener("abort", abort); resolve(result); } };
       const abort = () => { void this.sink.resolveInteraction({ interactionId, outcome: "expired", reason: "native_cancelled" }); finish({ behavior: "deny", message: "Request cancelled" }); };
@@ -492,10 +514,58 @@ export class ClaudeBackendSession implements BackendSession {
         }
         if (!answer) finish({ behavior: "deny", message: "Request cancelled" });
         else if (answer.kind === "approval") finish(answer.optionId === "deny" ? { behavior: "deny", message: "User denied tool execution" } : { behavior: "allow", updatedInput: input, ...(answer.optionId === "allow-session" ? { updatedPermissions: details.suggestions?.filter((entry) => entry.destination === "session") } : {}) });
-        else if (answer.kind === "userInput") finish({ behavior: "allow", updatedInput: { ...input, answers: Object.fromEntries(rawQuestions.map((question, index) => [str(question.question)!, answer.answers[`q${index}`]])) } });
+        else if (answer.kind === "userInput") finish({
+          behavior: "allow",
+          updatedInput: {
+            ...input,
+            answers: Object.fromEntries(rawQuestions.map((question, index) => [
+              str(question.question)!, answer.answers[`q${index}`],
+            ])),
+          },
+        });
         else finish({ behavior: "deny", message: "Invalid response" });
       }).catch(() => finish({ behavior: "deny", message: "Interaction unavailable" }));
     });
+  }
+  private createUserQuestionRequest(interactionId: string, turnId: string, itemId: string, rawQuestions: Record<string, unknown>[]): InteractionRequested {
+    return {
+      interactionId,
+      kind: "userInput",
+      turnId,
+      itemId,
+      questions: rawQuestions.map((question, index) => ({
+        // Answers above use the same zero-based qN IDs to recover the native question text.
+        id: `q${index}`,
+        prompt: str(question.question)!,
+        ...(Array.isArray(question.options) ? {
+          options: question.options.map((option) => ({
+            id: str(record(option).label) ?? String(option),
+            label: str(record(option).label) ?? String(option),
+          })),
+        } : {}),
+        ...(question.secret === true ? { secret: true } : {}),
+      })),
+    };
+  }
+  private createToolApprovalRequest(
+    interactionId: string, turnId: string, toolName: string, input: Record<string, unknown>,
+    details: Parameters<NonNullable<Options["canUseTool"]>>[2],
+  ): InteractionRequested {
+    return {
+      interactionId,
+      kind: "approval",
+      turnId,
+      itemId: details.toolUseID,
+      title: details.title ?? toolName,
+      input: safe(input),
+      options: [
+        { id: "allow-once", label: "Allow once", semantic: "allowOnce" },
+        ...(details.suggestions?.some((entry) => entry.destination === "session") ? [
+          { id: "allow-session", label: "Allow for this session", semantic: "allowSession" as const },
+        ] : []),
+        { id: "deny", label: "Deny", semantic: "deny" },
+      ],
+    };
   }
   private async elicitationRequest(request: Parameters<NonNullable<Options["onElicitation"]>>[0], details: Parameters<NonNullable<Options["onElicitation"]>>[1]): Promise<Awaited<ReturnType<NonNullable<Options["onElicitation"]>>>> {
     const interactionId = details.requestId;
@@ -570,12 +640,33 @@ export class ClaudeBackendSession implements BackendSession {
         const patch = (params as AhpRequestMap["session/config/set"]).patch;
         this.configOperations++;
         try {
-          if (patch.model !== undefined) { if (typeof patch.model !== "string") throw new HarnessSdkError("INVALID_PARAMS"); await this.query!.setModel(patch.model); this.model = patch.model; }
-          if (patch.permissionMode !== undefined) await this.query!.setPermissionMode(permission(patch.permissionMode));
-          if (patch.fastMode !== undefined) { if (typeof patch.fastMode !== "boolean") throw new HarnessSdkError("INVALID_PARAMS"); await this.query!.applyFlagSettings({ fastMode: patch.fastMode }); }
-          if (patch.effort !== undefined) { if (patch.effort !== null && !isEffort(patch.effort)) throw new HarnessSdkError("INVALID_PARAMS"); await this.query!.applyFlagSettings({ effortLevel: patch.effort }); }
-          if (patch.maxThinkingTokens !== undefined) { if (patch.maxThinkingTokens !== null && typeof patch.maxThinkingTokens !== "number") throw new HarnessSdkError("INVALID_PARAMS"); await this.query!.setMaxThinkingTokens(patch.maxThinkingTokens); }
-          this.config = { ...this.config, ...patch }; this.capabilityRevision++; result = this.snapshot(); await this.sink.emit({ type: "session/state", payload: result });
+          // Apply settings sequentially without rollback on failure. Model changes
+          // take effect immediately; commit the config snapshot only after all settings succeed.
+          if (patch.model !== undefined) {
+            if (typeof patch.model !== "string") throw new HarnessSdkError("INVALID_PARAMS");
+            await this.query!.setModel(patch.model);
+            this.model = patch.model;
+          }
+          if (patch.permissionMode !== undefined) {
+            await this.query!.setPermissionMode(permission(patch.permissionMode));
+          }
+          if (patch.fastMode !== undefined) {
+            if (typeof patch.fastMode !== "boolean") throw new HarnessSdkError("INVALID_PARAMS");
+            await this.query!.applyFlagSettings({ fastMode: patch.fastMode });
+          }
+          if (patch.effort !== undefined) {
+            if (patch.effort !== null && !isEffort(patch.effort)) throw new HarnessSdkError("INVALID_PARAMS");
+            await this.query!.applyFlagSettings({ effortLevel: patch.effort });
+          }
+          if (patch.maxThinkingTokens !== undefined) {
+            if (patch.maxThinkingTokens !== null && typeof patch.maxThinkingTokens !== "number") throw new HarnessSdkError("INVALID_PARAMS");
+            await this.query!.setMaxThinkingTokens(patch.maxThinkingTokens);
+          }
+
+          this.config = { ...this.config, ...patch };
+          this.capabilityRevision++;
+          result = this.snapshot();
+          await this.sink.emit({ type: "session/state", payload: result });
         } catch (cause) { throw sdkError(cause, "CLAUDE_CONFIG_FAILED", true); }
         finally { this.configOperations--; }
         break;
@@ -706,7 +797,10 @@ export class ClaudeBackendSession implements BackendSession {
           }
           const apiMessageId = str(record(message.message).id); const blockIndex = apiMessageId ? blockCounts.get(apiMessageId) ?? 0 : index;
           if (apiMessageId) blockCounts.set(apiMessageId, blockIndex + 1);
-          const item = this.blockItem(block, str(block.id) ?? `${apiMessageId ?? message.uuid}:${blockIndex}`, block.type === "tool_use");
+          const id = str(block.id) ?? `${apiMessageId ?? message.uuid}:${blockIndex}`;
+          const running = block.type === "tool_use";
+          const status = this.active?.stoppedTools.get(id) ?? (running ? "running" : "completed");
+          const item = this.blockItem(block, id, status);
           if (block.type === "tool_use") delete item.status;
           items.push({ turnId: currentTurn, ...(currentNativeTurn ? { nativeTurnId: currentNativeTurn } : {}), nativeItemId: message.uuid, item });
         }

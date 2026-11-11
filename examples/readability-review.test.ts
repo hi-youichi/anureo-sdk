@@ -26,19 +26,35 @@ async function fixture(files: Record<string, string | Uint8Array>) {
   return cwd
 }
 
-type Input = {
-  task: string
+type FileReviewInput = {
+  task: 'file-review'
   path: string
   kind: string
   source: string
+}
+
+type PackageReviewInput = {
+  task: 'package-review'
   input: {
     package: { path: string }
     files: Array<{ path: string; findingIds: string[] }>
-    packages: Array<{ result: { ok: boolean; value?: { actions: Array<{ findingIds: string[] }> } } }>
   }
 }
 
-async function backend(options: { invalidEvidence?: boolean; invalidSummary?: boolean; changeSource?: string } = {}) {
+type ProjectReviewInput = {
+  task: 'project-review'
+  input: {
+    packages: Array<{
+      result:
+        | { ok: true; value: { actions: Array<{ findingIds: string[] }> } }
+        | { ok: false; error: string }
+    }>
+  }
+}
+
+type Input = FileReviewInput | PackageReviewInput | ProjectReviewInput
+
+async function backend(options: { invalidEvidence?: boolean; invalidFindingReferences?: boolean; changeSource?: string } = {}) {
   const calls: Input[] = []
   const completedFiles = new Set<string>()
   const completedPackages = new Set<string>()
@@ -74,12 +90,12 @@ async function backend(options: { invalidEvidence?: boolean; invalidSummary?: bo
         }
         const ids = input.task === 'package-review'
           ? input.input.files.flatMap(file => file.findingIds)
-          : input.input.packages.flatMap(pkg => pkg.result.ok ? pkg.result.value!.actions.flatMap(action => action.findingIds) : [])
+          : input.input.packages.flatMap(pkg => pkg.result.ok ? pkg.result.value.actions.flatMap(action => action.findingIds) : [])
         output = {
           summary: '优先改善名称，保持行为。', disagreements: [],
-          actions: ids.length || options.invalidSummary ? [{
+          actions: ids.length || options.invalidFindingReferences ? [{
             priority: 'low', title: '改善命名', rationale: '降低理解成本。', proposal: '先局部重命名，再验证。',
-            findingIds: options.invalidSummary ? ['missing.ts#99'] : ids,
+            findingIds: options.invalidFindingReferences ? ['missing.ts#99'] : ids,
           }] : [],
         }
         if (input.task === 'package-review') completedPackages.add(input.input.package.path)
@@ -154,7 +170,7 @@ test('invalid evidence remains a coverage gap and does not stop package or proje
 
 test('source changes and invented synthesis references cannot produce a complete report', async () => {
   const cwd = await fixture({ 'changing.ts': 'export const x = 1\n' })
-  const harness = await backend({ changeSource: cwd, invalidSummary: true })
+  const harness = await backend({ changeSource: cwd, invalidFindingReferences: true })
   const report = await reviewProject({ ...harness, cwd, packages: await discoverPackages(cwd), outputDir: join(cwd, 'out'), concurrency: 1 })
   expect(report.complete).toBe(false)
   expect(report.packages[0]!.files[0]!.result).toMatchObject({ ok: false, error: expect.stringContaining('Source changed') })

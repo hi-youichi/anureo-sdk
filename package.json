@@ -23,6 +23,7 @@
     "example:workflow": "bun examples/workflow.ts",
     "example:workflow-schema": "bun examples/workflow-structured.ts",
     "review:readability": "bun examples/readability-review.ts",
+    "fix:readability": "bun examples/readability-fix.ts",
     "example:schema": "bun examples/structured-output.ts"
   },
   "devDependencies": {

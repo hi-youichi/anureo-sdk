@@ -46,7 +46,12 @@ test('Claude nominal success without native structured_output never falls back t
   }
 }, 15_000)
 
-for (const scenario of ['workflow-schema', 'auth-expired']) test(`Zod agent crosses Codex native process: ${scenario}`, async () => {
+const codexCases = [
+  { scenario: 'workflow-schema', expected: { answer: 42 }, description: 'returns a successful structured result' },
+  { scenario: 'auth-expired', expected: null, description: 'returns null when authentication expires' },
+] as const
+
+for (const { scenario, expected, description } of codexCases) test(`Zod agent crosses Codex native process: ${description}`, async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'anureo-workflow-codex-'))
   const log = join(cwd, 'requests.jsonl')
   const client = await createClient({ adapter: createCodexAdapter({ command: process.execPath,
@@ -55,7 +60,7 @@ for (const scenario of ['workflow-schema', 'auth-expired']) test(`Zod agent cros
   }), identity: { adapterId: 'codex', runtimeConfigId: scenario } })
   try {
     const value = await agent('answer', { client, cwd, schema: z.object({ answer: z.literal(42) }) })
-    expect(value).toEqual(scenario === 'workflow-schema' ? { answer: 42 } : null)
+    expect(value).toEqual(expected)
     const starts = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line)).filter(frame => frame.method === 'turn/start')
     expect(starts).toHaveLength(1)
     expect(starts[0].params.outputSchema).toMatchObject({ type: 'object', properties: { answer: { const: 42 } } })

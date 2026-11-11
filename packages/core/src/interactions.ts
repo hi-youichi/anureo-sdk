@@ -6,7 +6,8 @@ import type { NativeInteractionResponder } from "./ports";
 interface RecordState {
   request: InteractionRequested;
   responder: NativeInteractionResponder;
-  state: "pending" | "responding" | "resolved";
+  // Settling covers native calls for both a response and a cancellation notification.
+  state: "pending" | "settling" | "resolved";
   timer: ReturnType<typeof setTimeout>;
   resolve: (response: InteractionResponse) => void;
   reject: (cause: unknown) => void;
@@ -49,17 +50,26 @@ export class InteractionRegistry {
     const fingerprint = createHash("sha256").update(JSON.stringify(response)).digest("hex");
     if (record.responseRequestId === requestId && record.responseFingerprint === fingerprint && record.responseOperation) return record.responseOperation;
     if (record.state !== "pending") throw new HarnessSdkError("INTERACTION_ALREADY_RESOLVED");
-    record.state = "responding"; record.responseRequestId = requestId; record.responseFingerprint = fingerprint; clearTimeout(record.timer);
+    record.state = "settling"; record.responseRequestId = requestId; record.responseFingerprint = fingerprint; clearTimeout(record.timer);
     record.responseOperation = (async () => {
       try {
         await waitForRequest(() => record.responder(response), { timeoutMs: this.limits.responseTimeoutMs ?? 30_000 });
         if (record.state === "resolved") throw new HarnessSdkError("RESULT_UNKNOWN", "Interaction ended while response was in flight", false, true);
         const result: InteractionResult = { interactionId: id, outcome: "responded" };
-        record.state = "resolved"; await this.publish(result); record.resolve(response); return result;
+        // Mark the interaction no longer actionable before publishing or settling the waiter.
+        record.state = "resolved";
+        await this.publish(result);
+        record.resolve(response);
+        return result;
       } catch (cause) {
+        // This also catches publication failures, not just responder failures.
         const error = sdkError(cause, "RESULT_UNKNOWN", true);
-        if (record.state !== "resolved") { record.state = "resolved"; await this.publish({ interactionId: id, outcome: "unknown", reason: error.code }); }
-        record.reject(error); throw error;
+        if (record.state !== "resolved") {
+          record.state = "resolved";
+          await this.publish({ interactionId: id, outcome: "unknown", reason: error.code });
+        }
+        record.reject(error);
+        throw error;
       }
     })();
     return record.responseOperation;
@@ -68,14 +78,15 @@ export class InteractionRegistry {
     const record = this.records.get(id);
     if (!record) throw new HarnessSdkError("INTERACTION_EXPIRED");
     if (record.state === "resolved") throw new HarnessSdkError("INTERACTION_ALREADY_RESOLVED");
-    if (record.state === "responding") {
+    if (record.state === "settling") {
+      // Only the literal "cancelled" refuses to end an in-flight operation; other reasons mark its result unknown.
       if (reason === "cancelled") throw new HarnessSdkError("INTERACTION_ALREADY_RESOLVED");
       record.state = "resolved"; clearTimeout(record.timer);
       const result: InteractionResult = { interactionId: id, outcome: "unknown", reason };
       try { await this.publish(result); } finally { record.reject(new HarnessSdkError("RESULT_UNKNOWN", "Interaction ended while response was in flight", false, true)); }
       return result;
     }
-    record.state = "responding"; clearTimeout(record.timer);
+    record.state = "settling"; clearTimeout(record.timer);
     try { await waitForRequest(() => record.responder(null, reason), { timeoutMs: this.limits.responseTimeoutMs ?? 30_000 }); }
     catch { outcome = "unknown"; }
     record.state = "resolved";

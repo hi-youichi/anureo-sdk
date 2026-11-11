@@ -4,6 +4,19 @@ import path from 'node:path'
 import { createClient } from '@anureo/sdk'
 import { createCodexAdapter } from '../src'
 
+type SmokeResult = {
+  status: 'passed'
+  version: string
+  isolatedState: true
+} & (
+  | {
+    scope: 'offline-version-handshake-open-close'
+    authenticatedTurn: false
+    reconciliationStopped?: boolean
+  }
+  | { scope: 'authenticated-turn' }
+)
+
 const offline = process.argv.includes('--offline')
 if (!offline && process.env.COWORK_HX_CODEX_SMOKE !== '1') {
   console.log(JSON.stringify({ status: 'skipped', reason: 'Set COWORK_HX_CODEX_SMOKE=1 and explicit executable/home for a real authenticated turn; skipped is not acceptance evidence' }))
@@ -23,11 +36,12 @@ const client = await createClient({adapter,identity:{adapterId:'codex',runtimeCo
 try {
   const initialized = await adapter.initialize({ protocolVersions: [1], protocolContract: 'native-lifecycle', clientInfo: { name: 'anureo-harness-smoke', version: '0.1.0' }, clientCapabilities: { interactions: ['approval'] } })
   const session = await client.sessions.create({cwd:temporary,permissionMode:'never'})
-  let result: Record<string, unknown>
+  let result: SmokeResult
   if (offline) {
     result = { status: 'passed', scope: 'offline-version-handshake-open-close', version: initialized.runtime.version, isolatedState: true, authenticatedTurn: false }
   } else {
-    const collection = (async () => {
+    // Start listening before submit to cancel interactions and await turn/completed.
+    const nativeTurnCompletion = (async () => {
       for await (const event of session.events()) {
         // This smoke never grants command/file execution automatically.
         if (event.type === 'interaction/requested') await session.request('interaction/cancel', { requestId: `cancel:${event.payload.interactionId}`, sessionId: session.binding.sessionId, interactionId: event.payload.interactionId, reason: 'smoke_non_authorizing' })
@@ -37,11 +51,11 @@ try {
     })()
     const turn = await session.submit({input:'Reply with the single word OK. Do not run tools or change files.'})
     await turn.result()
-    const terminal = await collection
-    if (terminal.status !== 'completed') throw new Error(`Native turn ended with ${terminal.status}`)
+    const nativeTurnOutcome = await nativeTurnCompletion
+    if (nativeTurnOutcome.status !== 'completed') throw new Error(`Native turn ended with ${nativeTurnOutcome.status}`)
     result = { status: 'passed', scope: 'authenticated-turn', version: initialized.runtime.version, isolatedState: true }
   }
   await session.close()
-  if(offline) result.reconciliationStopped = (await adapter.inspectExecution(session.binding, 'no-authenticated-turn')).stopped
+  if (result.scope === 'offline-version-handshake-open-close') result.reconciliationStopped = (await adapter.inspectExecution(session.binding, 'no-authenticated-turn')).stopped
   console.log(JSON.stringify(result))
 } finally { await client.dispose(); await rm(temporary, { recursive: true, force: true }) }

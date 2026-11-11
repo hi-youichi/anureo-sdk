@@ -6,8 +6,11 @@ Adapter connecting the Anureo SDK to the [Codex](https://github.com/openai/codex
 
 ## Usage
 
-This shows the revised workspace API, not the published 0.2.0 API. Root migration and local
-validation are complete.
+This shows the revised workspace API, not the published 0.2.0 API. The lifecycle
+revision updates AHP v1 and package root entries in place. The root implementation
+and tests use the revised lifecycle; parallel versioned entries have been removed.
+Root migration and local validation are complete, including passing local
+conformance and clean-install checks.
 
 ```typescript
 import { createClient } from '@anureo/sdk'
@@ -28,7 +31,7 @@ The adapter probes the binary's version during initialization (or trusts an expl
 
 ## Version profiles
 
-Codex's native protocol changes between releases. The adapter selects the newest profile the reported version reaches:
+Codex's native protocol changes between releases. The adapter selects the newest profile whose minimum version is no higher than the reported version. Below `0.148.0`, nothing is known about the native schema: only the safe baseline capability set is published.
 
 | Profile since | Native methods used |
 |---|---|
@@ -36,8 +39,7 @@ Codex's native protocol changes between releases. The adapter selects the newest
 | `0.164.0` | `thread/turns/list`, `thread/revert(beforeTurnId)`, paged `thread/items/list`, live `thread/settings/update` |
 
 - Versions `0.148.0` and `0.164.0` are **verified** against the pinned native schemas in [`protocol/`](protocol/) — `bun run protocol:check` (also wired as the workspace-level `protocol:check`) validates their hashes and provenance on every run.
-- Any other version runs on the nearest profile but is reported as unverified; optional native methods that the runtime rejects as method-not-found are closed at call time, not guessed from the version number.
-- Below `0.148.0` nothing is known about the native schema: only the safe baseline capability set is published.
+- Any other version is reported as unverified; optional native methods that the runtime rejects as method-not-found are closed at call time, not guessed from the version number.
 
 Use `resolveCodexProfile(version)` and `codexCapabilities(version)` to inspect the mapping without spawning a process.
 
@@ -73,11 +75,10 @@ bun run smoke            # optional live smoke against a local binary
 
 ## AHP v1 lifecycle revision
 
-The lifecycle design updates AHP v1 and package root entries in place.
-The root implementation and tests use the revised lifecycle; parallel versioned
-entries have been removed. Local conformance and clean-install checks have passed. Preserve native expectedTurnId validation for exact steering; do not treat an input receipt as proof of a new execution.
-See the [design and implementation plan](../../docs/native-harness-lifecycle.md).
-
 Use `await turn.steer({ input })` before `await turn.result()` for exact guidance.
-The adapter maps the target to native expectedTurnId; a stale target rejects.
+The adapter maps the target to native `expectedTurnId`, preserving native target
+validation; a stale target rejects. An input receipt alone does not prove that a
+new execution has started or completed.
+
+See the [design and implementation plan](../../draft/docs/native-harness-lifecycle.md).
 See the [complete example](../../README.md#usage-example).
