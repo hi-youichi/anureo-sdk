@@ -26,7 +26,8 @@ marked **BREAKING**.
 
 - Code-review repair reports expose `changesKnown`; uncertain native outcomes no
   longer display an empty change set as no changes. Keep bare-package import
-  navigation candidates inside their package roots.
+  navigation candidates inside their package roots. Retain operation and cleanup
+  causes together in CLI diagnostics.
 
 - Add `@anureo/adapter-pi`, an in-process adapter for the Pi coding agent
   (`@earendil-works/pi-coding-agent`, verified against 1.5.2). Supports submit,

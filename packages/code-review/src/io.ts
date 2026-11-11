@@ -74,5 +74,17 @@ export async function saveJson(path: string, value: unknown) {
   } catch { throw new HarnessSdkError('WORKFLOW_STORAGE_FAILED') }
 }
 export function errorText(error: unknown): string {
-  return error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+  const messages: string[] = [], pending: unknown[] = [error]
+  const seen = new Set<Error>()
+  while (pending.length) {
+    const current = pending.pop()
+    if (!(current instanceof Error)) { messages.push(String(current)); continue }
+    if (seen.has(current)) { messages.push('[Repeated error]'); continue }
+    seen.add(current)
+    messages.push(`${current.name}: ${current.message}`)
+    if (current instanceof AggregateError) {
+      for (let i = current.errors.length - 1; i >= 0; i--) pending.push(current.errors[i])
+    }
+  }
+  return messages.join('; ')
 }

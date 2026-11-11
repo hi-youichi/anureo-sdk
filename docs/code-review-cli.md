@@ -254,7 +254,8 @@ correct. Real-model quality acceptance remains unfinished.
 
 Exit status is `0` for a complete review, `1` for an error or coverage gap, and
 `130` for a handled interrupt. Findings and pending risks do not themselves make
-the exit status nonzero. An interrupt stops queued calls and releases observation
+the exit status nonzero. When operation and resource cleanup both fail, stderr retains the aggregate
+message and each underlying error. An interrupt stops queued calls and releases observation
 resources; it does not prove that a remote operation was cancelled.
 
 ## Apply readability suggestions
