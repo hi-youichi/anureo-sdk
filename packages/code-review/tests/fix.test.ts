@@ -1,7 +1,7 @@
 import { cleanupFixtures } from './fixtures/cleanup'
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID, createHash } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createClient, HarnessSdkError, type Client } from '@anureo/sdk'
@@ -227,4 +227,46 @@ test('a stop requested during file preparation prevents session dispatch and per
   expect(report.results[0]!.status).toBe('not_started')
   expect(JSON.parse(await readFile(join(cwd, 'out/results.json'), 'utf8')).results[0].status).toBe('not_started')
   expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('original\n')
+})
+
+test('fix CLI waits for Client cleanup and records its failure before publishing completion', async () => {
+  const cwd = await fixture(['a.ts'])
+  const taskId = 'module:a:angle:D12'
+  const source = { id: 'snapshot:fixture', path: 'a.ts', sha256: finding('a.ts').sha256, kind: 'text', source: '1: original' }
+  const candidate = { ...reviewCandidate('D12', [source]), category: 'readability' as const, decision: 'local_refactor' as const, id: `${taskId}#1`, taskId }
+  const verification = defaultOutput({ task: 'design-verification', findings: [candidate] }) as { decisions: object[] }
+  const report = { reportKind: 'design-review', formatVersion: 2, cwd, changedPaths: [],
+    findings: [{ ...candidate, stale: false, canonicalId: candidate.id, review: verification.decisions[0] }],
+    tasks: [{ task: { id: taskId, level: 'module', primaryFiles: ['a.ts'], dimensions: ['D12'] },
+      status: 'completed', error: null, analysis: { summary: 'fixture', designContext: [] } }],
+  }
+  const reportPath = join(cwd, 'input.json')
+  await writeFile(reportPath, JSON.stringify(report))
+  for (const [cleanupFails, publishFails] of [[true, false], [false, false], [true, true]] as const) {
+    const outputDir = join(cwd, `out-${cleanupFails}-${publishFails}`)
+    const disposals = join(cwd, `disposals-${cleanupFails}-${publishFails}.json`)
+    const entry = fileURLToPath(new URL('./fixtures/fix-cleanup.ts', import.meta.url))
+    const child = Bun.spawn([process.execPath, entry, 'fix', cwd, '--report', reportPath, '--output', outputDir, '--format', 'json'], {
+      cwd, env: { ...process.env, FIX_REPORT: join(outputDir, 'report.json'), FIX_DISPOSALS: disposals, FIX_CLEANUP_FAIL: cleanupFails ? '1' : '0', FIX_PUBLISH_BLOCK: publishFails ? join(outputDir, 'report.md') : '' }, stdout: 'pipe', stderr: 'pipe',
+    })
+    const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
+    expect(code).toBe(cleanupFails ? 1 : 0)
+    expect(JSON.parse(await readFile(disposals, 'utf8'))).toEqual({ disposals: 1, reportExisted: false })
+    const saved = JSON.parse(await readFile(join(outputDir, 'report.json'), 'utf8'))
+    expect(saved.complete).toBe(!cleanupFails)
+    expect(saved.results[0].status).toBe('already_satisfied')
+    if (cleanupFails) expect(saved.errors.join(' ')).toContain('fixture client cleanup failure')
+    else expect(saved.errors).toEqual([])
+    if (publishFails) {
+      expect(stdout).toBe('')
+      expect(stderr).toContain('EISDIR')
+    } else {
+      expect(JSON.parse(stdout).complete).toBe(!cleanupFails)
+      expect(await readFile(join(outputDir, 'report.md'), 'utf8')).toContain(cleanupFails ? '本次修复未完整结束' : '选定局部建议已处理')
+    }
+    if (cleanupFails) expect(stderr).toContain('fixture client cleanup failure')
+    else expect(stderr).not.toContain('fixture client cleanup failure')
+    expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('original\n')
+    await expect(access(join(outputDir, 'writer.lock'))).rejects.toMatchObject({ code: 'ENOENT' })
+  }
 })

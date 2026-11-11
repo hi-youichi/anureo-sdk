@@ -347,9 +347,11 @@ constitute a filesystem sandbox for the model's tools.
 
 The repair host does not run tests, generation or project commands. Model
 instructions also prohibit them; changes that require generation or a larger
-write scope are deferred. Completion means the suggestions were handled with
-recorded static checks, not that tests passed or that the resulting program is
-proven correct. `--dry-run` reads the report and eligible target hashes and prints the
+write scope are deferred. Completion requires selected suggestions to be handled and Client cleanup to
+succeed. Per-finding outcomes remain available when cleanup fails. Final reports
+are published after Client cleanup settles, with lifecycle failures in `errors`;
+publication failures also propagate to the CLI. Checks record static review;
+project tests and runtime correctness require separate verification. `--dry-run` reads the report and eligible target hashes and prints the
 plan, including skipped reasons; it starts no backend and edits no source. Repair artifacts include the plan,
 per-finding records, results and JSON/Markdown reports.
 

@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { chooseOutput, progress, withClient, withOutputClaim } from './cli-shared'
 import { fileHash, fixReadability, parseReport, writeOwnership } from './fix'
-import { createGate, saveJson } from './io'
+import { createGate, errorText, saveJson } from './io'
 import { readDesignConfig } from './project'
 
 const help = `Usage: anureo-review fix [project] --report <report.json> [options]
@@ -59,23 +59,43 @@ export async function fixMain(args: string[]) {
   if (values['dry-run']) { console.log(JSON.stringify(plan, null, 2)); return }
   if (driftedFiles.length) throw new Error(`Report source changed before repair: ${driftedFiles.join(', ')}`)
   if (!findings.length) throw new Error('No eligible local readability findings; use --dry-run to inspect skipped findings')
-  await withOutputClaim(outputDir, () => withClient(cwd, maxOutputBytes, true, async (client, shouldStop) => {
-    const result = await fixReadability({ client, cwd, findings, writeGroups, outputDir, concurrency, shouldStop, progress,
-      model: values.model ?? process.env.ANUREO_REVIEW_MODEL,
-    })
-    const complete = !shouldStop() && !result.stopReason && result.results.every(item => ['changed', 'already_satisfied'].includes(item.status))
-    const report = { ...result, ...plan, complete, validation: 'Static review only; no tests or project commands were run by the host.' }
-    const markdown = ['# 可读性修复结果', '', `完成状态：${complete ? '选定局部建议已处理' : '存在未完成的局部建议'}；跳过 ${skipped.length} 条其他发现。`,
+  await withOutputClaim(outputDir, async () => {
+    let result: Awaited<ReturnType<typeof fixReadability>> | undefined
+    let stopped = () => false
+    let failed = false
+    let failure: unknown
+    try {
+      await withClient(cwd, maxOutputBytes, true, async (client, shouldStop) => {
+        stopped = shouldStop
+        result = await fixReadability({ client, cwd, findings, writeGroups, outputDir, concurrency, shouldStop, progress,
+          model: values.model ?? process.env.ANUREO_REVIEW_MODEL,
+        })
+      })
+    } catch (error) { failed = true; failure = error }
+    if (!result) {
+      if (failed) throw failure
+      throw new Error('Repair finished without a result')
+    }
+    const complete = !failed && !stopped() && !result.stopReason && result.results.every(item => ['changed', 'already_satisfied'].includes(item.status))
+    const report = { ...result, ...plan, complete, errors: failed ? [errorText(failure)] : [], validation: 'Static review only; no tests or project commands were run by the host.' }
+    const markdown = ['# 可读性修复结果', '', `完成状态：${complete ? '选定局部建议已处理' : '本次修复未完整结束'}；跳过 ${skipped.length} 条其他发现。`,
       '仅记录源码修改与静态核对；未执行测试或项目命令。', '',
       ...result.results.flatMap(item => [`## ${item.id}`, '', `状态：${item.status}。${item.summary}`,
         `修改文件：${item.changesKnown ? item.changedFiles.join('、') || '无' : `未知；已观察到的修改：${item.changedFiles.join('、') || '未确认'}`}`, ...item.checks.map(check => `- ${check}`), '']),
       '## 未进入本次修复的发现', '', ...skipped.map(item => `- ${item.id}：${item.reason}`), '',
       '## 原审查覆盖缺口', '', ...coverageGaps.map(gap => `- ${gap}`), '',
+      ...report.errors.flatMap(error => ['## 运行错误', '', error, '']),
     ].join('\n')
-    await saveJson(join(outputDir, 'report.json'), report)
-    await writeFile(join(outputDir, 'report.md'), `${markdown}\n`)
-    console.error(`Artifacts: ${outputDir}`)
-    process.stdout.write(values.format === 'json' ? `${JSON.stringify(report, null, 2)}\n` : `${markdown}\n`)
-    if (!shouldStop() && !complete) process.exitCode = 1
-  }))
+    try {
+      await saveJson(join(outputDir, 'report.json'), report)
+      await writeFile(join(outputDir, 'report.md'), `${markdown}\n`)
+      console.error(`Artifacts: ${outputDir}`)
+      process.stdout.write(values.format === 'json' ? `${JSON.stringify(report, null, 2)}\n` : `${markdown}\n`)
+    } catch (error) {
+      if (failed) throw new AggregateError([failure, error], 'Client cleanup and report publication failed')
+      throw error
+    }
+    if (failed) throw failure
+    if (!stopped() && !complete) process.exitCode = 1
+  })
 }

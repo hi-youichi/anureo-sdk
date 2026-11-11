@@ -8,6 +8,9 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- Publish readability repair reports after Client cleanup; retain successful findings
+  alongside lifecycle failures and preserve report publication errors.
+
 - Identify changed resume configuration in review progress without restoring old defaults.
 
 - Retain structured call failure certainty, stop repair dispatch after interrupted
