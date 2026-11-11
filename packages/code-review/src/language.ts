@@ -7,7 +7,11 @@ export type SourceSymbol = { name: string; startLine: number; endLine: number; c
 export type SourceIndex = {
   path: string; language: string; adapter: string; capabilities: Array<'symbols' | 'imports' | 'static_calls'>
   symbols: SourceSymbol[]; imports: Array<{ specifier: string; target: string | null }>
-  exports: string[]; calls: Array<{ expression: string; line: number; target: { path: string; line: number } | null }>
+  exports: string[]; calls: Array<{
+    expression: string; line: number; target: { path: string; line: number } | null
+    /** Zero-based UTF-16 offsets into the complete source snapshot, with an exclusive end. */
+    sourceRange?: { start: number; end: number }; expressionTruncated?: boolean
+  }>
   unknowns: string[]
 }
 /** Adapters supply navigation, never design judgements or runtime guarantees. IDs must version their semantics. */
@@ -25,7 +29,7 @@ const languages: Record<string, string> = {
   '.vue': 'vue', '.svelte': 'svelte', '.lua': 'lua', '.dart': 'dart', '.r': 'r',
 }
 const typescript: LanguageAdapter = {
-  id: 'typescript-compiler-v1', supports: source => /\.[cm]?[jt]sx?$/i.test(source.path), index: indexTypeScript,
+  id: 'typescript-compiler-v2', supports: source => /\.[cm]?[jt]sx?$/i.test(source.path), index: indexTypeScript,
 }
 
 /** Every text file remains reviewable, including extensionless code and an unknown DSL. */

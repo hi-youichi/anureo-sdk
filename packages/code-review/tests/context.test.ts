@@ -234,3 +234,23 @@ test('a rejected supplemental batch drains reads without registering partial sna
   await new Promise<void>(resolve => setImmediate(resolve))
   expect([...context.snapshots.keys()]).toEqual(before)
 })
+
+test('long call-chain navigation stays bounded and preserves exact source locations', async () => {
+  const text = `const emoji = "😀"; const result = client${'.next()'.repeat(140)}\n`
+  const cwd = await fixture({ 'chain.ts': text })
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  const calls = context.index.find(item => item.path === 'chain.ts')!.calls
+  expect(calls).toHaveLength(140)
+  expect(calls.every(call => call.expression.length <= 513)).toBe(true)
+  expect(calls.some(call => call.expressionTruncated)).toBe(true)
+  for (const call of calls) {
+    const range = call.sourceRange!
+    const original = text.slice(range.start, range.end)
+    expect(original.startsWith('client')).toBe(true)
+    if (call.expressionTruncated) expect(call.expression).toBe(`${original.slice(0, 512)}…`)
+    else expect(call.expression).toBe(original)
+    expect(call.line).toBe(1)
+    expect(call.target).toBeNull()
+  }
+  expect(context.index[0]!.unknowns.join(' ')).toContain('truncated')
+})

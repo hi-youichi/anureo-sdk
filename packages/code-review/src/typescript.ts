@@ -72,7 +72,7 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
   const checker = program.getTypeChecker()
   return [...sources.keys()].map(path => {
     const source = program.getSourceFile(path)!
-    const item: SourceIndex = { path: path.slice(1), language: /\.[cm]?tsx?$/i.test(path) ? 'typescript' : 'javascript', adapter: 'typescript-compiler-v1', capabilities: ['symbols', 'imports', 'static_calls'], symbols: [], imports: [], exports: [], calls: [], unknowns: [] }
+    const item: SourceIndex = { path: path.slice(1), language: /\.[cm]?tsx?$/i.test(path) ? 'typescript' : 'javascript', adapter: 'typescript-compiler-v2', capabilities: ['symbols', 'imports', 'static_calls'], symbols: [], imports: [], exports: [], calls: [], unknowns: [] }
     function visit(node: ts.Node) {
       const named = node as ts.Node & { name?: ts.Node; body?: ts.Node }
       if (named.name && (ts.isFunctionLike(node) || ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node)
@@ -100,11 +100,16 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
         const concrete = declaration && 'body' in declaration && declaration.body
         const target = concrete && targetSource && sources.has(targetSource.fileName)
           ? { path: targetSource.fileName.slice(1), line: targetSource.getLineAndCharacterOfPosition(declaration.getStart()).line + 1 } : null
-        item.calls.push({ expression: node.expression.getText(source), line: source.getLineAndCharacterOfPosition(node.getStart()).line + 1, target })
+        const start = node.expression.getStart(source), end = node.expression.getEnd()
+        const expressionTruncated = end - start > 512
+        const expression = source.text.slice(start, Math.min(end, start + 512)) + (expressionTruncated ? '…' : '')
+        item.calls.push({ expression, sourceRange: { start, end }, expressionTruncated,
+          line: source.getLineAndCharacterOfPosition(node.getStart()).line + 1, target })
       }
       ts.forEachChild(node, visit)
     }
     visit(source)
+    if (item.calls.some(call => call.expressionTruncated)) item.unknowns.push('Long call expression navigation is truncated; sourceRange locates the complete expression in the original snapshot.')
     if (item.calls.some(call => !call.target)) item.unknowns.push('Dynamic/injected/external calls need implementation context; a signature does not establish the runtime target.')
     return item
   })

@@ -212,7 +212,10 @@ Analysis records actual participants, collaboration, state and effects,
 invariants and uncertainties. Collaboration forms are open; no fixed pattern
 catalog or expected-answer dataset is loaded.
 
-JS/TS has compiler-based navigation. Other text sources, including unknown DSLs,
+JS/TS has compiler-based navigation. Call expressions longer than 512 UTF-16 code
+units have explicitly marked shortened navigation text and a zero-based, end-exclusive
+`sourceRange` into the full snapshot. Source evidence always uses the original text.
+Other text sources, including unknown DSLs,
 remain available in full with literal search and exact line/hash evidence. Empty
 symbol or call indexes mean unindexed, not absent. Necessary unknown language or
 runtime semantics remain explicit gaps. Binary files, submodules and symlinks are

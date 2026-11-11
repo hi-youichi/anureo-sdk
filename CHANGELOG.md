@@ -18,6 +18,7 @@ marked **BREAKING**.
   Bound complete review tasks so checkpoints publish promptly; preserve UTF-8 BOM
   hashes and repository-aware evidence validation. Legacy report reuse requires
   matching backend provenance. Editing runs exclusively claim their output directories.
+  Keep long call-chain navigation bounded while retaining exact source ranges.
 
 - Add `@anureo/adapter-pi`, an in-process adapter for the Pi coding agent
   (`@earendil-works/pi-coding-agent`, verified against 1.5.2). Supports submit,
