@@ -20,7 +20,9 @@ marked **BREAKING**.
   matching backend provenance. Editing runs exclusively claim their output directories.
   Keep long call-chain navigation bounded while retaining exact source ranges.
   Validate duplicate roots before checkpoint/repair admission and compare restored
-  findings by value, independent of JSON object key ordering.
+  findings by value, independent of JSON object key ordering. Keep cross-task
+  grouping in the final summary so earlier task results cannot become hidden
+  verification inputs during recovery.
 
 - Code-review repair reports expose `changesKnown`; uncertain native outcomes no
   longer display an empty change set as no changes. Keep bare-package import

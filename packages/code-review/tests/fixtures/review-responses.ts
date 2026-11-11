@@ -4,7 +4,7 @@ import { dimensions } from '../../src/schema'
 export type Source = { id: string; path: string; sha256: string; kind: string; source: string }
 export type Request = {
   task: string; primaryFiles?: string[]; kind?: string; id?: string; assignment?: DesignTask; round?: number
-  sources?: Source[]; findings?: Finding[]; candidates?: Finding[]
+  sources?: Source[]; findings?: Finding[]; candidates?: Finding[]; knownFindings?: Finding[]
   dependencies?: Array<{ status: string }>
   contextResolution?: { candidates: string[] }
   validationFeedback?: Array<{ path: string; message: string }>

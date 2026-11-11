@@ -127,7 +127,7 @@ export function designCoverage(results: TaskResult[], selectedDimensions: readon
 }
 
 // Bump when prompting, validation, or snapshot contracts change.
-const reviewWorkflowRevision = '2'
+const reviewWorkflowRevision = '3'
 
 /** Persistence identity is independent of backend Session IDs and final report generation. */
 export async function reviewDesign(options: DesignOptions): Promise<DesignReport> {
@@ -381,33 +381,31 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
     })
     const navigation = context.index.filter(item => task.primaryFiles.includes(item.path)
       || item.imports.some(i => i.target && task.primaryFiles.includes(i.target)))
-    const inputHash = hash(JSON.stringify({ task, model: model ?? null, instructions: designInstructions, dimensions: plan.dimensions, planningHash: plan.planningHash, designParadigms, budgets: plan.budgets,
+    const inputHash = hash(JSON.stringify({ task, verificationScope: 'task-local', model: model ?? null, instructions: designInstructions, dimensions: plan.dimensions, planningHash: plan.planningHash, designParadigms, budgets: plan.budgets,
       schemaFingerprint: currentSchemaFingerprint,
       configuredContracts: configuredContracts.map(s => [s.path, s.sha256]),
       baseline: task.primaryFiles.map(path => [path, context.baseline.get(path)?.sha256]), navigation, dependencies }))
     const empty: TaskResult = { task, status: 'failed', error: null, snapshotIds: [], analysis: null, findings: [], verification: null, inputHash, reused: false }
     let result = empty
     let imported = false
-    function duplicateTargetsAvailable(old: TaskResult) {
+    function taskLocalDuplicates(old: TaskResult) {
       const ownIds = new Set(old.findings.map(f => f.id))
-      const currentIds = new Set([...results.values()].flatMap(r => r.findings.map(f => f.id)))
-      return !old.verification?.decisions.some(d => d.duplicateOf && !ownIds.has(d.duplicateOf) && !currentIds.has(d.duplicateOf))
+      return !old.verification?.decisions.some(d => d.duplicateOf && !ownIds.has(d.duplicateOf))
     }
     function validate(saved: TaskResult) {
       if (saved.task.id !== task.id || saved.inputHash !== inputHash || !saved.analysis) throw new HarnessSdkError('WORKFLOW_CHECKPOINT_INVALID')
       const allowed = new Set(saved.snapshotIds)
       checkAnalysis(task, analysisSchema.parse(saved.analysis), allowed)
       if (!isDeepStrictEqual(saved.findings, saved.analysis.findings.map((f, i) => ({ ...f, id: `${task.id}#${i + 1}`, taskId: task.id })))) throw new HarnessSdkError('WORKFLOW_CHECKPOINT_INVALID')
-      if (saved.findings.length) checkVerification(saved.findings, verificationSchema.parse(saved.verification), allowed,
-        [...results.values()].flatMap(r => r.findings).concat(saved.findings))
+      if (saved.findings.length) checkVerification(saved.findings, verificationSchema.parse(saved.verification), allowed)
     }
     try {
       if (stopReason) throw new HarnessSdkError('WORKFLOW_STEP_INCOMPLETE')
       result = await checkpointTask({ run, context, outputDir, taskId: task.id,
-        input: { inputHash }, repeatable: options.repeatable === true, canReuse: duplicateTargetsAvailable, validate,
+        input: { inputHash }, repeatable: options.repeatable === true, canReuse: taskLocalDuplicates, validate,
         execute: async () => {
           let old = prior?.tasks.find(r => r.task.id === task.id && r.status === 'completed' && r.inputHash === inputHash)
-          if (old && !duplicateTargetsAvailable(old)) old = undefined
+          if (old && !taskLocalDuplicates(old)) old = undefined
           if (old) {
             // A task may have read sources outside primaryFiles. A changed contextual source
             // invalidates that task even when its primary input and dependencies did not change.
@@ -429,7 +427,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
             if (!old.analysis) throw new Error('Missing resumed analysis')
             checkAnalysis(task, analysisSchema.parse(old.analysis), new Set(old.snapshotIds))
             if (!isDeepStrictEqual(old.findings, old.analysis.findings.map((f, i) => ({ ...f, id: `${task.id}#${i + 1}`, taskId: task.id })))) throw new Error('Invalid resumed finding ownership')
-            if (old.findings.length) checkVerification(old.findings, verificationSchema.parse(old.verification), new Set(old.snapshotIds), [...results.values()].flatMap(r => r.findings).concat(old.findings))
+            if (old.findings.length) checkVerification(old.findings, verificationSchema.parse(old.verification), new Set(old.snapshotIds))
             imported = true
             result = { ...old, task, reused: true }
           } else {
@@ -476,7 +474,6 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
             if (value.status === 'incomplete') throw new Error(`Incomplete analysis: ${value.gaps.join('; ') || value.summary}`)
             if (result.findings.length) {
               let verification: Verification | null = null
-              const knownFindings = [...results.values()].flatMap(r => r.findings)
               for (let round = 0; round <= plan.budgets.contextRounds; round++) {
                 verification = await invokeChecked(task.id, `verify-${round}`, { task: 'design-verification', assignment: task, findings: result.findings,
                   designContext: value.designContext, designParadigms,
@@ -486,14 +483,14 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
                     '重新核对 designContext 的参与者、协作、效应与不变量；按实际语言/契约检查原子性、不可变性和消息语义，不能把一种范式的惯例当作所有实现的要求。',
                     'accepted 需因果、契约或结构论证成立。行为/性能未复现的风险用 pending。不声称运行过测试。',
                     '指出 improves/regresses/invariants 及整体权衡；只改善局部却破坏关键不变量的方案 rejected。',
-                    '同一根因可 duplicateOf 现有合法发现 ID；不同触发和后果不得仅因模式相同合并。',
+                    'duplicateOf 只能引用本次 findings 中的其他 ID；跨任务去重由全部任务完成后的根因汇总处理。不同触发和后果不得仅因模式相同合并。',
                     '需要补读时 status=needs_context，decisions 为空；最终 decisions 不能遗漏、重复或增加 finding。',
                     'contextRequests 使用明确 path 或精确 symbol/literal query，不能用自然语言作为检索词；超预算时从候选列表选择明确路径。',
-                  ], knownFindings }, verificationSchema, output => {
+                  ] }, verificationSchema, output => {
                     checkRequests(output.contextRequests)
                     if (output.status === 'needs_context') {
                       if (output.decisions.length || !output.contextRequests.length) throw new Error('Invalid verifier context request')
-                    } else checkVerification(result.findings, output, allowed, [...knownFindings, ...result.findings])
+                    } else checkVerification(result.findings, output, allowed)
                   })
                 if (verification.status !== 'needs_context') break
                 if (verification.decisions.length || !verification.contextRequests.length) throw new Error('Invalid verifier context request')
@@ -501,7 +498,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
                 await supplement(verification.contextRequests)
               }
               if (!verification) throw new Error('Missing verification')
-              checkVerification(result.findings, verification, allowed, [...knownFindings, ...result.findings])
+              checkVerification(result.findings, verification, allowed)
               result.verification = verification
               result.snapshotIds = [...allowed]
               if (verification.status !== 'reviewed') throw new Error(`Incomplete verification: ${verification.summary}`)
@@ -523,19 +520,19 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
     return result
   }
 
-  function checkVerification(findings: Finding[], value: Verification, allowed: Set<string>, known: Finding[]) {
+  function checkVerification(findings: Finding[], value: Verification, allowed: Set<string>) {
     checkEvidence(context, allowed, value.decisions.map((decision, i) => ({ path: `decisions[${i}].evidence`, evidence: decision.evidence })))
     if (value.contextRequests.length) throw new Error('Final verification still requests context')
-    const ids = findings.map(f => f.id)
-    if (value.decisions.length !== ids.length || new Set(value.decisions.map(d => d.findingId)).size !== ids.length
-      || value.decisions.some(d => !ids.includes(d.findingId))) throw new Error('Verification finding ID mismatch')
+    const ids = new Set(findings.map(f => f.id))
+    if (value.decisions.length !== ids.size || new Set(value.decisions.map(d => d.findingId)).size !== ids.size
+      || value.decisions.some(d => !ids.has(d.findingId))) throw new Error('Verification finding ID mismatch')
     for (const d of value.decisions) {
       if ([...d.improves, ...d.regresses].some(id => !plan.angles.some(a => a.id === id))) throw new Error('Unknown verification angle')
-      if (d.duplicateOf && (d.duplicateOf === d.findingId || !known.some(f => f.id === d.duplicateOf))) throw new Error('Invalid duplicate reference')
+      if (d.duplicateOf && (d.duplicateOf === d.findingId || !ids.has(d.duplicateOf))) throw new Error('Invalid duplicate reference')
       if (d.verdict === 'accepted' && !d.invariants.length) throw new Error('Accepted proposal lacks invariant review')
     }
-    const decisions = new Map([...results.values()].filter(result => result.status === 'completed').flatMap(result => result.verification?.decisions ?? []).concat(value.decisions).map(d => [d.findingId, d]))
-    const roots = resolveDuplicateRoots(known.map(finding => ({ id: finding.id, duplicateOf: decisions.get(finding.id)?.duplicateOf ?? null })))
+    const decisions = new Map(value.decisions.map(d => [d.findingId, d]))
+    const roots = resolveDuplicateRoots(findings.map(finding => ({ id: finding.id, duplicateOf: decisions.get(finding.id)?.duplicateOf ?? null })))
     for (const finding of findings) {
       const root = roots.get(finding.id)
       if (root === null || root === undefined) throw new Error(`Invalid duplicate chain: ${finding.id}`)

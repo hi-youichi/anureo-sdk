@@ -593,3 +593,46 @@ test('completed findings and verification survive canonical checkpoint key order
   expect(next.calls.some(call => ['design-analysis', 'design-verification'].includes(call.task))).toBe(false)
   expect(report.findings).toEqual(initial.findings)
 })
+
+
+test('changed supplemental context cannot preserve a stale cross-task alias during recovery', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n', 'b.ts': 'export const b = "old"\n',
+    '.gitignore': 'extra.md\n', 'extra.md': 'old contract\n' })
+  const hook = (input: Request, output: unknown) => {
+    const paths = input.assignment?.primaryFiles ?? []
+    if (input.task === 'design-analysis' && input.assignment!.angleId === 'D12' && (paths.includes('a.ts') || paths.includes('b.ts'))) {
+      const result = analysisSchema.parse(output)
+      if (paths.includes('a.ts') && input.round === 0) return { ...result, status: 'needs_context', contextRequests: [
+        { path: 'extra.md', symbol: null, query: null, reason: 'Read the current contract' },
+      ] }
+      const cause = paths.includes('a.ts') && input.sources!.some(source => source.path === 'extra.md' && source.source.includes('new')) ? 'new' : 'old'
+      result.findings = [{ ...candidate('D12', input.sources!), title: `${cause} contract`, cause }]
+      return result
+    }
+    if (input.task === 'design-verification' && paths.includes('b.ts')) {
+      const root = input.knownFindings?.find(finding => finding.title === 'old contract')
+      if (root) (output as { decisions: Array<{ duplicateOf: string | null }> }).decisions[0]!.duplicateOf = root.id
+    }
+    if (input.task === 'design-summary') {
+      const groups = new Map<string, Finding[]>()
+      for (const finding of input.candidates!) groups.set(finding.cause, [...(groups.get(finding.cause) ?? []), finding])
+      return { summary: 'Group only matching current causes', groups: [...groups].map(([cause, findings]) => ({
+        title: cause, findingIds: findings.map(finding => finding.id), priority: 'medium', proposal: 'Preserve current evidence', tradeoffs: 'Different causes remain separate',
+      })), gaps: [] }
+    }
+    return output
+  }
+  const first = await backend(hook)
+  const source = await options(cwd, first.client, { concurrency: 1, responseCorrections: 0 })
+  const initial = await reviewDesign(source)
+  expect(initial.complete).toBe(true)
+  expect(initial.rootGroups).toHaveLength(1)
+  await writeFile(join(cwd, 'extra.md'), 'new contract\n')
+  const next = await backend(hook)
+  const report = await reviewDesign(await options(cwd, next.client, { concurrency: 1, responseCorrections: 0,
+    resumeFrom: source.outputDir, outputDir: `${source.outputDir}-resumed` }))
+  expect(report.complete).toBe(true)
+  expect(report.rootGroups).toHaveLength(2)
+  expect(report.tasks.find(task => task.task.primaryFiles.includes('b.ts') && task.task.angleId === 'D12')!.reused).toBe(true)
+  expect([...first.calls, ...next.calls].filter(call => call.task === 'design-verification').every(call => call.knownFindings === undefined)).toBe(true)
+})

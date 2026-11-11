@@ -266,7 +266,12 @@ containing exactly one primary file and supported by unambiguous target evidence
 unverified candidates, structural/behavior changes and findings owned by multi-file
 modules remain in `skipped` with reasons. Root groups choose a fresh accepted
 representative before a fresh pending finding, so a pending alias does not hide
-an accepted candidate. Only completed tasks supply root-group members. Cycles,
+an accepted candidate. Only completed tasks supply root-group members.
+Verification aliases refer only to findings in the same task; the final summary
+handles cross-task root-cause grouping after all task results are available.
+This keeps per-task checkpoints independent of completion order and earlier
+model conclusions. The workflow policy revision invalidates older task inputs
+when this verification contract changes. Cycles,
 missing alias targets and aliases resolving to unverified or rejected roots fail
 verification before a task checkpoint is committed. The repair reader checks the
 alias graph again for older reports. This is a local repair selection, not an
