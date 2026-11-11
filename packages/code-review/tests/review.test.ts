@@ -722,3 +722,38 @@ test('deleted supplemental context invalidates a legacy task while independent t
   expect(resumed.calls.reusedTasks).toBe(original.tasks.length - 1)
   expect(next.calls.filter(call => call.task === 'design-analysis').map(call => call.assignment!.primaryFiles)).toEqual([['a.ts']])
 })
+
+test('a 73-of-100 code review resumes 27 tasks without a final report or another planning call', async () => {
+  const files = Object.fromEntries(Array.from({ length: 50 }, (_, index) => [
+    `file-${String(index).padStart(2, '0')}.ts`, `export const value${index} = ${index}\n`,
+  ]))
+  const cwd = await fixture(files)
+  const first = await backend()
+  let completed = 0
+  const source = await options(cwd, first.client, { concurrency: 1,
+    shouldStop: () => completed === 73,
+    progress: message => { if (message.startsWith('task end:') && message.endsWith('(completed)')) completed++ },
+  })
+  const interrupted = await reviewDesign(source)
+  expect(interrupted.plan.tasks).toHaveLength(100)
+  expect(interrupted.complete).toBe(false)
+  expect(interrupted.tasks.filter(task => task.status === 'completed')).toHaveLength(73)
+  expect(first.calls.filter(call => call.task === 'design-analysis')).toHaveLength(73)
+  expect((await readdir(join(source.outputDir, 'checkpoints'))).filter(name => /^[a-f0-9]{64}\.json$/.test(name))).toHaveLength(74)
+  await rm(join(source.outputDir, 'report.json'))
+  await rm(join(source.outputDir, 'report.md'))
+  const originalManifest = await readFile(join(source.outputDir, 'run.json'), 'utf8')
+  const next = await backend()
+  const resumed = await reviewDesign(await options(cwd, next.client, { concurrency: 4,
+    resumeFrom: source.outputDir, outputDir: `${source.outputDir}-recovered`,
+  }))
+  expect(resumed.complete).toBe(true)
+  expect(resumed.calls.reusedTasks).toBe(73)
+  expect(resumed.tasks).toHaveLength(100)
+  expect(resumed.tasks.every(task => task.status === 'completed')).toBe(true)
+  expect(next.calls.filter(call => call.task === 'design-planning')).toHaveLength(0)
+  const retried = next.calls.filter(call => call.task === 'design-analysis').map(call => call.assignment!.id).sort()
+  expect(retried).toHaveLength(27)
+  expect(retried).toEqual(interrupted.tasks.filter(task => task.status !== 'completed').map(task => task.task.id).sort())
+  expect(await readFile(join(source.outputDir, 'run.json'), 'utf8')).toBe(originalManifest)
+}, 30000)
