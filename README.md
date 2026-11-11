@@ -102,6 +102,7 @@ composition, or `@anureo/protocol` for direct access to the wire contract.
 | [@anureo/adapter-codex](packages/codex/README.md) | Codex app-server adapter |
 | [@anureo/adapter-claude](packages/claude/README.md) | Claude Agent SDK adapter |
 | [@anureo/adapter-acp](packages/acp/README.md) | Standard ACP agents, including DSH |
+| [@anureo/adapter-pi](packages/pi/README.md) | Pi coding agent, embedded in-process through its TypeScript SDK |
 | [@anureo/adapter-ahp](packages/ahp/README.md) | External AHP harnesses over stdio or WebSocket |
 | [@anureo/workflow](packages/workflow/README.md) | Agent calls, parallel tasks, and per-item pipelines |
 | [@anureo/code-review](docs/code-review-cli.md) | `anureo-review` CLI for code design and readability reviews |

@@ -1,0 +1,42 @@
+{
+  "name": "@anureo/adapter-pi",
+  "description": "Anureo SDK adapter for the Pi coding agent, embedded through its TypeScript SDK",
+  "version": "0.2.0",
+  "license": "Apache-2.0",
+  "keywords": ["anureo", "ahp", "harness", "agent", "pi"],
+  "homepage": "https://github.com/hi-youichi/anureo-sdk#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
+    "directory": "packages/pi"
+  },
+  "bugs": { "url": "https://github.com/hi-youichi/anureo-sdk/issues" },
+  "publishConfig": { "access": "public" },
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./host": "./src/host.ts",
+    "./mapping": "./src/mapping.ts",
+    "./catalog": "./src/catalog.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --pretty false",
+    "test": "bun test tests",
+    "spike": "bun scripts/spike.ts",
+    "smoke": "bun scripts/smoke.ts",
+    "live": "bun scripts/live-check.ts"
+  },
+  "dependencies": {
+    "@anureo/protocol": "workspace:*",
+    "@anureo/sdk": "workspace:*"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.5.2 <2"
+  },
+  "devDependencies": {
+    "@anureo/conformance": "workspace:*",
+    "@earendil-works/pi-coding-agent": "1.5.2"
+  },
+  "engines": { "node": ">=22" }
+}

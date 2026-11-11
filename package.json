@@ -38,6 +38,7 @@
     "typescript": "5.8.3",
     "@anureo/protocol": "workspace:*",
     "@anureo/adapter-acp": "workspace:*",
+    "@anureo/adapter-pi": "workspace:*",
     "@anureo/workflow": "workspace:*",
     "zod": "4.6.7"
   }

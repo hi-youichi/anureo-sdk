@@ -8,6 +8,14 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- Add `@anureo/adapter-pi`, an in-process adapter for the Pi coding agent
+  (`@earendil-works/pi-coding-agent`, verified against 1.5.2). Supports submit,
+  steer/follow-up, interrupt, history, fork, resume and compaction, plus model,
+  thinking-level and `read-only`/`agent-full-access` permission configuration.
+  Pi has no approval gate, so permissions are enforced with tool allowlists and no
+  interactions, revert, goal or review are advertised. Pi runs inside the host
+  process with the host's credentials and file access; see the package README.
+
 - **BREAKING:** workflow `agent` supports Zod object schemas and infers
   `z.output<S> | null`; text mode now returns `string | null`. Convert schemas to
   native JSON Schema before submission, validate raw JSON and the original Zod
