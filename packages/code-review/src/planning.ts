@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { ContextSelectionRequired, hash, sourceInput, type ReviewContext, type Snapshot } from './context'
+import { ContextSelectionRequired, hash, sourceInput, mergePromptSources, type ReviewContext, type Snapshot } from './context'
 import { dimensionSchema, dimensions, evidenceSchema, type ContextRequest, type DesignTask } from './schema'
 import { analysisSchema } from './schema'
 import { isEntryContract } from './project'
@@ -155,7 +155,7 @@ export async function discoverModules(context: ReviewContext, inventory: Invento
       'validationFeedback 是宿主对上次响应的校验错误；基于相同快照修正完整响应。逐条核对引文首尾行，不得省略错误证据、文件或参考角度来绕过覆盖约束。',
       '缺少必要实现时 status=needs_context，通过 contextRequests 请求明确路径；不能执行工具或命令。最终 planned 不得有 contextRequests/gaps。',
     ] }
-  const all = [...new Map([...inventory.primaryFiles.map(p => context.baseline.get(p)!), ...contracts].map(s => [s.path, s])).values()]
+  const all = mergePromptSources(inventory.primaryFiles.map(p => context.baseline.get(p)!), contracts)
   let sources = all
   const state = planningProgress()
   let previous: Planning | null = null
@@ -192,7 +192,7 @@ export async function discoverModules(context: ReviewContext, inventory: Invento
     if (round === inventory.budgets.contextRounds) throw new Error('Planning context budget exhausted')
     try {
       const added = await context.resolveRequestsDetailed(value.contextRequests as ContextRequest[], inventory.budgets.contextFiles)
-      sources = [...new Map([...sources, ...added.snapshots].map(s => [s.id, s])).values()]; resolution = added.resolution
+      sources = mergePromptSources(sources, added.snapshots); resolution = added.resolution
     } catch (error) {
       if (!(error instanceof ContextSelectionRequired)) throw error
       resolution = { status: 'selection_required', candidates: error.paths, message: error.message }

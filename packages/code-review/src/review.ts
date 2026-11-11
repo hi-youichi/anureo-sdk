@@ -8,7 +8,7 @@ import { resolveDuplicateRoots } from './duplicates'
 import { checkpointPlanning, checkpointTask, fatalReviewError } from './checkpoints'
 import { z } from 'zod'
 import { createGate, errorText, saveJson, type Package } from './io'
-import { ContextSelectionRequired, hash, ReviewContext, sourceInput, SnapshotIntegrityError, type Snapshot } from './context'
+import { ContextSelectionRequired, hash, ReviewContext, sourceInput, mergePromptSources, SnapshotIntegrityError, type Snapshot } from './context'
 import {
   analysisSchema, verificationSchema, summarySchema, dimensions, dimensionIds,
   type Analysis, type DesignSummary, type DesignTask, type Dimension, type Finding, type ReviewDecision, type Verification,
@@ -276,8 +276,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
   for (const reference of await context.contractReferences()) if (!catalogByPath.has(reference.path)) catalogByPath.set(reference.path, reference)
   const sourceCatalog = [...catalogByPath.values()]
   function withContracts(paths: string[]) {
-    const snapshots = [...new Set(paths)].map(path => context.baseline.get(path)!).concat(configuredContracts)
-    return [...new Map(snapshots.map(snapshot => [snapshot.path, snapshot])).values()]
+    return mergePromptSources([...new Set(paths)].map(path => context.baseline.get(path)!), configuredContracts)
   }
   // The first meaningful agent determines both modules and angles. No workers start before host validation.
   try {
@@ -432,8 +431,8 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
             async function supplement(requests: Analysis['contextRequests']) {
               try {
                 const { snapshots: added, resolution } = await context.resolveRequestsDetailed(requests, plan.budgets.contextFiles)
-                sources = [...sources, ...added]
-                for (const s of added) allowed.add(s.id)
+                sources = mergePromptSources(sources, added)
+                for (const s of sources) allowed.add(s.id)
                 contextResolution = resolution
               } catch (error) {
                 if (!(error instanceof ContextSelectionRequired)) throw error

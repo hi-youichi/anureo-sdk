@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { parseReport } from '../src/fix'
 import { discoverPackages } from '../src/io'
-import { hash, ReviewContext, SnapshotIntegrityError } from '../src/context'
+import { hash, ReviewContext, SnapshotIntegrityError, mergePromptSources } from '../src/context'
 import { createDesignPlan } from '../src/review'
 import { readDesignConfig } from '../src/project'
 import type { LanguageAdapter } from '../src/language'
@@ -329,4 +329,30 @@ test('changed and missing saved sources are cache misses without granting eviden
   await rm(join(cwd, 'contract.md'))
   expect(await context.matchesSavedSnapshots([saved])).toBe(false)
   expect(context.snapshots.has(saved.id)).toBe(false)
+})
+
+
+test('prompt source compaction keeps supplied IDs and all distinct versions without losing read history', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n' })
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  const original = context.baseline.get('a.ts')!
+  const repeated = await context.acquire('a.ts')
+  let sources = mergePromptSources([original], [repeated])
+  expect(sources.map(source => source.id)).toEqual([original.id])
+  expect(context.snapshots.has(repeated.id)).toBe(true)
+  await writeFile(join(cwd, 'a.ts'), 'export const a = 2\n')
+  const changed = await context.acquire('a.ts')
+  sources = mergePromptSources(sources, [changed, repeated])
+  expect(sources.map(source => source.id)).toEqual([original.id, changed.id])
+  await writeFile(join(cwd, 'a.ts'), original.text)
+  const restored = await context.acquire('a.ts')
+  expect(mergePromptSources(sources, [restored]).map(source => source.id)).toEqual([original.id, changed.id])
+  expect(context.snapshots.has(restored.id)).toBe(true)
+  expect(await context.changes()).toEqual(['a.ts'])
+})
+
+test('different unavailable-source diagnostics remain distinct prompt facts', () => {
+  const first = { id: 'first', path: 'a.ts', kind: 'unavailable' as const, sha256: null, text: '', error: 'missing' }
+  const second = { ...first, id: 'second', error: 'access denied' }
+  expect(mergePromptSources([first], [second])).toEqual([first, second])
 })

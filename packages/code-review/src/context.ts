@@ -285,3 +285,16 @@ export class ReviewContext {
 export function sourceInput(snapshot: Snapshot) {
   return { ...snapshot, text: undefined, source: snapshot.text.split('\n').map((line, index) => `${index + 1}: ${line}`).join('\n') }
 }
+
+/** Preserve observed content versions; identical rereads retain the already supplied evidence ID. */
+export function mergePromptSources(current: readonly Snapshot[], added: readonly Snapshot[]): Snapshot[] {
+  const seen = new Set<string>()
+  const sources: Snapshot[] = []
+  for (const snapshot of [...current, ...added]) {
+    const key = JSON.stringify([snapshot.path, snapshot.kind, snapshot.sha256, snapshot.error])
+    if (seen.has(key)) continue
+    seen.add(key)
+    sources.push(snapshot)
+  }
+  return sources
+}

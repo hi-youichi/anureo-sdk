@@ -224,7 +224,9 @@ consumer details remain available through the catalog and bounded full-source
 requests; the saved repository index remains complete. Navigation is not source
 evidence. Call expressions longer than 512 UTF-16 code
 units have explicitly marked shortened navigation text and a zero-based, end-exclusive
-`sourceRange` into the full snapshot. Source evidence always uses the original text.
+`sourceRange` into the full snapshot. Source evidence always uses the original text. Identical rereads are sent once, retaining
+the already supplied evidence ID; every distinct content version remains available.
+The source context still records the actual reads so observed changes are not hidden.
 Other text sources, including unknown DSLs,
 remain available in full with literal search and exact line/hash evidence. Empty
 symbol or call indexes mean unindexed, not absent. Necessary unknown language or
