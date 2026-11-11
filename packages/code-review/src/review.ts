@@ -15,7 +15,7 @@ import {
 } from './schema'
 import { designParadigms } from './paradigms'
 import { isEntryContract } from './project'
-import type { LanguageAdapter } from './language'
+import { taskNavigation, type LanguageAdapter } from './language'
 import { createModulePlan, discoverModules, inventoryPlan, planningSchema, type PlanningAttempt } from './planning'
 import { renderDesignReport } from './report'
 import { checkEvidence, contextRequestIssues, ResponseValidationError, validatedResponse } from './validation'
@@ -381,6 +381,8 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
     })
     const navigation = context.index.filter(item => task.primaryFiles.includes(item.path)
       || item.imports.some(i => i.target && task.primaryFiles.includes(i.target)))
+    // Fingerprint the complete source-derived index; compact only model-facing consumer hints.
+    const promptNavigation = taskNavigation(navigation, task.primaryFiles)
     const inputHash = hash(JSON.stringify({ task, verificationScope: 'task-local', model: model ?? null, instructions: designInstructions, dimensions: plan.dimensions, planningHash: plan.planningHash, designParadigms, budgets: plan.budgets,
       schemaFingerprint: currentSchemaFingerprint,
       configuredContracts: configuredContracts.map(s => [s.path, s.sha256]),
@@ -462,7 +464,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
                   '同一根因只给一个 finding。已被下级提出的问题不重复提出，可在 summary 中引用下级 ID。',
                   'contextRequests 优先填 catalog 的明确 path。symbol 填精确名称，query 只填逐字检索词，不能写自然语言指令。总量超限会返回候选清单供模型选择。',
                   'contextResolution 提供检索范围和实际命中；没有更多实现/消费者时不得继续重复索取。接口契约和局部不变量可独立审查，不能声称外部调用已验证。',
-                ], round, sources: sources.map(sourceInput), catalog: sourceCatalog, index: navigation, previous: value, contextResolution, dependencies },
+                ], round, sources: sources.map(sourceInput), catalog: sourceCatalog, index: promptNavigation, previous: value, contextResolution, dependencies },
                 analysisSchema, output => checkAnalysis(task, output, allowed))
               if (value.status !== 'needs_context') break
               if (round === plan.budgets.contextRounds) throw new Error('Context round budget exhausted')
@@ -477,7 +479,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
               for (let round = 0; round <= plan.budgets.contextRounds; round++) {
                 verification = await invokeChecked(task.id, `verify-${round}`, { task: 'design-verification', assignment: task, findings: result.findings,
                   designContext: value.designContext, designParadigms,
-                  sources: sources.map(sourceInput), catalog: sourceCatalog, index: navigation, contextResolution, round,
+                  sources: sources.map(sourceInput), catalog: sourceCatalog, index: promptNavigation, contextResolution, round,
                   requirements: [
                     '这是独立复核。重新检查原始源码和消费者，不接受分析者自述为事实；每个 findingId 恰好处理一次。',
                     '重新核对 designContext 的参与者、协作、效应与不变量；按实际语言/契约检查原子性、不可变性和消息语义，不能把一种范式的惯例当作所有实现的要求。',

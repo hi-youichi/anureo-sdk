@@ -22,7 +22,8 @@ marked **BREAKING**.
   Validate duplicate roots before checkpoint/repair admission and compare restored
   findings by value, independent of JSON object key ordering. Keep cross-task
   grouping in the final summary so earlier task results cannot become hidden
-  verification inputs during recovery.
+  verification inputs during recovery. Compact unrelated consumer navigation in
+  task prompts while retaining complete primary navigation and source snapshots.
 
 - Code-review repair reports expose `changesKnown`; uncertain native outcomes no
   longer display an empty change set as no changes. Keep bare-package import

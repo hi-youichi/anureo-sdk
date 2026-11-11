@@ -214,7 +214,11 @@ Analysis records actual participants, collaboration, state and effects,
 invariants and uncertainties. Collaboration forms are open; no fixed pattern
 catalog or expected-answer dataset is loaded.
 
-JS/TS has compiler-based navigation. Call expressions longer than 512 UTF-16 code
+JS/TS has compiler-based navigation. Task prompts retain complete navigation for
+primary files and explicitly partial inbound relations for consumer files. Other
+consumer details remain available through the catalog and bounded full-source
+requests; the saved repository index remains complete. Navigation is not source
+evidence. Call expressions longer than 512 UTF-16 code
 units have explicitly marked shortened navigation text and a zero-based, end-exclusive
 `sourceRange` into the full snapshot. Source evidence always uses the original text.
 Other text sources, including unknown DSLs,

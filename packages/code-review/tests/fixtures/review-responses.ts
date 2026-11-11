@@ -1,9 +1,11 @@
+import type { SourceIndex } from '../../src/language'
 import type { Analysis, DesignTask, Evidence, Finding } from '../../src/schema'
 import { dimensions } from '../../src/schema'
 
 export type Source = { id: string; path: string; sha256: string; kind: string; source: string }
 export type Request = {
   task: string; primaryFiles?: string[]; kind?: string; id?: string; assignment?: DesignTask; round?: number
+  index?: Array<SourceIndex & { navigationScope?: string }>
   sources?: Source[]; findings?: Finding[]; candidates?: Finding[]; knownFindings?: Finding[]
   dependencies?: Array<{ status: string }>
   contextResolution?: { candidates: string[] }

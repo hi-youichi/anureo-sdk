@@ -53,3 +53,17 @@ export function buildIndex(snapshots: Snapshot[], packages: Package[], adapters:
     unknowns: ['No syntax adapter: full source, literal search and exact quotes are available. Empty symbols/imports/calls mean unindexed, never absent. Use explicit paths or literal queries; evidence.symbol must be empty.'],
   })
 }
+
+/** Consumer hints are explicitly partial; only complete source snapshots authorize evidence. */
+export function taskNavigation(index: readonly SourceIndex[], primaryFiles: readonly string[]) {
+  const primary = new Set(primaryFiles)
+  return index.map(item => {
+    if (primary.has(item.path)) return item
+    const calls = item.calls.filter(call => call.target && primary.has(call.target.path))
+    return { ...item, navigationScope: 'inbound-only',
+      imports: item.imports.filter(link => link.target && primary.has(link.target)), calls,
+      symbols: item.symbols.filter(symbol => calls.some(call => symbol.startLine <= call.line && symbol.endLine >= call.line)),
+      exports: [], unknowns: ['This is a partial inbound navigation view. Other consumer symbols, calls and exports are not included; request the complete source when needed. Unresolved or dynamic relations remain unknown.'],
+    }
+  })
+}

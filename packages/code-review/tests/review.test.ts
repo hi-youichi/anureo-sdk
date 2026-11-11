@@ -636,3 +636,25 @@ test('changed supplemental context cannot preserve a stale cross-task alias duri
   expect(report.tasks.find(task => task.task.primaryFiles.includes('b.ts') && task.task.angleId === 'D12')!.reused).toBe(true)
   expect([...first.calls, ...next.calls].filter(call => call.task === 'design-verification').every(call => call.knownFindings === undefined)).toBe(true)
 })
+
+
+test('task prompts keep complete primary navigation and only relevant inbound consumer navigation', async () => {
+  const cwd = await fixture({ 'a.ts': 'export function a() { return 1 }\n',
+    'b.ts': `import { a } from './a.js'\nexport function related() { a() }\nfunction unrelated() { return client${'.next()'.repeat(140)} }\n` })
+  let inbound: NonNullable<Request['index']>[number] | undefined
+  let primary: NonNullable<Request['index']>[number] | undefined
+  const harness = await backend((input, output) => {
+    if (input.task === 'design-analysis' && input.assignment!.primaryFiles.includes('a.ts')) inbound = input.index!.find(item => item.path === 'b.ts')
+    if (input.task === 'design-analysis' && input.assignment!.primaryFiles.includes('b.ts')) primary = input.index!.find(item => item.path === 'b.ts')
+    return output
+  })
+  const report = await reviewDesign(await options(cwd, harness.client))
+  expect(report.complete).toBe(true)
+  expect(inbound!.navigationScope).toBe('inbound-only')
+  expect(inbound!.calls.map(call => call.expression)).toEqual(['a'])
+  expect(inbound!.imports.map(item => item.target)).toEqual(['a.ts'])
+  expect(inbound!.symbols.map(symbol => symbol.name)).toEqual(['related'])
+  expect(inbound!.unknowns.join(' ')).toContain('partial')
+  expect(primary!.calls).toHaveLength(141)
+  expect(primary!.symbols.some(symbol => symbol.name === 'unrelated')).toBe(true)
+})
