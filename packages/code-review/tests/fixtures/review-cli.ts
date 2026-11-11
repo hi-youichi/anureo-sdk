@@ -1,8 +1,8 @@
 import { mock } from 'bun:test'
-import { appendFile, readdir } from 'node:fs/promises'
+import { appendFile, readdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { createClient } from '@anureo/sdk'
+import { createClient, HarnessSdkError } from '@anureo/sdk'
 import { createScriptedAdapter } from '@anureo/conformance'
 import * as shared from '../../src/cli-shared'
 import { defaultOutput, type Request } from './review-responses'
@@ -11,12 +11,17 @@ import { defaultOutput, type Request } from './review-responses'
 mock.module('../../src/cli-shared', () => ({ ...shared,
   withClient: async <T>(cwd: string, maxOutputBytes: number, editing: boolean,
     execute: Parameters<typeof shared.withClient<T>>[3]): Promise<T> => {
-    if (editing) throw new Error('Review fixture must remain read-only')
+    if (editing && process.env.FIX_UNKNOWN !== '1') throw new Error('Review fixture must remain read-only')
     let analyses = 0
     const client = await createClient({
       adapter: createScriptedAdapter({ execute: async (call, sink) => {
         if (call.method !== 'input/submit' || !('input' in call.params)) return undefined
         const input = JSON.parse(call.params.input.filter(part => part.type === 'text').map(part => part.text).join('\n')) as Request
+        if (editing) {
+          const target = (input as Request & { finding: { path: string } }).finding.path
+          await writeFile(join(cwd, target), 'partial write before losing observation\n')
+          throw new HarnessSdkError('SOURCE_LOST', 'Unknown writer state', false, true)
+        }
         await appendFile(process.env.REVIEW_CALLS!, `${JSON.stringify({ task: input.task, taskId: input.assignment?.id })}\n`)
         if (process.env.REVIEW_CRASH === '1' && input.task === 'design-analysis' && ++analyses === 4) {
           // Model-call concurrency is distinct from checkpoint publication; wait for the

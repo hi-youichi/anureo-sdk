@@ -300,7 +300,10 @@ The host validates regular in-project targets and rejects symlink targets or
 parents before starting model work. It records drift from report hashes, then
 requires the model to recheck current source and contracts. The host compares
 owned-file hashes with reported `changed` / `already_satisfied` / `deferred`
-outcomes. A failed task stops later tasks in that write group; uncertain execution
+outcomes. `changedFiles` lists observed changes within the owned paths;
+`changesKnown=false` means the final change set could not be confirmed. Markdown
+shows an unknown change state in that case, including after an uncertain native
+outcome. A failed task stops later tasks in that write group; uncertain execution
 or cleanup stops new model work across groups. Ownership instructions do not
 constitute a filesystem sandbox for the model's tools.
 

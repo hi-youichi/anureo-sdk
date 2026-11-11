@@ -22,6 +22,10 @@ marked **BREAKING**.
   Validate duplicate roots before checkpoint/repair admission and compare restored
   findings by value, independent of JSON object key ordering.
 
+- Code-review repair reports expose `changesKnown`; uncertain native outcomes no
+  longer display an empty change set as no changes. Keep bare-package import
+  navigation candidates inside their package roots.
+
 - Add `@anureo/adapter-pi`, an in-process adapter for the Pi coding agent
   (`@earendil-works/pi-coding-agent`, verified against 1.5.2). Supports submit,
   steer/follow-up, interrupt, history, fork, resume and compaction, plus model,

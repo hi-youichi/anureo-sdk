@@ -254,3 +254,20 @@ test('long call-chain navigation stays bounded and preserves exact source locati
   }
   expect(context.index[0]!.unknowns.join(' ')).toContain('truncated')
 })
+
+test('bare-package root entries cannot resolve sibling files outside the package', async () => {
+  for (const entry of [{ main: '.' }, { exports: './' }]) {
+    const files = { 'consumer.ts': "import { value } from 'widget'\nvalue()\n", 'pkg/package.json': JSON.stringify({ name: 'widget', ...entry }),
+      'pkg.ts': 'export function value() { return "outside" }\n', 'pkg/index.ts': 'export function value() { return "inside" }\n' }
+    const cwd = await fixture(files)
+    const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+    const consumer = context.index.find(item => item.path === 'consumer.ts')!
+    expect(consumer.imports[0]!.target).toBe('pkg/index.ts')
+    expect(consumer.calls[0]!.target?.path).toBe('pkg/index.ts')
+    await rm(join(cwd, 'pkg/index.ts'))
+    const missing = await ReviewContext.create(cwd, await discoverPackages(cwd))
+    const unresolved = missing.index.find(item => item.path === 'consumer.ts')!
+    expect(unresolved.imports[0]!.target).toBeNull()
+    expect(unresolved.calls[0]!.target).toBeNull()
+  }
+})

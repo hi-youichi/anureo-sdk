@@ -32,11 +32,13 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
   }
   function resolveImport(specifier: string, from: string): string | null {
     let base: string
+    let packageRoot: string | undefined
     if (specifier.startsWith('.')) base = resolve(dirname(from), specifier)
     else {
       const pkg = packageNames.find(name => specifier === name || specifier.startsWith(`${name}/`))
       if (!pkg) return null
       const { root, manifest } = byName.get(pkg)!
+      packageRoot = root
       const suffix = specifier.slice(pkg.length)
       const key = suffix ? `.${suffix}` : '.'
       let entry: string | null
@@ -55,7 +57,8 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
     }
     const sourceEquivalent = base.replace(/\.mjs$/, '.mts').replace(/\.cjs$/, '.cts').replace(/\.jsx$/, '.tsx').replace(/\.js$/, '.ts')
     return [base, sourceEquivalent, `${base}.ts`, `${base}.tsx`, `${base}.js`, `${base}/index.ts`, `${base}/index.js`, `${base}.d.ts`]
-      .find(candidate => sources.has(candidate)) ?? null
+      .find(candidate => sources.has(candidate) && (!packageRoot || candidate === packageRoot
+        || candidate.startsWith(packageRoot.endsWith('/') ? packageRoot : `${packageRoot}/`))) ?? null
   }
   const compilerOptions: ts.CompilerOptions = { target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext, allowJs: true, noLib: true }
   const host: ts.CompilerHost = {

@@ -67,7 +67,7 @@ export async function fixMain(args: string[]) {
     const markdown = ['# 可读性修复结果', '', `完成状态：${complete ? '选定局部建议已处理' : '存在未完成的局部建议'}；跳过 ${skipped.length} 条其他发现。`,
       '仅记录源码修改与静态核对；未执行测试或项目命令。', '',
       ...result.results.flatMap(item => [`## ${item.id}`, '', `状态：${item.status}。${item.summary}`,
-        `修改文件：${item.changedFiles.join('、') || '无'}`, ...item.checks.map(check => `- ${check}`), '']),
+        `修改文件：${item.changesKnown ? item.changedFiles.join('、') || '无' : `未知；已观察到的修改：${item.changedFiles.join('、') || '未确认'}`}`, ...item.checks.map(check => `- ${check}`), '']),
       '## 未进入本次修复的发现', '', ...skipped.map(item => `- ${item.id}：${item.reason}`), '',
       '## 原审查覆盖缺口', '', ...coverageGaps.map(gap => `- ${gap}`), '',
     ].join('\n')
