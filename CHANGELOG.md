@@ -8,6 +8,9 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- Retain structured call failure certainty, stop repair dispatch after interrupted
+  file preparation, and drain fixture releases before cleaning temporary resources.
+
 - Reject stale repair inputs and scopes without readable text, choose eligible repair
   group representatives, clean failed JSON write temporaries, and preserve BOM
   package entry resolution.

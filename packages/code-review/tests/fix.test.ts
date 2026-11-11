@@ -1,3 +1,4 @@
+import { cleanupFixtures } from './fixtures/cleanup'
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID, createHash } from 'node:crypto'
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
@@ -12,8 +13,7 @@ import { fixReadability, parseReport, type Finding } from '../src/fix'
 const clients: Client[] = []
 const directories: string[] = []
 afterEach(async () => {
-  await Promise.all(clients.splice(0).map(client => client.dispose()))
-  await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true })))
+  await cleanupFixtures(clients, directories)
 })
 
 async function fixture(paths = ['a.ts', 'b.ts']) {
@@ -213,4 +213,18 @@ test('repair groups choose an eligible accepted member when the report represent
   expect(parseReport(JSON.stringify(report)).findings.map(f => f.id)).toEqual([ids[1]!])
   findings[0]!.decision = 'local_refactor'
   expect(parseReport(JSON.stringify(report)).findings.map(f => f.id)).toEqual([ids[0]!])
+})
+
+
+test('a stop requested during file preparation prevents session dispatch and persists not_started', async () => {
+  const cwd = await fixture(['a.ts'])
+  const harness = await backend(async () => { throw new Error('must not dispatch') })
+  let stopped = false
+  const report = await fixReadability({ ...harness, cwd, findings: [finding('a.ts')], outputDir: join(cwd, 'out'), concurrency: 1,
+    shouldStop: () => stopped, progress: message => { if (message.startsWith('start ')) stopped = true },
+  })
+  expect(harness.adapter.opened).toHaveLength(0)
+  expect(report.results[0]!.status).toBe('not_started')
+  expect(JSON.parse(await readFile(join(cwd, 'out/results.json'), 'utf8')).results[0].status).toBe('not_started')
+  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('original\n')
 })

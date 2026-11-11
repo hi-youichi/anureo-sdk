@@ -191,21 +191,27 @@ export async function fixReadability(options: FixOptions) {
     let before: string[] | undefined
     try {
       before = await fileHashes(cwd, paths)
-      const response = await agent(JSON.stringify({
-        task: 'fix-readability', finding, ownedFiles: paths,
-        currentSha256: await fileHash(cwd, finding.path),
-        sourceWarning: '报告行号和 evidence 属于旧快照；同一文件的前序修改已保留，请按当前符号与语义定位。',
-      }), { client, cwd, model, instructions, schema: resultSchema })
-      if (response === null) {
-        stopReason = `Agent returned null for ${finding.id}; no automatic retry`
-        throw new Error(stopReason)
+      const currentSha256 = await fileHash(cwd, finding.path)
+      const reason = stopReason ?? (options.shouldStop?.() ? 'Repair interrupted by host' : undefined)
+      if (reason) {
+        result = { id: finding.id, status: 'not_started', summary: reason, checks: [], changedFiles: [], changesKnown: true }
+      } else {
+        const response = await agent(JSON.stringify({
+          task: 'fix-readability', finding, ownedFiles: paths,
+          currentSha256,
+          sourceWarning: '报告行号和 evidence 属于旧快照；同一文件的前序修改已保留，请按当前符号与语义定位。',
+        }), { client, cwd, model, instructions, schema: resultSchema })
+        if (response === null) {
+          stopReason = `Agent returned null for ${finding.id}; no automatic retry`
+          throw new Error(stopReason)
+        }
+        const after = await fileHashes(cwd, paths)
+        const changedFiles = paths.filter((_, index) => before?.[index] !== after[index])
+        if ((response.status === 'changed') !== (changedFiles.length > 0)) {
+          throw new Error(`Reported status ${response.status} does not match file changes`)
+        }
+        result = { id: finding.id, ...response, changedFiles, changesKnown: true }
       }
-      const after = await fileHashes(cwd, paths)
-      const changedFiles = paths.filter((_, index) => before?.[index] !== after[index])
-      if ((response.status === 'changed') !== (changedFiles.length > 0)) {
-        throw new Error(`Reported status ${response.status} does not match file changes`)
-      }
-      result = { id: finding.id, ...response, changedFiles, changesKnown: true }
     } catch (error) {
       // Observation/cleanup failure cannot prove a native writer stopped; launch no more jobs.
       const failure = error as { outcomeUnknown?: boolean; code?: string }

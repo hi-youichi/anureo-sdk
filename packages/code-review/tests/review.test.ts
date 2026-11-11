@@ -1,3 +1,4 @@
+import { cleanupFixtures } from './fixtures/cleanup'
 import { afterEach, expect, test } from 'bun:test'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -18,8 +19,7 @@ import { candidate, defaultOutput, evidence, type Request, type Source } from '.
 const directories: string[] = []
 const clients: Client[] = []
 afterEach(async () => {
-  await Promise.all(clients.splice(0).map(client => client.dispose()))
-  await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true })))
+  await cleanupFixtures(clients, directories)
 })
 async function fixture(files: Record<string, string> = { 'a.ts': 'export const a = 1\n', 'b.ts': 'export const b = 2\n' }) {
   const cwd = await mkdtemp(join(tmpdir(), 'anureo-design-'))
@@ -673,4 +673,52 @@ test('failed JSON rename removes only its temporary file and preserves the desti
   const circular: { self?: unknown } = {}; circular.self = circular
   await expect(saveJson(join(cwd, 'circular.json'), circular)).rejects.toMatchObject({ code: 'WORKFLOW_STORAGE_FAILED' })
   expect((await readdir(cwd)).filter(path => path.endsWith('.tmp'))).toEqual([])
+})
+
+
+test('call artifacts retain known, unknown and unspecified outcomes without serializing arbitrary error details', async () => {
+  const cwd = await fixture()
+  const cases = [
+    { error: new HarnessSdkError('AUDIT_FAULT', 'same message', false, false), code: 'AUDIT_FAULT', unknown: false, fatal: false, cleanup: 0 },
+    { error: new HarnessSdkError('AUDIT_FAULT', 'same message', false, true), code: 'AUDIT_FAULT', unknown: true, fatal: true, cleanup: 0 },
+    { error: new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'same message', false, false, { cleanupErrors: [{ secret: 'not for artifacts' }] }), code: 'RESOURCE_RELEASE_FAILED', unknown: false, fatal: true, cleanup: 1 },
+    { error: new HarnessSdkError('AGENT_STARTUP_BLOCKED', 'same message', false, false, { workflowDisposition: 'startup_blocked' }), code: null, unknown: null, fatal: false, cleanup: 0 },
+  ]
+  for (const [index, expected] of cases.entries()) {
+    const harness = await backend(() => { throw expected.error })
+    const config = await options(cwd, harness.client, { outputDir: join(cwd, `out-${index}`) })
+    await reviewDesign(config).catch(() => {})
+    const errors = (await readdir(join(config.outputDir, 'calls'))).filter(name => name.endsWith('.error.json'))
+    expect(errors).toHaveLength(1)
+    const text = await readFile(join(config.outputDir, 'calls', errors[0]!), 'utf8')
+    expect(JSON.parse(text)).toMatchObject({ code: expected.code, outcomeUnknown: expected.unknown, fatal: expected.fatal, cleanupErrorCount: expected.cleanup })
+    expect(text).not.toContain('not for artifacts')
+  }
+})
+
+test('deleted supplemental context invalidates a legacy task while independent tasks remain reusable', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n', 'b.ts': 'export const b = 2\n',
+    '.gitignore': 'extra.md\n', 'extra.md': 'old supplemental contract\n' })
+  const first = await backend((input, output) => {
+    if (input.task === 'design-analysis' && input.assignment!.angleId === 'D12'
+      && input.assignment!.primaryFiles.includes('a.ts') && input.round === 0) {
+      return { ...analysisSchema.parse(output), status: 'needs_context', contextRequests: [
+        { path: 'extra.md', symbol: null, query: null, reason: 'Read supplemental contract' },
+      ] }
+    }
+    return output
+  })
+  const source = await options(cwd, first.client)
+  const original = await reviewDesign(source)
+  expect(original.complete).toBe(true)
+  const legacy = join(cwd, 'draft/docs/design-review/legacy-deleted')
+  await mkdir(legacy)
+  await writeFile(join(legacy, 'report.json'), JSON.stringify(original))
+  await cp(join(source.outputDir, 'snapshots'), join(legacy, 'snapshots'), { recursive: true })
+  await rm(join(cwd, 'extra.md'))
+  const next = await backend()
+  const resumed = await reviewDesign(await options(cwd, next.client, { resumeFrom: legacy, outputDir: `${legacy}-imported` }))
+  expect(resumed.complete).toBe(true)
+  expect(resumed.calls.reusedTasks).toBe(original.tasks.length - 1)
+  expect(next.calls.filter(call => call.task === 'design-analysis').map(call => call.assignment!.primaryFiles)).toEqual([['a.ts']])
 })

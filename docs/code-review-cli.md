@@ -349,3 +349,10 @@ summary representative cannot exclude an accepted local readability repair.
 JSON artifact writes remove their own temporary file on a handled write or rename
 failure, on a best-effort basis. Cleanup failure preserves the storage error. Forced
 process termination can leave temporary files; they are not committed checkpoints.
+
+
+Call error artifacts retain the existing `error` text plus `code`, `outcomeUnknown`,
+`fatal`, and `cleanupErrorCount`. A null code or outcome means it was not supplied;
+null is distinct from a known false outcome. Arbitrary error details are not copied.
+Repair dispatch checks stopping again after file preparation, immediately before
+starting the agent session; tasks stopped during preparation persist as `not_started`.

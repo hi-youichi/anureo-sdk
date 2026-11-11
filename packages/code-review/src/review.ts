@@ -243,7 +243,14 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
         return value
       } catch (error) {
         if (fatalReviewError(error)) { stopReason = errorText(error); hostFailure = error }
-        try { await saveJson(join(outputDir, 'calls', `${callId}.error.json`), { error: errorText(error) }) }
+        const diagnostic = error as { code?: unknown; outcomeUnknown?: unknown; details?: { cleanupErrors?: unknown } } | null
+        try { await saveJson(join(outputDir, 'calls', `${callId}.error.json`), {
+          error: errorText(error),
+          code: typeof diagnostic?.code === 'string' ? diagnostic.code : null,
+          outcomeUnknown: typeof diagnostic?.outcomeUnknown === 'boolean' ? diagnostic.outcomeUnknown : null,
+          fatal: fatalReviewError(error),
+          cleanupErrorCount: Array.isArray(diagnostic?.details?.cleanupErrors) ? diagnostic.details.cleanupErrors.length : 0,
+        }) }
         catch {
           const failure = new HarnessSdkError('WORKFLOW_STORAGE_FAILED', 'Could not record invocation failure', false,
             (error as { outcomeUnknown?: boolean })?.outcomeUnknown === true)
