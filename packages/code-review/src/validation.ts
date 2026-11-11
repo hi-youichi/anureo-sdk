@@ -1,17 +1,32 @@
 import type { ReviewContext } from './context'
 import { errorText } from './io'
-import type { Evidence } from './schema'
+import type { ContextRequest, Evidence } from './schema'
 
 export type ValidationIssue = { path: string; message: string }
 export class ResponseValidationError extends Error {
   constructor(readonly issues: ValidationIssue[]) { super(issues.map(issue => `${issue.path}: ${issue.message}`).join('; ')) }
 }
 
+/** Check returned selectors before retrieval; actual I/O failures remain execution failures. */
+export function contextRequestIssues(context: ReviewContext, requests: readonly ContextRequest[]): ValidationIssue[] {
+  const issues: ValidationIssue[] = []
+  requests.forEach((request, index) => {
+    if (request.path) {
+      try { context.assertContextPath(request.path) }
+      catch (cause) { issues.push({ path: `contextRequests[${index}].path`, message: errorText(cause) }) }
+    } else if (!request.symbol && !request.query) {
+      issues.push({ path: `contextRequests[${index}]`, message: 'Empty context request' })
+    }
+  })
+  return issues
+}
+
 /** Inspect every citation before asking for a replacement response. */
 export function checkEvidence(context: ReviewContext, allowed: Set<string>, groups: Array<{ path: string; evidence: Evidence[] }>) {
   const issues: ValidationIssue[] = []
+  const linesBySnapshot = new Map<string, string[]>()
   for (const group of groups) group.evidence.forEach((evidence, index) => {
-    try { context.validateEvidence([evidence], allowed) }
+    try { context.validateEvidence([evidence], allowed, linesBySnapshot) }
     catch (error) { issues.push({ path: `${group.path}[${index}]`, message: errorText(error) }) }
   })
   if (issues.length) throw new ResponseValidationError(issues)

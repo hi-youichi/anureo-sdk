@@ -4,6 +4,7 @@ import { dimensionSchema, dimensions, evidenceSchema, type ContextRequest, type 
 import { analysisSchema } from './schema'
 import { isEntryContract } from './project'
 import { errorText } from './io'
+import { contextRequestIssues } from './validation'
 
 export const planningSchema = z.strictObject({
   status: z.enum(['planned', 'needs_context', 'incomplete']), summary: z.string().min(1),
@@ -67,9 +68,11 @@ export function validatePlanning(context: ReviewContext, inventory: InventoryPla
   const issues: PlanningIssue[] = []
   const check = (invalid: boolean, path: string, message: string) => { if (invalid) issues.push({ path, message }) }
   const allowed = new Set(snapshotIds)
+  const linesBySnapshot = new Map<string, string[]>()
+  issues.push(...contextRequestIssues(context, discovery.contextRequests))
   discovery.modules.forEach((module, i) => {
     module.evidence.forEach((evidence, j) => {
-      try { context.validateEvidence([evidence], allowed) }
+      try { context.validateEvidence([evidence], allowed, linesBySnapshot) }
       catch (error) { issues.push({ path: `modules[${i}].evidence[${j}]`, message: errorText(error) }) }
     })
     check(!module.evidence.some(e => module.paths.includes(e.path)), `modules[${i}].evidence`, `Module lacks implementation evidence: ${module.id}`)
@@ -135,7 +138,8 @@ export function createModulePlan(context: ReviewContext, inventory: InventoryPla
 
 export async function discoverModules(context: ReviewContext, inventory: InventoryPlan, contracts: Snapshot[],
   invoke: (stage: string, input: object) => Promise<{ callId: string; value: Planning }>,
-  onAttempt?: (attempt: PlanningAttempt, state: PlanningProgress) => Promise<void>) {
+  onAttempt?: (attempt: PlanningAttempt, state: PlanningProgress) => Promise<void>,
+  measureInput: (input: object) => number = input => Buffer.byteLength(JSON.stringify(input))) {
   const catalog = [...context.baseline.values()].map(s => ({ path: s.path, kind: s.kind, sha256: s.sha256 }))
   const index = context.index.map(i => ({ path: i.path, language: i.language, capabilities: i.capabilities, symbols: i.symbols, imports: i.imports, exports: i.exports, unknowns: i.unknowns }))
   const base = { task: 'design-planning', primaryFiles: inventory.primaryFiles, catalog, index, referenceAngles: dimensions,
@@ -152,18 +156,21 @@ export async function discoverModules(context: ReviewContext, inventory: Invento
       '缺少必要实现时 status=needs_context，通过 contextRequests 请求明确路径；不能执行工具或命令。最终 planned 不得有 contextRequests/gaps。',
     ] }
   const all = [...new Map([...inventory.primaryFiles.map(p => context.baseline.get(p)!), ...contracts].map(s => [s.path, s])).values()]
-  let sources = Buffer.byteLength(JSON.stringify({ ...base, sources: all.map(sourceInput) })) <= inventory.budgets.maxInputBytes
-    ? all : [...new Map([...all.filter(s => isEntryContract(s.path)), ...contracts].map(s => [s.path, s])).values()]
+  let sources = all
   const state = planningProgress()
   let previous: Planning | null = null
   let resolution: object | null = null
   let round = 0, corrections = 0, attemptNumber = 0
+  const input = () => ({ ...base, sources: sources.map(sourceInput),
+    unreadFiles: inventory.primaryFiles.filter(p => !sources.some(s => s.path === p)), previous,
+    contextResolution: resolution, round, corrections, validationFeedback: state.validationIssues })
+  if (measureInput(input()) > inventory.budgets.maxInputBytes) {
+    sources = [...new Map([...all.filter(s => isEntryContract(s.path)), ...contracts].map(s => [s.path, s])).values()]
+  }
   while (true) {
     const stage = `planning-${attemptNumber++}`
     // Invocation errors propagate directly: only returned, schema-valid proposals can be corrected.
-    const { callId, value } = await invoke(stage, { ...base, sources: sources.map(sourceInput),
-      unreadFiles: inventory.primaryFiles.filter(p => !sources.some(s => s.path === p)), previous,
-      contextResolution: resolution, round, corrections, validationFeedback: state.validationIssues })
+    const { callId, value } = await invoke(stage, input())
     const snapshotIds = sources.map(s => s.id)
     const issues = validatePlanning(context, inventory, value, snapshotIds)
     const outcome = value.status === 'incomplete' ? 'incomplete' : issues.length ? 'invalid'

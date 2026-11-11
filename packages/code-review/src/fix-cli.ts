@@ -1,8 +1,8 @@
 import { readFile, realpath, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
-import { chooseOutput, progress, withClient } from './cli-shared'
-import { fileHash, fixReadability, parseReport } from './fix'
+import { chooseOutput, progress, withClient, withOutputClaim } from './cli-shared'
+import { fileHash, fixReadability, parseReport, writeOwnership } from './fix'
 import { createGate, saveJson } from './io'
 import { readDesignConfig } from './project'
 
@@ -48,15 +48,17 @@ export async function fixMain(args: string[]) {
   if (await realpath(reportCwd) !== cwd) throw new Error('Report belongs to a different project')
   const { outputDir } = await chooseOutput(cwd, values.output, 'fixes')
   const writeGroups = config?.writeGroups ?? []
-  const paths = [...new Set(findings.flatMap(finding => writeGroups.find(group => group.includes(finding.path)) ?? [finding.path]))]
-  const hashes = new Map(await Promise.all(paths.map(async path => [path, await fileHash(cwd, path)] as const)))
+  const ownedFiles = writeOwnership(writeGroups)
+  const paths = [...new Set(findings.flatMap(ownedFiles))]
+  const hashes = new Map<string, string>()
+  for (const path of paths) hashes.set(path, await fileHash(cwd, path))
   const driftedFiles = [...new Set(findings.filter(f => hashes.get(f.path) !== f.sha256).map(f => f.path))]
   const plan = { cwd, reportPath, outputDir, agents: findings.length, files: paths.length, concurrency, coverageGaps, driftedFiles, writeGroups, skipped,
-    findings: findings.map(finding => ({ ...finding, ownedFiles: writeGroups.find(group => group.includes(finding.path)) ?? [finding.path] })),
+    findings: findings.map(finding => ({ ...finding, ownedFiles: ownedFiles(finding) })),
   }
   if (values['dry-run']) { console.log(JSON.stringify(plan, null, 2)); return }
   if (!findings.length) throw new Error('No eligible local readability findings; use --dry-run to inspect skipped findings')
-  await withClient(cwd, maxOutputBytes, true, async (client, shouldStop) => {
+  await withOutputClaim(outputDir, () => withClient(cwd, maxOutputBytes, true, async (client, shouldStop) => {
     const result = await fixReadability({ client, cwd, findings, writeGroups, outputDir, concurrency, shouldStop, progress,
       model: values.model ?? process.env.ANUREO_REVIEW_MODEL,
     })
@@ -74,5 +76,5 @@ export async function fixMain(args: string[]) {
     console.error(`Artifacts: ${outputDir}`)
     process.stdout.write(values.format === 'json' ? `${JSON.stringify(report, null, 2)}\n` : `${markdown}\n`)
     if (!shouldStop() && !complete) process.exitCode = 1
-  })
+  }))
 }

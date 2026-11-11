@@ -39,7 +39,8 @@ export async function readSnapshot(cwd: string, path: string, exclusions: readon
   let text: string
   try {
     if (bytes.includes(0)) throw new Error('Binary data')
-    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    // Preserve the BOM so decoded text round-trips to the bytes named by sha256.
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
   } catch { return { id: `snapshot:${hash(`${path}\0${sha256}`)}`, path, sha256, kind: 'binary', text: '', error: null } }
   return { id: `snapshot:${hash(`${path}\0${sha256}`)}`, path, sha256, kind: 'text', text, error: null }
 }
@@ -49,9 +50,11 @@ export class ReviewContext {
   readonly baseline = new Map<string, Snapshot>()
   readonly index: SourceIndex[]
   private readonly evidenceSymbols = new Map<string, SourceSymbol[]>()
+  private readonly indexByPath: Map<string, SourceIndex>
   private constructor(readonly cwd: string, readonly packages: Package[], initial: Snapshot[], readonly adapters: readonly LanguageAdapter[], readonly exclusions: readonly string[]) {
     for (const s of initial) { this.baseline.set(s.path, s); this.snapshots.set(s.id, s) }
     this.index = buildIndex(initial, packages, adapters)
+    this.indexByPath = new Map(this.index.map(item => [item.path, item]))
   }
 
   static async create(cwd: string, packages: Package[], adapters: readonly LanguageAdapter[] = [], exclusions: readonly string[] = []) {
@@ -89,6 +92,10 @@ export class ReviewContext {
   async acquire(path: string): Promise<Snapshot> {
     const read = await this.currentSnapshot(path)
     if (read.kind !== 'text') throw new Error(`Context is not source text: ${path}`)
+    return this.registerRead(read)
+  }
+
+  private registerRead(read: Snapshot): Snapshot {
     const snapshot = { ...read, id: `${read.id}:read-${randomUUID()}` }
     this.snapshots.set(snapshot.id, snapshot)
     return snapshot
@@ -102,7 +109,12 @@ export class ReviewContext {
         const target = match[1]!.replace(/^<|>$/g, '').split('#')[0]!
         if (!target || /^[a-z]+:/i.test(target)) continue
         let path: string
-        try { path = posix.resolve('/', posix.dirname(source.path), decodeURIComponent(target)).slice(1); this.assertContextPath(path) } catch { continue }
+        try {
+          const decoded = decodeURIComponent(target)
+          if (posix.isAbsolute(decoded) || /^[a-z][a-z0-9+.-]*:/i.test(decoded)) continue
+          path = posix.normalize(posix.join(posix.dirname(source.path), decoded))
+          this.assertContextPath(path)
+        } catch { continue }
         if (this.baseline.has(path)) continue
         try {
           const root = await realpath(this.cwd)
@@ -119,7 +131,9 @@ export class ReviewContext {
     const searches: Array<{ request: ContextRequest; matchedPaths: string[]; definitionPaths: string[]; candidateConsumerPaths: string[] }> = []
     for (const request of requests) {
       if (!request.path && !request.symbol && !request.query) throw new Error('Empty context request')
-      const definitions = request.symbol ? this.index.filter(item => item.symbols.some(s => s.name === request.symbol || s.name.endsWith(`.${request.symbol}`))).map(item => item.path) : []
+      const symbol = request.symbol
+      const definitions = symbol ? this.index.filter(item => item.symbols.some(s => s.name === symbol || s.name.endsWith(`.${symbol}`))).map(item => item.path) : []
+      const definitionPaths = new Set(definitions)
       let matched: string[]
       if (request.path) {
         this.assertContextPath(request.path)
@@ -128,17 +142,23 @@ export class ReviewContext {
       } else {
         const matches = [...this.baseline.values()].filter(source => source.kind === 'text'
           && (request.symbol
-            ? this.index.find(item => item.path === source.path)?.symbols.some(s => s.name === request.symbol || s.name.endsWith(`.${request.symbol}`))
+            ? definitionPaths.has(source.path)
               || source.text.includes(request.symbol)
             : !request.query || source.text.includes(request.query)))
         matched = matches.map(source => source.path)
         for (const match of matches) paths.add(match.path)
       }
       searches.push({ request, matchedPaths: matched, definitionPaths: definitions,
-        candidateConsumerPaths: matched.filter(path => !definitions.includes(path)) })
+        candidateConsumerPaths: matched.filter(path => !definitionPaths.has(path)) })
     }
     if (paths.size > maxFiles) throw new ContextSelectionRequired([...paths], maxFiles)
-    const snapshots = await Promise.all([...paths].map(path => this.acquire(path)))
+    // Drain all reads and validate the whole batch before publishing shared evidence.
+    const reads = await Promise.allSettled([...paths].map(path => this.currentSnapshot(path)))
+    const snapshots = reads.map(read => {
+      if (read.status === 'rejected') throw read.reason
+      if (read.value.kind !== 'text') throw new Error(`Context is not source text: ${read.value.path}`)
+      return read.value
+    }).map(read => this.registerRead(read))
     return { snapshots, resolution: { status: 'resolved', searches, searchedPaths: [...this.baseline.keys()],
       limitations: 'This is a static inventory search. Candidate consumers are navigation matches, not proven runtime calls. Zero matches means no match in this inventory, not no possible external consumer.',
       instruction: '若只命中已经提供的定义，仓库未提供更多对应实现/候选消费者；不要重复请求同一符号。结合已读契约审查接口与不变量，将外部运行事实标为假设或待验证。确实缺少必要源码时只将相应维度标 incomplete。' } }
@@ -148,19 +168,30 @@ export class ReviewContext {
     return (await this.resolveRequestsDetailed(requests, maxFiles)).snapshots
   }
 
-  validateEvidence(evidence: Evidence[], allowed: Set<string>) {
+  validateEvidence(evidence: Evidence[], allowed: Set<string>, linesBySnapshot = new Map<string, string[]>()) {
     for (const e of evidence) {
       const snapshot = this.snapshots.get(e.snapshotId)
       if (!snapshot || !allowed.has(e.snapshotId) || snapshot.kind !== 'text' || snapshot.path !== e.path || snapshot.sha256 !== e.sha256) {
         throw new Error(`Invalid evidence snapshot: ${e.path}`)
       }
-      const lines = snapshot.text.split('\n')
+      let lines = linesBySnapshot.get(snapshot.id)
+      if (!lines) { lines = snapshot.text.split('\n'); linesBySnapshot.set(snapshot.id, lines) }
       if (e.endLine < e.startLine || e.endLine > lines.length || !lines.slice(e.startLine - 1, e.endLine).join('\n').includes(e.quote)) {
         throw new Error(`Invalid source evidence: ${e.path}:${e.startLine}-${e.endLine}`)
       }
       if (e.symbol) {
         let symbols = this.evidenceSymbols.get(snapshot.id)
-        if (!symbols) { symbols = buildIndex([snapshot], this.packages, this.adapters)[0]?.symbols ?? []; this.evidenceSymbols.set(snapshot.id, symbols) }
+        if (!symbols) {
+          const baseline = this.baseline.get(snapshot.path)
+          if (baseline?.kind === snapshot.kind && baseline.sha256 === snapshot.sha256) {
+            symbols = this.indexByPath.get(snapshot.path)?.symbols ?? []
+          } else {
+            // Recheck this historical file in the repository view used for navigation.
+            const repository = [...this.baseline.values()].filter(source => source.path !== snapshot.path).concat(snapshot)
+            symbols = buildIndex(repository, this.packages, this.adapters).find(item => item.path === snapshot.path)?.symbols ?? []
+          }
+          this.evidenceSymbols.set(snapshot.id, symbols)
+        }
         if (!symbols.some(s => (s.name === e.symbol || s.name.endsWith(`.${e.symbol}`)) && s.startLine <= e.endLine && s.endLine >= e.startLine)) {
           throw new Error(`Invalid evidence symbol: ${e.symbol}; unindexed source must use an empty symbol and exact line/quote evidence`)
         }
@@ -171,13 +202,20 @@ export class ReviewContext {
   async changes() {
     const current = (await discoverPackages(this.cwd, [], this.exclusions)).flatMap(pkg => pkg.files)
     const changed = new Set(current.filter(path => !this.baseline.has(path)))
+    const histories = new Map<string, Snapshot[]>()
     for (const snapshot of this.snapshots.values()) {
-      try {
-        const actual = await readSnapshot(this.cwd, snapshot.path, this.exclusions)
-        if (snapshot.sha256 !== actual.sha256 || snapshot.kind !== actual.kind) changed.add(snapshot.path)
-      } catch { changed.add(snapshot.path) }
+      const versions = histories.get(snapshot.path) ?? []
+      versions.push(snapshot)
+      histories.set(snapshot.path, versions)
     }
-    for (const path of this.baseline.keys()) if (!current.includes(path)) changed.add(path)
+    for (const [path, versions] of histories) {
+      try {
+        const actual = await readSnapshot(this.cwd, path, this.exclusions)
+        if (versions.some(snapshot => snapshot.sha256 !== actual.sha256 || snapshot.kind !== actual.kind)) changed.add(path)
+      } catch { changed.add(path) }
+    }
+    const currentPaths = new Set(current)
+    for (const path of this.baseline.keys()) if (!currentPaths.has(path)) changed.add(path)
     return [...changed].sort()
   }
 

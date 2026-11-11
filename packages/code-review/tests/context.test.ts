@@ -150,6 +150,45 @@ test('ignored contract references are independent of project documentation direc
   expect(context.baseline.has('specifications/state.adoc')).toBe(false)
 })
 
+test('UTF-8 BOM snapshots retain their exact bytes through text and evidence validation', async () => {
+  const text = '\ufeffexport const value = 1\n'
+  const cwd = await fixture({ 'bom.ts': text })
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  const snapshot = context.baseline.get('bom.ts')!
+  expect(snapshot.kind).toBe('text')
+  expect(snapshot.text).toBe(text)
+  expect(hash(snapshot.text)).toBe(snapshot.sha256!)
+  expect(() => context.validateEvidence([{ path: snapshot.path, snapshotId: snapshot.id, sha256: snapshot.sha256!,
+    symbol: 'value', startLine: 1, endLine: 1, quote: 'export const value = 1', role: 'declaration' }], new Set([snapshot.id]))).not.toThrow()
+})
+
+test('contract references cannot clamp escaped relative links into unrelated in-project files', async () => {
+  const cwd = await fixture({ '.gitignore': 'contract.md\nlocal.md\n', 'contract.md': 'unrelated internal contract',
+    'local.md': 'valid internal contract', 'README.md': '[escape](../contract.md)\n[encoded](%2e%2e/contract.md)\n[absolute](/contract.md)\n[valid](guide/../local.md)\n',
+    'docs/page.md': '[escape](../../contract.md)\n' })
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  expect(await context.contractReferences()).toEqual([{ path: 'local.md', kind: 'contract_reference', sha256: null }])
+})
+
+test('symbol evidence preserves repository context for baseline and reread language adapters', async () => {
+  const cwd = await fixture({ 'a.custom': 'step calculate = 1', 'registry.meta': 'calculate alternate' })
+  const adapter: LanguageAdapter = { id: 'cross-file-v1', supports: source => source.path.endsWith('.custom'),
+    index: (sources, _, repository) => sources.map(source => {
+      const name = /step (\w+)/.exec(source.text)?.[1] ?? ''
+      const registered = repository.some(file => file.path === 'registry.meta' && file.text.includes(name))
+      return { path: source.path, language: 'custom', adapter: 'cross-file-v1', capabilities: ['symbols'],
+        symbols: registered ? [{ name, startLine: 1, endLine: 1, column: 1, kind: 'step' }] : [],
+        imports: [], exports: [], calls: [], unknowns: [] }
+    }) }
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd), [adapter])
+  for (const name of ['calculate', 'alternate']) {
+    if (name === 'alternate') await writeFile(join(cwd, 'a.custom'), 'step alternate = 1')
+    const snapshot = name === 'calculate' ? context.baseline.get('a.custom')! : await context.acquire('a.custom')
+    expect(() => context.validateEvidence([{ path: snapshot.path, snapshotId: snapshot.id, sha256: snapshot.sha256!,
+      symbol: name, startLine: 1, endLine: 1, quote: `step ${name}`, role: 'step' }], new Set([snapshot.id]))).not.toThrow()
+  }
+})
+
 
 test('language navigation resolves declared package entries without assuming a source directory convention', async () => {
   const cwd = await fixture({ 'lib/package.json': JSON.stringify({ name: 'numbers', exports: './public.ts' }),
@@ -161,4 +200,37 @@ test('language navigation resolves declared package entries without assuming a s
   context = await ReviewContext.create(cwd, await discoverPackages(cwd))
   expect(context.index.find(i => i.path === 'caller.ts')!.imports[0]!.target).toBeNull()
   expect(context.index.find(i => i.path === 'caller.ts')!.unknowns.join()).toContain('Unresolved')
+})
+
+
+test('a rejected supplemental batch drains reads without registering partial snapshots', async () => {
+  const cwd = await fixture()
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  const original = context.currentSnapshot.bind(context)
+  let release!: () => void
+  let started!: () => void
+  let finished!: () => void
+  const readFinished = new Promise<void>(resolve => { finished = resolve })
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  const reading = new Promise<void>(resolve => { started = resolve })
+  context.currentSnapshot = async path => {
+    if (path === 'a.ts') {
+      started(); await waiting
+      try { return await original(path) } finally { finished() }
+    }
+    return original(path)
+  }
+  const before = [...context.snapshots.keys()]
+  const batch = context.resolveRequests([
+    { path: 'a.ts', symbol: null, query: null, reason: 'slow valid source' },
+    { path: 'missing.md', symbol: null, query: null, reason: 'missing source' },
+  ], 2)
+  // Observe rejection immediately, while still allowing the other read to drain.
+  const observed = batch.then(() => null, error => error)
+  await reading
+  release()
+  expect(await observed).toBeInstanceOf(Error)
+  await readFinished
+  await new Promise<void>(resolve => setImmediate(resolve))
+  expect([...context.snapshots.keys()]).toEqual(before)
 })

@@ -16,7 +16,7 @@ import { isEntryContract } from './project'
 import type { LanguageAdapter } from './language'
 import { createModulePlan, discoverModules, inventoryPlan, planningSchema, type PlanningAttempt } from './planning'
 import { renderDesignReport } from './report'
-import { checkEvidence, validatedResponse } from './validation'
+import { checkEvidence, contextRequestIssues, ResponseValidationError, validatedResponse } from './validation'
 
 export type Flow = { id: string; purpose: string; paths: string[]; symbols: string[] }
 export type TaskResult = {
@@ -28,6 +28,7 @@ type SummaryResult = { id: string; value: DesignSummary | null; error: string | 
 export type DesignPlan = ReturnType<typeof createDesignPlan>
 export type DesignReport = {
   reportKind: 'design-review'; formatVersion: 2; createdAt: string; cwd: string; complete: boolean
+  backendConfigDigest: string | null
   plan: DesignPlan; baseline: ReturnType<ReviewContext['gitBaseline']>; changedPaths: string[]
   tasks: TaskResult[]; summaries: SummaryResult[]; calls: { actual: number; reusedTasks: number }
   findings: Array<Finding & { review: ReviewDecision | null; canonicalId: string; stale: boolean }>
@@ -123,6 +124,9 @@ export function designCoverage(results: TaskResult[], selectedDimensions: readon
     modules: unitCounts(modules.map(m => m.status)), files: unitCounts(modules.flatMap(m => m.paths.map(() => m.status))) }
 }
 
+// Bump when prompting, validation, or snapshot contracts change.
+const reviewWorkflowRevision = '2'
+
 /** Persistence identity is independent of backend Session IDs and final report generation. */
 export async function reviewDesign(options: DesignOptions): Promise<DesignReport> {
   if (options.backendConfigDigest !== undefined && !options.backendConfigDigest.trim()) throw new HarnessSdkError('INVALID_PARAMS')
@@ -147,11 +151,11 @@ export async function reviewDesign(options: DesignOptions): Promise<DesignReport
     planningCorrections: options.planningCorrections ?? 2, responseCorrections: options.responseCorrections ?? 2,
     maxInputBytes: options.maxInputBytes ?? 256000, instructions: designInstructions, schemaFingerprint: schemaFingerprint(), designParadigms,
   }
-  const output = await workflow({ name: 'code-review', revision: '1', input,
+  const output = await workflow({ name: 'code-review', revision: reviewWorkflowRevision, input,
     directory: dirname(resolve(options.outputDir)), runId: basename(options.outputDir), resumeFrom,
   }, run => {
     options.progress?.(`workflow start: ${run.runId}`)
-    return reviewDesignRun(options, run, options.backendConfigDigest ? legacy : null)
+    return reviewDesignRun(options, run, options.backendConfigDigest && legacy?.backendConfigDigest === options.backendConfigDigest ? legacy : null)
   })
   if (output.status === 'incomplete') output.result.complete = false
   return output.result
@@ -161,11 +165,13 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
   const { client, cwd, packages, outputDir, model } = options
   const localGate = createGate(options.concurrency)
   const gated = options.gate ?? localGate
+  const taskGate = createGate(options.concurrency)
   const progress = options.progress ?? (() => {})
   const context = await ReviewContext.create(cwd, packages, options.adapters, options.outputExclusions)
   let plan = createDesignPlan(context, options)
   const configuredContracts = await Promise.all(plan.contractPaths.map(path => context.acquire(path)))
   const currentSchemaFingerprint = schemaFingerprint()
+  const planningEnvelopeBytes = Buffer.byteLength(designInstructions) + Buffer.byteLength(JSON.stringify(z.toJSONSchema(planningSchema)))
   const baseline = context.gitBaseline()
   const planWrites = createGate(1)
   await mkdir(outputDir, { recursive: true })
@@ -198,7 +204,9 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
   async function invoke<S extends z.ZodObject>(taskId: string, stage: string, input: object, schema: S,
     onCallId?: (callId: string) => void): Promise<z.output<S>> {
     const prompt = JSON.stringify(input)
-    if (Buffer.byteLength(prompt) > plan.budgets.maxInputBytes) throw new Error(`Input budget exceeded: ${taskId} (${Buffer.byteLength(prompt)} bytes)`)
+    const outputSchema = z.toJSONSchema(schema)
+    const inputBytes = Buffer.byteLength(prompt) + Buffer.byteLength(designInstructions) + Buffer.byteLength(JSON.stringify(outputSchema))
+    if (inputBytes > plan.budgets.maxInputBytes) throw new Error(`Input budget exceeded: ${taskId} (${inputBytes} bytes)`)
     const queuedAt = new Date().toISOString()
     let entered = false
     queuedCalls++
@@ -208,7 +216,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
       if (hostFailure) throw hostFailure
       if (stopReason || options.shouldStop?.()) throw new HarnessSdkError('REVIEW_STOPPED', stopReason ?? 'Review interrupted by host')
       const callId = `${String(++attempts).padStart(5, '0')}-${hash(taskId).slice(0, 12)}-${stage}`
-      const record = { callId, taskId, stage, model: model ?? null, queuedAt, input, instructions: designInstructions, schema: z.toJSONSchema(schema) }
+      const record = { callId, taskId, stage, model: model ?? null, queuedAt, input, instructions: designInstructions, schema: outputSchema, inputBytes }
       await saveJson(join(outputDir, 'calls', `${callId}.input.json`), record)
       onCallId?.(callId)
       if (/^(analysis|verify)-[1-4]$/.test(stage)) {
@@ -290,7 +298,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
           await context.save(outputDir)
           await saveJson(join(outputDir, 'plan.json'), { ...plan, baseline, concurrency: options.concurrency, model: model ?? null })
           if (attempt.outcome === 'invalid') progress(`planning validation failed: ${attempt.validationIssues.length} issue(s); proposal saved: ${attempt.callId}`)
-        })
+        }, input => Buffer.byteLength(JSON.stringify(input)) + planningEnvelopeBytes)
         if (!accepted) throw new HarnessSdkError('WORKFLOW_STEP_INCOMPLETE')
         return { proposal: accepted.proposal, snapshotIds: accepted.snapshotIds }
       },
@@ -326,10 +334,8 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
   }
 
   function checkRequests(requests: Analysis['contextRequests']) {
-    for (const request of requests) {
-      if (request.path) context.assertContextPath(request.path)
-      else if (!request.symbol && !request.query) throw new Error('Empty context request')
-    }
+    const issues = contextRequestIssues(context, requests)
+    if (issues.length) throw new ResponseValidationError(issues)
   }
 
   function checkAnalysis(task: DesignTask, value: Analysis, allowed: Set<string>) {
@@ -380,7 +386,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
     const empty: TaskResult = { task, status: 'failed', error: null, snapshotIds: [], analysis: null, findings: [], verification: null, inputHash, reused: false }
     let result = empty
     let imported = false
-    function canReuse(old: TaskResult) {
+    function duplicateTargetsAvailable(old: TaskResult) {
       const ownIds = new Set(old.findings.map(f => f.id))
       const currentIds = new Set([...results.values()].flatMap(r => r.findings.map(f => f.id)))
       return !old.verification?.decisions.some(d => d.duplicateOf && !ownIds.has(d.duplicateOf) && !currentIds.has(d.duplicateOf))
@@ -396,16 +402,10 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
     try {
       if (stopReason) throw new HarnessSdkError('WORKFLOW_STEP_INCOMPLETE')
       result = await checkpointTask({ run, context, outputDir, taskId: task.id,
-        input: { inputHash }, repeatable: options.repeatable === true, canReuse, validate,
+        input: { inputHash }, repeatable: options.repeatable === true, canReuse: duplicateTargetsAvailable, validate,
         execute: async () => {
           let old = prior?.tasks.find(r => r.task.id === task.id && r.status === 'completed' && r.inputHash === inputHash)
-          if (old) {
-            const ownIds = new Set(old.findings.map(f => f.id))
-            const currentIds = new Set([...results.values()].flatMap(r => r.findings.map(f => f.id)))
-            // A cached cross-task alias is reusable only after its referenced finding exists
-            // in the current run. Otherwise analyze again instead of trusting an old registry.
-            if (old.verification?.decisions.some(d => d.duplicateOf && !ownIds.has(d.duplicateOf) && !currentIds.has(d.duplicateOf))) old = undefined
-          }
+          if (old && !duplicateTargetsAvailable(old)) old = undefined
           if (old) {
             // A task may have read sources outside primaryFiles. A changed contextual source
             // invalidates that task even when its primary input and dependencies did not change.
@@ -535,7 +535,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
   }
 
   async function runBatch(tasks: DesignTask[]) {
-    const values = await parallel(tasks.map(task => () => runTask(task)))
+    const values = await parallel(tasks.map(task => () => taskGate(() => runTask(task))))
     for (const [i, value] of values.entries()) if (value === null && !results.has(tasks[i]!.id)) {
       const task = tasks[i]!
       results.set(task.id, { task, status: 'failed', error: 'Task escaped before recording a result', snapshotIds: [], analysis: null, findings: [], verification: null, inputHash: '', reused: false })
@@ -581,18 +581,29 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
     const review = result.verification?.decisions.find(d => d.findingId === f.id) ?? null
     return { ...f, review, canonicalId: review?.duplicateOf ?? f.id, stale: result.status === 'stale' }
   }))
-  const allIds = new Set(findings.map(f => f.id))
-  for (const finding of findings) {
+  const findingsById = new Map(findings.map(f => [f.id, f]))
+  const duplicateRoots = new Map<string, string | null>()
+  function duplicateRoot(start: string): string | null {
+    const path: string[] = []
     const visited = new Set<string>()
-    let id = finding.id
+    let id = start, root: string | null
     while (true) {
-      if (visited.has(id) || !allIds.has(id)) { errors.push(`Invalid duplicate chain: ${finding.id}`); break }
+      if (duplicateRoots.has(id)) { root = duplicateRoots.get(id)!; break }
+      const finding = findingsById.get(id)
+      if (!finding || visited.has(id)) { root = null; break }
       visited.add(id)
-      const next = findings.find(f => f.id === id)?.review?.duplicateOf
-      if (!next) { finding.canonicalId = id; break }
-      id = next
+      path.push(id)
+      if (!finding.review?.duplicateOf) { root = id; break }
+      id = finding.review.duplicateOf
     }
-    const root = findings.find(f => f.id === finding.canonicalId)
+    for (const member of path) duplicateRoots.set(member, root)
+    return root
+  }
+  for (const finding of findings) {
+    const rootId = duplicateRoot(finding.id)
+    if (rootId === null) errors.push(`Invalid duplicate chain: ${finding.id}`)
+    else finding.canonicalId = rootId
+    const root = findingsById.get(finding.canonicalId)
     if (finding.canonicalId !== finding.id && (!root?.review || root.review.verdict === 'rejected')) errors.push(`Duplicate root is not actionable: ${finding.id}`)
   }
   const finalGroups = summaries.find(s => s.id === 'project-summary')?.value?.groups ?? []
@@ -602,9 +613,12 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
     errors.push(`Summary contradicts verified duplicate: ${finding.id}`)
   }
   const rootGroups = finalGroups.map(group => {
-    const fresh = group.findingIds.filter(id => !findings.find(f => f.id === id)?.stale)
-    const canonicalId = [...(fresh.length ? fresh : group.findingIds)].sort()[0]!
-    for (const finding of findings) if (group.findingIds.includes(finding.id)) finding.canonicalId = canonicalId
+    const members = group.findingIds.map(id => findingsById.get(id)!)
+    const fresh = members.filter(f => !f.stale)
+    const candidates = fresh.length ? fresh : members
+    const accepted = candidates.filter(f => f.review?.verdict === 'accepted')
+    const canonicalId = (accepted.length ? accepted : candidates).map(f => f.id).sort()[0]!
+    for (const finding of members) finding.canonicalId = canonicalId
     return { canonicalId, findingIds: group.findingIds, rationale: group.tradeoffs }
   })
   const actionable = findings.filter(f => !f.stale && f.review && f.review.verdict !== 'rejected')
@@ -615,6 +629,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
     reportKind: 'design-review', formatVersion: 2, createdAt: new Date().toISOString(), cwd,
     complete: tasks.length > 0 && tasks.every(r => r.status === 'completed') && summaries.every(r => !r.error)
       && !changedPaths.length && !errors.length && coverage.entries.every(e => e.status !== 'incomplete'),
+    backendConfigDigest: options.backendConfigDigest ?? null,
     plan, baseline, changedPaths, tasks, summaries, findings, findingCounts, rootGroups, coverage, errors,
     calls: { actual: calls, reusedTasks: tasks.filter(t => t.reused).length },
     preflight: { reusedFrom: options.preflight?.directory ?? null, schemaFingerprint: schemaFingerprint() },

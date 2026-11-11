@@ -74,7 +74,7 @@ export async function checkpointPlanning<Input>(options: {
   execute: () => Promise<{ proposal: Planning; snapshotIds: string[] }>
 }) {
   const schema = z.strictObject({ proposal: planningSchema, snapshots: z.array(snapshotSchema) })
-  const validate = async (value: z.output<typeof schema>) => {
+  const restoreValidateAndSave = async (value: z.output<typeof schema>) => {
     for (const snapshot of value.snapshots) options.context.snapshots.set(snapshot.id, snapshot)
     const issues = validatePlanning(options.context, options.inventory, value.proposal, value.snapshots.map(s => s.id))
     if (value.proposal.status !== 'planned' || issues.length) throw new PlanningValidationError(issues)
@@ -83,13 +83,13 @@ export async function checkpointPlanning<Input>(options: {
   return options.run.step({ key: 'planning', schema, input: options.input,
     recovery: options.repeatable ? 'repeatable' : 'manual', reuse: async saved => {
       if (!await matchingSnapshots(options.context, saved.snapshots)) return false
-      await validate(saved)
+      await restoreValidateAndSave(saved)
       return true
     } }, async () => {
     try {
       const accepted = await options.execute()
       const value = await schema.parseAsync({ proposal: accepted.proposal, snapshots: snapshotsFor(options.context, accepted.snapshotIds) })
-      await validate(value)
+      await restoreValidateAndSave(value)
       return value
     } catch (cause) { throw reviewError(cause) }
   })

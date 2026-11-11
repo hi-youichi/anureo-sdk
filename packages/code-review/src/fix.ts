@@ -88,7 +88,7 @@ export function parseReport(text: string) {
   return { cwd: report.cwd, findings, skipped, coverageGaps: report.tasks.filter(t => t.status !== 'completed').map(t => t.task.id) }
 }
 
-function writeOwnership(groups: string[][]) {
+export function writeOwnership(groups: string[][]) {
   const owners = new Map<string, string[]>()
   for (const group of groups) {
     if (!group.length || new Set(group).size !== group.length) throw new Error('Write groups must contain unique paths')
@@ -120,6 +120,12 @@ export async function fileHash(cwd: string, path: string) {
     throw new Error(`Target must be a regular project file without symlink parents: ${path}`)
   }
   return createHash('sha256').update(await readFile(absolute)).digest('hex')
+}
+
+async function fileHashes(cwd: string, paths: readonly string[]): Promise<string[]> {
+  const hashes: string[] = []
+  for (const path of paths) hashes.push(await fileHash(cwd, path))
+  return hashes
 }
 
 const instructions = [
@@ -159,7 +165,7 @@ export async function fixReadability(options: FixOptions) {
     let result: Result
     let before: string[] | undefined
     try {
-      before = await Promise.all(paths.map(path => fileHash(cwd, path)))
+      before = await fileHashes(cwd, paths)
       const response = await agent(JSON.stringify({
         task: 'fix-readability', finding, ownedFiles: paths,
         currentSha256: await fileHash(cwd, finding.path),
@@ -169,7 +175,7 @@ export async function fixReadability(options: FixOptions) {
         stopReason = `Agent returned null for ${finding.id}; no automatic retry`
         throw new Error(stopReason)
       }
-      const after = await Promise.all(paths.map(path => fileHash(cwd, path)))
+      const after = await fileHashes(cwd, paths)
       const changedFiles = paths.filter((_, index) => before?.[index] !== after[index])
       if ((response.status === 'changed') !== (changedFiles.length > 0)) {
         throw new Error(`Reported status ${response.status} does not match file changes`)
@@ -181,8 +187,11 @@ export async function fixReadability(options: FixOptions) {
       if (failure?.outcomeUnknown || failure?.code === 'RESOURCE_RELEASE_FAILED') {
         stopReason = `Uncertain execution or cleanup at ${finding.id}: ${errorText(error)}`
       }
-      const observed = before && !stopReason
-        ? await Promise.allSettled(paths.map(path => fileHash(cwd, path))) : []
+      const observed: PromiseSettledResult<string>[] = []
+      if (before && !stopReason) for (const path of paths) {
+        try { observed.push({ status: 'fulfilled', value: await fileHash(cwd, path) }) }
+        catch (reason) { observed.push({ status: 'rejected', reason }) }
+      }
       const changedFiles = paths.filter((_, index) => {
         const after = observed[index]
         return after?.status === 'fulfilled' && after.value !== before?.[index]

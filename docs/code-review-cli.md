@@ -47,14 +47,14 @@ that Git does not ignore. It does not expand into Git submodules or dependencies
 | `--output <directory>` | Save artifacts in a new or empty directory. Default: `<project>/.anureo/reviews/<run>`. |
 | `--format markdown\|json` | Select the report written to stdout. Default: Markdown. Both report files remain in the artifact directory. |
 | `--model <model>` | Override the model; otherwise use `ANUREO_REVIEW_MODEL`, then the backend default. |
-| `--concurrency <1..16>` | Shared limit across model calls. Default: 4. |
+| `--concurrency <1..16>` | Limit on active module/angle tasks and shared model calls. Default: 4. |
 | `--resume <directory>` | Revalidate and reuse compatible completed tasks from a prior review. Use a separate output directory. |
 | `--backend-config-digest <id>` | Caller-maintained fingerprint of the effective backend configuration. Supply the same value on the original run and resume to enable automatic result reuse; `ANUREO_REVIEW_BACKEND_CONFIG_DIGEST` is the environment fallback. |
 | `--context-rounds <0..4>` | Additional reads per planning, analysis or verification. Default: 2. |
 | `--context-files <1..50>` | File limit per additional read. Default: 10. |
 | `--planning-corrections <0..4>` | Additional calls to correct returned planner proposals that fail host validation. Default: 2. Set 0 to fail immediately. Separate from context reads. |
 | `--response-corrections <0..4>` | Additional calls per returned analysis, verification or summary response that fails host validation. Default: 2. Separate from context reads and planning corrections. |
-| `--max-input-bytes <bytes>` | Input budget per model call, at least 1024. Default: 256000. |
+| `--max-input-bytes <bytes>` | UTF-8 byte budget for the JSON prompt, instructions and output schema together, at least 1024. Default: 256000. Backend framing and token counts are separate. |
 | `--max-output-bytes <bytes>` | SDK result budget, at least 1024. Default: 1048576. |
 | `--dry-run` | Print inventory and planning budgets without a backend or artifacts. Modules, concrete angles and worker counts remain unknown. |
 | `--help`, `--version` | Print usage or the package version without starting a backend. |
@@ -87,7 +87,9 @@ failure or process exit, `--resume` reads those checkpoints even when `report.js
 was never produced. It creates a separate new run, keeps the old directory unchanged,
 and carries prior effective history into the new directory. Failed or unfinished
 read-only tasks can be attempted again during this explicit resume; there is no
-automatic retry of invocation failures inside a run.
+automatic retry of invocation failures inside a run. Task admission is bounded for
+the whole analysis/verification/checkpoint chain, so completed tasks can become
+durable before the remaining task queue starts.
 
 Use the same backend configuration fingerprint on the original and resumed calls.
 Change it when the executable, backend defaults, permissions or other effective
@@ -105,9 +107,11 @@ after their PIDs are confirmed absent; this does not prove that a native backend
 execution stopped.
 
 Corrupt or missing committed materials fail recovery instead of silently rerunning.
-Complete legacy version-2 reports can still seed new checkpoints after the existing
-source, evidence and ownership validations. Incomplete legacy artifacts without
-the required report are not inferred to be successful.
+Complete legacy version-2 reports can seed new checkpoints only when their recorded
+`backendConfigDigest` matches the explicit current fingerprint and the source,
+evidence and ownership validations pass. Older reports without that provenance
+are read as resume inputs but do not provide reusable task results. Incomplete
+legacy artifacts without the required report are not inferred to be successful.
 
 Task failures remain visible coverage gaps, and a new summary is generated from
 the currently validated tasks. Review's CLI configures a read-only backend and
@@ -216,7 +220,7 @@ recorded as metadata or unavailable input; source symlinks are never followed.
 
 Review artifacts include `run.json`, `attempts/`, `results/`, `checkpoints/`, `inherited/`,
 `result.json`, `plan.json`, `planning/`, `index.json`, snapshots, call records,
-per-task analysis and verification, summaries, `report.json` and `report.md`. Report format version 2 records planner output,
+per-task analysis and verification, summaries, `report.json` and `report.md`. Report format version 2 records the backend configuration fingerprint, planner output,
 reference-angle decisions and module/angle task ownership. Version 1 reports are
 not compatible with the new resume/repair path.
 `plan.planning` separates the latest proposed plan, validation errors and attempt
@@ -255,7 +259,9 @@ resources; it does not prove that a remote operation was cancelled.
 `readability` with the `local_refactor` decision, owned by a completed module
 containing exactly one primary file and supported by unambiguous target evidence. Duplicate aliases, stale or
 unverified candidates, structural/behavior changes and findings owned by multi-file
-modules remain in `skipped` with reasons. This is a local repair selection, not an
+modules remain in `skipped` with reasons. Root groups choose a fresh accepted
+representative before a fresh pending finding, so a pending alias does not hide
+an accepted candidate. This is a local repair selection, not an
 automatic implementation of every design finding.
 
 ```sh
@@ -269,6 +275,9 @@ there is no built-in historical report path. The report must belong to the selec
 Legacy readability Markdown and display-only Markdown reports are not repair inputs. The command supports `--config`,
 `--output`, `--concurrency`, `--model`, `--format`, `--max-output-bytes`, `--dry-run`
 and `--help`. Its default artifact root is `<project>/.anureo/fixes/<run>`.
+An editing run exclusively claims its output directory through final report
+publication and Client cleanup. Concurrent writers and nonempty prior runs are
+rejected before editing starts; a stale editing directory must not be reused.
 
 Related source and generated files can be grouped in project configuration:
 

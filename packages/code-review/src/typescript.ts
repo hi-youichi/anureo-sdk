@@ -21,6 +21,7 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
       byName.set(manifest.name, { root: `/${dirname(snapshot.path) === '.' ? '' : dirname(snapshot.path)}`, manifest })
     } catch { /* An invalid manifest is not an import-resolution contract. */ }
   }
+  const packageNames = [...byName.keys()].sort((a, b) => b.length - a.length)
   function exportTarget(value: unknown): string | null {
     if (typeof value === 'string') return value.startsWith('./') ? value : null
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -33,7 +34,7 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
     let base: string
     if (specifier.startsWith('.')) base = resolve(dirname(from), specifier)
     else {
-      const pkg = [...byName.keys()].sort((a, b) => b.length - a.length).find(name => specifier === name || specifier.startsWith(`${name}/`))
+      const pkg = packageNames.find(name => specifier === name || specifier.startsWith(`${name}/`))
       if (!pkg) return null
       const { root, manifest } = byName.get(pkg)!
       const suffix = specifier.slice(pkg.length)

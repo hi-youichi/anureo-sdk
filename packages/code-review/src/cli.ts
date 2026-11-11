@@ -94,10 +94,10 @@ export async function main(args: string[]): Promise<void> {
     planningCorrections: Number(values['planning-corrections']),
     responseCorrections: Number(values['response-corrections']),
   }
-  const context = await ReviewContext.create(cwd, packages, [], outputExclusions)
-  for (const path of config?.contracts ?? []) await context.acquire(path)
-  const plan = createDesignPlan(context, options)
   if (values['dry-run']) {
+    const context = await ReviewContext.create(cwd, packages, [], outputExclusions)
+    for (const path of config?.contracts ?? []) await context.acquire(path)
+    const plan = createDesignPlan(context, options)
     console.log(JSON.stringify({ ...plan, cwd, outputDir, concurrency }, null, 2)); return
   }
   const model = values.model ?? process.env.ANUREO_REVIEW_MODEL
