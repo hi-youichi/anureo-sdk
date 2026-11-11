@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path'
 import { createClient, HarnessSdkError, type Client } from '@anureo/sdk'
 import { createScriptedAdapter } from '@anureo/conformance'
 import { parseReport } from '../src/fix'
-import { discoverPackages } from '../src/io'
+import { discoverPackages, saveJson } from '../src/io'
 import { hash, ReviewContext } from '../src/context'
 import { createDesignPlan, reviewDesign, type DesignOptions } from '../src/review'
 import { analysisSchema, dimensions, type Analysis, type DesignTask, type Evidence, type Finding } from '../src/schema'
@@ -657,4 +657,20 @@ test('task prompts keep complete primary navigation and only relevant inbound co
   expect(inbound!.unknowns.join(' ')).toContain('partial')
   expect(primary!.calls).toHaveLength(141)
   expect(primary!.symbols.some(symbol => symbol.name === 'unrelated')).toBe(true)
+})
+
+
+test('failed JSON rename removes only its temporary file and preserves the destination', async () => {
+  const cwd = await fixture()
+  const destination = join(cwd, 'artifact.json')
+  await mkdir(destination)
+  await writeFile(join(destination, 'existing'), 'keep')
+  await expect(saveJson(destination, { report: 'new' })).rejects.toMatchObject({ code: 'WORKFLOW_STORAGE_FAILED' })
+  expect((await readdir(cwd)).filter(path => path.endsWith('.tmp'))).toEqual([])
+  expect(await readFile(join(destination, 'existing'), 'utf8')).toBe('keep')
+  await saveJson(join(cwd, 'success.json'), { report: 'new' })
+  expect(JSON.parse(await readFile(join(cwd, 'success.json'), 'utf8'))).toEqual({ report: 'new' })
+  const circular: { self?: unknown } = {}; circular.self = circular
+  await expect(saveJson(join(cwd, 'circular.json'), circular)).rejects.toMatchObject({ code: 'WORKFLOW_STORAGE_FAILED' })
+  expect((await readdir(cwd)).filter(path => path.endsWith('.tmp'))).toEqual([])
 })

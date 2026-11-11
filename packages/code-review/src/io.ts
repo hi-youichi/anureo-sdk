@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { lstat, mkdir, readFile, realpath, writeFile, rename } from 'node:fs/promises'
+import { lstat, mkdir, readFile, realpath, writeFile, rename, rm } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { isProjectMarker, type DesignConfig } from './project'
@@ -66,12 +66,17 @@ export function createGate(concurrency: number) {
 
 /** Unique temp paths avoid torn records; each logical artifact has one writer. */
 export async function saveJson(path: string, value: unknown) {
+  let temp: string | undefined
   try {
+    const text = `${JSON.stringify(value, null, 2)}\n`
     await mkdir(dirname(path), { recursive: true })
-    const temp = `${path}.${randomUUID()}.tmp`
-    await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
+    temp = `${path}.${randomUUID()}.tmp`
+    await writeFile(temp, text, { mode: 0o600 })
     await rename(temp, path)
-  } catch { throw new HarnessSdkError('WORKFLOW_STORAGE_FAILED') }
+  } catch {
+    if (temp) await rm(temp, { force: true }).catch(() => {})
+    throw new HarnessSdkError('WORKFLOW_STORAGE_FAILED')
+  }
 }
 export function errorText(error: unknown): string {
   const messages: string[] = [], pending: unknown[] = [error]

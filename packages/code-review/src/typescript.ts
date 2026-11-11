@@ -13,7 +13,7 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
   for (const snapshot of repository) {
     if (snapshot.kind !== 'text' || !/(^|\/)package\.json$/.test(snapshot.path)) continue
     try {
-      const manifest = JSON.parse(snapshot.text)
+      const manifest = JSON.parse(snapshot.text.replace(/^\uFEFF/, ''))
       if (typeof manifest.name !== 'string') continue
       // Ambiguous package identities cannot identify a static target.
       if (ambiguousNames.has(manifest.name)) continue

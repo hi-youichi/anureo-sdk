@@ -48,6 +48,7 @@ export function inventoryPlan(context: ReviewContext, options: PlanningOptions =
   if (!Number.isInteger(responseCorrections) || responseCorrections < 0 || responseCorrections > 4) throw new Error('responseCorrections must be 0..4')
   const primaryFiles = [...new Set(options.scope ?? context.baseline.keys())].sort()
   if (!primaryFiles.length || primaryFiles.some(path => !context.baseline.has(path))) throw new Error('Scope must name existing Git-visible files')
+  if (!primaryFiles.some(path => context.baseline.get(path)?.kind === 'text')) throw new Error('Scope must include readable source text; binary and symlink metadata cannot be reviewed')
   const contractPaths = [...new Set(options.contracts ?? [])].sort()
   contractPaths.forEach(path => context.assertContextPath(path))
   options.dimensions?.forEach(id => dimensionSchema.parse(id))
@@ -94,13 +95,14 @@ export function validatePlanning(context: ReviewContext, inventory: InventoryPla
       || (c.decision === 'not_applicable' ? c.angleIds.length !== 0 : c.angleIds.length === 0)), 'referenceCoverage', 'Reference angle applicability coverage mismatch')
   const paths = discovery.modules.flatMap(m => m.paths)
   const excluded = discovery.excludedFiles.map(e => e.path)
-  check(new Set(paths).size !== paths.length || new Set(excluded).size !== excluded.length || paths.some(p => excluded.includes(p)), 'modules', 'Duplicate primary module ownership')
-  check([...paths, ...excluded].length !== inventory.primaryFiles.length || [...paths, ...excluded].some(p => !inventory.primaryFiles.includes(p)), 'modules', 'Planner file coverage mismatch')
+  const pathSet = new Set(paths), excludedSet = new Set(excluded), primarySet = new Set(inventory.primaryFiles)
+  check(pathSet.size !== paths.length || excludedSet.size !== excluded.length || paths.some(p => excludedSet.has(p)), 'modules', 'Duplicate primary module ownership')
+  check([...paths, ...excluded].length !== inventory.primaryFiles.length || [...paths, ...excluded].some(p => !primarySet.has(p)), 'modules', 'Planner file coverage mismatch')
   check(paths.some(p => context.baseline.get(p)?.kind !== 'text'), 'modules', 'Module sources must be readable text; unavailable input is a planning gap')
   check(excluded.some(p => !context.baseline.has(p) || context.baseline.get(p)?.kind === 'text' || context.baseline.get(p)?.kind === 'unavailable'), 'excludedFiles', 'Planner cannot exclude text, unknown or unavailable input')
   const supplied = new Set(snapshotIds.map(id => context.snapshots.get(id)?.path))
   check(paths.some(p => !supplied.has(p)) || discovery.reviewedFiles.length !== paths.length || new Set(discovery.reviewedFiles).size !== paths.length
-    || discovery.reviewedFiles.some(p => !paths.includes(p)), 'reviewedFiles', 'Planner must read and account for all module sources')
+    || discovery.reviewedFiles.some(p => !pathSet.has(p)), 'reviewedFiles', 'Planner must read and account for all module sources')
   check(!!inventory.requestedDimensions?.some(id => !discovery.angles.some(a => a.id === id)), 'angles', 'Requested angle is absent from planner output')
   return issues
 }

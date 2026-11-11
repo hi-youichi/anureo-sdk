@@ -57,6 +57,7 @@ export async function fixMain(args: string[]) {
     findings: findings.map(finding => ({ ...finding, ownedFiles: ownedFiles(finding) })),
   }
   if (values['dry-run']) { console.log(JSON.stringify(plan, null, 2)); return }
+  if (driftedFiles.length) throw new Error(`Report source changed before repair: ${driftedFiles.join(', ')}`)
   if (!findings.length) throw new Error('No eligible local readability findings; use --dry-run to inspect skipped findings')
   await withOutputClaim(outputDir, () => withClient(cwd, maxOutputBytes, true, async (client, shouldStop) => {
     const result = await fixReadability({ client, cwd, findings, writeGroups, outputDir, concurrency, shouldStop, progress,

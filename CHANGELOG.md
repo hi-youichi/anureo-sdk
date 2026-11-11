@@ -8,6 +8,10 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- Reject stale repair inputs and scopes without readable text, choose eligible repair
+  group representatives, clean failed JSON write temporaries, and preserve BOM
+  package entry resolution.
+
 - Add optional workflow persistence: `workflow(options, body)` provides a durable
   run ID and explicit, schema-inferred `run.step()` checkpoints. Resume creates a
   new run, validates and imports compatible results, and preserves effective

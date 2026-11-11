@@ -182,3 +182,35 @@ test('fix CLI reports unknown changes after an editing observation fails', async
   expect(saved.complete).toBe(false)
   expect(saved.results[0].changesKnown).toBe(false)
 })
+
+test('rejects pre-existing report drift before starting any repair session', async () => {
+  const cwd = await fixture()
+  await writeFile(join(cwd, 'b.ts'), 'unreviewed current content\n')
+  const harness = await backend(async () => { throw new Error('must not dispatch') })
+  await expect(fixReadability({ ...harness, cwd, findings: [finding('a.ts'), finding('b.ts')],
+    outputDir: join(cwd, 'out'), concurrency: 2,
+  })).rejects.toThrow('Report source changed before repair: b.ts')
+  expect(harness.adapter.opened).toHaveLength(0)
+  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('original\n')
+  expect(await readFile(join(cwd, 'b.ts'), 'utf8')).toBe('unreviewed current content\n')
+})
+
+
+test('repair groups choose an eligible accepted member when the report representative is pending or requires design work', async () => {
+  const taskId = 'module:a:angle:D12'
+  const source = { id: 'snapshot:fixture', path: 'a.ts', sha256: finding('a.ts').sha256, kind: 'text', source: '1: original' }
+  const base = { ...reviewCandidate('D12', [source]), category: 'readability' as const, decision: 'local_refactor' as const, taskId, stale: false }
+  const ids = [1, 2, 3].map(n => `${taskId}#${n}`)
+  const findings = ids.map(id => ({ ...base, id, canonicalId: ids[0]!, review: null as unknown }))
+  for (const value of findings) value.review = (defaultOutput({ task: 'design-verification', findings: [value] }) as { decisions: object[] }).decisions[0]
+  const report = { reportKind: 'design-review', formatVersion: 2, cwd: '/unused', changedPaths: [], findings,
+    tasks: [{ task: { id: taskId, level: 'module', primaryFiles: ['a.ts'], dimensions: ['D12'] }, status: 'completed', error: null, analysis: null }] }
+  const firstReview = findings[0]!.review as { verdict: string }
+  firstReview.verdict = 'pending'
+  expect(parseReport(JSON.stringify(report)).findings.map(f => f.id)).toEqual([ids[1]!])
+  firstReview.verdict = 'accepted'
+  findings[0]!.decision = 'structural_refactor' as typeof base.decision
+  expect(parseReport(JSON.stringify(report)).findings.map(f => f.id)).toEqual([ids[1]!])
+  findings[0]!.decision = 'local_refactor'
+  expect(parseReport(JSON.stringify(report)).findings.map(f => f.id)).toEqual([ids[0]!])
+})

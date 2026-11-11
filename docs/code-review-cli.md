@@ -231,7 +231,11 @@ Other text sources, including unknown DSLs,
 remain available in full with literal search and exact line/hash evidence. Empty
 symbol or call indexes mean unindexed, not absent. Necessary unknown language or
 runtime semantics remain explicit gaps. Binary files, submodules and symlinks are
-recorded as metadata or unavailable input; source symlinks are never followed.
+recorded as metadata or unavailable input. A scope with no readable text is rejected
+locally before planning. Stable source symlinks are metadata and are not followed.
+Path checks and reads are separate filesystem operations: use a trusted checkout
+whose directory tree is not being replaced concurrently. These checks do not
+provide filesystem isolation against a process that can replace project paths.
 
 Review artifacts include `run.json`, `attempts/`, `results/`, `checkpoints/`, `inherited/`,
 `result.json`, `plan.json`, `planning/`, `index.json`, snapshots, call records,
@@ -334,3 +338,14 @@ per-finding records, results and JSON/Markdown reports.
 The workspace aliases `bun run review:readability` and `bun run fix:readability`
 call the same review engine with `--dimension D12` and the fix subcommand. The old executables and
 their test files have moved out of `examples/` into `packages/code-review`.
+
+
+Repair checks the selected report hashes against the current files before any model
+session starts and rejects pre-existing drift. Later edits within the same repair
+write group remain available to subsequent findings. Root groups choose one member
+that independently meets every repair eligibility condition; a pending or structural
+summary representative cannot exclude an accepted local readability repair.
+
+JSON artifact writes remove their own temporary file on a handled write or rename
+failure, on a best-effort basis. Cleanup failure preserves the storage error. Forced
+process termination can leave temporary files; they are not committed checkpoints.

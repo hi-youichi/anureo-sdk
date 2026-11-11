@@ -81,7 +81,6 @@ export function parseReport(text: string) {
     else if (finding.review?.verdict !== 'accepted') reason = 'Finding was not accepted by independent verification'
     else if (rootId === null) reason = 'Invalid duplicate chain'
     else if (rootId !== finding.id && (!rootReview || rootReview.verdict === 'rejected')) reason = 'Duplicate root is not actionable'
-    else if (finding.canonicalId !== finding.id) reason = 'Duplicate of another root finding'
     else if (finding.category !== 'readability' || finding.decision !== 'local_refactor') reason = 'Requires a separate design or behavior change plan'
     else if (task.task.primaryFiles.length !== 1) reason = 'Requires an explicit multi-file change plan'
     const path = task.task.primaryFiles[0]!
@@ -93,7 +92,22 @@ export function parseReport(text: string) {
       detail: JSON.stringify(finding), context: JSON.stringify({ summary: task.analysis?.summary, designContext: task.analysis?.designContext, review: finding.review }),
     })
   }
-  return { cwd: report.cwd, findings, skipped, coverageGaps: report.tasks.filter(t => t.status !== 'completed').map(t => t.task.id) }
+  // Statistical representatives may be pending or require design changes. Choose
+  // among independently eligible repairs, preserving each member's own write scope.
+  const representatives = new Map<string, Finding>()
+  for (const finding of findings) {
+    const canonicalId = reviewedFindings.get(finding.id)!.canonicalId
+    const canonical = reviewedFindings.get(canonicalId)
+    if (!canonical || canonical.canonicalId !== canonicalId) throw new Error(`Invalid root group: ${finding.id}`)
+    const prior = representatives.get(canonicalId)
+    if (!prior || finding.id === canonicalId || (prior.id !== canonicalId && finding.id.localeCompare(prior.id) < 0)) representatives.set(canonicalId, finding)
+  }
+  const selected = findings.filter(finding => {
+    if (representatives.get(reviewedFindings.get(finding.id)!.canonicalId) === finding) return true
+    skipped.push({ id: finding.id, reason: 'Duplicate of another eligible repair finding' })
+    return false
+  })
+  return { cwd: report.cwd, findings: selected, skipped, coverageGaps: report.tasks.filter(t => t.status !== 'completed').map(t => t.task.id) }
 }
 
 export function writeOwnership(groups: string[][]) {
@@ -161,7 +175,10 @@ export async function fixReadability(options: FixOptions) {
   let stopReason: string | undefined
 
   // Check all write targets before starting any model work.
-  for (const path of new Set(findings.flatMap(ownedFiles))) await fileHash(cwd, path)
+  const initialHashes = new Map<string, string>()
+  for (const path of new Set(findings.flatMap(ownedFiles))) initialHashes.set(path, await fileHash(cwd, path))
+  const drifted = findings.filter(finding => initialHashes.get(finding.path) !== finding.sha256)
+  if (drifted.length) throw new Error(`Report source changed before repair: ${[...new Set(drifted.map(finding => finding.path))].join(', ')}`)
   await saveJson(join(outputDir, 'plan.json'), {
     findings, agents: findings.length, concurrency: options.concurrency,
     groups: groups.map(group => ({ findingIds: group.map(finding => finding.id), ownedFiles: ownedFiles(group[0]!) })),

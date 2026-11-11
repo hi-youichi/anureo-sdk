@@ -356,3 +356,21 @@ test('different unavailable-source diagnostics remain distinct prompt facts', ()
   const second = { ...first, id: 'second', error: 'access denied' }
   expect(mergePromptSources([first], [second])).toEqual([first, second])
 })
+
+test('non-text-only scope fails locally while mixed text and metadata remain reviewable', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n', 'data.bin': '\0binary' })
+  await symlink('a.ts', join(cwd, 'link.ts'))
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  expect(() => createDesignPlan(context, { scope: ['data.bin', 'link.ts'] })).toThrow('Scope must include readable source text')
+  expect(createDesignPlan(context, { scope: ['a.ts', 'data.bin', 'link.ts'] }).primaryFiles).toEqual(['a.ts', 'data.bin', 'link.ts'])
+})
+
+test('BOM package manifests retain byte identity and resolve their exported entry', async () => {
+  const cwd = await fixture({ 'pkg/package.json': '\uFEFF{"name":"bom-package","exports":"./entry.ts"}',
+    'pkg/entry.ts': 'export const a = 1\n', 'consumer.ts': "import { a } from 'bom-package'\nconsole.log(a)\n" })
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  const manifest = context.baseline.get('pkg/package.json')!
+  expect(manifest.text.startsWith('\uFEFF')).toBe(true)
+  expect(hash(manifest.text)).toBe(manifest.sha256!)
+  expect(context.index.find(item => item.path === 'consumer.ts')!.imports[0]!.target).toBe('pkg/entry.ts')
+})
