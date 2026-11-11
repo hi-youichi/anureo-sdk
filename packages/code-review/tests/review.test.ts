@@ -408,7 +408,7 @@ test('unknown backend configuration disables automatic result reuse', async () =
 
 test('legacy v2 reports import validated tasks into new workflow checkpoints', async () => {
   const cwd = await fixture()
-  const first = await backend()
+  const first = await backend(duplicateCandidates)
   const source = await options(cwd, first.client)
   await reviewDesign(source)
   const legacy = join(cwd, 'draft/docs/design-review/legacy')
@@ -420,6 +420,7 @@ test('legacy v2 reports import validated tasks into new workflow checkpoints', a
     outputDir: join(cwd, 'draft/docs/design-review/imported') }))
   expect(report.complete).toBe(true)
   expect(report.calls.reusedTasks).toBe(4)
+  expect(report.findings).toHaveLength(3)
   expect(next.calls.some(c => c.task === 'design-analysis')).toBe(false)
 })
 
