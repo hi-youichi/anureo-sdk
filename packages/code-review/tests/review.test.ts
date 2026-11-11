@@ -508,3 +508,87 @@ test('the input byte limit includes instructions and the output schema', async (
   expect(next.calls).toHaveLength(0)
   expect(report.errors.join(' ')).toContain('Input budget exceeded')
 })
+
+async function duplicateCandidates(input: Request, output: unknown) {
+  if (input.task !== 'design-analysis' || input.assignment!.angleId !== 'D12') return output
+  const result = analysisSchema.parse(output)
+  const finding = { ...candidate('D12', input.sources!), category: 'readability' as const, decision: 'local_refactor' as const }
+  result.findings = input.assignment!.moduleId === 'm0' ? [finding, { ...finding, title: '另一条局部建议' }] : [finding]
+  return result
+}
+
+test('cyclic verification cannot publish a completed task or repair root', async () => {
+  const cwd = await fixture()
+  const harness = await backend(async (input, output) => {
+    output = await duplicateCandidates(input, output)
+    if (input.task === 'design-verification' && input.assignment!.moduleId === 'm0') {
+      const result = output as { decisions: Array<{ findingId: string; duplicateOf: string | null }> }
+      result.decisions[0]!.duplicateOf = result.decisions[1]!.findingId
+      result.decisions[1]!.duplicateOf = result.decisions[0]!.findingId
+    }
+    return output
+  })
+  const source = await options(cwd, harness.client, { concurrency: 1, responseCorrections: 0 })
+  const report = await reviewDesign(source)
+  expect(report.complete).toBe(false)
+  const invalid = report.tasks.find(task => task.task.moduleId === 'm0' && task.task.angleId === 'D12')!
+  expect(invalid.status).toBe('failed')
+  expect(invalid.error).toContain('Invalid duplicate chain')
+  expect(report.rootGroups.flatMap(group => group.findingIds).every(id => !id.startsWith(invalid.task.id))).toBe(true)
+  expect(report.findingCounts.uniqueActionable).toBe(1)
+  const eligible = parseReport(JSON.stringify(report)).findings
+  expect(eligible).toHaveLength(1)
+  expect(eligible[0]!.id.startsWith('module:m1:')).toBe(true)
+  const markers = await Promise.all((await readdir(join(source.outputDir, 'checkpoints'))).filter(name => /^[a-f0-9]{64}\.json$/.test(name))
+    .map(name => readFile(join(source.outputDir, 'checkpoints', name), 'utf8').then(JSON.parse)))
+  expect(markers.some(marker => marker.stepKey === `task:${invalid.task.id}`)).toBe(false)
+  const next = await backend(duplicateCandidates)
+  const resumed = await reviewDesign(await options(cwd, next.client, { concurrency: 1, responseCorrections: 0,
+    resumeFrom: source.outputDir, outputDir: `${source.outputDir}-resumed` }))
+  expect(resumed.complete).toBe(true)
+  expect(resumed.calls.reusedTasks).toBe(3)
+  expect(next.calls.filter(call => call.task === 'design-analysis').map(call => call.assignment!.id)).toEqual([invalid.task.id])
+})
+
+test('repair parsing rejects cyclic legacy roots without discarding independent accepted findings', async () => {
+  const cwd = await fixture()
+  const harness = await backend(duplicateCandidates)
+  const report = await reviewDesign(await options(cwd, harness.client, { concurrency: 1 }))
+  expect(report.complete).toBe(true)
+  const [first, second, independent] = report.findings
+  first!.review!.duplicateOf = second!.id
+  second!.review!.duplicateOf = first!.id
+  for (const finding of report.findings) finding.canonicalId = finding.id
+  const parsed = parseReport(JSON.stringify(report))
+  expect(parsed.findings.map(finding => finding.id)).toEqual([independent!.id])
+  expect(parsed.skipped.filter(finding => finding.reason === 'Invalid duplicate chain').map(finding => finding.id)).toEqual([first!.id, second!.id])
+})
+
+test('an incomplete verification cannot supply a repair representative for completed tasks', async () => {
+  const cwd = await fixture()
+  const harness = await backend(async (input, output) => {
+    output = await duplicateCandidates(input, output)
+    if (input.task === 'design-verification' && input.assignment!.moduleId === 'm0') return { ...(output as object), status: 'incomplete' }
+    return output
+  })
+  const report = await reviewDesign(await options(cwd, harness.client, { concurrency: 1, responseCorrections: 0 }))
+  expect(report.complete).toBe(false)
+  expect(report.rootGroups.flatMap(group => group.findingIds)).toEqual(['module:m1:angle:D12#1'])
+  expect(parseReport(JSON.stringify(report)).findings.map(finding => finding.id)).toEqual(['module:m1:angle:D12#1'])
+})
+
+test('completed findings and verification survive canonical checkpoint key ordering', async () => {
+  const cwd = await fixture()
+  const first = await backend(duplicateCandidates)
+  const source = await options(cwd, first.client, { concurrency: 1 })
+  const initial = await reviewDesign(source)
+  expect(initial.complete).toBe(true)
+  expect(initial.findings).toHaveLength(3)
+  const next = await backend(duplicateCandidates)
+  const report = await reviewDesign(await options(cwd, next.client, { concurrency: 1,
+    resumeFrom: source.outputDir, outputDir: `${source.outputDir}-resumed` }))
+  expect(report.complete).toBe(true)
+  expect(report.calls.reusedTasks).toBe(4)
+  expect(next.calls.some(call => ['design-analysis', 'design-verification'].includes(call.task))).toBe(false)
+  expect(report.findings).toEqual(initial.findings)
+})

@@ -5,6 +5,7 @@ import { z } from 'zod'
 import type { Client } from '@anureo/sdk'
 import { agent, parallel } from '@anureo/workflow'
 import { createGate, errorText, saveJson } from './io'
+import { resolveDuplicateRoots } from './duplicates'
 import { analysisSchema, dimensionSchema, verificationSchema } from './schema'
 
 const resultSchema = z.strictObject({
@@ -63,6 +64,8 @@ export function parseReport(text: string) {
   if (new Set(report.findings.map(f => f.id)).size !== report.findings.length
     || new Set(report.tasks.map(t => t.task.id)).size !== report.tasks.length) throw new Error('Invalid or duplicate finding/task IDs')
   const tasks = new Map(report.tasks.map(task => [task.task.id, task]))
+  const duplicateRoots = resolveDuplicateRoots(report.findings.map(finding => ({ id: finding.id, duplicateOf: finding.review?.duplicateOf ?? null })))
+  const reviewedFindings = new Map(report.findings.map(finding => [finding.id, finding]))
   const findings: Finding[] = []
   const skipped: Array<{ id: string; reason: string }> = []
   for (const finding of report.findings) {
@@ -70,9 +73,13 @@ export function parseReport(text: string) {
     const task = tasks.get(finding.taskId)
     if (!task || !task.task.dimensions.includes(finding.primaryDimension)
       || !finding.id.startsWith(`${task.task.id}#`) || !/^[1-9]\d*$/.test(finding.id.slice(task.task.id.length + 1))) throw new Error(`Invalid finding ownership: ${finding.id}`)
+    const rootId = duplicateRoots.get(finding.id)
+    const rootReview = rootId ? reviewedFindings.get(rootId)?.review : null
     let reason: string | undefined
     if (finding.stale || task.status !== 'completed' || finding.evidence.some(e => report.changedPaths.includes(e.path))) reason = 'Source or analysis is stale/incomplete'
     else if (finding.review?.verdict !== 'accepted') reason = 'Finding was not accepted by independent verification'
+    else if (rootId === null) reason = 'Invalid duplicate chain'
+    else if (rootId !== finding.id && (!rootReview || rootReview.verdict === 'rejected')) reason = 'Duplicate root is not actionable'
     else if (finding.canonicalId !== finding.id) reason = 'Duplicate of another root finding'
     else if (finding.category !== 'readability' || finding.decision !== 'local_refactor') reason = 'Requires a separate design or behavior change plan'
     else if (task.task.primaryFiles.length !== 1) reason = 'Requires an explicit multi-file change plan'

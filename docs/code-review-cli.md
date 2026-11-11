@@ -97,6 +97,8 @@ configuration changes. The SDK Client does not expose those internals for reliab
 automatic fingerprinting. Without an explicit fingerprint, a fresh cache identity
 disables automatic cross-run reuse. Inputs, schema, instructions, planning and
 every actually read source snapshot are checked in addition to this fingerprint.
+Restored findings are compared by structured value; JSON object key order does not
+change the result or its ownership.
 
 The artifact path is printed before execution; the workflow run ID is logged after
 its manifest is initialized. Storage failures, unknown native execution outcomes
@@ -264,7 +266,10 @@ containing exactly one primary file and supported by unambiguous target evidence
 unverified candidates, structural/behavior changes and findings owned by multi-file
 modules remain in `skipped` with reasons. Root groups choose a fresh accepted
 representative before a fresh pending finding, so a pending alias does not hide
-an accepted candidate. This is a local repair selection, not an
+an accepted candidate. Only completed tasks supply root-group members. Cycles,
+missing alias targets and aliases resolving to unverified or rejected roots fail
+verification before a task checkpoint is committed. The repair reader checks the
+alias graph again for older reports. This is a local repair selection, not an
 automatic implementation of every design finding.
 
 ```sh

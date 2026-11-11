@@ -1,8 +1,10 @@
 import { readFile, mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { HarnessSdkError, type Client } from '@anureo/sdk'
 import { agent, parallel, workflow, type WorkflowContext } from '@anureo/workflow'
+import { resolveDuplicateRoots } from './duplicates'
 import { checkpointPlanning, checkpointTask, fatalReviewError } from './checkpoints'
 import { z } from 'zod'
 import { createGate, errorText, saveJson, type Package } from './io'
@@ -395,7 +397,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
       if (saved.task.id !== task.id || saved.inputHash !== inputHash || !saved.analysis) throw new HarnessSdkError('WORKFLOW_CHECKPOINT_INVALID')
       const allowed = new Set(saved.snapshotIds)
       checkAnalysis(task, analysisSchema.parse(saved.analysis), allowed)
-      if (JSON.stringify(saved.findings) !== JSON.stringify(saved.analysis.findings.map((f, i) => ({ ...f, id: `${task.id}#${i + 1}`, taskId: task.id })))) throw new HarnessSdkError('WORKFLOW_CHECKPOINT_INVALID')
+      if (!isDeepStrictEqual(saved.findings, saved.analysis.findings.map((f, i) => ({ ...f, id: `${task.id}#${i + 1}`, taskId: task.id })))) throw new HarnessSdkError('WORKFLOW_CHECKPOINT_INVALID')
       if (saved.findings.length) checkVerification(saved.findings, verificationSchema.parse(saved.verification), allowed,
         [...results.values()].flatMap(r => r.findings).concat(saved.findings))
     }
@@ -426,7 +428,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
             }
             if (!old.analysis) throw new Error('Missing resumed analysis')
             checkAnalysis(task, analysisSchema.parse(old.analysis), new Set(old.snapshotIds))
-            if (JSON.stringify(old.findings) !== JSON.stringify(old.analysis.findings.map((f, i) => ({ ...f, id: `${task.id}#${i + 1}`, taskId: task.id })))) throw new Error('Invalid resumed finding ownership')
+            if (!isDeepStrictEqual(old.findings, old.analysis.findings.map((f, i) => ({ ...f, id: `${task.id}#${i + 1}`, taskId: task.id })))) throw new Error('Invalid resumed finding ownership')
             if (old.findings.length) checkVerification(old.findings, verificationSchema.parse(old.verification), new Set(old.snapshotIds), [...results.values()].flatMap(r => r.findings).concat(old.findings))
             imported = true
             result = { ...old, task, reused: true }
@@ -532,6 +534,13 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
       if (d.duplicateOf && (d.duplicateOf === d.findingId || !known.some(f => f.id === d.duplicateOf))) throw new Error('Invalid duplicate reference')
       if (d.verdict === 'accepted' && !d.invariants.length) throw new Error('Accepted proposal lacks invariant review')
     }
+    const decisions = new Map([...results.values()].filter(result => result.status === 'completed').flatMap(result => result.verification?.decisions ?? []).concat(value.decisions).map(d => [d.findingId, d]))
+    const roots = resolveDuplicateRoots(known.map(finding => ({ id: finding.id, duplicateOf: decisions.get(finding.id)?.duplicateOf ?? null })))
+    for (const finding of findings) {
+      const root = roots.get(finding.id)
+      if (root === null || root === undefined) throw new Error(`Invalid duplicate chain: ${finding.id}`)
+      if (root !== finding.id && (!decisions.has(root) || decisions.get(root)!.verdict === 'rejected')) throw new Error(`Duplicate root is not actionable: ${finding.id}`)
+    }
   }
 
   async function runBatch(tasks: DesignTask[]) {
@@ -545,7 +554,7 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
   async function summarize(id: string, children: TaskResult[]) {
     const result: SummaryResult = { id, value: null, error: null }
     try {
-      const candidates = children.flatMap(r => r.findings.map(f => ({ ...f, review: r.verification?.decisions.find(d => d.findingId === f.id) ?? null })))
+      const candidates = children.filter(r => r.status === 'completed').flatMap(r => r.findings.map(f => ({ ...f, review: r.verification?.decisions.find(d => d.findingId === f.id) ?? null })))
         .filter(f => f.review && f.review.verdict !== 'rejected')
       const ids = new Set(candidates.map(f => f.id))
       const value = await invokeChecked(id, 'summary', { task: 'design-summary', id, candidates,
@@ -582,25 +591,9 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
     return { ...f, review, canonicalId: review?.duplicateOf ?? f.id, stale: result.status === 'stale' }
   }))
   const findingsById = new Map(findings.map(f => [f.id, f]))
-  const duplicateRoots = new Map<string, string | null>()
-  function duplicateRoot(start: string): string | null {
-    const path: string[] = []
-    const visited = new Set<string>()
-    let id = start, root: string | null
-    while (true) {
-      if (duplicateRoots.has(id)) { root = duplicateRoots.get(id)!; break }
-      const finding = findingsById.get(id)
-      if (!finding || visited.has(id)) { root = null; break }
-      visited.add(id)
-      path.push(id)
-      if (!finding.review?.duplicateOf) { root = id; break }
-      id = finding.review.duplicateOf
-    }
-    for (const member of path) duplicateRoots.set(member, root)
-    return root
-  }
+  const duplicateRoots = resolveDuplicateRoots(findings.map(finding => ({ id: finding.id, duplicateOf: finding.review?.duplicateOf ?? null })))
   for (const finding of findings) {
-    const rootId = duplicateRoot(finding.id)
+    const rootId = duplicateRoots.get(finding.id)!
     if (rootId === null) errors.push(`Invalid duplicate chain: ${finding.id}`)
     else finding.canonicalId = rootId
     const root = findingsById.get(finding.canonicalId)
@@ -612,16 +605,17 @@ async function reviewDesignRun(options: DesignOptions, run: WorkflowContext<unkn
     && groupsById.has(finding.id) && groupsById.get(finding.id) !== groupsById.get(finding.review.duplicateOf)) {
     errors.push(`Summary contradicts verified duplicate: ${finding.id}`)
   }
-  const rootGroups = finalGroups.map(group => {
+  const rootGroups = finalGroups.flatMap(group => {
+    if (group.findingIds.some(id => duplicateRoots.get(id) === null)) return []
     const members = group.findingIds.map(id => findingsById.get(id)!)
-    const fresh = members.filter(f => !f.stale)
+    const fresh = members.filter(f => !f.stale && results.get(f.taskId)?.status === 'completed')
     const candidates = fresh.length ? fresh : members
     const accepted = candidates.filter(f => f.review?.verdict === 'accepted')
     const canonicalId = (accepted.length ? accepted : candidates).map(f => f.id).sort()[0]!
     for (const finding of members) finding.canonicalId = canonicalId
-    return { canonicalId, findingIds: group.findingIds, rationale: group.tradeoffs }
+    return [{ canonicalId, findingIds: group.findingIds, rationale: group.tradeoffs }]
   })
-  const actionable = findings.filter(f => !f.stale && f.review && f.review.verdict !== 'rejected')
+  const actionable = findings.filter(f => !f.stale && results.get(f.taskId)?.status === 'completed' && f.review && f.review.verdict !== 'rejected' && duplicateRoots.get(f.id) !== null)
   const findingCounts = { candidates: findings.length, accepted: findings.filter(f => f.review?.verdict === 'accepted').length,
     pending: findings.filter(f => f.review?.verdict === 'pending').length, rejected: findings.filter(f => f.review?.verdict === 'rejected').length,
     unverified: findings.filter(f => !f.review).length, uniqueActionable: new Set(actionable.map(f => f.canonicalId)).size }
