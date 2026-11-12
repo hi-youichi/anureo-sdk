@@ -1,5 +1,7 @@
 // Vanilla ACP JSON-RPC wire fixture. No Anureo runtime, SDK patches or credentials.
 import { createInterface } from 'node:readline';
+import { submitOutput } from './mcp-output-client.mjs';
+const mcpBySession = new Map();
 const extensions = process.argv.includes('--extensions');
 const nativeLifecycle = process.argv.includes('--native-lifecycle');
 const nativeHeld = new Map();
@@ -74,7 +76,7 @@ async function handle(frame) {
       agentCapabilities: {
         loadSession: true,
         promptCapabilities: { image: true, embeddedContext: true },
-        mcpCapabilities: { http: true },
+        mcpCapabilities: { http: scenario !== 'mcp-stdio-output' },
         sessionCapabilities: {
           ...(noResume ? {} : { resume: {} }),
           close: {},
@@ -84,8 +86,9 @@ async function handle(frame) {
     });
     return;
   }
-  if (frame.method === 'session/new') { if (authRequired) { send({ id: frame.id, error: { code: -32000, message: 'Authentication required' } }); return; } const id = `native-${++nextId}`; historyBySession.set(id, []); respond({ sessionId: id, ...configFor(id) }); return; }
+  if (frame.method === 'session/new') { if (authRequired) { send({ id: frame.id, error: { code: -32000, message: 'Authentication required' } }); return; } const id = `native-${++nextId}`; historyBySession.set(id, []); mcpBySession.set(id, p.mcpServers); respond({ sessionId: id, ...configFor(id) }); return; }
   if (frame.method === 'session/resume' || frame.method === 'session/load') {
+    mcpBySession.set(p.sessionId, p.mcpServers);
     if (scenario === 'titles') {
       update(p.sessionId, { sessionUpdate: 'session_info_update', title: `Restored via ${frame.method}` });
       update(p.sessionId, { sessionUpdate: 'session_info_update', updatedAt: '2026-10-28T00:00:00Z' });
@@ -101,6 +104,11 @@ async function handle(frame) {
   if (frame.method === 'session/set_config_option') { const data = configFor(p.sessionId); const option = data.configOptions.find((option) => option.id === p.configId); if (option) option.currentValue = p.value; respond({ configOptions: data.configOptions }); return; }
   if (frame.method === 'session/cancel') { const promptId = waitingPromptIdsBySession.get(p.sessionId); if (promptId !== undefined) { send({ id: promptId, result: { stopReason: 'cancelled' } }); waitingPromptIdsBySession.delete(p.sessionId); } return; }
   if (frame.method === 'session/prompt') {
+    if (scenario === 'mcp-output' || scenario === 'mcp-stdio-output') {
+      await submitOutput(mcpBySession.get(p.sessionId).find(server => server.name === 'anureo_output'), p.prompt);
+      update(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Submitted through MCP' } });
+      respond({ stopReason: 'end_turn' }); return;
+    }
     if (nativeLifecycle) {
       const submissionId = p._meta?.ahp?.submissionId, joined = nativeHeld.has(p.sessionId);
       const event = (type, payload) => send({ method: '_ahp/event', params: { sessionId: p.sessionId, turnId: 'actual-acp', event: { type, payload } } });

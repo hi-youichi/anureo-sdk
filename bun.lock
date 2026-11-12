@@ -98,6 +98,8 @@
       "version": "0.2.0",
       "dependencies": {
         "@anureo/protocol": "workspace:*",
+        "@modelcontextprotocol/sdk": "1.32.2",
+        "ajv": "8.20.0",
       },
     },
     "packages/hermes": {
@@ -117,6 +119,7 @@
       "dependencies": {
         "@anureo/protocol": "workspace:*",
         "@anureo/sdk": "workspace:*",
+        "typebox": "1.3.27",
       },
       "devDependencies": {
         "@anureo/conformance": "workspace:*",
@@ -143,8 +146,10 @@
         "zod": "4.6.7",
       },
       "devDependencies": {
+        "@anureo/adapter-acp": "workspace:*",
         "@anureo/adapter-claude": "workspace:*",
         "@anureo/adapter-codex": "workspace:*",
+        "@anureo/adapter-pi": "workspace:*",
         "@anureo/conformance": "workspace:*",
       },
     },

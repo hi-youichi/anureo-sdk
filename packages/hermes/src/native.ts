@@ -35,6 +35,7 @@ export interface Description {
   profileId: string
   epoch: number
   createParameters: string[]
+  editorMcp: boolean
 }
 export function describe(value: unknown, expected: { instanceId: string; profileId: string }): Description {
   const data = object(value), creation = object(data.session_create)
@@ -44,7 +45,8 @@ export function describe(value: unknown, expected: { instanceId: string; profile
   if (!['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1'].every(value => capabilities.includes(value)) || !sources.includes('tool') || !['request_id', 'source', 'cwd', 'model'].every(value => parameters.includes(value))) {
     throw new HarnessSdkError('HERMES_GATEWAY_UNSUPPORTED', 'Hermes canonical gateway capabilities are required')
   }
-  return { instanceId: expected.instanceId, profileId: expected.profileId, epoch: integer(data.authority_epoch), createParameters: parameters }
+  return { instanceId: expected.instanceId, profileId: expected.profileId, epoch: integer(data.authority_epoch), createParameters: parameters,
+    editorMcp: capabilities.includes('acp-session-mcp-v1') && sources.includes('acp') && parameters.includes('editor') }
 }
 
 export interface Receipt {

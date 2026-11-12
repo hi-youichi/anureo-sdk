@@ -20,7 +20,7 @@ export async function startFake(scenario = 'lifecycle') {
         ...options, env: { ...process.env, FAKE_HERMES_SCENARIO: scenario, FAKE_HERMES_URL: url, ...options.env } })
     },
     async control(action: string) { await fetch(url + '/control', { method: 'POST', body: JSON.stringify({ action }) }) },
-    async state(): Promise<{ creates: number; attaches: number; interrupts: number; disconnects: number; connections: number; methods: string[]; inputs: Array<{ inputId: string; text: string }>; responses: Array<Record<string, unknown>>; attachArgs: string[][]; active: number; viewers: number }> {
+    async state(): Promise<{ createParams: Array<Record<string, unknown>>; creates: number; attaches: number; interrupts: number; disconnects: number; connections: number; methods: string[]; inputs: Array<{ inputId: string; text: string }>; responses: Array<Record<string, unknown>>; attachArgs: string[][]; active: number; viewers: number }> {
       return await (await fetch(url + '/state')).json() as Awaited<ReturnType<typeof this.state>>
     },
     async dispose() { await child.dispose() },

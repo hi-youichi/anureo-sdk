@@ -15,6 +15,7 @@ import { ResultAccumulator } from './lifecycle/result';
 import { Turn, type ExecutionObservation } from './lifecycle/resources';
 import type { Input, TurnResult } from './lifecycle/types';
 import { deferred, immutable, inputBlocks, positive } from './lifecycle/value';
+import { withStructuredOutput } from './structured-output/adapter';
 
 export type InteractionHandlers = { [K in InteractionRequested['kind']]?: (request: Extract<InteractionRequested, { kind: K }>, context: { signal: AbortSignal }) => Promise<Extract<InteractionResponse, { kind: K }>> };
 export interface ClientOptions {
@@ -105,6 +106,7 @@ export class Session implements SessionEventSink {
   get reference(): Readonly<{ binding: SessionBinding; cwd: string }> { return immutable({ binding: this.binding, cwd: this.params.cwd }); }
   get capabilities(): Readonly<Capabilities> { return immutable(this.state.capabilities); }
   get snapshot(): Readonly<SessionState> { return immutable(this.secrets.state(this.state)); }
+  projectOutput(text: string): string { return this.secrets.text(text); }
   async attach(backend: BackendSession): Promise<void> {
     for (const key of ['sessionId', 'adapterId', 'runtimeConfigId'] as const) if (backend.binding[key] !== this.binding[key]) { await backend.dispose(); throw new HarnessSdkError('SESSION_BINDING_MISMATCH'); }
     if (this.closed) { await backend.dispose(); throw this.observationFailure ?? new HarnessSdkError('SESSION_CLOSED'); }
@@ -465,6 +467,7 @@ export class Client {
   private readonly owned = new Set<Session>();
   private readonly createId: () => string;
   constructor(private readonly options: ClientOptions) {
+    this.options = { ...options, adapter: withStructuredOutput(options.adapter, { queue: options.runtime?.queue, maxSubmissions: options.limits?.maxSubmissions, maxResultBytes: options.limits?.maxResultBytes, maxItems: options.limits?.maxItems }) };
     this.createId = options.runtime?.createId ?? randomUUID;
     for (const value of [options.identity.adapterId, options.identity.runtimeConfigId]) if (typeof value !== 'string' || !value.trim()) throw new HarnessSdkError('INVALID_PARAMS');
     for (const value of Object.values(options.limits ?? {})) positive(value, 1);

@@ -11,6 +11,11 @@ actual executions; manages interactions, privacy, bounded observations and retai
 results. Adapters provide native admission, association and terminal evidence.
 Core does not impose a universal business queue.
 
+Structured output uses native schemas when available, direct tools on Pi, and a
+session-scoped MCP result bridge on supported ACP and Hermes adapters. Both Session outputSchema and workflow schema
+use the same path; see [structured output](../../docs/structured-output.md) for
+availability, process ownership, tool definition and admission limits.
+
 > Part of the [Anureo SDK workspace](../../README.md).
 
 ## Exports

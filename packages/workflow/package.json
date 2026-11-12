@@ -14,6 +14,6 @@
     "ajv": "8.20.0",
     "zod": "4.6.7"
   },
-  "devDependencies": { "@anureo/conformance": "workspace:*", "@anureo/adapter-claude": "workspace:*", "@anureo/adapter-codex": "workspace:*" },
+  "devDependencies": { "@anureo/conformance": "workspace:*", "@anureo/adapter-claude": "workspace:*", "@anureo/adapter-codex": "workspace:*", "@anureo/adapter-acp": "workspace:*", "@anureo/adapter-pi": "workspace:*" },
   "engines": { "node": ">=22" }
 }

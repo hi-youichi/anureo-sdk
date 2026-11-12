@@ -12,6 +12,7 @@ if (!process.argv.includes('--server')) {
   process.exit(0)
 }
 
+const createParams = []
 let epoch = 1, instance = 'owner-1', creates = 0, attaches = 0, interrupts = 0, disconnects = 0
 const tickets = new Set(), sessions = new Map(), createIds = new Map(), methods = [], inputs = [], responses = [], attachArgs = []
 const origins = [], upgrades = [], connections = new Set()
@@ -51,6 +52,27 @@ function disconnect(session) {
 }
 function progress(row) {
   const s = row.session
+  if (scenario === 'mcp') {
+    void (async () => {
+      const server = s.mcpServers?.find(server => server.name === 'anureo_output')
+      if (!server) throw new Error('missing MCP config')
+      const outputId = row.text.match(/outputId: (anureo_output_[a-f0-9]{48})/)?.[1]
+      const rpc = async (id, method, params) => {
+        const response = await fetch(server.url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...Object.fromEntries(server.headers.map(header => [header.name, header.value])) }, body: JSON.stringify({ jsonrpc: '2.0', id, method, params }) })
+        if (!response.ok) throw new Error('MCP HTTP failure')
+        const message = await response.json()
+        if (message.error) throw new Error('MCP protocol failure')
+        return message.result
+      }
+      await rpc(1, 'initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'fake-hermes', version: '1' } })
+      const tools = await rpc(2, 'tools/list', {})
+      if (tools.tools[0]?.name !== 'submit_result') throw new Error('missing tool')
+      const result = await rpc(3, 'tools/call', { name: 'submit_result', arguments: { outputId, value: { sum: 42 } } })
+      if (result.isError) throw new Error('submission failed')
+      finish(row, 'complete', 'MCP accepted')
+    })().catch(() => finish(row, 'error', 'MCP failed'))
+    return
+  }
   if (scenario === 'global-events') for (const socket of s.viewers) {
     send(socket, { jsonrpc: '2.0', method: 'event', params: { type: 'sessions.changed', session_id: '', payload: {} } })
   }
@@ -104,14 +126,16 @@ async function request(socket, method, p) {
   methods.push(method)
   if (method === 'runtime.describe' && scenario === 'describe-hang') return NO_REPLY
   if (method === 'runtime.describe') return { instance_id: instance, profile_id: 'fake-profile', authority_epoch: epoch,
-    capabilities: scenario === 'old-contract' ? [] : ['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1'],
-    session_create: { sources: ['tool'], parameters: ['request_id', 'source', 'cwd', 'model', 'client'] } }
+    capabilities: scenario === 'old-contract' ? [] : ['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1', ...(scenario === 'mcp' ? ['acp-session-mcp-v1'] : [])],
+    session_create: { sources: ['tool', ...(scenario === 'mcp' ? ['acp'] : [])], parameters: ['request_id', 'source', 'cwd', 'model', 'client', ...(scenario === 'mcp' ? ['editor'] : [])] } }
   if (method === 'session.create') {
-    if (p.source !== 'tool' || !p.cwd || !p.request_id) throw 'invalid_params'
+    createParams.push(p)
+    if ((p.source !== 'tool' && !(scenario === 'mcp' && p.source === 'acp' && p.editor?.edit_approval_policy === 'ask')) || !p.cwd || !p.request_id) throw 'invalid_params'
     let session = createIds.get(p.request_id)
     if (!session) {
       session = { id: `session-${++creates}`, seq: 0, replay: 'replay-1', generation: 0, queue: [], active: null, events: [], rows: new Map(), viewers: new Set(), prompts: new Map(), requests: new Map() }
       sessions.set(session.id, session); createIds.set(p.request_id, session)
+      session.mcpServers = p.editor?.mcp_servers
     }
     session.viewers.add(socket); socket.data.session = session; return snapshot(session, socket)
   }
@@ -181,7 +205,7 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0,
       // Bun negotiates the first offered protocol; supplying it again duplicates the header on older Bun.
       if (server.upgrade(req, { data: { subscription: randomUUID() } })) return
     }
-    if (path === '/state') return Response.json({ creates, attaches, interrupts, disconnects, methods, inputs, responses, attachArgs, origins, upgrades, connections: connections.size,
+    if (path === '/state') return Response.json({ creates, attaches, interrupts, disconnects, createParams, methods, inputs, responses, attachArgs, origins, upgrades, connections: connections.size,
       active: [...sessions.values()].filter(s => !!s.active).length, viewers: [...sessions.values()].reduce((n, s) => n + s.viewers.size, 0) })
     if (path === '/control') {
       const { action } = await req.json()

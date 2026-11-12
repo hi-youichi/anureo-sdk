@@ -158,11 +158,16 @@ streamed messages/reasoning/tools, approvals/user input, and exact-turn interrup
 Unrecognized tools retain their native name with `kind: 'other'`.
 
 Unsupported operations reject with `CAPABILITY_UNSUPPORTED` before dispatch:
-JSON Schema output, image/file input, turn overrides, history, fork/revert,
+Native JSON Schema output, image/file input, turn overrides, history, fork/revert,
 compaction, goals, review, steer and configuration patches. Explicit session
-`instructions`, `mcpServers` and `permissionMode` are also rejected. Profile MCP
+`instructions` and `permissionMode` are also rejected. Profile MCP
 configuration can still be used by Hermes itself. Hermes safe-mode/yolo/toolsets
 are not translated into a read-only/workspace sandbox guarantee.
 
 The ordinary text `@anureo/workflow` agent flow can use this adapter. Workflow
-schemas or explicit instructions remain subject to these capability limits.
+schemas use the SDK MCP bridge on new sessions when the gateway advertises
+`acp-session-mcp-v1`, an ACP source and the `editor` creation parameter.
+Session `mcpServers` are then mapped to `editor.mcp_servers` on the ACP editor
+surface with per-edit approval (`ask`). Older gateways and resumed sessions do
+not install the bridge. See [structured output](structured-output.md) for process
+ownership and result semantics. Explicit instructions retain the limits above.

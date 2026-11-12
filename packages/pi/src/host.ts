@@ -2,7 +2,10 @@
  * The only module that imports the Pi SDK. Everything else talks to `PiSessionHost`, a small
  * Pi-independent surface, so tests inject a scripted host and a subprocess host can replace this one.
  */
-import type { AgentSession, AgentSessionEvent, SessionManager, SettingsManager } from '@earendil-works/pi-coding-agent'
+import type { AgentSession, AgentSessionEvent, SessionManager, ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import type { StructuredOutputToolDefinition } from '@anureo/sdk'
+import { Type } from 'typebox'
+import { join } from 'node:path'
 
 export type PiHostContent =
   | { type: 'text'; text: string }
@@ -84,6 +87,8 @@ export interface PiSessionHost {
   availableThinkingLevels(): string[]
   setThinkingLevel(level: string): string
   setActiveTools(names: string[]): void
+  /** Dynamic output tool support; absent on hosts which cannot replace tools safely. */
+  setOutputTool?(tool?: StructuredOutputToolDefinition): Promise<void>
   /** Entries on the active branch, oldest first. */
   entries(): PiHostEntry[]
   compact(instructions?: string): Promise<{ summary?: string }>
@@ -180,13 +185,19 @@ class DefaultPiHost implements PiSessionHost {
   private readonly listeners = new Set<(event: PiHostEvent) => void>()
   private unsubscribe?: () => void
   private disposed = false
+  private outputTool?: string
+  private readonly outputCalls = new Map<string, unknown>()
   constructor(
     private readonly session: AgentSession,
     private readonly pi: typeof import('@earendil-works/pi-coding-agent'),
     private readonly open: PiHostOpenOptions,
     readonly persistent: boolean,
+    private readonly extensions: ExtensionAPI,
   ) {
     this.unsubscribe = session.subscribe(event => {
+      // Pi validates with coercion before execute(). Preserve the original arguments for SDK validation.
+      if (event.type === 'tool_execution_start' && event.toolName === this.outputTool) this.outputCalls.set(event.toolCallId, structuredClone(event.args))
+      if (event.type === 'tool_execution_end') this.outputCalls.delete(event.toolCallId)
       const mapped = toHostEvent(event)
       if (mapped) this.emit(mapped)
     })
@@ -227,7 +238,41 @@ class DefaultPiHost implements PiSessionHost {
   }
   availableThinkingLevels(): string[] { return thinkingLevelsOf(this.session.getAvailableThinkingLevels()) }
   setThinkingLevel(level: string): string { this.session.setThinkingLevel(level as Parameters<AgentSession['setThinkingLevel']>[0]); return this.session.thinkingLevel }
-  setActiveTools(names: string[]): void { this.session.setActiveToolsByName(names) }
+  setActiveTools(names: string[]): void { this.extensions.setActiveTools([...new Set([...names, ...(this.outputTool ? [this.outputTool] : [])])]) }
+  async setOutputTool(tool?: StructuredOutputToolDefinition): Promise<void> {
+    if (this.disposed) return
+    if (tool && this.busy) throw new Error('STRUCTURED_OUTPUT_BUSY')
+    this.outputCalls.clear()
+    const active = this.extensions.getActiveTools().filter(name => name !== this.outputTool)
+    if (tool) {
+      // Keep object schemas as the actual model-facing parameters. Other JSON roots use a value envelope.
+      const definition = structuredClone({ name: tool.name, description: tool.description, schema: tool.schema })
+      const object = typeof definition.schema === 'object' && definition.schema.type === 'object'
+      // A nested resource keeps local references rooted at the original schema for non-object values.
+      const valueSchema = typeof definition.schema === 'boolean' ? definition.schema : { ...definition.schema, $id: definition.schema.$id ?? 'urn:anureo:output-result' }
+      const parameters = object ? definition.schema : {
+        ...(typeof definition.schema === 'object' && definition.schema.$schema ? { $schema: definition.schema.$schema } : {}),
+        type: 'object', properties: { value: valueSchema }, required: ['value'], additionalProperties: false,
+      }
+      const execute = tool.execute
+      const calls = this.outputCalls
+      this.extensions.registerTool({
+        name: definition.name, label: 'Submit result', description: definition.description,
+        parameters: Type.Unsafe<Record<string, unknown>>(parameters),
+        async execute(id, args) {
+          const original = calls.has(id) ? calls.get(id) : args
+          const result = await execute(object ? original : record(original).value)
+          return { content: [{ type: 'text', text: JSON.stringify(result) }], details: result,
+            ...(result.accepted ? { terminate: true } : { isError: true }) }
+        },
+      })
+      this.outputTool = definition.name
+      this.extensions.setActiveTools([...new Set([...active, definition.name])])
+    } else {
+      this.extensions.setActiveTools(active)
+      this.outputTool = undefined
+    }
+  }
   entries(): PiHostEntry[] { return this.session.sessionManager.getBranch().map(entryToHost) }
   async compact(instructions?: string): Promise<{ summary?: string }> {
     const result = await this.session.compact(instructions)
@@ -251,6 +296,7 @@ class DefaultPiHost implements PiSessionHost {
     this.disposed = true
     this.unsubscribe?.(); this.unsubscribe = undefined
     this.listeners.clear()
+    this.outputCalls.clear()
     this.session.dispose()
   }
 }
@@ -258,27 +304,30 @@ class DefaultPiHost implements PiSessionHost {
 async function createHostFromManager(pi: typeof import('@earendil-works/pi-coding-agent'), open: PiHostOpenOptions, sessionManager: SessionManager, persistent: boolean): Promise<PiSessionHost> {
   const agentDir = open.agentDir ?? pi.getAgentDir()
   const settingsManager = pi.SettingsManager.create(open.cwd, agentDir)
-  const modelRuntime = await pi.ModelRuntime.create({ agentDir } as never)
+  const modelRuntime = await pi.ModelRuntime.create({ authPath: join(agentDir, 'auth.json'), modelsPath: join(agentDir, 'models.json') })
   const model = open.model ? (() => { const slash = open.model!.indexOf('/'); return slash > 0 ? modelRuntime.getModel(open.model!.slice(0, slash), open.model!.slice(slash + 1)) : undefined })() : undefined
   if (open.model && !model) throw new Error('MODEL_NOT_FOUND')
+  let extensions: ExtensionAPI | undefined
+  const loader = new pi.DefaultResourceLoader({
+    cwd: open.cwd, agentDir, settingsManager,
+    disabledBuiltinExtensions: ['mcp'],
+    extensionFactories: [api => { extensions = api }],
+    ...(open.instructions ? { appendSystemPrompt: [open.instructions] } : {}),
+  })
+  await loader.reload()
   const { session } = await pi.createAgentSession({
-    cwd: open.cwd, agentDir, sessionManager, settingsManager, modelRuntime,
+    cwd: open.cwd, agentDir, sessionManager, settingsManager, modelRuntime, resourceLoader: loader,
     ...(model ? { model } : {}),
     ...(open.thinkingLevel ? { thinkingLevel: open.thinkingLevel as never } : {}),
-    ...(open.tools ? { tools: open.tools } : {}),
-    ...(open.instructions ? { resourceLoader: await instructedLoader(pi, open, agentDir, settingsManager) } : {}),
   })
-  return new DefaultPiHost(session, pi, open, persistent)
-}
-
-async function instructedLoader(pi: typeof import('@earendil-works/pi-coding-agent'), open: PiHostOpenOptions, agentDir: string, settingsManager: SettingsManager) {
-  const loader = new pi.DefaultResourceLoader({ cwd: open.cwd, agentDir, settingsManager, appendSystemPrompt: open.instructions } as never)
-  await loader.reload()
-  return loader
+  if (!extensions) { session.dispose(); throw new Error('PI_OUTPUT_TOOLS_UNAVAILABLE') }
+  const host = new DefaultPiHost(session, pi, open, persistent, extensions)
+  if (open.tools) host.setActiveTools(open.tools)
+  return host
 }
 
 /** Default factory: embeds Pi in-process through `createAgentSession`. */
-export const createPiHost: PiHostFactory = async open => {
+export const createPiHost: PiHostFactory = async (open: PiHostOpenOptions) => {
   const pi = await import('@earendil-works/pi-coding-agent')
   let manager
   if (!open.persist) manager = pi.SessionManager.inMemory(open.cwd)

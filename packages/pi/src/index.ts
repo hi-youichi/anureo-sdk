@@ -4,7 +4,7 @@ import {
   type AhpRequestMap, type AhpResultMap, type Boundary, type Capabilities, type HistoryItem,
   type InitializeParams, type InitializeResult, type Item, type JsonObject, type SessionBinding, type SessionOpenParams, type SessionState,
 } from '@anureo/protocol'
-import { HarnessSdkError, sdkError, type BackendSession, type HarnessAdapter, type SessionEventSink, type SessionMethod } from '@anureo/sdk'
+import { HarnessSdkError, sdkError, type BackendSession, type HarnessAdapter, type SessionEventSink, type SessionMethod, type StructuredOutputToolPort } from '@anureo/sdk'
 import { createPiHost, type PiHostEntry, type PiHostEvent, type PiHostFactory, type PiHostMessage, type PiSessionHost } from './host'
 import {
   PERMISSION_MODES, completeTool, contentText, createRedactor, historyItems, nativeInput, permissionTools, piTurnError, toolItem, turnStarts, usageOf,
@@ -97,6 +97,7 @@ export class PiAdapter implements HarnessAdapter {
   }
   async openSession(params: SessionOpenParams, sink: SessionEventSink): Promise<BackendSession> {
     if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
+    if (params.mcpServers?.length) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Pi uses direct tools and does not accept MCP servers')
     if (params.binding.adapterId !== 'pi') throw new HarnessSdkError('SESSION_BINDING_MISMATCH')
     const session = new PiBackendSession(this, params, sink)
     try { await session.open() } catch (cause) { await session.dispose().catch(() => {}); throw cause }
@@ -160,6 +161,9 @@ export class PiBackendSession implements BackendSession {
       if (!option) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Unknown Pi config option')
       if (!validateJsonSchema(option.schema, value)) throw new HarnessSdkError('INVALID_PARAMS', 'Invalid Pi config value')
     }
+  }
+  get structuredOutputTool(): StructuredOutputToolPort | undefined {
+    return this.host?.setOutputTool ? { configure: tool => this.host.setOutputTool!(tool) } : undefined
   }
   get nativeId(): string { return this.binding.nativeRef?.value ?? '' }
 

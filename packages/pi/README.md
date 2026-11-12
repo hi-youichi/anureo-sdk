@@ -46,7 +46,20 @@ Pi executes in the host process with the host's credentials, environment and fil
 | config | `model`, `thinkingLevel`, `permissionMode` | Values are validated against what Pi lists. |
 | text + base64 image input | prompt images | URL images and file inputs are rejected. |
 
-Not supported and never advertised: interactions (approval, user input, elicitation, dynamic tools), revert, goal, review, structured output schemas, `turn/steer` and `turn/interrupt` (Pi has no turn ids to match atomically — use session-level interrupt and native delivery).
+Not supported natively: interactions (approval, user input, elicitation, dynamic tools), revert, goal, review, structured output schemas, `turn/steer` and `turn/interrupt` (Pi has no turn ids to match atomically — use session-level interrupt and native delivery).
+
+The default embedded host supports [structured output](../../docs/structured-output.md)
+through a dynamically registered Pi tool. Each structured submission replaces
+`anureo_submit_result` with the current business JSON Schema. A validated tool
+result requests native termination; the SDK publishes success only after Pi
+settles successfully. The tool is disabled after the real terminal or definite
+submission rejection. Text-only inputs have no active output tool.
+
+Pi does not use MCP. Session `mcpServers` are unsupported, and the embedded host
+disables Pi's built-in MCP extension. Custom hosts can opt into structured output
+by implementing `PiSessionHost.setOutputTool(tool?)`: replace the definition,
+invoke its submission-bound callback, and disable it when passed `undefined`.
+Hosts without this method retain text support without advertising output schemas.
 
 ### Permission modes
 
@@ -92,3 +105,16 @@ PI_SMOKE_MODEL=provider/id bun run live       # multi-turn, history, fork, resum
 ```
 
 Most unit tests drive a scripted host; `tests/replay.test.ts` replays a real run recorded from Pi 1.5.2 (`protocol/1.5.2/run.json`). The live scripts were verified with Zhipu's `zai/glm-5.3-flash` using `ZAI_API_KEY` in the environment. `scripts/fork-probe.ts` checks Pi's session-file semantics without credentials.
+
+The direct structured-output live check exercises schema A → schema B → plain
+text on one real session, recalls a nonce supplied only on the first turn, checks
+public history, and runs a separate workflow schema call:
+
+```sh
+# From the repository root, using credentials already configured for Pi:
+PI_SMOKE_MODEL=provider/id bun run example:pi-tool-schema
+# Optional: PI_SMOKE_AGENT_DIR=/path/to/pi/agent
+```
+
+The real provider check passed with Pi 1.5.2 and
+`zai-coding-cn/glm-5.3-flash` on the China Coding Plan endpoint.

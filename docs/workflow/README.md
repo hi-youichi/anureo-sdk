@@ -113,9 +113,11 @@ if (result !== null) {
 ```
 
 The library converts the Zod schema to self-contained draft-07 JSON Schema,
-checks it before creating a Session, and sends it via `outputSchema`. Backends
-must advertise `turn.outputSchema`; unsupported calls reject without submitting
-input. Raw JSON Schema remains available through the SDK Session API, and is not
+checks it before creating a Session, and sends it via `outputSchema`. The SDK
+selects native output, direct Pi tools, or an installed MCP result bridge; effective session support
+is advertised by `turn.outputSchema`. Unsupported calls reject without submitting
+input. See [SDK structured output](../structured-output.md) for route availability,
+process ownership and same-session admission limits. Raw JSON Schema remains available through the SDK Session API, and is not
 accepted as workflow `schema`.
 
 At a successful terminal result, the library parses the complete final JSON text,
@@ -138,6 +140,7 @@ and does not trigger another model request. Ordinary mismatch throws
 `AGENT_STRUCTURED_OUTPUT_INVALID`; an exception from a refinement throws
 `AGENT_STRUCTURED_OUTPUT_VALIDATION_FAILED`. Missing and malformed JSON throw
 `AGENT_STRUCTURED_OUTPUT_MISSING` and `AGENT_STRUCTURED_OUTPUT_NOT_JSON`.
+SDK JSON/schema failures can surface earlier as `STRUCTURED_OUTPUT_*` errors.
 Schema errors throw `INVALID_PARAMS`. Diagnostics omit output values and custom
 refinement messages. Successful conversion does not guarantee that every schema
 keyword is accepted by every native backend.

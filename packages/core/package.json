@@ -28,7 +28,8 @@
     ".": "./src/index.ts",
     "./process": "./src/process.ts",
     "./queue": "./src/queue.ts",
-    "./diagnostics": "./src/diagnostics.ts"
+    "./diagnostics": "./src/diagnostics.ts",
+    "./structured-output-stdio": "./src/structured-output/stdio.mjs"
   },
   "scripts": {
     "build": "tsc --noEmit",
@@ -36,7 +37,9 @@
     "test": "bun test src"
   },
   "dependencies": {
-    "@anureo/protocol": "workspace:*"
+    "@anureo/protocol": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "ajv": "8.20.0"
   },
   "engines": {
     "node": ">=22"

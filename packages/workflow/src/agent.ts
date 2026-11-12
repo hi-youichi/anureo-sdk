@@ -31,7 +31,7 @@ export async function agent(prompt: string, options: AgentOptions): Promise<stri
   if (!session) return null // A failed open never hands session ownership to this call.
   let outcome: AgentOutcome
   try {
-    if (output && !session.capabilities.turn?.outputSchema) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Backend does not support outputSchema')
+    if (output && !session.capabilities.turn?.outputSchema) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Session does not support structured output')
     const turn = await session.submit({ input: prompt, ...(output ? { outputSchema: output.schema } : {}) }, { timeoutMs: LONG_OBSERVATION_TIMEOUT_MS })
     const result = await turn.result({ timeoutMs: LONG_OBSERVATION_TIMEOUT_MS })
     if (result.status === 'completed') {

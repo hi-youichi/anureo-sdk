@@ -22,6 +22,8 @@
     "example:dsh": "bun examples/dsh.ts",
     "example:workflow": "bun examples/workflow.ts",
     "example:workflow-schema": "bun examples/workflow-structured.ts",
+    "example:workflow-tool-schema": "bun examples/workflow-output-tools.ts",
+    "example:pi-tool-schema": "bun examples/pi-structured-live.ts",
     "example:workflow-persistence": "bun examples/workflow-persistence.ts",
     "review": "bun packages/code-review/bin/anureo-review.ts",
     "review:readability": "bun packages/code-review/bin/anureo-review.ts --dimension D12",

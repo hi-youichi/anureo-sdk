@@ -76,7 +76,7 @@ result, and releases its resources. `client` and `cwd` are required; `model` and
 `instructions` are optional. The caller owns the borrowed Client.
 
 `schema` accepts a Zod 4 object schema. The library converts it to draft-07 JSON
-Schema, requires backend `turn.outputSchema` support, validates the raw JSON
+Schema, requires effective session `turn.outputSchema` support, validates the raw JSON
 result, then validates it with the original Zod schema and returns `z.output<S>`.
 This package depends on Zod 4.6.7. Applications that import Zod to author schemas
 should also declare it as their own dependency. Schema-associated types infer business fields;

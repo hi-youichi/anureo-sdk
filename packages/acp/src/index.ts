@@ -158,6 +158,10 @@ function selectPermissionOption(options: readonly acp.PermissionOption[], decisi
 }
 
 export class AcpAdapter implements HarnessAdapter {
+  outputBridgeTransport(): 'http' | 'stdio' | undefined {
+    if (!this.options.command || this.options.connect) return undefined
+    return this.capabilities.mcp?.http ? 'http' : 'stdio'
+  }
   private connection: acp.ClientConnection | undefined;
   private channel: AcpChannel | undefined;
   private info: acp.InitializeResponse | undefined;
@@ -483,10 +487,10 @@ export class AcpBackendSession implements BackendSession {
       }
       return;
     }
-    await this.sink.emit(raw, { ...(typeof scope.turnId === 'string' ? { turnId: scope.turnId } : this.activeTurn ? { turnId: this.activeTurn } : {}) });
     if (raw.type === 'turn/completed' && this.activeTurn === raw.payload.turnId) {
       this.activeTurn = undefined; this.standardSubmissionId = undefined; this.standardTurnStarted = false;
     }
+    await this.sink.emit(raw, { ...(typeof scope.turnId === 'string' ? { turnId: scope.turnId } : this.activeTurn ? { turnId: this.activeTurn } : {}) });
   }
   private async submitReview(params: AhpRequestMap['review/start']): Promise<AhpResultMap['review/start']> {
     const method = this.adapter.extension.methods.review; if (!method) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
@@ -535,6 +539,9 @@ export class AcpBackendSession implements BackendSession {
       await this.ensureStandardStarted(); await this.mapper.complete();
       const outcome = stopOutcome(completed.stopReason);
       if (outcome.notice) await this.sink.emit({ type: 'notice', payload: { severity: 'warning', code: outcome.notice.code, message: outcome.notice.message } }, { turnId });
+      // A result observer can immediately submit again after terminal publication.
+      // Release native admission first, and never let this prompt's finally clear its successor.
+      if (this.activeTurn === turnId) { this.activeTurn = undefined; this.standardSubmissionId = undefined; this.standardTurnStarted = false; }
       await this.sink.emit({ type: 'turn/completed', payload: { turnId, status: outcome.status } });
       return { submissionId: start.submissionId, accepted: true, disposition: 'started', turnId };
     } catch (cause) {
@@ -544,7 +551,7 @@ export class AcpBackendSession implements BackendSession {
         else await this.sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: { code: error.code, message: error.code, retryable: false, outcomeUnknown: false } } });
       }
       throw error;
-    } finally { this.activeTurn = undefined; this.standardSubmissionId = undefined; this.standardTurnStarted = false; }
+    } finally { if (this.activeTurn === turnId) { this.activeTurn = undefined; this.standardSubmissionId = undefined; this.standardTurnStarted = false; } }
   }
   configure(data: Record<string, unknown>): void {
     if (Object.hasOwn(data, 'sessionTitle')) { this.sessionTitle = data.sessionTitle as string | null; return; }

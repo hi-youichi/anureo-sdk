@@ -10,11 +10,15 @@ export type { HermesAdapterOptions } from './options'
 export class HermesAdapter implements HarnessAdapter {
   private initialized?: Promise<InitializeResult>
   private profileId?: string
+  private editorMcp = false
   private disposed = false
   private readonly abort = new AbortController()
   private probe?: HermesRpc
   private readonly sessions = new Set<HermesSession>()
   readonly options: HermesAdapterOptions
+  outputBridgeTransport(params: SessionOpenParams): 'http' | undefined {
+    return this.editorMcp && params.mode === 'new' ? 'http' : undefined
+  }
   constructor(options: HermesAdapterOptions = {}) {
     try { validateOptions(options) } catch { throw new HarnessSdkError('INVALID_PARAMS', 'Invalid Hermes adapter options') }
     this.options = { ...options, ...(options.args ? { args: [...options.args] } : {}), ...(options.env ? { env: { ...options.env } } : {}) }
@@ -32,6 +36,7 @@ export class HermesAdapter implements HarnessAdapter {
         const description = describe(await channel.request('runtime.describe'), grant)
         if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
         this.profileId = description.profileId
+        this.editorMcp = description.editorMcp
         return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT,
           runtime: { name: 'hermes', version: grant.version, adapter: 'hermes-gateway/0.2.0' }, capabilities: hermesCapabilities() }
       } catch (cause) {
@@ -44,7 +49,7 @@ export class HermesAdapter implements HarnessAdapter {
     if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
     if (!this.profileId) throw new HarnessSdkError('NOT_INITIALIZED')
     assertRequest('session/open', params)
-    if (params.mode === 'fork' || params.instructions !== undefined || params.permissionMode !== undefined || params.mcpServers !== undefined || Object.keys(params.config ?? {}).length) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
+    if (params.mode === 'fork' || params.instructions !== undefined || params.permissionMode !== undefined || params.mcpServers !== undefined && (!this.editorMcp || params.mode !== 'new') || Object.keys(params.config ?? {}).length) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
     if (params.mode === 'resume' && params.binding.nativeRef?.provider !== 'hermes') throw new HarnessSdkError('SESSION_BINDING_MISMATCH')
     const session = new HermesSession(params, sink, this.options, this.profileId, () => this.sessions.delete(session))
     this.sessions.add(session)

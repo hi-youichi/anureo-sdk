@@ -84,6 +84,10 @@ capability checks, and resource ownership.
 
 Direct `agent()` calls return `null` for designated confirmed terminal failures;
 other failures throw. Pass a Zod object as `schema` to infer structured results.
+
+Schema calls use native output when available, with an MCP result bridge on
+supported ACP and Hermes sessions, and direct tools on Pi. See [structured output](docs/structured-output.md)
+for adapter requirements, tool definitions and process lifecycle.
 Inside `parallel()` and `pipeline()`, callback failures become `null` at their
 original positions. A pipeline also skips an item's remaining stages on `null`.
 
@@ -122,6 +126,7 @@ Every example uses a real backend and requires its credentials.
 | [Greeting](examples/greeting.ts) | `bun run example` | Authenticated Codex CLI; streams a greeting. |
 | [Workflow](examples/workflow.ts) | `bun run example:workflow` | Authenticated Codex CLI; prints arithmetic agent inputs, outputs, and a checked summary. |
 | [Zod workflow](examples/workflow-structured.ts) | `bun run example:workflow-schema all` | Authenticated Codex and Claude CLIs; returns typed `{ sum: 42 }` from the same Zod schema. Select `codex` or `claude` to run one backend. |
+| [Tool structured workflow](examples/workflow-output-tools.ts) | `bun run example:workflow-tool-schema dsh` | Installed credentials for DSH, Hermes or Pi. Add `--session` to switch schemas sequentially on one SDK session. |
 | [Persistent workflow](examples/workflow-persistence.ts) | `bun run example:workflow-persistence [runId]` | Deterministic callbacks; saves a run ID and resumes completed steps without model requests. |
 | [Structured output](examples/structured-output.ts) | `bun run example:schema codex` | Authenticated Codex CLI; prints a parsed JSON result for `17 + 25`. Use `claude` for Claude, or omit the argument to run both backends. |
 | [DSH over ACP](examples/dsh.ts) | `bun run example:dsh` | DSH 0.2.2+ on PATH, Node.js 24.9+ for DSH, and configured DSH credentials; streams a reply and handles per-call approvals. |

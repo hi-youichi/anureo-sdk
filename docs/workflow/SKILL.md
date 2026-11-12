@@ -186,6 +186,8 @@ if (result !== null) {
 }
 ```
 
+The SDK selects native output, direct Pi tools, or a session-scoped MCP bridge;
+see [structured output](../structured-output.md) for supported adapters and limits.
 The library converts the schema for the backend, parses complete final JSON,
 validates raw data and calls the original schema's `safeParseAsync()`. It returns
 validated data, without caller parsing or casts. Use required fields and closed
