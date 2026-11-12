@@ -1,12 +1,16 @@
 #!/usr/bin/env bun
-// Scripted Codex app-server protocol, no model calls or credentials.
+// Emulates the Codex app-server wire lifecycle for CLI subprocess tests; it must not run models or read credentials.
 import readline from 'node:readline'
 if (process.argv.includes('--version')) { process.stdout.write('codex-cli 0.164.0\n'); process.exit(0) }
+/** Serialize one fixture reply/event to stdout, returning the stream write result.
+ * The protocol loop owns ordering; serialization or synchronous stream errors escape to fail the test. */
 const send = value => process.stdout.write(`${JSON.stringify(value)}\n`)
 const threadId = 'refactor-fixture'
 for await (const line of readline.createInterface({ input: process.stdin })) {
   const message = JSON.parse(line)
   if (message.id === undefined) continue
+  /** Send a result for this request ID, returning send's write result or propagating its errors.
+   * The protocol loop must acknowledge turn/start before publishing that turn's lifecycle events. */
   const reply = result => send({ id: message.id, result })
   switch (message.method) {
     case 'initialize': reply({ userAgent: 'codex/0.164.0' }); break
@@ -18,6 +22,8 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
       const result = prompt.startsWith('PLAN')
         ? { summary: 'One module', modules: [{ id: 'main', name: 'Main', description: 'Entry point', files: ['main.ts'] }] }
         : { summary: 'Direct and readable implementation; keep it.', changes: [], deferred: [] }
+      // The adapter needs the turn acknowledgement before it can associate subsequent events.
+      // Final text must arrive before completion so structured-output parsing sees a full response.
       reply({ turn: { id: 'turn', status: 'inProgress', items: [] } })
       send({ method: 'turn/started', params: { threadId, turn: { id: 'turn', status: 'inProgress', items: [] } } })
       send({ method: 'item/completed', params: { threadId, turnId: 'turn', item: {

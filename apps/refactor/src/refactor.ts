@@ -1,94 +1,27 @@
-import { randomUUID } from 'node:crypto'
-import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises'
+// Sequences design, planning and serial module work; it must not own locking, command policy or result types.
+import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { Client } from '@anureo/sdk'
 import { agent } from '@anureo/workflow'
-import { loadGraph, type GraphLoader } from './graph'
+import { defaultChecks, runChecks, validateChecks } from './checks'
+import { failure, message } from './errors'
+import { captureTree, changes, repositoryDirectory, treeVersion } from './git-tree'
+import { loadGraph } from './graph'
+import type { RefactorOptions } from './options'
+import { validatePlan } from './plan-validation'
 import { designPrompt, modulePrompt, planPrompt } from './prompts'
-import { modulePlanSchema, workSchema, type ModulePlan, type RefactorModule, type Work } from './schema'
-import { captureTree, changes, exec, isSource, repositoryDirectory, treeVersion, validatePlan, validateSourcePath } from './source'
+import { saveReport } from './report-store'
+import type { ModuleResult, RefactorReport, StepResult } from './results'
+import { withRun } from './run-lifecycle'
+import { modulePlanSchema, workSchema, type ModulePlan } from './schema'
+import { isSource, validateSourcePath } from './source-policy'
 
-export interface CheckResult { command: string; status: 'passed' | 'failed'; output: string }
-export interface Failure { code: string | null; outcomeUnknown: boolean; cleanupFailed: boolean }
-/** One agent step: it reviews and edits in a single pass. */
-export interface StepResult extends Work {
-  status: 'applied' | 'unchanged' | 'failed'
-  changedFiles: string[]
-  checks: CheckResult[]
-  error: string | null
-  failure: Failure | null
-}
-export interface ModuleResult { module: RefactorModule; step: StepResult | null }
-export interface RefactorReport {
-  runId: string
-  cwd: string
-  directory: string
-  status: 'completed' | 'incomplete'
-  reviewOnly: boolean
-  /** Cross-module design step, run before modules are planned. */
-  design: StepResult | null
-  plan: ModulePlan | null
-  modules: ModuleResult[]
-  errors: string[]
-  failure: Failure | null
-  progressErrors: string[]
-}
-export interface RefactorOptions {
-  client: Client
-  cwd: string
-  model?: string
-  /** Read-only mode is stated in the prompts; the host does not enforce it. */
-  reviewOnly?: boolean
-  repographEntry?: string
-  /** Override the real repograph subprocess for embedding/tests. */
-  graphLoader?: GraphLoader
-  /** Explicit shell commands, or root package.json typecheck/test scripts by default. */
-  checks?: readonly string[]
-  onProgress?: (message: string) => void
-}
+/** Caller configuration re-exported here to preserve direct imports; ownership stays with the caller. */
+export type { RefactorOptions } from './options'
+/** Host-observed report types retained for direct consumers; importing them performs no work. */
+export type { RefactorReport, ModuleResult, StepResult, CheckResult, Failure } from './results'
 
-function message(cause: unknown): string { return cause instanceof Error ? cause.message : String(cause) }
-function failure(cause: unknown): Failure {
-  const error = (cause && typeof cause === 'object' ? cause : {}) as { outcomeUnknown?: boolean; code?: unknown; details?: Record<string, unknown> }
-  return {
-    code: typeof error.code === 'string' ? error.code : null,
-    outcomeUnknown: error.outcomeUnknown === true,
-    cleanupFailed: error.code === 'RESOURCE_RELEASE_FAILED' || error.details?.cleanupFailed === true
-      || (Array.isArray(error.details?.cleanupErrors) && error.details.cleanupErrors.length > 0),
-  }
-}
-
-async function saveReport(report: RefactorReport): Promise<void> {
-  const path = join(report.directory, 'report.json')
-  const temporary = `${path}.tmp`
-  await writeFile(temporary, `${JSON.stringify(report, null, 2)}\n`)
-  await rename(temporary, path)
-}
-
-async function defaultChecks(cwd: string): Promise<string[]> {
-  let pkg: { packageManager?: string; scripts?: Record<string, unknown> }
-  try { pkg = JSON.parse(await readFile(join(cwd, 'package.json'), 'utf8')) }
-  catch (cause) {
-    if ((cause as NodeJS.ErrnoException).code === 'ENOENT') return []
-    throw cause
-  }
-  const manager = /^(bun|npm|pnpm|yarn)@/.exec(pkg.packageManager ?? '')?.[1] ?? 'npm'
-  return ['typecheck', 'test'].filter(name => typeof pkg.scripts?.[name] === 'string').map(name => `${manager} run ${name}`)
-}
-
-async function runChecks(cwd: string, commands: readonly string[], results: CheckResult[]): Promise<void> {
-  for (const command of commands) {
-    try {
-      const { stdout, stderr } = await exec('sh', ['-c', command], { cwd, maxBuffer: 8 << 20, timeout: 300_000 })
-      results.push({ command, status: 'passed', output: `${stdout}${stderr}`.slice(-4000) })
-    } catch (cause) {
-      const error = cause as { stdout?: string; stderr?: string }
-      results.push({ command, status: 'failed', output: `${error.stdout ?? ''}${error.stderr ?? ''}\n${message(cause)}`.slice(-4000) })
-      throw new Error(`Validation failed: ${command}`)
-    }
-  }
-}
-
+/** Capture a host baseline for design/planning and validate eligible paths before agent dispatch.
+ * Reads Git and the filesystem; rejects empty inventories, unsafe source paths and snapshot errors. */
 async function inventory(cwd: string): Promise<{ tree: Map<string, string>; files: string[] }> {
   const tree = await captureTree(cwd)
   const files = [...tree.keys()].filter(isSource)
@@ -97,6 +30,9 @@ async function inventory(cwd: string): Promise<{ tree: Map<string, string>; file
   return { tree, files }
 }
 
+/** Ask one read-only agent to partition the post-design inventory for module preparation.
+ * Returns an exact-cover plan without writing files; uses the caller-owned client and rejects
+ * absent output, invalid assignments, schema errors and agent failures. */
 async function plan(options: RefactorOptions, files: string[], version: string): Promise<ModulePlan> {
   const result = await agent(planPrompt(files, version), {
     client: options.client, cwd: options.cwd, model: options.model, permissionMode: 'read-only', schema: modulePlanSchema,
@@ -106,7 +42,10 @@ async function plan(options: RefactorOptions, files: string[], version: string):
   return result
 }
 
-/** One agent session that reviews and edits; the host records the real diff and runs the checks. */
+/** Run a design/module session with the caller-owned client and return its host-observed result.
+ * The agent and shell checks may edit files; unchanged work never runs checks.
+ * Agent/check failures become a failed step with partial edits retained; initial or recovery snapshot
+ * errors still reject. Review-only is a prompt instruction and only suppresses host checks. */
 async function runStep(options: RefactorOptions, prompt: string, checks: readonly string[]): Promise<StepResult> {
   const step: StepResult = { summary: '', changes: [], deferred: [], status: 'unchanged', changedFiles: [], checks: [], error: null, failure: null }
   const before = await captureTree(options.cwd)
@@ -128,76 +67,118 @@ async function runStep(options: RefactorOptions, prompt: string, checks: readonl
   return step
 }
 
-/** Hold the repository-wide lock and the run directory for the duration of `body`. */
-async function withRun(options: RefactorOptions & { cwd: string }, body: (report: RefactorReport, progress: (event: string) => void) => Promise<void>): Promise<RefactorReport> {
-  const root = join(options.cwd, '.anureo', 'refactor')
-  await mkdir(root, { recursive: true })
-  const lockPath = join(root, 'writer.lock')
-  const lock = await open(lockPath, 'wx').catch(() => { throw new Error(`Cannot acquire refactor lock: ${lockPath}. Check for an active run before removing a stale lock.`) })
-  const runId = randomUUID()
-  const report: RefactorReport = {
-    runId, cwd: options.cwd, directory: join(root, runId), status: 'incomplete', reviewOnly: options.reviewOnly ?? false,
-    design: null, plan: null, modules: [], errors: [], failure: null, progressErrors: [],
-  }
-  const progress = (event: string) => {
-    try { options.onProgress?.(event) } catch (cause) { report.progressErrors.push(message(cause)) }
-  }
-  try {
-    await mkdir(report.directory)
-    progress(`run: ${report.directory}`)
-    await body(report, progress)
-    report.status = 'completed'
-  } catch (cause) { report.errors.push(message(cause)); report.failure = failure(cause) }
-  finally {
-    // Publication failures must still release the writer lock; they do not undo edits.
-    try { await saveReport(report) }
-    finally { try { await lock.close() } finally { await rm(lockPath) } }
-  }
-  return report
+/** Context shared by serial phases only while withRun holds the writer lock.
+ * Phases publish into the same report; checks are selected once before the initial inventory. */
+interface RunContext {
+  options: RefactorOptions
+  report: RefactorReport
+  checks: readonly string[]
+  progress: (event: string) => void
 }
 
-/** Order of work: cross-module design first, then module planning on the resulting tree, then
- * one agent per module in series. Each step reviews and edits; a failed step stops the run
- * because later steps would build on an unvalidated tree. */
+/** Successful design output needed by planning; the graph describes the pre-design tree. */
+interface DesignResult {
+  design: StepResult
+  graphFile: string
+}
+
+/** Prepared module work; graphFile is the post-design baseline, before any module edits. */
+interface ModuleExecution {
+  plan: ModulePlan
+  graphFile: string
+  design: string
+}
+
+/** Export the current graph for a locked phase and return its artifact path.
+ * May start the graph subprocess and writes under the run directory; loader, serialization
+ * and filesystem errors reject before the phase can dispatch an agent. */
+async function exportGraph({ options, report }: RunContext, name: string): Promise<string> {
+  const file = join(report.directory, name)
+  const loader = options.graphLoader
+  const graph = loader
+    ? await loader(options.cwd)
+    : await loadGraph(options.cwd, options.repographEntry)
+  await writeFile(file, JSON.stringify(graph))
+  return file
+}
+
+/** Publish an already-recorded step for design/module callers, then enforce the failure gate.
+ * Reports progress before writing the checkpoint; publication errors reject before step errors.
+ * Saving failed work before throwing preserves partial edits in the report seen by finalization. */
+async function checkpointStep(context: RunContext, input: { step: StepResult; label: string; failureMessage: string }): Promise<void> {
+  context.progress(`${input.label}: ${input.step.status}`)
+  await saveReport(context.report)
+  if (input.step.status === 'failed') throw new Error(`${input.failureMessage}: ${input.step.error}`)
+}
+
+/** Establish the baseline, run design and checkpoint its outcome before allowing planning.
+ * Called under the run lock; writes baseline/graph/report artifacts and may edit/check files.
+ * Inventory, export, snapshot, publication and failed-step errors reject without undoing edits. */
+async function runDesign(context: RunContext): Promise<DesignResult> {
+  const { options, report, checks, progress } = context
+  const initial = await inventory(options.cwd)
+  await writeFile(join(report.directory, 'baseline.json'), JSON.stringify(Object.fromEntries(initial.tree), null, 2))
+  progress('graph: started')
+  const graphFile = await exportGraph(context, 'graph-design.json')
+  progress('design: started')
+  const design = await runStep(options, designPrompt({
+    files: initial.files, graphFile, version: treeVersion(initial.tree), checks,
+    mode: options.reviewOnly ? 'read-only' : 'edit',
+  }), checks)
+  report.design = design
+  await checkpointStep(context, { step: design, label: 'design', failureMessage: 'Cross-module design failed' })
+  return { design, graphFile }
+}
+
+/** Reinventory after successful design, validate the plan and prepare its baseline graph.
+ * Called before any module; records the plan before a needed graph refresh and report write.
+ * Reads Git/files, starts a read-only agent and may export a graph; any failure rejects. */
+async function prepareModules(context: RunContext, input: DesignResult): Promise<ModuleExecution> {
+  const current = await inventory(context.options.cwd)
+  const modulePlan = await plan(context.options, current.files, treeVersion(current.tree))
+  context.report.plan = modulePlan
+  const graphFile = input.design.changedFiles.length ? await exportGraph(context, 'graph-modules.json') : input.graphFile
+  await saveReport(context.report)
+  return { plan: modulePlan, graphFile, design: input.design.summary }
+}
+
+/** Execute prepared modules serially under the run lock, stopping after the first failed checkpoint.
+ * Owns the previous-step edit flag: refresh immediately after edits, otherwise use the prepared
+ * baseline graph. Records a module before export/dispatch so failures leave its pending slot.
+ * Agent/check edits remain on disk; export, snapshot, publication and failed-step errors reject. */
+async function runModules(context: RunContext, input: ModuleExecution): Promise<void> {
+  const { options, report, checks, progress } = context
+  let previousStepChangedFiles = false
+  for (const module of input.plan.modules) {
+    const result: ModuleResult = { module, step: null }
+    report.modules.push(result)
+    const graphFile = previousStepChangedFiles ? await exportGraph(context, `graph-before-${module.id}.json`) : input.graphFile
+    progress(`module/${module.id}: started`)
+    const step = await runStep(options, modulePrompt({
+      module, graphFile, version: treeVersion(await captureTree(options.cwd)), checks,
+      mode: options.reviewOnly ? 'read-only' : 'edit', design: input.design,
+    }), checks)
+    result.step = step
+    await checkpointStep(context, { step, label: `module/${module.id}`, failureMessage: `Module ${module.id} failed` })
+    previousStepChangedFiles = step.changedFiles.length > 0
+  }
+}
+
+/** Run design, plan the resulting tree, then edit modules serially using a caller-owned client.
+ * Writes baselines, graphs and reports under cwd/.anureo/refactor while holding a writer lock;
+ * agent edits and explicit check commands may modify the target. A failed phase stops later work
+ * and returns an incomplete report, including checkpoint write failures, so later work cannot
+ * build on an unvalidated tree. Invalid input, repository preflight, lock, final publication
+ * and cleanup failures reject; partial edits remain. */
 export async function refactorCode(input: RefactorOptions): Promise<RefactorReport> {
-  if (input.checks?.some(command => !command.trim())) throw new Error('check commands must be nonempty')
+  validateChecks(input.checks)
   const cwd = await repositoryDirectory(input.cwd)
   const options = { ...input, cwd }
-  const exportGraph = async (report: RefactorReport, name: string) => {
-    const file = join(report.directory, name)
-    await writeFile(file, JSON.stringify(await (input.graphLoader ?? ((directory: string) => loadGraph(directory, input.repographEntry)))(cwd)))
-    return file
-  }
   return withRun(options, async (report, progress) => {
     const checks = input.reviewOnly ? [] : input.checks ?? await defaultChecks(cwd)
-    const initial = await inventory(cwd)
-    await writeFile(join(report.directory, 'baseline.json'), JSON.stringify(Object.fromEntries(initial.tree), null, 2))
-
-    progress('graph: started')
-    const designGraph = await exportGraph(report, 'graph-design.json')
-    progress('design: started')
-    report.design = await runStep(options, designPrompt(initial.files, designGraph, treeVersion(initial.tree), checks, options.reviewOnly ?? false), checks)
-    progress(`design: ${report.design.status}`)
-    await saveReport(report)
-    if (report.design.status === 'failed') throw new Error(`Cross-module design failed: ${report.design.error}`)
-
-    const current = await inventory(cwd)
-    report.plan = await plan(options, current.files, treeVersion(current.tree))
-    const graphFile = report.design.changedFiles.length ? await exportGraph(report, 'graph-modules.json') : designGraph
-    await saveReport(report)
-
-    let dirty = false
-    for (const module of report.plan.modules) {
-      const result: ModuleResult = { module, step: null }
-      report.modules.push(result)
-      const file = dirty ? await exportGraph(report, `graph-before-${module.id}.json`) : graphFile
-      dirty = false
-      progress(`module/${module.id}: started`)
-      result.step = await runStep(options, modulePrompt(module, file, treeVersion(await captureTree(cwd)), checks, options.reviewOnly ?? false, report.design.summary), checks)
-      progress(`module/${module.id}: ${result.step.status}`)
-      await saveReport(report)
-      if (result.step.status === 'failed') throw new Error(`Module ${module.id} failed: ${result.step.error}`)
-      dirty = result.step.changedFiles.length > 0
-    }
+    const context = { options, report, checks, progress }
+    const design = await runDesign(context)
+    const modules = await prepareModules(context, design)
+    await runModules(context, modules)
   })
 }

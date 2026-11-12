@@ -1,10 +1,15 @@
+// Optionally verifies the real repograph adapter; it must not run a live backend in the default suite.
 import { expect, test } from 'bun:test'
 import { realpath, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { defaultRepographEntry, loadGraph } from '../src/graph'
-import { exec } from '../src/source'
+import { exec } from '../src/process'
 import { temporary } from './helpers'
 
+/** Opt-in live-backend check for adapter maintainers using REPOGRAPH_CLI or the default checkout.
+ * Creates a fixture repository and index, then checks caller edges and index counts. Assertions,
+ * process and backend failures reject; shared temporary() cleanup removes the repository, while
+ * the finally block deletes the external index only after loadGraph has returned its identity. */
 test.skipIf(process.env.REPOGRAPH_INTEGRATION !== '1')('real repograph exports cross-file callers for module review', async () => {
   const cwd = await realpath(await temporary())
   await exec('git', ['init', '-q', cwd])

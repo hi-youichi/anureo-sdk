@@ -1,5 +1,9 @@
-import type { RefactorReport, StepResult } from './refactor'
+// Renders host-observed reports as text; it must not run refactors or persist their state.
+import type { RefactorReport, StepResult } from './results'
 
+/** Append one step's host facts to formatReport's buffer in presentation order, returning void.
+ * Mutates only the buffer; valid step records have no expected errors. Unknown outcomes remain
+ * explicit because a failure message alone cannot establish whether edits ran. */
 function appendStep(lines: string[], step: StepResult): void {
   lines.push(`Result: ${step.status}. ${step.error ?? step.summary}`)
   if (step.failure?.outcomeUnknown) lines.push('Agent execution outcome is unknown; inspect source and backend execution before starting another run.')
@@ -10,13 +14,20 @@ function appendStep(lines: string[], step: StepResult): void {
   if (step.status === 'applied' && !step.checks.length) lines.push('No validation commands ran; runtime behavior was not tested.')
 }
 
+/** Render a structured run as newline-terminated text for CLI/library presentation.
+ * Pure formatting preserves design-before-module order and includes check and observer failures;
+ * it does not inspect files, retry work or change the supplied report. CLI/library callers must
+ * supply a valid host record; formatting such records has no expected errors. */
 export function formatReport(report: RefactorReport): string {
   const lines = [
     `Refactor: ${report.status}${report.reviewOnly ? ' (read-only prompt)' : ''}`,
     `Directory: ${report.cwd}`,
     `Report: ${report.directory}/report.json`,
   ]
-  if (report.design) { lines.push('', 'Cross-module design'); appendStep(lines, report.design) }
+  if (report.design) {
+    lines.push('', 'Cross-module design')
+    appendStep(lines, report.design)
+  }
   lines.push('', report.plan?.summary ?? 'Module planning did not complete.')
   for (const item of report.modules) {
     lines.push('', `${item.module.id}: ${item.module.name}`)
