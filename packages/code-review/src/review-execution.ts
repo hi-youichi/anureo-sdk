@@ -19,11 +19,11 @@ export interface ReviewExecutionOptions {
   onProgress?: (event: ReviewProgress) => void
 }
 
-type ReviewPhase = 'review' | 'verification'
-type Schedule = <T>(execute: () => Promise<T>) => Promise<T>
+export type ReviewPhase = 'review' | 'verification'
+export type Schedule = <T>(execute: () => Promise<T>) => Promise<T>
 
-/** One permit pool shared by every module and angle in a review pass. */
-function createConcurrencyLimiter(limit: number): Schedule {
+/** One permit pool shared by every module, angle, and fix agent in a run. */
+export function createReviewSchedule(limit: number): Schedule {
   let available = limit
   const waiting: Array<() => void> = []
   return async execute => {
@@ -64,7 +64,8 @@ function failedAngleReview(angle: ReviewAngle, message: string): AngleReview {
   return { angle, status: 'failed', error: reviewFailure(new Error(message)) }
 }
 
-async function reviewModule(
+/** Review one module's angles concurrently through the shared schedule. */
+export async function reviewModule(
   options: ReviewExecutionOptions, module: ReviewModule, phase: ReviewPhase,
   schedule: Schedule, previous: ModuleReview | undefined,
 ): Promise<ModuleReview> {
@@ -75,15 +76,7 @@ async function reviewModule(
     failedAngleReview(angle, `Angle task for ${angle.id} failed before producing a result`)) }
 }
 
-export async function reviewModules(
-  options: ReviewExecutionOptions, modules: readonly ReviewModule[], phase: ReviewPhase,
-  previous?: readonly ModuleReview[],
-): Promise<ModuleReview[]> {
-  const schedule = createConcurrencyLimiter(options.concurrency)
-  const results = await parallel(modules.map(module => () =>
-    reviewModule(options, module, phase, schedule, previous?.find(value => value.module.id === module.id))))
-  return modules.map((module, index) => results[index] ?? {
-    module, angles: options.angles.map(angle =>
-      failedAngleReview(angle, `Module task for ${module.id} failed before producing a result`)),
-  })
+/** Coverage placeholder when a module's lifecycle task fails before producing a result. */
+export function failedModuleReview(options: ReviewExecutionOptions, module: ReviewModule, message: string): ModuleReview {
+  return { module, angles: options.angles.map(angle => failedAngleReview(angle, message)) }
 }

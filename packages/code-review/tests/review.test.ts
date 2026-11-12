@@ -61,7 +61,7 @@ test('analysis finishes before nested module/angle reviews, which run concurrent
   finish.resolve()
   const report = await pending
   expect(report.status).toBe('completed')
-  expect(report.modules.map(result => [result.module.id, result.angles.map(result => result.angle.id)]))
+  expect(report.modules.map(outcome => [outcome.review.module.id, outcome.review.angles.map(result => result.angle.id)]))
     .toEqual([['a', ['correctness', 'contracts']], ['b', ['correctness', 'contracts']]])
   expect(prompts.every(prompt => prompt.includes('Check cleanup'))).toBe(true)
   expect(prompts.every(prompt => prompt.includes('Read and analyze source code only. Do not modify files,'))).toBe(true)
@@ -107,10 +107,10 @@ test('defaults to correctness, code quality, and design angles and passes their 
   for (const angle of defaultAngles) {
     expect(prompts.filter(prompt => prompt.includes(`Angle: ${angle.title}\n${angle.instructions}`))).toHaveLength(2)
   }
-  for (const module of report.modules) {
-    expect(module.angles.map(result => result.angle.id)).toEqual(['correctness', 'code-quality', 'design'])
+  for (const outcome of report.modules) {
+    expect(outcome.review.angles.map(result => result.angle.id)).toEqual(['correctness', 'code-quality', 'design'])
   }
-  expect(report.modules[0]?.angles[0]).toMatchObject({ status: 'completed', findings: [finding] })
+  expect(report.modules[0]?.review.angles[0]).toMatchObject({ status: 'completed', findings: [finding] })
   expect(formatReport(report)).toContain('[P2] Incorrect fallback (a.ts:1-1)')
   expect(formatReport(report)).toContain('Suggestion: Treat zero as a valid value')
   expect(prompts.filter(prompt => prompt.includes('In each suggestion,'))).toHaveLength(prompts.length - 1)
@@ -127,14 +127,14 @@ test.each(['RATE_LIMITED', 'NATIVE_FAILED'])('failed angle %s preserves coverage
   })
   const report = await reviewCode({ client, cwd, angles, concurrency: 1 })
   expect(report.status).toBe('incomplete')
-  const result = report.modules[0]!.angles[0]!
+  const result = report.modules[0]!.review.angles[0]!
   expect(result.status).toBe('failed')
   if (result.status === 'failed') {
     expect(result.error.code).toBe(code === 'RATE_LIMITED' ? 'REVIEW_AGENT_INCOMPLETE' : code)
     expect(result.error.outcomeUnknown).toBe(false)
   }
-  expect(report.modules[0]?.angles[1]?.status).toBe('completed')
-  expect(report.modules[1]?.angles.every(result => result.status === 'completed')).toBe(true)
+  expect(report.modules[0]?.review.angles[1]?.status).toBe('completed')
+  expect(report.modules[1]?.review.angles.every(result => result.status === 'completed')).toBe(true)
   expect(adapter.opened).toHaveLength(5)
   expect(formatReport(report)).toContain('Review failed:')
   const manifest = JSON.parse(await readFile(join(report.workflowDirectory, report.runId, 'run.json'), 'utf8'))
@@ -144,7 +144,7 @@ test.each(['RATE_LIMITED', 'NATIVE_FAILED'])('failed angle %s preserves coverage
   expect(journal.filter((event: { type: string }) => event.type === 'failed')).toHaveLength(1)
 })
 
-test('progress callback failure preserves coverage and releases the shared concurrency slot', async () => {
+test('progress callback failure preserves results and releases the shared concurrency slot', async () => {
   const { client, cwd, adapter } = await fixture()
   const report = await reviewCode({
     client, cwd, angles, concurrency: 1,
@@ -154,16 +154,16 @@ test('progress callback failure preserves coverage and releases the shared concu
       }
     },
   })
-  expect(report.status).toBe('incomplete')
-  expect(report.modules[0]?.angles[0]).toMatchObject({
-    angle: { id: 'correctness' }, status: 'failed',
-    error: { message: 'Angle task for correctness failed before producing a result' },
+  expect(report.status).toBe('completed')
+  expect(report.modules[0]?.review.angles[0]).toMatchObject({
+    angle: { id: 'correctness' }, status: 'completed', findings: [],
   })
-  expect(report.modules[0]?.angles[1]?.status).toBe('completed')
-  expect(report.modules[1]?.angles.map(result => result.status)).toEqual(['completed', 'completed'])
-  expect(report.modules.map(result => result.module.id)).toEqual(['a', 'b'])
-  // Analysis plus the three surviving angles; the failed callback must not dispatch an agent.
-  expect(adapter.opened).toHaveLength(4)
+  expect(report.progressErrors).toEqual([{ message: 'Progress sink failed', code: null, outcomeUnknown: false }])
+  expect(formatReport(report)).toContain('Progress reporting errors\n- Progress sink failed')
+  expect(report.modules[0]?.review.angles[1]?.status).toBe('completed')
+  expect(report.modules[1]?.review.angles.map(result => result.status)).toEqual(['completed', 'completed'])
+  expect(report.modules.map(outcome => outcome.review.module.id)).toEqual(['a', 'b'])
+  expect(adapter.opened).toHaveLength(5)
 })
 
 test('failure normalization retains only valid issue paths and codes', () => {
@@ -186,7 +186,7 @@ test('schema-invalid findings retain diagnostics in text and persisted JSON repo
     findings: [{ ...finding, severity: 'invalid' }],
   })
   const report = await reviewCode({ client, cwd, maxModules: 1, angles: [correctnessAngle] })
-  expect(report.modules[0]?.angles[0]).toMatchObject({ status: 'failed', error: {
+  expect(report.modules[0]?.review.angles[0]).toMatchObject({ status: 'failed', error: {
     code: 'STRUCTURED_OUTPUT_INVALID', outcomeUnknown: false,
     issues: [{ path: '/findings/0/severity', code: 'enum' }],
   } })
@@ -198,7 +198,7 @@ test('scripted startup-blocked terminal details produce a dropped agent result',
   const { client, cwd } = await fixture(prompt => prompt.startsWith('Analyze') ? plan
     : new HarnessSdkError('AGENT_STARTUP_BLOCKED', 'Blocked', false, false, { workflowDisposition: 'startup_blocked' }))
   const report = await reviewCode({ client, cwd, maxModules: 1, angles: [correctnessAngle] })
-  expect(report.modules[0]?.angles[0]).toMatchObject({ status: 'failed', error: { code: 'REVIEW_AGENT_INCOMPLETE' } })
+  expect(report.modules[0]?.review.angles[0]).toMatchObject({ status: 'failed', error: { code: 'REVIEW_AGENT_INCOMPLETE' } })
 })
 
 test('scripted native cleanup metadata stops further agent dispatch', async () => {
@@ -216,7 +216,7 @@ test('persists the run, validated analysis, every angle result, and the final re
   const report = await reviewCode({ client, cwd, workflowDirectory: directory })
   const path = join(report.workflowDirectory, report.runId)
   const manifest = JSON.parse(await readFile(join(path, 'run.json'), 'utf8'))
-  expect(manifest.identity).toMatchObject({ name: 'code-review', revision: '5', runId: report.runId })
+  expect(manifest.identity).toMatchObject({ name: 'code-review', revision: '7', runId: report.runId })
   expect(manifest.identity.input.analysisPrompt).toBe(prompts[0])
   expect(manifest.identity.input.concurrency).toBe(8)
   expect(manifest.status).toBe('completed')
@@ -261,7 +261,7 @@ test('limits review to one module and one angle without dropping the full analys
   expect(prompts).toHaveLength(2)
   expect(report.status).toBe('completed')
   expect(report.plan.modules).toHaveLength(2)
-  expect(report.modules.map(result => result.module.id)).toEqual(['a'])
+  expect(report.modules.map(outcome => outcome.review.module.id)).toEqual(['a'])
   expect(report.scope).toEqual({ moduleIds: ['a'], angleIds: ['correctness'] })
   expect(formatReport(report)).toContain('Scope: 1 of 2 planned modules; angles: correctness')
   const path = join(report.workflowDirectory, report.runId)
@@ -276,7 +276,7 @@ test('selects an exact module and a built-in angle before scheduling review work
   expect(prompts).toHaveLength(2)
   expect(prompts[1]).toContain('"id":"b"')
   expect(prompts[1]).toContain('Angle: Design')
-  expect(report.modules.map(result => result.module.id)).toEqual(['b'])
+  expect(report.modules.map(outcome => outcome.review.module.id)).toEqual(['b'])
   expect(report.scope).toEqual({ moduleIds: ['b'], angleIds: ['design'] })
 })
 
@@ -326,7 +326,7 @@ test.each(['\n', '\r\n', '\r', '\u2028', '\u2029'])('finding locations recognize
   await writeFile(join(cwd, 'a.ts'), `export const first = 1${ending}export const second = 2${ending}`)
   const report = await reviewCode({ client, cwd, maxModules: 1, angles: [correctnessAngle] })
   expect(report.status).toBe('completed')
-  expect(report.modules[0]?.angles[0]).toMatchObject({ status: 'completed', findings: [expected] })
+  expect(report.modules[0]?.review.angles[0]).toMatchObject({ status: 'completed', findings: [expected] })
 })
 
 test.each([
@@ -340,8 +340,8 @@ test.each([
   })
   const report = await reviewCode({ client, cwd })
   expect(report.status).toBe('incomplete')
-  expect(report.modules[0]?.angles[0]?.status).toBe('failed')
-  expect(report.modules[1]?.angles[0]).toMatchObject({ status: 'completed', findings: [] })
+  expect(report.modules[0]?.review.angles[0]?.status).toBe('failed')
+  expect(report.modules[1]?.review.angles[0]).toMatchObject({ status: 'completed', findings: [] })
 })
 
 test('invalid options are rejected before opening any sessions', async () => {

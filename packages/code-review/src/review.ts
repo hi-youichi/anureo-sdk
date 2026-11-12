@@ -4,13 +4,13 @@ import { promisify } from 'node:util'
 import { realpath, stat } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { HarnessSdkError, type Client } from '@anureo/sdk'
-import { agent, workflow } from '@anureo/workflow'
+import { agent, parallel, workflow } from '@anureo/workflow'
 import { defaultAngles, type ReviewAngle } from './angles'
-import type { ReviewFailure } from './errors'
+import { reviewFailure, type ReviewFailure } from './errors'
 import { fixFindings, type FixReport } from './fix'
 import { DEFAULT_WORKFLOW_DIRECTORY } from './paths'
 import { buildAnalysisPrompt, readOnlyInstructions } from './prompts'
-import { reviewModules, type ReviewExecutionOptions } from './review-execution'
+import { createReviewSchedule, failedModuleReview, reviewModule, type ReviewExecutionOptions, type Schedule } from './review-execution'
 import { modulePlanSchema, type Finding, type ModulePlan, type ReviewModule } from './schema'
 import { validateOutput, validatePlan } from './validation'
 
@@ -28,20 +28,32 @@ export interface ModuleReview {
   angles: AngleReview[]
 }
 
+/** A module's original review, incremental fix, and final verification.
+ * Fixes start as modules finish reviewing. Verification runs after all fixes settle. */
+export interface ModuleOutcome {
+  review: ModuleReview
+  /** Null when no fix was requested. */
+  fix: FixReport | null
+  /** Review of the final tree, including dependency changes from other modules.
+   * Null unless at least one module's fix was applied. */
+  verification: ModuleReview | null
+}
+
 export interface ReviewReport {
   runId: string
   workflowDirectory: string
   cwd: string
-  /** 'completed' only when every review/verification angle completed and the fix
-   * (if requested) did not fail; engine-level interruption also downgrades to 'incomplete'. */
+  /** 'completed' only when every module's review/verification angles completed
+   * and its fix (if requested) did not fail; engine-level interruption also
+   * downgrades to 'incomplete'. */
   status: 'completed' | 'incomplete'
   plan: ModulePlan
   scope: { moduleIds: string[]; angleIds: string[] }
-  modules: ModuleReview[]
-  fix: FixReport | null
-  /** Post-fix re-review of the selected scope; null unless a fix was applied. */
-  verification: ModuleReview[] | null
-  /** Findings from the authoritative pass: verification when a fix was applied, otherwise the original review. */
+  modules: ModuleOutcome[]
+  /** Errors thrown by onProgress. Observers do not change execution outcomes. */
+  progressErrors: ReviewFailure[]
+  /** Findings from final verification when any fix was applied, otherwise
+   * from the original reviews. */
   findingCount: number
 }
 
@@ -49,7 +61,7 @@ export type ReviewProgress =
   | { stage: 'workflow'; status: 'started'; runId: string; directory: string }
   | { stage: 'analysis'; status: 'started' | 'completed' }
   | { stage: 'review' | 'verification'; status: 'started' | 'completed' | 'failed'; moduleId: string; angleId: string }
-  | { stage: 'fix'; status: 'started' | 'completed' | 'failed' | 'skipped' }
+  | { stage: 'fix'; status: 'started' | 'completed' | 'failed' | 'skipped'; moduleId: string }
 
 export interface ReviewOptions {
   client: Client
@@ -61,14 +73,16 @@ export interface ReviewOptions {
   moduleIds?: readonly string[]
   /** Review at most this many selected modules, in plan order. */
   maxModules?: number
-  /** Let an agent fix findings by editing sources directly, then review the selected scope again. Defaults to false. */
+  /** Fix each module's findings as soon as its review completes, then re-review
+   * the selected scope after all fixes settle. Defaults to false. */
   fix?: boolean
   /** Session permission mode for the fix agent (edits and checks). Harness-specific; see fixPermissionMode(). */
   fixPermissionMode?: string
-  /** Shared limit across all modules and angles; defaults to DEFAULT_REVIEW_CONCURRENCY. */
+  /** Shared limit across all modules, angles, and fix agents; defaults to DEFAULT_REVIEW_CONCURRENCY. */
   concurrency?: number
   /** Durable run storage. Defaults to <cwd>/.anureo/workflows. */
   workflowDirectory?: string
+  /** Observational only: thrown errors are collected in the report's progressErrors. */
   onProgress?: (event: ReviewProgress) => void
 }
 
@@ -150,53 +164,113 @@ async function analyzeModules(execution: ReviewExecutionOptions, prompt: string)
   return plan
 }
 
-interface ReportInput {
+/** Serialize writers before acquiring agent capacity, leaving queued fixes out
+ * of the shared permit pool. A failed fix stops subsequent writers. */
+function createFixRunner(execution: ReviewExecutionOptions, schedule: Schedule, permissionMode?: string) {
+  let tail: Promise<void> = Promise.resolve()
+  let stoppedBy: string | undefined
+  return (review: ModuleReview): Promise<FixReport> => {
+    const result = tail.then(async (): Promise<FixReport> => {
+      const onProgress = (status: 'started' | 'completed' | 'failed' | 'skipped') =>
+        execution.onProgress?.({ stage: 'fix', status, moduleId: review.module.id })
+      if (stoppedBy !== undefined) {
+        onProgress('skipped')
+        return { status: 'skipped', summary: `Fix skipped because module ${stoppedBy}'s fix failed. Inspect the working tree before continuing.`,
+          changedFiles: [], error: null }
+      }
+      const fix = await schedule(async () => fixFindings({
+        sourceVersion: await readGitStateFingerprint(execution.cwd),
+        client: execution.client, cwd: execution.cwd, directory: execution.directory, modules: [review], model: execution.model,
+        ...(permissionMode !== undefined ? { permissionMode } : {}), onProgress,
+      }))
+      if (fix.status === 'failed') stoppedBy = review.module.id
+      return fix
+    })
+    // Unexpected local failures must also stop queued writers. Workflow-level
+    // fatal errors retain their original cause in the engine's run state.
+    tail = result.then(() => undefined, () => { stoppedBy = review.module.id })
+    return result
+  }
+}
+
+interface LifecycleOptions {
+  execution: ReviewExecutionOptions
+  module: ReviewModule
+  schedule: Schedule
+  runFix: ((review: ModuleReview) => Promise<FixReport>) | null
+}
+
+/** Review one module and enqueue its fix immediately. Final verification waits
+ * for every writer, since modules can read and depend on one another's files. */
+async function reviewModuleLifecycle(options: LifecycleOptions): Promise<ModuleOutcome> {
+  const { execution, module, schedule, runFix } = options
+  const review = await reviewModule({ ...execution, sourceVersion: await readGitStateFingerprint(execution.cwd) },
+    module, 'review', schedule, undefined)
+  const fix = runFix ? await runFix(review) : null
+  return { review, fix, verification: null }
+}
+
+function moduleOutcomeComplete(outcome: ModuleOutcome): boolean {
+  const anglesComplete = (review: ModuleReview) => review.angles.every(angle => angle.status === 'completed')
+  return anglesComplete(outcome.review)
+    && (outcome.verification === null || anglesComplete(outcome.verification))
+    && outcome.fix?.status !== 'failed'
+}
+
+function buildReviewReport(input: {
   runId: string
   execution: ReviewExecutionOptions
   plan: ModulePlan
   selectedModules: readonly ReviewModule[]
-  reviews: ModuleReview[]
-  fix: FixReport | null
-  verification: ModuleReview[] | null
-}
-
-function buildReviewReport(input: ReportInput): ReviewReport {
-  const { runId, execution, plan, selectedModules, reviews, fix, verification } = input
-  const allPassesComplete = [...reviews, ...(verification ?? [])]
-    .every(module => module.angles.every(angle => angle.status === 'completed'))
-  // A successful fix makes verification the authoritative pass for findings.
-  const authoritativeReviews = verification ?? reviews
-  const findingCount = authoritativeReviews.reduce((count, module) => count + module.angles.reduce(
+  outcomes: ModuleOutcome[]
+  progressErrors: ReviewFailure[]
+}): ReviewReport {
+  const { runId, execution, plan, selectedModules, outcomes, progressErrors } = input
+  const findingCount = outcomes.reduce((count, outcome) => count + (outcome.verification ?? outcome.review).angles.reduce(
     (sum, angle) => sum + (angle.status === 'completed' ? angle.findings.length : 0), 0), 0)
   return {
-    runId, workflowDirectory: execution.directory, cwd: execution.cwd, plan, modules: reviews, fix, verification,
+    runId, workflowDirectory: execution.directory, cwd: execution.cwd, plan, modules: outcomes, progressErrors,
     scope: { moduleIds: selectedModules.map(module => module.id), angleIds: execution.angles.map(angle => angle.id) },
-    status: allPassesComplete && fix?.status !== 'failed' ? 'completed' : 'incomplete', findingCount,
+    status: outcomes.every(moduleOutcomeComplete) ? 'completed' : 'incomplete', findingCount,
   }
 }
 
-/** Analyze modules once, then review modules and their angles concurrently. Borrows the client. */
+/** Analyze once, fix modules incrementally, then verify the final selected scope. */
 export async function reviewCode(options: ReviewOptions): Promise<ReviewReport> {
-  const prepared = await prepareReview(options)
+  const progressErrors: ReviewFailure[] = []
+  const prepared = await prepareReview({ ...options, onProgress: event => {
+    try { options.onProgress?.(event) }
+    catch (cause) { progressErrors.push(reviewFailure(cause)) }
+  } })
   const { execution, fixRequested, moduleIds, maxModules } = prepared
   // Bump revision when the persisted input/checkpoint contract changes.
   // sourceVersion carries the Git state fingerprint; backendConfiguration remains reserved.
   const completed = await workflow({
-    name: 'code-review', revision: '5', directory: execution.directory, input: prepared.workflowInput,
+    name: 'code-review', revision: '7', directory: execution.directory, input: prepared.workflowInput,
   }, async (run): Promise<ReviewReport> => {
-    options.onProgress?.({ stage: 'workflow', status: 'started', runId: run.runId, directory: execution.directory })
+    execution.onProgress?.({ stage: 'workflow', status: 'started', runId: run.runId, directory: execution.directory })
     const plan = await analyzeModules(execution, prepared.analysisPrompt)
     const selectedModules = selectModules(plan, moduleIds, maxModules)
-    const reviews = await reviewModules(execution, selectedModules, 'review')
-    const fix = fixRequested ? await fixFindings({
-      sourceVersion: execution.sourceVersion,
-      client: options.client, cwd: execution.cwd, directory: execution.directory, modules: reviews, model: options.model,
-      ...(options.fixPermissionMode !== undefined ? { permissionMode: options.fixPermissionMode } : {}),
-      onProgress: status => options.onProgress?.({ stage: 'fix', status }),
-    }) : null
-    const verification = fix?.status === 'applied'
-      ? await reviewModules(execution, selectedModules, 'verification', reviews) : null
-    return buildReviewReport({ runId: run.runId, execution, plan, selectedModules, reviews, fix, verification })
+    const schedule = createReviewSchedule(execution.concurrency)
+    const runFix = fixRequested ? createFixRunner(execution, schedule, options.fixPermissionMode) : null
+    const results = await parallel(selectedModules.map(module => () => reviewModuleLifecycle({
+      execution, module, schedule, runFix,
+    })))
+    // parallel preserves positions; retain coverage when a lifecycle task fails outside its agent calls.
+    const outcomes = selectedModules.map((module, index) => results[index] ?? {
+      review: failedModuleReview(execution, module, `Module task for ${module.id} failed before producing a result`),
+      fix: null, verification: null,
+    })
+    if (outcomes.some(outcome => outcome.fix?.status === 'applied')) {
+      const finalExecution = { ...execution, sourceVersion: await readGitStateFingerprint(execution.cwd) }
+      const verifications = await parallel(outcomes.map(outcome => () =>
+        reviewModule(finalExecution, outcome.review.module, 'verification', schedule, outcome.review)))
+      for (const [index, outcome] of outcomes.entries()) {
+        outcome.verification = verifications[index] ?? failedModuleReview(execution, outcome.review.module,
+          `Verification task for ${outcome.review.module.id} failed before producing a result`)
+      }
+    }
+    return buildReviewReport({ runId: run.runId, execution, plan, selectedModules, outcomes, progressErrors })
   })
   return { ...completed.result, status: completed.status === 'incomplete' ? 'incomplete' : completed.result.status }
 }

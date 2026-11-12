@@ -83,7 +83,7 @@ test.each([
   const report = JSON.parse(io.read().stdout)
   expect(report.scope).toEqual({ moduleIds: [moduleId], angleIds: ['design'] })
   expect(report.modules).toHaveLength(1)
-  expect(report.modules[0].angles).toHaveLength(1)
+  expect(report.modules[0].review.angles).toHaveLength(1)
   expect(prompts).toHaveLength(2)
   expect(io.read().stderr).not.toContain('/correctness] started')
 })
@@ -139,7 +139,7 @@ test('partial reviews retain failed coverage in JSON and exit 2', async () => {
   expect(await runCli([cwd, '--json'], { ...io, createClient: async () => client })).toBe(2)
   const report = JSON.parse(io.read().stdout)
   expect(report.status).toBe('incomplete')
-  expect(report.modules[0].angles[0].status).toBe('failed')
+  expect(report.modules[0].review.angles[0].status).toBe('failed')
   expect(adapter.disposeCount).toBe(1)
 })
 

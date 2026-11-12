@@ -19,13 +19,14 @@ Pi runs in-process; CLI-based harnesses require their corresponding executable.
 Options:
   --harness <id>          Review backend (default: codex): ${reviewHarnesses.join(', ')}
   --model <name>          Model override (defaults to CODEX_MODEL or backend default)
-  --concurrency <number>  Maximum simultaneous review agents (default: ${DEFAULT_REVIEW_CONCURRENCY})
+  --concurrency <number>  Maximum simultaneous review and fix agents (default: ${DEFAULT_REVIEW_CONCURRENCY})
   --max-modules <number>  Review at most this many modules, in plan order
   --module <id>          Select an analyzed module ID (repeatable)
   --angle <id>           Select a built-in angle (repeatable): ${defaultAngles.map(angle => angle.id).join(', ')}
   --focus <text>          Additional focus for module analysis and review
-  --fix                  Let an agent edit selected sources directly to fix findings,
-                         then review again; existing uncommitted changes are allowed
+  --fix                  Fix each module's findings directly once its review
+                         completes, then re-review the selected scope after all
+                         fixes finish; existing uncommitted changes are allowed
   --workflow-dir <path>   Durable run storage (default: <directory>/${DEFAULT_WORKFLOW_DIRECTORY})
   --json                 Print the structured report as JSON
   --help, -h             Show this help
@@ -88,7 +89,7 @@ type ReviewCommand = Extract<ReturnType<typeof parseCommand>, { kind: 'review' }
 function formatProgress(event: ReviewProgress): string {
   if (event.stage === 'workflow') return `[workflow] ${event.runId} (${event.directory})\n`
   if (event.stage === 'analysis') return `[analysis] ${event.status}\n`
-  if (event.stage === 'fix') return `[fix] ${event.status}\n`
+  if (event.stage === 'fix') return `[fix/${event.moduleId}] ${event.status}\n`
   return `[${event.stage === 'verification' ? 'verification/' : ''}${event.moduleId}/${event.angleId}] ${event.status}\n`
 }
 

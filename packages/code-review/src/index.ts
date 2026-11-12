@@ -1,5 +1,5 @@
 export { reviewCode } from './review'
-export type { ReviewOptions, ReviewReport, ModuleReview, AngleReview, ReviewFailure, ReviewProgress } from './review'
+export type { ReviewOptions, ReviewReport, ModuleOutcome, ModuleReview, AngleReview, ReviewFailure, ReviewProgress } from './review'
 export { correctnessAngle, codeQualityAngle, designAngle, defaultAngles } from './angles'
 export type { ReviewAngle } from './angles'
 export { findingSeverities } from './schema'
