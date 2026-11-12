@@ -50,7 +50,7 @@ async function runStep(options: RefactorOptions, prompt: string, checks: readonl
   const step: StepResult = { summary: '', changes: [], deferred: [], status: 'unchanged', changedFiles: [], checks: [], error: null, failure: null }
   const before = await captureTree(options.cwd)
   try {
-    const work = await agent(prompt, { client: options.client, cwd: options.cwd, model: options.model, permissionMode: 'agent', schema: workSchema })
+    const work = await agent(prompt, { client: options.client, cwd: options.cwd, model: options.model, permissionMode: 'agent-full-access', schema: workSchema })
     if (!work) throw new Error('Agent returned no result')
     Object.assign(step, work)
     step.changedFiles = changes(before, await captureTree(options.cwd))

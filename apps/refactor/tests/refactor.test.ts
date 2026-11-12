@@ -43,7 +43,7 @@ test('design runs first, then planning, then one editing agent per module in ser
   expect(report.modules.map(item => item.step?.status)).toEqual(['applied', 'applied'])
   expect(report.modules.every(item => item.step?.checks[0]?.status === 'passed')).toBe(true)
   expect(context.adapter.opened.filter(session => session.permissionMode === 'read-only')).toHaveLength(1)
-  expect(context.adapter.opened.filter(session => session.permissionMode === 'agent')).toHaveLength(3)
+  expect(context.adapter.opened.filter(session => session.permissionMode === 'agent-full-access')).toHaveLength(3)
   expect(context.prompts.find(prompt => prompt.startsWith(MODULE))).toContain('Cross-module design step already done in this run: Edited')
   expect(JSON.parse(await readFile(join(report.directory, 'report.json'), 'utf8'))).toEqual(report)
   expect(await stat(join(context.cwd, '.anureo/refactor/writer.lock')).catch(() => null)).toBeNull()

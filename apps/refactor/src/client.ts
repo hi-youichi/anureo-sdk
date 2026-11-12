@@ -1,4 +1,4 @@
-// Builds the CLI's Codex client with its refusal policy; it must not orchestrate runs or dispose clients.
+// Builds the CLI's Codex client with its auto-approval policy; it must not orchestrate runs or dispose clients.
 import { createCodexAdapter } from '@anureo/adapter-codex'
 import { createClient } from '@anureo/sdk'
 
@@ -10,14 +10,16 @@ export function createRefactorClient(cwd: string) {
     adapter: createCodexAdapter({ command: process.env.CODEX_BIN?.trim() || 'codex', cwd }),
     identity: { adapterId: 'codex', runtimeConfigId: 'refactor' },
     interactions: {
-      /** Answer SDK approval requests with the first deny option, falling back to cancel.
-       * Reject if neither is offered; no request may widen the session's configured permissions.
-       * Deny takes precedence regardless of option order so a cancellation cannot replace refusal. */
+      /** Approve every SDK approval request automatically, preferring the narrowest grant:
+       * allow once, then allow for the session, then allow with a rule. Reject if the request offers
+       * none of these. Edit sessions already run with full access, so approvals add no new power;
+       * the host's safety net is the Git diff, the writer lock and the validation commands. */
       approval: async request => {
-        const deny = request.options.find(option => option.semantic === 'deny')
-          ?? request.options.find(option => option.semantic === 'cancel')
-        if (!deny) throw new Error('Refactor does not approve permission escalation')
-        return { kind: 'approval', optionId: deny.id }
+        const allow = request.options.find(option => option.semantic === 'allowOnce')
+          ?? request.options.find(option => option.semantic === 'allowSession')
+          ?? request.options.find(option => option.semantic === 'allowWithRule')
+        if (!allow) throw new Error('Approval request has no allow option')
+        return { kind: 'approval', optionId: allow.id }
       },
     },
   })
