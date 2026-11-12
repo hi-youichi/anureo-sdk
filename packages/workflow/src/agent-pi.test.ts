@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import { createClient, type StructuredOutputToolDefinition } from '@anureo/sdk'
 import { createPiAdapter } from '@anureo/adapter-pi'
-import { fakeFactory } from '../../pi/tests/fake-host'
+import { fakeFactory } from '../../adapter/pi/tests/fake-host'
 import { z } from 'zod'
 import { agent } from './agent'
 

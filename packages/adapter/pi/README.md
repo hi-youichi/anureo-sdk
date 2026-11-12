@@ -2,7 +2,7 @@
 
 Adapter connecting the Anureo SDK to the [Pi](https://github.com/badlogic/pi-mono) coding agent. Pi runs **in-process** through its TypeScript SDK (`@earendil-works/pi-coding-agent`, `createAgentSession`); the adapter maps sessions, runs, tool activity and usage onto the unified AHP session model.
 
-> Part of the [Anureo SDK workspace](../../README.md). Install with `npm install @anureo/adapter-pi @earendil-works/pi-coding-agent`.
+> Part of the [Anureo SDK workspace](../../../README.md). Install with `npm install @anureo/adapter-pi @earendil-works/pi-coding-agent`.
 
 ## Usage
 
@@ -48,7 +48,7 @@ Pi executes in the host process with the host's credentials, environment and fil
 
 Not supported natively: interactions (approval, user input, elicitation, dynamic tools), revert, goal, review, structured output schemas, `turn/steer` and `turn/interrupt` (Pi has no turn ids to match atomically — use session-level interrupt and native delivery).
 
-The default embedded host supports [structured output](../../docs/structured-output.md)
+The default embedded host supports [structured output](../../../docs/structured-output.md)
 through a dynamically registered Pi tool. Each structured submission replaces
 `anureo_submit_result` with the current business JSON Schema. A validated tool
 result requests native termination; the SDK publishes success only after Pi
@@ -92,7 +92,7 @@ Only `src/host.ts` imports the Pi SDK. Everything else uses the small `PiSession
 ## Development
 
 ```sh
-cd packages/pi
+cd packages/adapter/pi
 bun run typecheck
 bun test tests
 bun run smoke                                  # offline: opens a real in-memory Pi session

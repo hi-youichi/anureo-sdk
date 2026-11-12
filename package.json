@@ -9,7 +9,8 @@
     "bun": ">=1.4.2"
   },
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "packages/adapter/*"
   ],
   "scripts": {
     "generate": "bun run --filter @anureo/protocol generate",

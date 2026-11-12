@@ -1,6 +1,6 @@
 {
-  "name": "@anureo/adapter-codex",
-  "description": "Anureo SDK adapter for the Codex CLI app-server protocol over stdio JSONL",
+  "name": "@anureo/adapter-ahp",
+  "description": "Anureo SDK adapter for external AHP harnesses over stdio or WebSocket",
   "version": "0.2.0",
   "license": "Apache-2.0",
   "keywords": [
@@ -8,14 +8,14 @@
     "ahp",
     "harness",
     "agent",
-    "codex",
-    "openai"
+    "sdk",
+    "client"
   ],
   "homepage": "https://github.com/hi-youichi/anureo-sdk#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
-    "directory": "packages/codex"
+    "directory": "packages/adapter/ahp"
   },
   "bugs": {
     "url": "https://github.com/hi-youichi/anureo-sdk/issues"
@@ -25,21 +25,16 @@
   },
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
-    "./jsonl": "./src/jsonl.ts",
-    "./mapping": "./src/mapping.ts",
-    "./catalog": "./src/catalog.ts"
+    ".": "./src/index.ts"
   },
   "scripts": {
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit --pretty false",
-    "test": "bun test tests",
-    "protocol:check": "bun scripts/protocol-check.ts",
-    "smoke": "bun scripts/smoke.ts"
+    "test": "bun test tests"
   },
   "dependencies": {
-    "@anureo/sdk": "workspace:*",
-    "@anureo/protocol": "workspace:*"
+    "@anureo/protocol": "workspace:*",
+    "@anureo/sdk": "workspace:*"
   },
   "devDependencies": {
     "@anureo/conformance": "workspace:*"

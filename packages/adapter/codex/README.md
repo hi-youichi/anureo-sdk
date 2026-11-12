@@ -2,7 +2,7 @@
 
 Adapter connecting the Anureo SDK to the [Codex](https://github.com/openai/codex) CLI's `app-server` mode over stdio JSONL. It spawns the binary, speaks Codex's native protocol, and maps requests, events, items, and usage onto the unified AHP session model.
 
-> Part of the [Anureo SDK workspace](../../README.md). Install with `npm install @anureo/adapter-codex`.
+> Part of the [Anureo SDK workspace](../../../README.md). Install with `npm install @anureo/adapter-codex`.
 
 ## Usage
 
@@ -61,7 +61,7 @@ The adapter exposes session-scoped config options through AHP: `permissionMode` 
 ## Development
 
 ```sh
-cd packages/codex
+cd packages/adapter/codex
 bun run typecheck
 bun test tests
 bun run protocol:check   # verify pinned native schema hashes and mappings
@@ -70,8 +70,8 @@ bun run smoke            # optional live smoke against a local binary
 
 ## Documentation
 
-- [Architecture](../../docs/architecture.md) — adapters' role in the SDK (currently in Chinese)
-- [AHP v1 protocol](../../spec/ahp-v1.md)
+- [Architecture](../../../docs/architecture.md) — adapters' role in the SDK (currently in Chinese)
+- [AHP v1 protocol](../../../spec/ahp-v1.md)
 
 ## AHP v1 lifecycle revision
 
@@ -80,5 +80,5 @@ The adapter maps the target to native `expectedTurnId`, preserving native target
 validation; a stale target rejects. An input receipt alone does not prove that a
 new execution has started or completed.
 
-See the [design and implementation plan](../../draft/docs/native-harness-lifecycle.md).
-See the [complete example](../../README.md#usage-example).
+See the [design and implementation plan](../../../draft/docs/native-harness-lifecycle.md).
+See the [complete example](../../../README.md#usage-example).

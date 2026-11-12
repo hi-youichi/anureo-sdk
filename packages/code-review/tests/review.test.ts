@@ -6,8 +6,8 @@ import { correctnessAngle, defaultAngles, designAngle, formatReport, reviewCode,
 import { reviewFailure } from '../src/errors'
 import { createReviewClient } from '../src/client'
 // Cross-package test dependency: hermes fake MCP server; coordinate changes
-// with packages/hermes/tests/helpers.ts.
-import { startFake } from '../../hermes/tests/helpers'
+// with packages/adapter/hermes/tests/helpers.ts.
+import { startFake } from '../../adapter/hermes/tests/helpers'
 import { finding, fixture, plan } from './helpers'
 
 const angles = [correctnessAngle, { id: 'contracts', title: 'Contracts', instructions: 'Check caller contracts.' }]

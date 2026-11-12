@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 import { z } from 'zod'
 import { validateJsonSchema } from '@anureo/protocol'
 import { HarnessSdkError } from '@anureo/sdk'
-import { compileOutputSchema } from '../../claude/src/output-schema'
+import { compileOutputSchema } from '../../adapter/claude/src/output-schema'
 import { prepareOutputSchema } from './output-schema'
 
 const findings = z.strictObject({ issues: z.array(z.string()), state: z.enum(['ready', 'done']), note: z.string().nullable() })

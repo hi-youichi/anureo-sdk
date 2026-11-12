@@ -2,7 +2,7 @@
 
 Adapter connecting the Anureo SDK to **external harnesses that implement AHP** over stdio or WebSocket. These harnesses can themselves be built with the Anureo SDK.
 
-> Part of the [Anureo SDK workspace](../../README.md). Install with `npm install @anureo/adapter-ahp`.
+> Part of the [Anureo SDK workspace](../../../README.md). Install with `npm install @anureo/adapter-ahp`.
 
 ## Usage
 
@@ -51,15 +51,15 @@ A standalone revised-v1 reference harness lives in [examples/reference.ts](examp
 ## Development
 
 ```sh
-cd packages/ahp
+cd packages/adapter/ahp
 bun run typecheck
 bun test tests
 ```
 
 ## Documentation
 
-- [AHP v1 protocol](../../spec/ahp-v1.md) — the wire contract
-- [Architecture](../../docs/architecture.md)
+- [AHP v1 protocol](../../../spec/ahp-v1.md) — the wire contract
+- [Architecture](../../../docs/architecture.md)
 
 ## AHP v1 lifecycle revision
 
@@ -67,4 +67,4 @@ The lifecycle design updates AHP v1 and package root entries in place.
 Root migration and local validation are complete: the root implementation and tests
 use the revised lifecycle, and parallel versioned entries have been removed.
 Local conformance and clean-install checks have passed.
-See the [design and implementation plan](../../docs/native-harness-lifecycle.md).
+See the [design and implementation plan](../../../docs/native-harness-lifecycle.md).

@@ -105,11 +105,11 @@ composition, or `@anureo/protocol` for direct access to the wire contract.
 | Package and guide | Purpose |
 | --- | --- |
 | [@anureo/sdk](packages/core/README.md) | Client, Session, Turn, and shared runtime components |
-| [@anureo/adapter-codex](packages/codex/README.md) | Codex app-server adapter |
-| [@anureo/adapter-claude](packages/claude/README.md) | Claude Agent SDK adapter |
-| [@anureo/adapter-acp](packages/acp/README.md) | Standard ACP agents, including DSH |
-| [@anureo/adapter-pi](packages/pi/README.md) | Pi coding agent, embedded in-process through its TypeScript SDK |
-| [@anureo/adapter-ahp](packages/ahp/README.md) | External AHP harnesses over stdio or WebSocket |
+| [@anureo/adapter-codex](packages/adapter/codex/README.md) | Codex app-server adapter |
+| [@anureo/adapter-claude](packages/adapter/claude/README.md) | Claude Agent SDK adapter |
+| [@anureo/adapter-acp](packages/adapter/acp/README.md) | Standard ACP agents, including DSH |
+| [@anureo/adapter-pi](packages/adapter/pi/README.md) | Pi coding agent, embedded in-process through its TypeScript SDK |
+| [@anureo/adapter-ahp](packages/adapter/ahp/README.md) | External AHP harnesses over stdio or WebSocket |
 | [@anureo/adapter-hermes](docs/hermes-adapter.md) | Hermes canonical gateway through ticketed local WebSocket |
 | [@anureo/workflow](packages/workflow/README.md) | Agent calls, parallel tasks, pipelines, and durable workflow steps |
 | [@anureo/code-review](docs/code-review-cli.md) | Module analysis and parallel code review with a CLI |

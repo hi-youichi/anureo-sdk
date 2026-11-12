@@ -2,7 +2,7 @@
 
 Adapter connecting the Anureo SDK to the official [`@anthropic-ai/claude-agent-sdk`](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk). It drives the Claude SDK's streaming `query()` interface and maps messages, permissions, tool use, and subagents onto the unified AHP session model.
 
-> Part of the [Anureo SDK workspace](../../README.md). Install with `npm install @anureo/adapter-claude`.
+> Part of the [Anureo SDK workspace](../../../README.md). Install with `npm install @anureo/adapter-claude`.
 
 ## Usage
 
@@ -60,7 +60,7 @@ behavior with real Claude execution remains unconfirmed by these tests.
 Additional guidance uses another `await session.submit({ input, delivery: 'native' })`.
 It may join the same execution or reach a later one. Session input delivery is
 distinct from atomic exact-turn steering. See the
-[Claude example](../../docs/native-harness-lifecycle.md#42-claude追加会话指导与精确-steer-分开).
+[Claude example](../../../docs/native-harness-lifecycle.md#42-claude追加会话指导与精确-steer-分开).
 
 ## Structured output
 
@@ -136,16 +136,16 @@ For script-based Claude executables, `executableRuntime: 'node' | 'bun' | 'deno'
 ## Development
 
 ```sh
-cd packages/claude
+cd packages/adapter/claude
 bun run typecheck
 bun test src
 ```
 
 ## Documentation
 
-- [Architecture](../../docs/architecture.md) — adapters' role in the SDK (currently in Chinese)
-- [AHP v1 protocol](../../spec/ahp-v1.md)
+- [Architecture](../../../docs/architecture.md) — adapters' role in the SDK (currently in Chinese)
+- [AHP v1 protocol](../../../spec/ahp-v1.md)
 
 ## AHP v1 lifecycle revision
 
-See the [design and implementation plan](../../docs/native-harness-lifecycle.md).
+See the [design and implementation plan](../../../docs/native-harness-lifecycle.md).

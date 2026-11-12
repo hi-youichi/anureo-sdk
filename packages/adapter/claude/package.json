@@ -15,7 +15,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
-    "directory": "packages/claude"
+    "directory": "packages/adapter/claude"
   },
   "bugs": {
     "url": "https://github.com/hi-youichi/anureo-sdk/issues"

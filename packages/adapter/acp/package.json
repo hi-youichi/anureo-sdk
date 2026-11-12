@@ -1,20 +1,21 @@
 {
-  "name": "@anureo/adapter-hermes",
-  "description": "Anureo SDK adapter for the Hermes canonical TUI gateway",
+  "name": "@anureo/adapter-acp",
+  "description": "Anureo SDK adapter for standard Agent Client Protocol (ACP) agents",
   "version": "0.2.0",
   "license": "Apache-2.0",
   "keywords": [
     "anureo",
     "ahp",
-    "hermes",
+    "harness",
     "agent",
-    "gateway"
+    "acp",
+    "agent-client-protocol"
   ],
   "homepage": "https://github.com/hi-youichi/anureo-sdk#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
-    "directory": "packages/hermes"
+    "directory": "packages/adapter/acp"
   },
   "bugs": {
     "url": "https://github.com/hi-youichi/anureo-sdk/issues"
@@ -32,8 +33,9 @@
     "test": "bun test tests"
   },
   "dependencies": {
+    "@anureo/sdk": "workspace:*",
     "@anureo/protocol": "workspace:*",
-    "@anureo/sdk": "workspace:*"
+    "@agentclientprotocol/sdk": "1.4.0"
   },
   "devDependencies": {
     "@anureo/conformance": "workspace:*"

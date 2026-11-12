@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { agent } from './agent'
 
 test('workflow Zod output uses the same MCP path and retains local refinement failures', async () => {
-  const adapter = createAcpAdapter({ command: process.execPath, args: [fileURLToPath(new URL('../../acp/tests/fixtures/fake-acp.mjs', import.meta.url)), '--scenario', 'mcp-output'] })
+  const adapter = createAcpAdapter({ command: process.execPath, args: [fileURLToPath(new URL('../../adapter/acp/tests/fixtures/fake-acp.mjs', import.meta.url)), '--scenario', 'mcp-output'] })
   const client = await createClient({ adapter, identity: { adapterId: 'acp', runtimeConfigId: 'workflow-mcp' } })
   try {
     const schema = z.object({ sum: z.number().int() })

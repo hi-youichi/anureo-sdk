@@ -2,7 +2,7 @@
 
 Adapter connecting the Anureo SDK to agents implementing the [Agent Client Protocol](https://agentclientprotocol.com) (ACP), using the official `@agentclientprotocol/sdk` 1.4.0. ACP is an editor↔agent protocol; this adapter brings any standard ACP agent behind the AHP session model — the interoperability proof that AHP is a host-side semantic layer, not a competing agent protocol.
 
-> Part of the [Anureo SDK workspace](../../README.md). Install with `npm install @anureo/adapter-acp`.
+> Part of the [Anureo SDK workspace](../../../README.md). Install with `npm install @anureo/adapter-acp`.
 
 ## Usage
 
@@ -87,7 +87,7 @@ DSH advertises the standard ACP v1 baseline only — no `_ahp` extension, no mod
 ## Development
 
 ```sh
-cd packages/acp
+cd packages/adapter/acp
 bun run typecheck
 bun test tests
 ```
@@ -96,12 +96,12 @@ The conformance tests spawn a scripted ACP agent (implementing the standard wire
 
 ## Documentation
 
-- [Architecture](../../docs/architecture.md) — adapters' role in the SDK (currently in Chinese)
-- [AHP v1 protocol](../../spec/ahp-v1.md)
+- [Architecture](../../../docs/architecture.md) — adapters' role in the SDK (currently in Chinese)
+- [AHP v1 protocol](../../../spec/ahp-v1.md)
 
 ## AHP v1 lifecycle revision
 
 The lifecycle design updates AHP v1 and package root entries in place.
 The root implementation and tests use the revised lifecycle; parallel versioned
 entries have been removed. Local conformance and clean-install checks have passed. Standard ACP remains limited to guarantees it can prove; overlapping input requires an explicit correlation extension, and session cancellation must not masquerade as exact-turn interrupt.
-See the [design and implementation plan](../../docs/native-harness-lifecycle.md).
+See the [design and implementation plan](../../../docs/native-harness-lifecycle.md).

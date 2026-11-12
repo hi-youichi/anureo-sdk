@@ -9,10 +9,10 @@ test('a bundled consumer runs on Node from an unrelated cwd against the native W
   const native = await startFake(), directory = await mkdtemp(join(tmpdir(), 'anureo-hermes-node-'))
   try {
     const entry = join(directory, 'consumer.ts'), output = join(directory, 'consumer.mjs')
-    const root = resolve(import.meta.dir, '../../..')
+    const root = resolve(import.meta.dir, '../../../..')
     await writeFile(entry, `
 import { createClient } from ${JSON.stringify(join(root, 'packages/core/src/index.ts'))}
-import { createHermesAdapter } from ${JSON.stringify(join(root, 'packages/hermes/src/index.ts'))}
+import { createHermesAdapter } from ${JSON.stringify(join(root, 'packages/adapter/hermes/src/index.ts'))}
 const client = await createClient({
   adapter: createHermesAdapter({ command: process.env.FIXTURE_BUN, args: [process.env.FIXTURE_ENTRY], env: process.env, timeoutMs: 2000 }),
   identity: { adapterId: 'hermes', runtimeConfigId: 'node-test' },
