@@ -3,8 +3,8 @@ import { spawnHarnessProcess } from '@anureo/sdk/process'
 import { createHermesAdapter, type HermesAdapterOptions } from '../src'
 
 export const fixture = resolve(import.meta.dir, 'fixtures/fake-hermes.mjs')
-export async function startFake(scenario = 'lifecycle') {
-  const child = await spawnHarnessProcess({ command: process.execPath, args: [fixture, '--server'], env: { ...process.env, FAKE_HERMES_SCENARIO: scenario } })
+export async function startFake(scenario = 'lifecycle', env: Record<string, string> = {}) {
+  const child = await spawnHarnessProcess({ command: process.execPath, args: [fixture, '--server'], env: { ...process.env, ...env, FAKE_HERMES_SCENARIO: scenario } })
   void (async () => { for await (const _chunk of child.stderr) { /* no native stderr in public test output */ } })()
   const iterator = child.stdout[Symbol.asyncIterator](); let output = ''
   for (;;) {

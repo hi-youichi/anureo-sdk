@@ -1,26 +1,24 @@
 {
   "name": "@anureo/code-review",
   "version": "0.2.0",
-  "description": "CLI for source-backed, multi-dimensional code design reviews across projects and languages",
+  "description": "Module-based parallel code review powered by Anureo workflows",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "git+https://github.com/hi-youichi/anureo-sdk.git", "directory": "packages/code-review" },
   "publishConfig": { "access": "public" },
   "type": "module",
+  "exports": { ".": "./src/index.ts" },
   "bin": { "anureo-review": "./bin/anureo-review.ts" },
-  "exports": {},
-  "files": ["bin", "src"],
   "scripts": {
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit --pretty false",
     "test": "bun test tests"
   },
   "dependencies": {
-    "@anureo/sdk": "workspace:*",
     "@anureo/adapter-codex": "workspace:*",
+    "@anureo/sdk": "workspace:*",
     "@anureo/workflow": "workspace:*",
-    "typescript": "5.8.3",
     "zod": "4.6.7"
   },
   "devDependencies": { "@anureo/conformance": "workspace:*" },
-  "engines": { "bun": ">=1.4.2" }
+  "engines": { "node": ">=22", "bun": ">=1.4.2" }
 }

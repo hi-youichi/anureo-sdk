@@ -12,6 +12,7 @@ if (!process.argv.includes('--server')) {
   process.exit(0)
 }
 
+const responder = process.env.FAKE_HERMES_RESPONSE_MODULE ? await import(process.env.FAKE_HERMES_RESPONSE_MODULE) : null
 const createParams = []
 let epoch = 1, instance = 'owner-1', creates = 0, attaches = 0, interrupts = 0, disconnects = 0
 const tickets = new Set(), sessions = new Map(), createIds = new Map(), methods = [], inputs = [], responses = [], attachArgs = []
@@ -108,6 +109,7 @@ function progress(row) {
     return
   }
   if (['hold', 'overlap', 'interrupt', 'close-active', 'observer-cancel', 'queued-cancel'].includes(scenario)) return
+  if (responder) { finish(row, 'complete', responder.respond(row.text)); return }
   publish(s, 'reasoning.delta', { text: 'brief reasoning' })
   publish(s, 'tool.start', { tool_id: 'tool-1', name: 'future_unknown_tool', args: { query: 'safe' } })
   publish(s, 'tool.complete', { tool_id: 'tool-1', name: 'future_unknown_tool', result: { value: 42 } })

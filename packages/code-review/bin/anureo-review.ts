@@ -1,8 +1,4 @@
 #!/usr/bin/env bun
-import { main } from '../src/cli.ts'
-import { errorText } from '../src/io.ts'
+import { runCli } from '../src/cli'
 
-await main(process.argv.slice(2)).catch(error => {
-  console.error(errorText(error))
-  if (!process.exitCode) process.exitCode = 1
-})
+process.exitCode = await runCli(process.argv.slice(2))

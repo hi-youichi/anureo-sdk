@@ -6,7 +6,6 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "allowImportingTsExtensions": true,
     "types": ["bun", "node"]
   },
   "include": ["src", "bin", "tests"]

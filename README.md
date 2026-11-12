@@ -112,7 +112,7 @@ composition, or `@anureo/protocol` for direct access to the wire contract.
 | [@anureo/adapter-ahp](packages/ahp/README.md) | External AHP harnesses over stdio or WebSocket |
 | [@anureo/adapter-hermes](docs/hermes-adapter.md) | Hermes canonical gateway through ticketed local WebSocket |
 | [@anureo/workflow](packages/workflow/README.md) | Agent calls, parallel tasks, pipelines, and durable workflow steps |
-| [@anureo/code-review](docs/code-review-cli.md) | `anureo-review` CLI for code design and readability reviews |
+| [@anureo/code-review](docs/code-review-cli.md) | Module analysis and parallel code review with a CLI |
 | [@anureo/protocol](packages/protocol/README.md) | AHP v1 JSON Schema, TypeScript types, and validation |
 | [@anureo/conformance](packages/conformance/README.md) | Shared conformance tests and scripted fixtures |
 

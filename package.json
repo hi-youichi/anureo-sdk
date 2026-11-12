@@ -18,6 +18,7 @@
     "typecheck": "bun run --filter '@anureo/*' typecheck",
     "typecheck:tooling": "tsc --noEmit",
     "test": "bun test --timeout 15000 packages",
+    "review": "bun packages/code-review/bin/anureo-review.ts",
     "example": "bun examples/greeting.ts",
     "example:dsh": "bun examples/dsh.ts",
     "example:workflow": "bun examples/workflow.ts",
@@ -25,14 +26,10 @@
     "example:workflow-tool-schema": "bun examples/workflow-output-tools.ts",
     "example:pi-tool-schema": "bun examples/pi-structured-live.ts",
     "example:workflow-persistence": "bun examples/workflow-persistence.ts",
-    "review": "bun packages/code-review/bin/anureo-review.ts",
-    "review:readability": "bun packages/code-review/bin/anureo-review.ts --dimension D12",
-    "fix:readability": "bun packages/code-review/bin/anureo-review.ts fix",
     "example:schema": "bun examples/structured-output.ts",
     "example:hermes": "bun examples/hermes.ts"
   },
   "devDependencies": {
-    "@anureo/code-review": "workspace:*",
     "@anureo/sdk": "workspace:*",
     "@anureo/conformance": "workspace:*",
     "@anureo/adapter-codex": "workspace:*",
@@ -44,6 +41,7 @@
     "@anureo/adapter-acp": "workspace:*",
     "@anureo/adapter-pi": "workspace:*",
     "@anureo/workflow": "workspace:*",
+    "@anureo/code-review": "workspace:*",
     "zod": "4.6.7",
     "@anureo/adapter-hermes": "workspace:*"
   }

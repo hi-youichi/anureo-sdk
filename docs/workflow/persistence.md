@@ -155,5 +155,3 @@ not backed up; use `reuse` to validate or reconstruct them.
 Final state publication and lock release are separate operations. If release fails
 after the result was committed, the caller receives an error while the committed
 result remains on disk. Inspect that evidence before choosing a recovery action.
-
-For an application integration, see [code-review recovery](../code-review-cli.md#failure-recovery).
