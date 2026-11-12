@@ -127,7 +127,7 @@ async function request(socket, method, p) {
   if (method === 'runtime.describe' && scenario === 'describe-hang') return NO_REPLY
   if (method === 'runtime.describe') return { instance_id: instance, profile_id: 'fake-profile', authority_epoch: epoch,
     capabilities: scenario === 'old-contract' ? [] : ['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1', ...(scenario === 'mcp' ? ['acp-session-mcp-v1'] : [])],
-    session_create: { sources: ['tool', ...(scenario === 'mcp' ? ['acp'] : [])], parameters: ['request_id', 'source', 'cwd', 'model', 'client', ...(scenario === 'mcp' ? ['editor'] : [])] } }
+    session_create: { sources: ['tool', ...(scenario === 'mcp' ? ['acp'] : [])], parameters: ['request_id', 'source', 'cwd', 'model', 'client', ...(scenario === 'mcp' ? ['editor'] : []), ...(scenario === 'no-toolsets' ? [] : ['toolsets'])] } }
   if (method === 'session.create') {
     createParams.push(p)
     if ((p.source !== 'tool' && !(scenario === 'mcp' && p.source === 'acp' && p.editor?.edit_approval_policy === 'ask')) || !p.cwd || !p.request_id) throw 'invalid_params'

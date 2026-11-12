@@ -5,6 +5,8 @@ export interface HermesAdapterOptions {
   /** Arguments preceding Hermes CLI arguments, for a wrapper executable. */
   args?: string[]
   profile?: string
+  /** Native toolset selection for new sessions; [] disables model tools. Omit to inherit the profile. */
+  toolsets?: string[]
   /** Complete child environment; omitted means inherit. */
   env?: Record<string, string | undefined>
   startup?: 'start' | 'attach'
@@ -34,6 +36,7 @@ export function validateOptions(options: HermesAdapterOptions): void {
       if (key.endsWith('Ms') && value > 2_147_483_647) throw new Error(`Invalid Hermes option: ${key}`)
     }
   }
+  if (options.toolsets !== undefined && (!Array.isArray(options.toolsets) || options.toolsets.some(value => typeof value !== 'string' || !value.trim() || value.includes('\0')))) throw new Error('Invalid Hermes toolsets')
   if (options.startup !== undefined && !['start', 'attach'].includes(options.startup)) throw new Error('Invalid Hermes startup mode')
   if (options.profile !== undefined && (!options.profile.trim() || options.profile.includes('\0'))) throw new Error('Invalid Hermes profile')
   if (options.command !== undefined && (typeof options.command !== 'string' || !options.command || options.command.includes('\0'))) throw new Error('Invalid Hermes command')

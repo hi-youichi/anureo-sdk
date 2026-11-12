@@ -130,6 +130,7 @@ delivery is reported as unknown. The adapter never replays a secret answer.
 | `command` | `hermes` | Hermes executable |
 | `args` | `[]` | Wrapper arguments preceding the Hermes CLI arguments |
 | `profile` | installation default | Passed as `-p <profile>` to every attach |
+| `toolsets` | profile selection | Native toolsets for new sessions; `[]` disables model tools. Requires the advertised create parameter. Does not change resumed sessions. |
 | `env` | inherited | Complete child environment; never mutates `process.env` |
 | `startup` | `start` | `start` permits on-demand ensure; `attach` only connects to an existing owner |
 | `timeoutMs` | 30000 | Attach, connect and native request deadlines |

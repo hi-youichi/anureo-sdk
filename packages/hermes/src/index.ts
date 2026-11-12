@@ -21,7 +21,7 @@ export class HermesAdapter implements HarnessAdapter {
   }
   constructor(options: HermesAdapterOptions = {}) {
     try { validateOptions(options) } catch { throw new HarnessSdkError('INVALID_PARAMS', 'Invalid Hermes adapter options') }
-    this.options = { ...options, ...(options.args ? { args: [...options.args] } : {}), ...(options.env ? { env: { ...options.env } } : {}) }
+    this.options = { ...options, ...(options.toolsets ? { toolsets: [...options.toolsets] } : {}), ...(options.args ? { args: [...options.args] } : {}), ...(options.env ? { env: { ...options.env } } : {}) }
   }
   initialize(params: InitializeParams): Promise<InitializeResult> {
     if (this.disposed) return Promise.reject(new HarnessSdkError('RUNTIME_DISPOSED'))

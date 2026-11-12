@@ -60,6 +60,7 @@ export class HermesSession implements BackendSession {
     const rpc = this.channel()
     let snapshot: NativeObject
     if (this.params.mode === 'new') {
+      if (this.options.toolsets !== undefined && !this.description!.createParameters.includes('toolsets')) throw new HarnessSdkError('HERMES_GATEWAY_UNSUPPORTED', 'Hermes gateway does not support explicit toolsets')
       const params: NativeObject = { request_id: this.params.requestId, source: 'tool', cwd: this.params.cwd }
       if (this.params.mcpServers !== undefined) {
         if (!this.description!.editorMcp) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
@@ -69,6 +70,7 @@ export class HermesSession implements BackendSession {
           ? { name: server.name, command: server.command, args: server.args ?? [], env: Object.entries(server.env ?? {}).map(([name, value]) => ({ name, value })) }
           : { type: 'http', name: server.name, url: server.url, headers: Object.entries(server.headers ?? {}).map(([name, value]) => ({ name, value })) }) }
       }
+      if (this.options.toolsets !== undefined) params.toolsets = [...this.options.toolsets]
       if (this.params.model !== undefined) params.model = this.params.model
       if (this.description!.createParameters.includes('client')) params.client = { name: 'anureo-sdk', version: '0.2.0' }
       snapshot = object(await rpc.request('session.create', params, true))

@@ -29,3 +29,33 @@ test('attach-only mode never ensures or recovers a shared owner', async () => {
     expect(calls[0]!.slice(0, 2)).toEqual(['-p', 'selected'])
   } finally { await client.dispose(); await fake.dispose() }
 })
+
+test('explicit toolsets are copied and forwarded, including the empty selection', async () => {
+  const fake = await startFake()
+  const toolsets: string[] = []
+  const adapter = fake.adapter({ toolsets })
+  toolsets.push('terminal')
+  const client = await createClient({ adapter, identity: { adapterId: 'hermes', runtimeConfigId: 'toolsets' } })
+  try {
+    await client.sessions.create({ cwd: process.cwd(), model: 'glm-5.3' })
+    const state = await fake.state()
+    expect(state.createParams).toHaveLength(1)
+    expect(state.createParams[0]).toMatchObject({ source: 'tool', model: 'glm-5.3', toolsets: [] })
+    expect(state.inputs).toHaveLength(0)
+  } finally { await client.dispose(); await fake.dispose() }
+})
+
+test('a gateway without toolset selection is rejected before session creation', async () => {
+  const fake = await startFake('no-toolsets')
+  const client = await createClient({ adapter: fake.adapter({ toolsets: [] }), identity: { adapterId: 'hermes', runtimeConfigId: 'toolsets' } })
+  try {
+    await expect(client.sessions.create({ cwd: process.cwd() })).rejects.toMatchObject({ code: 'HERMES_GATEWAY_UNSUPPORTED', outcomeUnknown: false })
+    const state = await fake.state()
+    expect(state.methods).not.toContain('session.create')
+    expect(state.inputs).toHaveLength(0)
+  } finally { await client.dispose(); await fake.dispose() }
+})
+
+test.each([null, '', [null], [''], ['\0'], [42]].map(toolsets => ({ toolsets })))('invalid toolset selection fails locally: %j', ({ toolsets }) => {
+  expect(() => createHermesAdapter({ toolsets: toolsets as unknown as string[] })).toThrow('Invalid Hermes adapter options')
+})
