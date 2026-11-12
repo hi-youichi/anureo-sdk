@@ -13,6 +13,7 @@
         "@anureo/code-review": "workspace:*",
         "@anureo/conformance": "workspace:*",
         "@anureo/protocol": "workspace:*",
+        "@anureo/refactor": "workspace:*",
         "@anureo/sdk": "workspace:*",
         "@anureo/workflow": "workspace:*",
         "@types/bun": "1.4.0",
@@ -32,6 +33,23 @@
         "@anureo/adapter-codex": "workspace:*",
         "@anureo/adapter-hermes": "workspace:*",
         "@anureo/adapter-pi": "workspace:*",
+        "@anureo/sdk": "workspace:*",
+        "@anureo/workflow": "workspace:*",
+        "zod": "4.6.7",
+      },
+      "devDependencies": {
+        "@anureo/conformance": "workspace:*",
+        "@anureo/protocol": "workspace:*",
+      },
+    },
+    "apps/refactor": {
+      "name": "@anureo/refactor",
+      "version": "0.2.0",
+      "bin": {
+        "anureo-refactor": "./bin/anureo-refactor.ts",
+      },
+      "dependencies": {
+        "@anureo/adapter-codex": "workspace:*",
         "@anureo/sdk": "workspace:*",
         "@anureo/workflow": "workspace:*",
         "zod": "4.6.7",
@@ -203,6 +221,8 @@
     "@anureo/conformance": ["@anureo/conformance@workspace:packages/conformance"],
 
     "@anureo/protocol": ["@anureo/protocol@workspace:packages/protocol"],
+
+    "@anureo/refactor": ["@anureo/refactor@workspace:apps/refactor"],
 
     "@anureo/sdk": ["@anureo/sdk@workspace:packages/core"],
 
