@@ -1,21 +1,32 @@
 import { resolve } from 'node:path'
+import { createClient } from '@anureo/sdk'
+import { createScriptedAdapter } from '@anureo/conformance'
 import { z } from 'zod'
-import { pipeline, workflow } from '@anureo/workflow'
+import { agent, pipeline, workflow } from '@anureo/workflow'
 
-// This example uses deterministic application callbacks; it makes no model requests.
-const result = await workflow({
-  name: 'square-numbers', revision: '1', directory: resolve('.anureo/workflows'),
-  input: { numbers: [2, 3, 4] }, resumeFrom: process.argv[2],
-}, async run => {
-  console.log(`Run: ${run.runId}`)
-  const values = await pipeline(run.input.numbers, number => run.step({
-    key: `square:${number}`, input: { number },
-    schema: z.strictObject({ value: z.number() }), recovery: 'repeatable',
-  }, () => {
-    console.log(`Executing square:${number}`)
-    return { value: number * number }
-  }))
-  if (values.some(value => value === null)) throw new Error('A step did not complete')
-  return values.map(value => value!.value)
-})
-console.log(JSON.stringify(result))
+// This example uses a scripted backend; it makes no model requests. Each agent()
+// call inside workflow() is journaled automatically: resuming with the printed
+// run ID replays identical calls from the journal without opening new sessions.
+const schema = z.strictObject({ answer: z.string() })
+const adapter = createScriptedAdapter()
+const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: 'example' } })
+try {
+  const result = await workflow({
+    name: 'agent-journal', revision: '1', directory: resolve('.anureo/workflows'),
+    input: { questions: ['Map the modules.', 'List risky files.'] },
+    resumeFrom: process.argv[2],
+  }, async run => {
+    console.log(`Run: ${run.runId}`)
+    return pipeline(run.input.questions, async question => {
+      // The scripted backend echoes the prompt as its final message, so the
+      // prompt text doubles as the schema-valid JSON answer.
+      const prompt = JSON.stringify({ answer: `answered: ${question}` })
+      const output = await agent(prompt, { client, cwd: process.cwd(), schema })
+      return output === null ? null : output.answer
+    })
+  })
+  console.log(JSON.stringify(result))
+  console.log(`Sessions opened: ${adapter.opened.length}`)
+} finally {
+  await client.dispose()
+}

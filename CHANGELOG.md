@@ -8,6 +8,20 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- **BREAKING** Replace the explicit `run.step()` checkpoint API with an automatic
+  agent-call journal. `WorkflowContext` now exposes only `runId` and `input`;
+  every `agent()` call inside a `workflow()` body is checkpointed by a chained
+  prompt-and-options key, and `resumeFrom` replays identical calls from
+  `journal.json` without opening sessions. Run directories use checkpoint format
+  version 2 with a single `journal.json` replacing `attempts/`, `checkpoints/`,
+  `results/`, and `inherited/`; format-v1 directories are rejected on resume.
+  `StepOptions` (`key`, `input`, `schema`, `recovery`, `reuse`) is removed along
+  with `WORKFLOW_STEP_INCOMPLETE`; prior calls with unknown outcomes reject with
+  `WORKFLOW_RECONCILIATION_REQUIRED`. `Client` now exposes a readonly `identity`.
+  code-review migrates off `run.step`, embeds a git source-state fingerprint in
+  every prompt so journaled results never go stale silently, and bumps its
+  workflow revision to 5.
+
 - Retain per-file unreadable paths and observation errors in repair JSON and Markdown.
 
 - Publish readability repair reports after Client cleanup; retain successful findings

@@ -143,14 +143,17 @@ arguments still reject the call.
 ## Durable workflow
 
 `workflow(options, body)` saves an initial manifest before passing explicit
-`runId`, `input` and `step` to the body. Use `run.step({ key, input, schema }, execute)`
-to persist validated results and `resumeFrom` to reuse them in a new run. Existing
-three-primitive functions keep their independent behavior.
+`runId` and `input` to the body. Every `agent()` call made inside the body is
+journaled automatically: identical calls on a `resumeFrom` run return their
+saved results without opening new sessions, and any changed call invalidates
+the calls after it. Existing three-primitive functions keep their independent
+behavior, and `agent()` outside `workflow()` is unchanged.
 
-The [persistence reference](../../docs/workflow/persistence.md) defines JSON inputs,
-schema inference, manual/repeatable recovery, error handling and file guarantees.
-Try `bun run example:workflow-persistence` and then repeat with its printed run ID.
-This example uses deterministic callbacks and makes no model requests.
+The [persistence reference](../../docs/workflow/persistence.md) defines the
+journal contract, cache keys, error handling and file guarantees.
+Try `bun run example:workflow-persistence` and then repeat with its printed run
+ID: the resumed run opens zero new sessions. This example uses a scripted
+backend and makes no model requests.
 
 ## Examples
 

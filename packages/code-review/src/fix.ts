@@ -4,7 +4,7 @@ import { promisify } from 'node:util'
 import { lstat, readFile, readlink, realpath } from 'node:fs/promises'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { HarnessSdkError, type Client } from '@anureo/sdk'
-import { agent, type WorkflowContext } from '@anureo/workflow'
+import { agent } from '@anureo/workflow'
 import { reviewFailure, type ReviewFailure } from './errors'
 import { fixResultSchema } from './schema'
 import type { ModuleReview } from './review'
@@ -134,7 +134,9 @@ async function reviewTree(cwd: string, root: string, allowed: readonly string[],
 }
 
 export async function fixFindings(options: {
-  run: Pick<WorkflowContext<unknown>, 'step' | 'runId'>
+  runId: string
+  /** Source fingerprint embedded in the fix prompt; null outside git. */
+  sourceVersion: string | null
   client: Client
   cwd: string
   directory: string
@@ -144,7 +146,7 @@ export async function fixFindings(options: {
   permissionMode?: string
   onProgress?: (status: 'started' | 'completed' | 'failed' | 'skipped') => void
 }): Promise<FixReport> {
-  const { run, cwd, modules } = options
+  const { cwd, modules } = options
   const result: FixReport = { status: 'skipped', summary: '', changedFiles: [], error: null, verification: null }
   if (modules.some(module => module.angles.some(angle => angle.status !== 'completed'))) {
     result.summary = 'Fix skipped because the selected review is incomplete.'
@@ -160,9 +162,10 @@ export async function fixFindings(options: {
     return result
   }
   const files = modules.flatMap(module => module.module.files)
+  const sourceState = options.sourceVersion === null ? '' : `\nSource state fingerprint: ${options.sourceVersion}\n`
   const prompt = `Fix these review findings after checking them against the current source.
 Findings: ${JSON.stringify(findings)}
-Allowed source files: ${JSON.stringify(files)}
+Allowed source files: ${JSON.stringify(files)}${sourceState}
 Edit only the listed files directly in the working tree, using minimal changes consistent
 with each file's language and style. Consolidate duplicate findings across angles. Do not
 change unrelated behavior or weaken tests. If a finding is unsupported or cannot be fixed
@@ -172,28 +175,23 @@ the working tree against git afterwards, then independently reviews the selected
 ${fixInstructions}`
   options.onProgress?.('started')
   try {
-    const outcome = await run.step({
-      key: 'fix:apply', input: { prompt, instructions: fixInstructions, permissionMode: options.permissionMode ?? null },
-      schema: fixResultSchema, reuse: () => false, recovery: 'manual',
-    }, async () => {
-      const root = await repositoryRoot(cwd)
-      const before = await captureTree(cwd, root, files, options.directory)
-      const output = await agent(prompt, {
-        client: options.client, cwd, model: options.model,
-        ...(options.permissionMode !== undefined ? { permissionMode: options.permissionMode } : {}),
-        schema: fixResultSchema,
-      })
-      if (output === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Fix agent returned no result')
-      const { changedFiles, violations } = await reviewTree(cwd, root, files, options.directory, before)
-      if (violations.length > 0) {
-        // The agent already wrote files, so the tree is in a real, possibly partial state
-        // the caller must resolve manually with git; the fix is reported as failed and the
-        // workflow completes as incomplete with the violating paths listed.
-        throw new HarnessSdkError('REVIEW_FIX_SCOPE',
-          `Fix changed paths outside the selected source files; inspect the working tree and revert with git: ${violations.join(', ')}`)
-      }
-      return { summary: output.summary, changedFiles }
+    const root = await repositoryRoot(cwd)
+    const before = await captureTree(cwd, root, files, options.directory)
+    const output = await agent(prompt, {
+      client: options.client, cwd, model: options.model,
+      ...(options.permissionMode !== undefined ? { permissionMode: options.permissionMode } : {}),
+      schema: fixResultSchema,
     })
+    if (output === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Fix agent returned no result')
+    const { changedFiles, violations } = await reviewTree(cwd, root, files, options.directory, before)
+    if (violations.length > 0) {
+      // The agent already wrote files, so the tree is in a real, possibly partial state
+      // the caller must resolve manually with git; the fix is reported as failed and the
+      // workflow completes as incomplete with the violating paths listed.
+      throw new HarnessSdkError('REVIEW_FIX_SCOPE',
+        `Fix changed paths outside the selected source files; inspect the working tree and revert with git: ${violations.join(', ')}`)
+    }
+    const outcome = { summary: output.summary, changedFiles }
     result.summary = outcome.summary
     if (outcome.changedFiles.length === 0) {
       options.onProgress?.('skipped')

@@ -9,47 +9,31 @@ export const runIdSchema = z.string().min(1).refine(value => value !== '.' && va
   && value.trim().length > 0 && !/[\\/\x00-\x1f\x7f]/.test(value) && Buffer.byteLength(value) <= 255)
 export const uuidSchema = z.string().uuid()
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/)
-const keySchema = z.string().min(1).refine(value => Buffer.byteLength(value) <= 1024)
 const jsonSchema: z.ZodType<JsonValue> = z.lazy(() => z.union([
   z.null(), z.boolean(), z.number().finite(), z.string(), z.array(jsonSchema), z.record(z.string(), jsonSchema),
 ]))
 export const failureSchema = z.strictObject({
   code: z.string(), retryable: z.boolean(), outcomeUnknown: z.boolean(), cleanupFailed: z.boolean(),
 })
-const originSchema = z.strictObject({ runId: runIdSchema, attemptId: uuidSchema })
 const identitySchema = z.strictObject({
   runId: runIdSchema, directory: z.string(), name: z.string().min(1), revision: z.string().min(1), input: jsonSchema,
 })
 export const manifestSchema = z.strictObject({
-  checkpointFormatVersion: z.literal(1), fingerprintVersion: z.literal(1),
+  checkpointFormatVersion: z.literal(2),
   identity: identitySchema, createdAt: z.string().datetime(),
   resumedFrom: z.strictObject({ directory: z.string(), runId: runIdSchema }).nullable(),
   status: z.enum(['running', 'completed', 'incomplete', 'failed']),
   resultDigest: hashSchema.nullable(), failure: failureSchema.nullable(), recordDigest: hashSchema,
 })
-export const specSchema = z.strictObject({
-  key: keySchema, input: jsonSchema, schema: jsonSchema, inputDigest: hashSchema, schemaDigest: hashSchema,
-})
-export const attemptSchema = z.strictObject({
-  checkpointFormatVersion: z.literal(1), runId: runIdSchema, attemptId: uuidSchema, step: specSchema,
-  mode: z.enum(['execute', 'reuse']), status: z.enum(['started', 'failed', 'outcome_unknown']),
-  failure: failureSchema.nullable(), recordDigest: hashSchema,
-})
-export const checkpointSchema = z.strictObject({
-  checkpointFormatVersion: z.literal(1), runId: runIdSchema, stepKey: keySchema, attemptId: uuidSchema,
-  inputDigest: hashSchema, schemaDigest: hashSchema, resultDigest: hashSchema, resultFile: z.string(),
-  completedAt: z.string().datetime(), reusedFrom: originSchema.nullable(), recordDigest: hashSchema,
-})
-export const inheritedSchema = z.strictObject({
-  checkpointFormatVersion: z.literal(1),
-  steps: z.array(z.strictObject({ key: keySchema, recordedIn: originSchema, state: z.discriminatedUnion('kind', [
-    z.strictObject({ kind: z.literal('uncommitted'), outcome: z.enum(['started', 'failed', 'outcome_unknown']) }),
-    z.strictObject({ kind: z.literal('committed'), inputDigest: hashSchema, schemaDigest: hashSchema,
-      value: jsonSchema, origin: originSchema }),
-  ]) })), recordDigest: hashSchema,
-})
+export const journalKeySchema = z.string().regex(/^v1:[a-f0-9]{64}$/)
+export const journalEventSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('started'), key: journalKeySchema, agentId: uuidSchema }),
+  z.strictObject({ type: z.literal('result'), key: journalKeySchema, agentId: uuidSchema, result: jsonSchema }),
+  z.strictObject({ type: z.literal('failed'), key: journalKeySchema, agentId: uuidSchema,
+    code: z.string().min(1), outcomeUnknown: z.boolean() }),
+])
 export const lockSchema = z.strictObject({
-  checkpointFormatVersion: z.literal(1), token: uuidSchema, hostname: z.string(),
+  checkpointFormatVersion: z.literal(2), token: uuidSchema, hostname: z.string(),
   pid: z.number().int().positive(), createdAt: z.string().datetime(), recordDigest: hashSchema,
 })
 export type Manifest = z.output<typeof manifestSchema>
