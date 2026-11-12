@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/NousResearch/hermes-agent",
+  "release": "v0.23.1",
+  "commit": "3b421578588243f920886e6fe79a6faa87ea026e",
+  "protocol": "hermes-gateway-v1",
+  "sources": [
+    "hermes_cli/gateway_runtime_cli.py",
+    "tui_gateway/contracts/canonical.py",
+    "tui_gateway/contracts/canonical_sessions.py",
+    "gateway/session_controls.py",
+    "gateway/session_pending_controls.py",
+    "gateway/session_server_requests.py",
+    "gateway/session_settlement_recovery.py"
+  ]
+}

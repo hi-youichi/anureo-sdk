@@ -25,7 +25,8 @@
     "review": "bun packages/code-review/bin/anureo-review.ts",
     "review:readability": "bun packages/code-review/bin/anureo-review.ts --dimension D12",
     "fix:readability": "bun packages/code-review/bin/anureo-review.ts fix",
-    "example:schema": "bun examples/structured-output.ts"
+    "example:schema": "bun examples/structured-output.ts",
+    "example:hermes": "bun examples/hermes.ts"
   },
   "devDependencies": {
     "@anureo/code-review": "workspace:*",
@@ -39,6 +40,7 @@
     "@anureo/protocol": "workspace:*",
     "@anureo/adapter-acp": "workspace:*",
     "@anureo/workflow": "workspace:*",
-    "zod": "4.6.7"
+    "zod": "4.6.7",
+    "@anureo/adapter-hermes": "workspace:*"
   }
 }

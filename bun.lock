@@ -8,6 +8,7 @@
         "@anureo/adapter-acp": "workspace:*",
         "@anureo/adapter-claude": "workspace:*",
         "@anureo/adapter-codex": "workspace:*",
+        "@anureo/adapter-hermes": "workspace:*",
         "@anureo/code-review": "workspace:*",
         "@anureo/conformance": "workspace:*",
         "@anureo/protocol": "workspace:*",
@@ -98,6 +99,17 @@
         "@anureo/protocol": "workspace:*",
       },
     },
+    "packages/hermes": {
+      "name": "@anureo/adapter-hermes",
+      "version": "0.2.0",
+      "dependencies": {
+        "@anureo/protocol": "workspace:*",
+        "@anureo/sdk": "workspace:*",
+      },
+      "devDependencies": {
+        "@anureo/conformance": "workspace:*",
+      },
+    },
     "packages/protocol": {
       "name": "@anureo/protocol",
       "version": "0.2.0",
@@ -151,6 +163,8 @@
     "@anureo/adapter-claude": ["@anureo/adapter-claude@workspace:packages/claude"],
 
     "@anureo/adapter-codex": ["@anureo/adapter-codex@workspace:packages/codex"],
+
+    "@anureo/adapter-hermes": ["@anureo/adapter-hermes@workspace:packages/hermes"],
 
     "@anureo/code-review": ["@anureo/code-review@workspace:packages/code-review"],
 

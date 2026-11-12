@@ -74,3 +74,18 @@ new lifecycle scenarios before claiming conformance to the revised v1.
 
 To list a third-party implementation, open a PR with a pointer to a CI
 job that runs the conformance suite against it.
+
+### Workspace Hermes adapter
+
+`@anureo/adapter-hermes` implements the revised v1 native lifecycle against the
+Hermes `hermes-gateway-v1` contract inspected at v0.23.1. Its scripted native
+CLI/WebSocket child-process fixture passes the applicable shared conformance
+cases and native overlap, close-active and observer-cancel scenarios. Supported
+surfaces are text execution, queued admission, approvals/user input, resume and
+exact-turn interruption. Unsupported surfaces remain capability gated.
+
+Conformance is established against the protocol fixture. A real single-turn
+model run also passed on Hermes `v0.23.1+2913.gbba2061`; live multi-turn,
+approval, interrupt and replay scenarios remain unverified. See the
+[adapter guide](docs/hermes-adapter.md) for requirements, resource ownership
+and capability limits.

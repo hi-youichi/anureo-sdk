@@ -1,6 +1,6 @@
 # Anureo SDK
 
-Build TypeScript applications that use Codex, Claude, ACP agents, and external
+Build TypeScript applications that use Codex, Claude, Hermes, ACP agents, and external
 AHP harnesses through a shared client interface.
 
 - **Connect backends:** choose an adapter and manage it through the same SDK.
@@ -103,6 +103,7 @@ composition, or `@anureo/protocol` for direct access to the wire contract.
 | [@anureo/adapter-claude](packages/claude/README.md) | Claude Agent SDK adapter |
 | [@anureo/adapter-acp](packages/acp/README.md) | Standard ACP agents, including DSH |
 | [@anureo/adapter-ahp](packages/ahp/README.md) | External AHP harnesses over stdio or WebSocket |
+| [@anureo/adapter-hermes](docs/hermes-adapter.md) | Hermes canonical gateway through ticketed local WebSocket |
 | [@anureo/workflow](packages/workflow/README.md) | Agent calls, parallel tasks, and per-item pipelines |
 | [@anureo/code-review](docs/code-review-cli.md) | `anureo-review` CLI for code design and readability reviews |
 | [@anureo/protocol](packages/protocol/README.md) | AHP v1 JSON Schema, TypeScript types, and validation |
@@ -120,6 +121,7 @@ Every example uses a real backend and requires its credentials.
 | [Zod workflow](examples/workflow-structured.ts) | `bun run example:workflow-schema all` | Authenticated Codex and Claude CLIs; returns typed `{ sum: 42 }` from the same Zod schema. Select `codex` or `claude` to run one backend. |
 | [Structured output](examples/structured-output.ts) | `bun run example:schema codex` | Authenticated Codex CLI; prints a parsed JSON result for `17 + 25`. Use `claude` for Claude, or omit the argument to run both backends. |
 | [DSH over ACP](examples/dsh.ts) | `bun run example:dsh` | DSH 0.2.2+ on PATH, Node.js 24.9+ for DSH, and configured DSH credentials; streams a reply and handles per-call approvals. |
+| [Hermes gateway](examples/hermes.ts) | `bun run example:hermes` | Configured Hermes with canonical gateway attach (v0.23.1 contract); runs arithmetic through the selected profile. See the [verification scope](docs/hermes-adapter.md#requirements-and-verification). |
 
 For Claude, log in with `claude auth login` before running its example. Backend
 paths, model overrides, and other settings are documented in the linked example
