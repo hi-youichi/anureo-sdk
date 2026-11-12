@@ -1,11 +1,19 @@
 import { expect, test } from 'bun:test'
 import { HarnessSdkError } from '@anureo/sdk'
 import { createScriptedAdapter } from '@anureo/conformance'
+import type { ApprovalOption } from '@anureo/protocol'
 import { runCli } from '../src/cli'
 import { createReviewClient } from '../src/client'
 import { finding, fixture, output, plan } from './helpers'
 
-test.each([false, true])('production client passes session config through and refuses approval (deny option: %s)', async withDeny => {
+test.each([
+  { semantics: ['deny', 'allowWithRule', 'allowSession', 'allowOnce'], expected: 'allowOnce' },
+  { semantics: ['allowOnce'], expected: 'allowOnce' },
+  { semantics: ['deny', 'allowWithRule', 'allowSession'], expected: 'allowSession' },
+  { semantics: ['deny', 'allowWithRule'], expected: 'allowWithRule' },
+  { semantics: ['deny', 'cancel'], expected: undefined },
+  { semantics: [undefined], expected: undefined },
+] satisfies Array<{ semantics: ApprovalOption['semantic'][]; expected: ApprovalOption['semantic'] }>)('production client preserves config and auto-approves known allow options: %j', async ({ semantics, expected }) => {
   const codex = createScriptedAdapter()
   const cwd = process.cwd()
   const client = await createReviewClient(cwd, 'codex', codex)
@@ -13,19 +21,19 @@ test.each([false, true])('production client passes session config through and re
     await client.openSession({
       requestId: 'open', mode: 'new', cwd,
       binding: { sessionId: 'policy', adapterId: 'codex', runtimeConfigId: 'code-review' },
-      ...(withDeny ? { config: { permissionMode: 'agent-full-access', custom: 'preserved' } } : {}),
+      config: { permissionMode: 'agent-full-access', custom: 'preserved' },
     })
-    expect(codex.opened[0]?.config ?? {}).toEqual(withDeny ? { permissionMode: 'agent-full-access', custom: 'preserved' } : {})
+    expect(codex.opened[0]?.config).toEqual({ permissionMode: 'agent-full-access', custom: 'preserved' })
     const responses: unknown[] = []
     const pending = codex.sinks.get('policy')!.requestInteraction({
-      interactionId: 'approval', kind: 'approval', options: [
-        { id: 'approve', label: 'Allow', semantic: 'allowOnce' },
-        ...(withDeny ? [{ id: 'refuse', label: 'Refuse', semantic: 'deny' as const }] : []),
-      ],
+      interactionId: 'approval', kind: 'approval', options: semantics.map((semantic, index) => ({
+        id: `option-${index}`, label: `Option ${index}`, ...(semantic !== undefined ? { semantic } : {}),
+      })),
     }, async response => { responses.push(response) })
-    if (withDeny) {
-      await expect(pending).resolves.toEqual({ kind: 'approval', optionId: 'refuse' })
-      expect(responses).toEqual([{ kind: 'approval', optionId: 'refuse' }])
+    if (expected !== undefined) {
+      const answer = { kind: 'approval' as const, optionId: `option-${semantics.findIndex(semantic => semantic === expected)}` }
+      await expect(pending).resolves.toEqual(answer)
+      expect(responses).toEqual([answer])
     } else {
       await expect(pending).rejects.toMatchObject({ code: 'INTERACTION_CANCELLED' })
       expect(responses).toEqual([null])

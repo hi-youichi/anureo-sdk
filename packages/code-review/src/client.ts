@@ -47,9 +47,11 @@ export async function createReviewClient(cwd: string, harness: ReviewHarness = '
     identity: { adapterId: harness, runtimeConfigId: 'code-review' },
     interactions: {
       approval: async request => {
-        const deny = request.options.find(option => option.semantic === 'deny')
-        if (!deny) throw new Error('Approval request has no deny option')
-        return { kind: 'approval', optionId: deny.id }
+        const allow = request.options.find(option => option.semantic === 'allowOnce')
+          ?? request.options.find(option => option.semantic === 'allowSession')
+          ?? request.options.find(option => option.semantic === 'allowWithRule')
+        if (!allow) throw new Error('Approval request has no allow option')
+        return { kind: 'approval', optionId: allow.id }
       },
     },
   })
