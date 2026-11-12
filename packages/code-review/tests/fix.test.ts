@@ -262,6 +262,26 @@ test.each(['RATE_LIMITED', 'NATIVE_FAILED'])('fix agent failure %s produces an i
   expect(await readFile(join(cwd, 'a.ts'))).toEqual(before)
 })
 
+test('failed fix execution retains partial edits and scope violations with the original error', async () => {
+  const { client, cwd, prompts } = await fixFixture({ fix: async directory => {
+    await writeFile(join(directory, 'a.ts'), fixed)
+    await writeFile(join(directory, 'b.ts'), fixed)
+    return new HarnessSdkError('NATIVE_FAILED', 'Fix interrupted after writing files')
+  } })
+  await commitFixture(cwd)
+  const report = await reviewCode({ client, cwd, ...single, fix: true })
+  expect(report.status).toBe('incomplete')
+  expect(report.fix).toMatchObject({
+    status: 'failed', changedFiles: ['a.ts'],
+    error: { code: 'NATIVE_FAILED', outcomeUnknown: false },
+  })
+  expect(report.fix?.error?.message).toContain('Fix interrupted after writing files')
+  expect(report.fix?.error?.message).toMatch(/out-of-scope changes:\s+M b\.ts/)
+  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe(fixed)
+  expect(report.verification).toBeNull()
+  expect(prompts).toHaveLength(3)
+})
+
 test('unknown fix-agent outcomes reject the workflow without a scope check', async () => {
   const { client, cwd, prompts } = await fixFixture({ fix: () => new HarnessSdkError('RECEIPT_LOST', 'Unknown execution', false, true) })
   await commitFixture(cwd)

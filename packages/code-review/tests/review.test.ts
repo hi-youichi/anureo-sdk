@@ -144,6 +144,28 @@ test.each(['RATE_LIMITED', 'NATIVE_FAILED'])('failed angle %s preserves coverage
   expect(journal.filter((event: { type: string }) => event.type === 'failed')).toHaveLength(1)
 })
 
+test('progress callback failure preserves coverage and releases the shared concurrency slot', async () => {
+  const { client, cwd, adapter } = await fixture()
+  const report = await reviewCode({
+    client, cwd, angles, concurrency: 1,
+    onProgress: event => {
+      if (event.stage === 'review' && event.moduleId === 'a' && event.angleId === 'correctness' && event.status === 'started') {
+        throw new Error('Progress sink failed')
+      }
+    },
+  })
+  expect(report.status).toBe('incomplete')
+  expect(report.modules[0]?.angles[0]).toMatchObject({
+    angle: { id: 'correctness' }, status: 'failed',
+    error: { message: 'Angle task for correctness failed before producing a result' },
+  })
+  expect(report.modules[0]?.angles[1]?.status).toBe('completed')
+  expect(report.modules[1]?.angles.map(result => result.status)).toEqual(['completed', 'completed'])
+  expect(report.modules.map(result => result.module.id)).toEqual(['a', 'b'])
+  // Analysis plus the three surviving angles; the failed callback must not dispatch an agent.
+  expect(adapter.opened).toHaveLength(4)
+})
+
 test('failure normalization retains only valid issue paths and codes', () => {
   const issues = [
     { path: '/findings/0/severity', code: 'enum' },
