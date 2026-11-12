@@ -1,11 +1,32 @@
 import { expect, test } from 'bun:test'
-import { readFile, readdir, symlink } from 'node:fs/promises'
+import { readFile, readdir, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 import { correctnessAngle, defaultAngles, designAngle, formatReport, reviewCode, type ReviewProgress } from '../src'
+import { reviewFailure } from '../src/errors'
+import { createReviewClient } from '../src/client'
+import { startFake } from '../../hermes/tests/helpers'
 import { finding, fixture, plan } from './helpers'
 
 const angles = [correctnessAngle, { id: 'contracts', title: 'Contracts', instructions: 'Check caller contracts.' }]
+
+test('Hermes submits analysis instructions through input instead of session options', async () => {
+  const { cwd } = await fixture()
+  const native = await startFake('mcp')
+  try {
+    const client = await createReviewClient(cwd, 'hermes', native.adapter())
+    try {
+      // This gateway submits { sum: 42 }, which intentionally fails the module-plan schema.
+      // Reaching that turn proves the real adapter accepted the session and analysis input.
+      await expect(reviewCode({ client, cwd })).rejects.toMatchObject({ code: 'HERMES_TURN_FAILED' })
+      const state = await native.state()
+      expect(state.creates).toBe(1)
+      expect(state.inputs).toHaveLength(1)
+      expect(state.inputs[0]?.text).toContain('Analyze this codebase')
+      expect(state.inputs[0]?.text).toContain('Read and analyze source code only. Do not modify files,')
+    } finally { await client.dispose() }
+  } finally { await native.dispose() }
+})
 
 test('analysis finishes before nested module/angle reviews, which run concurrently in stable order', async () => {
   const analysisGate = Promise.withResolvers<void>()
@@ -41,6 +62,8 @@ test('analysis finishes before nested module/angle reviews, which run concurrent
   expect(report.modules.map(result => [result.module.id, result.angles.map(result => result.angle.id)]))
     .toEqual([['a', ['correctness', 'contracts']], ['b', ['correctness', 'contracts']]])
   expect(prompts.every(prompt => prompt.includes('Check cleanup'))).toBe(true)
+  expect(prompts.every(prompt => prompt.includes('Read and analyze source code only. Do not modify files,'))).toBe(true)
+  expect(adapter.opened.every(session => session.instructions === undefined)).toBe(true)
   expect(adapter.opened.every(session => session.model === 'review-model')).toBe(true)
   expect([...adapter.backends.values()].every(backend => backend.disposeCount === 1)).toBe(true)
   expect(adapter.disposeCount).toBe(0)
@@ -87,6 +110,8 @@ test('defaults to correctness, code quality, and design angles and passes their 
   }
   expect(report.modules[0]?.angles[0]).toMatchObject({ status: 'completed', findings: [finding] })
   expect(formatReport(report)).toContain('[P2] Incorrect fallback (a.ts:1-1)')
+  expect(formatReport(report)).toContain('Suggestion: Treat zero as a valid value')
+  expect(prompts.filter(prompt => prompt.includes('In each suggestion,'))).toHaveLength(prompts.length - 1)
   expect(formatReport(report)).toContain('No findings.')
 })
 
@@ -115,13 +140,57 @@ test.each(['RATE_LIMITED', 'NATIVE_FAILED'])('failed angle %s preserves coverage
   expect(await readdir(join(report.workflowDirectory, report.runId, 'checkpoints'))).toHaveLength(4)
 })
 
+test('failure normalization retains only valid issue paths and codes', () => {
+  const issues = [
+    { path: '/findings/0/severity', code: 'enum' },
+    { path: ['findings', 0, 'lineStart'], code: 'too_small' },
+  ]
+  const error = new HarnessSdkError('AGENT_STRUCTURED_OUTPUT_INVALID', 'Invalid output', false, false, {
+    issues: [...issues.map(issue => ({ ...issue, message: 'Private diagnostic' })),
+      null, { path: null, code: 'type' }, { path: ['findings', {}], code: 'type' },
+      { path: ['findings', -1], code: 'type' }, { path: '/', code: 1 }, { path: '/', code: '' }],
+    privateDetail: 'Do not expose',
+  })
+  expect(reviewFailure(error)).toEqual({ message: 'Invalid output', code: error.code, outcomeUnknown: false, issues })
+  expect(reviewFailure(new Error('Ordinary failure'))).toEqual({ message: 'Ordinary failure', code: null, outcomeUnknown: false })
+})
+
+test('schema-invalid findings retain diagnostics in text and persisted JSON reports', async () => {
+  const { client, cwd } = await fixture(prompt => prompt.startsWith('Analyze') ? plan : {
+    findings: [{ ...finding, severity: 'invalid' }],
+  })
+  const report = await reviewCode({ client, cwd, maxModules: 1, angles: [correctnessAngle] })
+  expect(report.modules[0]?.angles[0]).toMatchObject({ status: 'failed', error: {
+    code: 'STRUCTURED_OUTPUT_INVALID', outcomeUnknown: false,
+    issues: [{ path: '/findings/0/severity', code: 'enum' }],
+  } })
+  expect(formatReport(report)).toContain('Validation issue: "/findings/0/severity" [enum]')
+  expect(JSON.parse(await readFile(join(report.workflowDirectory, report.runId, 'result.json'), 'utf8'))).toEqual(report)
+})
+
+test('scripted startup-blocked terminal details produce a dropped agent result', async () => {
+  const { client, cwd } = await fixture(prompt => prompt.startsWith('Analyze') ? plan
+    : new HarnessSdkError('AGENT_STARTUP_BLOCKED', 'Blocked', false, false, { workflowDisposition: 'startup_blocked' }))
+  const report = await reviewCode({ client, cwd, maxModules: 1, angles: [correctnessAngle] })
+  expect(report.modules[0]?.angles[0]).toMatchObject({ status: 'failed', error: { code: 'REVIEW_AGENT_INCOMPLETE' } })
+})
+
+test('scripted native cleanup metadata stops further agent dispatch', async () => {
+  const { client, cwd, adapter } = await fixture(prompt => prompt.startsWith('Analyze') ? plan
+    : new HarnessSdkError('NATIVE_FAILED', 'Cleanup failed', false, false, { cleanupFailed: true }))
+  await expect(reviewCode({ client, cwd, angles, concurrency: 1 })).rejects.toMatchObject({
+    code: 'NATIVE_FAILED', outcomeUnknown: false, details: { cleanupFailed: true },
+  })
+  expect(adapter.opened).toHaveLength(2)
+})
+
 test('persists the run, validated analysis, every angle result, and the final report', async () => {
   const { client, cwd, prompts } = await fixture()
   const directory = join(cwd, 'custom-workflows')
   const report = await reviewCode({ client, cwd, workflowDirectory: directory })
   const path = join(report.workflowDirectory, report.runId)
   const manifest = JSON.parse(await readFile(join(path, 'run.json'), 'utf8'))
-  expect(manifest.identity).toMatchObject({ name: 'code-review', revision: '2', runId: report.runId })
+  expect(manifest.identity).toMatchObject({ name: 'code-review', revision: '4', runId: report.runId })
   expect(manifest.identity.input.analysisPrompt).toBe(prompts[0])
   expect(manifest.identity.input.concurrency).toBe(8)
   expect(manifest.status).toBe('completed')
@@ -221,6 +290,15 @@ test('null module analysis cannot become an empty successful report', async () =
   const { client, cwd, adapter } = await fixture(() => new HarnessSdkError('RATE_LIMITED'))
   await expect(reviewCode({ client, cwd })).rejects.toThrow('Module analysis failed')
   expect(adapter.opened).toHaveLength(1)
+})
+
+test.each(['\n', '\r\n', '\r', '\u2028', '\u2029'])('finding locations recognize source line terminator %j', async ending => {
+  const expected = { ...finding, lineStart: 2, lineEnd: 2 }
+  const { client, cwd } = await fixture(prompt => prompt.startsWith('Analyze') ? plan : { findings: [expected] })
+  await writeFile(join(cwd, 'a.ts'), `export const first = 1${ending}export const second = 2${ending}`)
+  const report = await reviewCode({ client, cwd, maxModules: 1, angles: [correctnessAngle] })
+  expect(report.status).toBe('completed')
+  expect(report.modules[0]?.angles[0]).toMatchObject({ status: 'completed', findings: [expected] })
 })
 
 test.each([

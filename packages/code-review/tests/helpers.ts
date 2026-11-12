@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createClient, HarnessSdkError, type Client } from '@anureo/sdk'
 import { createScriptedAdapter, type FakeAdapterOptions } from '@anureo/conformance'
+import type { JsonObject } from '@anureo/protocol'
 import type { ModulePlan } from '../src/schema'
 
 const clients: Client[] = []
@@ -24,6 +25,7 @@ export const plan: ModulePlan = {
 
 export const finding = {
   severity: 'P2' as const, title: 'Incorrect fallback', body: 'A zero input returns the fallback instead of zero.',
+  suggestion: 'Treat zero as a valid value: `return n === 0 ? n : (n || 1)`',
   file: 'a.ts', lineStart: 1, lineEnd: 1,
 }
 
@@ -46,6 +48,7 @@ export async function fixture(
     if (output instanceof HarnessSdkError) {
       await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: {
         code: output.code, message: output.message, retryable: output.retryable, outcomeUnknown: output.outcomeUnknown,
+        ...(output.details === undefined ? {} : { details: output.details as JsonObject }),
       } } })
     } else {
       await sink.emit({ type: 'item/completed', payload: { item: {

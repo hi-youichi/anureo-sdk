@@ -1,6 +1,8 @@
 import { expect, test } from 'bun:test'
 import { HarnessSdkError } from '@anureo/sdk'
+import { createScriptedAdapter } from '@anureo/conformance'
 import { runCli } from '../src/cli'
+import { createReviewClient } from '../src/client'
 import { finding, fixture, plan } from './helpers'
 
 function output() {
@@ -9,6 +11,40 @@ function output() {
   return { stdout: (text: string) => { stdout.push(text) }, stderr: (text: string) => { stderr.push(text) },
     read: () => ({ stdout: stdout.join(''), stderr: stderr.join('') }) }
 }
+
+test.each([false, true])('production client passes session config through and refuses approval (deny option: %s)', async withDeny => {
+  const codex = createScriptedAdapter()
+  const cwd = process.cwd()
+  const client = await createReviewClient(cwd, 'codex', codex)
+  try {
+    await client.openSession({
+      requestId: 'open', mode: 'new', cwd,
+      binding: { sessionId: 'policy', adapterId: 'codex', runtimeConfigId: 'code-review' },
+      ...(withDeny ? { config: { permissionMode: 'agent-full-access', custom: 'preserved' } } : {}),
+    })
+    expect(codex.opened[0]?.config ?? {}).toEqual(withDeny ? { permissionMode: 'agent-full-access', custom: 'preserved' } : {})
+    const responses: unknown[] = []
+    const pending = codex.sinks.get('policy')!.requestInteraction({
+      interactionId: 'approval', kind: 'approval', options: [
+        { id: 'approve', label: 'Allow', semantic: 'allowOnce' },
+        ...(withDeny ? [{ id: 'refuse', label: 'Refuse', semantic: 'deny' as const }] : []),
+      ],
+    }, async response => { responses.push(response) })
+    if (withDeny) {
+      await expect(pending).resolves.toEqual({ kind: 'approval', optionId: 'refuse' })
+      expect(responses).toEqual([{ kind: 'approval', optionId: 'refuse' }])
+    } else {
+      await expect(pending).rejects.toMatchObject({ code: 'INTERACTION_CANCELLED' })
+      expect(responses).toEqual([null])
+    }
+  } finally { await client.dispose() }
+  expect(codex.disposeCount).toBe(1)
+})
+
+test('production Claude client initializes with the existing login home', async () => {
+  const client = await createReviewClient(process.cwd(), 'claude')
+  await client.dispose()
+})
 
 test('help and argument errors never initialize a backend', async () => {
   const io = output()
@@ -21,10 +57,24 @@ test('help and argument errors never initialize a backend', async () => {
     ['--max-modules', '0'], ['--max-modules', '1.5'], ['--module', ' '],
     ['--module', 'a', '--module', 'a'], ['--angle', 'missing'],
     ['--angle', 'correctness', '--angle', 'correctness'],
+    ['--harness', 'missing'],
   ]) {
     expect(await runCli(args, dependencies)).toBe(2)
   }
   expect(opened).toBe(0)
+})
+
+test('CLI selects the requested harness and defaults to codex', async () => {
+  const io = output()
+  const harnesses: string[] = []
+  const dependencies = { ...io, createClient: async (_cwd: string, harness: string) => { harnesses.push(harness); throw new Error('Stop') } }
+  expect(await runCli(['--harness', 'hermes', '.'], dependencies)).toBe(2)
+  expect(await runCli(['.'], dependencies)).toBe(2)
+  expect(harnesses).toEqual(['hermes', 'codex'])
+  const unknown = output()
+  expect(await runCli(['--harness', 'missing', '.'], { ...unknown, createClient: async () => { throw new Error('Must not open') } })).toBe(2)
+  expect(unknown.read().stderr).toContain('Unknown harness: missing')
+  expect(unknown.read().stderr).toContain('Available: codex, claude, hermes, pi')
 })
 
 test.each([
@@ -111,4 +161,19 @@ test('analysis failures and cleanup errors dispose the client and exit 2', async
   expect(await runCli([clean.cwd], { ...io, createClient: async () => clean.client })).toBe(2)
   expect(io.read().stderr).toContain('Cleanup failed')
   clean.client.dispose = dispose
+})
+
+test.each([false, true])('CLI retains execution and cleanup errors together (unknown outcome: %s)', async unknown => {
+  const code = unknown ? 'RECEIPT_LOST' : 'NATIVE_FAILED'
+  const { client, cwd } = await fixture(() => new HarnessSdkError(code, 'Original execution failure', false, unknown))
+  const dispose = client.dispose.bind(client)
+  client.dispose = async () => { await dispose(); throw new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'Cleanup failed') }
+  const io = output()
+  try {
+    expect(await runCli([cwd], { ...io, createClient: async () => client })).toBe(2)
+    expect(io.read().stderr).toContain('Original execution failure')
+    expect(io.read().stderr).toContain(`[${code}]`)
+    expect(io.read().stderr).toContain('Cleanup failed [RESOURCE_RELEASE_FAILED]')
+    if (unknown) expect(io.read().stderr).toContain('execution outcome unknown')
+  } finally { client.dispose = dispose }
 })

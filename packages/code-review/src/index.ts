@@ -3,4 +3,5 @@ export type { ReviewOptions, ReviewReport, ModuleReview, AngleReview, ReviewFail
 export { correctnessAngle, codeQualityAngle, designAngle, defaultAngles } from './angles'
 export type { ReviewAngle } from './angles'
 export type { Finding, ModulePlan, ReviewModule } from './schema'
+export type { FixReport } from './fix'
 export { formatReport } from './report'
