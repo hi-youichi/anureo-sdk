@@ -5,8 +5,8 @@ import { agent, parallel, workflow } from '@anureo/workflow'
 import { defaultAngles, type ReviewAngle } from './angles'
 import { reviewFailure as failure, type ReviewFailure } from './errors'
 import { fixFindings, type FixReport } from './fix'
-import { assertReviewablePath } from './paths'
-import { modulePlanSchema, reviewOutputSchema, type Finding, type ModulePlan, type ReviewModule } from './schema'
+import { assertReviewablePath, DEFAULT_WORKFLOW_DIRECTORY, isInsideDirectory, OPERATIONAL_PATH_SEGMENTS } from './paths'
+import { findingSeverities, modulePlanSchema, reviewOutputSchema, type Finding, type ModulePlan, type ReviewModule } from './schema'
 
 export type { ReviewFailure } from './errors'
 
@@ -26,11 +26,17 @@ export interface ReviewReport {
   runId: string
   workflowDirectory: string
   cwd: string
+  /** 'completed' only when every review/verification angle completed and the fix
+   * (if requested) did not fail; engine-level interruption also downgrades to 'incomplete'. */
   status: 'completed' | 'incomplete'
   plan: ModulePlan
   scope: { moduleIds: string[]; angleIds: string[] }
   modules: ModuleReview[]
   fix: FixReport | null
+  /** Post-fix re-review of the selected scope; null unless a fix was applied. */
+  verification: ModuleReview[] | null
+  /** Findings from the authoritative pass: verification when a fix was applied, otherwise the original review. */
+  findingCount: number
 }
 
 export type ReviewProgress =
@@ -87,7 +93,10 @@ async function sourceFile(cwd: string, file: string, directory: string): Promise
   const absolute = await realpath(resolve(cwd, file))
   await assertReviewablePath(cwd, absolute, directory)
   const local = relative(cwd, absolute)
-  if (local === '..' || local.startsWith(`..${sep}`) || isAbsolute(local) || !(await stat(absolute)).isFile()) {
+  // realpath on both sides makes escape impossible; the containment re-check is
+  // defensive (the boundary is enforced by assertReviewablePath in paths.ts).
+  // The isFile() test is the live condition here.
+  if (!isInsideDirectory(cwd, absolute) || !(await stat(absolute)).isFile()) {
     throw new Error(`Source file is outside the review directory or is not a file: ${file}`)
   }
   return local.split(sep).join('/')
@@ -99,6 +108,9 @@ async function validatePlan(cwd: string, plan: ModulePlan, directory: string): P
   const modules: ReviewModule[] = []
   for (const module of plan.modules) {
     if (ids.has(module.id)) throw new Error(`Duplicate module id: ${module.id}`)
+    // Workflow step keys (`${phase}:${JSON.stringify([module.id, angle.id])}`) are
+    // capped at 1024 bytes by the workflow engine; reject oversized ids before dispatch.
+    if (Buffer.byteLength(module.id) > 256) throw new Error(`Module id is too long (max 256 bytes): ${module.id.slice(0, 64)}`)
     ids.add(module.id)
     const owned: string[] = []
     for (const file of module.files) {
@@ -125,7 +137,7 @@ async function validateFindings(cwd: string, module: ReviewModule, findings: Fin
       lines = text.length === 0 ? 0 : segments.length - (segments.at(-1) === '' ? 1 : 0)
       lineCounts.set(file, lines)
     }
-    if (finding.lineEnd < finding.lineStart || finding.lineEnd > lines) throw new Error(`Invalid finding location: ${file}:${finding.lineStart}-${finding.lineEnd}; expected 1 <= lineStart <= lineEnd <= ${lines}`)
+    if (finding.lineStart < 1 || finding.lineEnd < finding.lineStart || finding.lineEnd > lines) throw new Error(`Invalid finding location: ${file}:${finding.lineStart}-${finding.lineEnd}; expected 1 <= lineStart <= lineEnd <= ${lines}`)
     validated.push({ ...finding, file })
   }
   return validated
@@ -160,10 +172,16 @@ export async function reviewCode(options: ReviewOptions): Promise<ReviewReport> 
   if (moduleIds && (moduleIds.length === 0 || moduleIds.some(id => !id.trim()) || new Set(moduleIds).size !== moduleIds.length)) {
     throw new Error('moduleIds must contain unique nonempty module ids')
   }
+  if (moduleIds && moduleIds.some(id => Buffer.byteLength(id) > 256)) {
+    throw new Error('moduleIds must be at most 256 bytes each (workflow step-key limit)')
+  }
   const angles = (options.angles ?? defaultAngles).map(angle => ({ ...angle }))
   if (angles.length === 0 || angles.some(angle => !angle.id.trim() || !angle.title.trim() || !angle.instructions.trim())
     || new Set(angles.map(angle => angle.id)).size !== angles.length) {
     throw new Error('Review angles must have unique nonempty ids and nonempty titles and instructions')
+  }
+  if (angles.some(angle => Buffer.byteLength(angle.id) > 256)) {
+    throw new Error('Review angle ids must be at most 256 bytes (workflow step-key limit)')
   }
   const cwd = await realpath(resolve(options.cwd))
   if (!(await stat(cwd)).isDirectory()) throw new Error(`Review directory is not a directory: ${cwd}`)
@@ -174,12 +192,16 @@ Inspect the directory structure, source files, package boundaries, callers, and 
 Return a summary and a nonempty module list with stable unique ids, names,
 responsibilities in description, and explicit source file paths relative to the working directory.
 Assign each reviewable source file to exactly one module. Exclude dependencies,
-generated files, build output, vendored code, and .anureo workflow records. Modules may read each other's files
+generated files, build output, vendored code, and operational directories
+(${OPERATIONAL_PATH_SEGMENTS.join(', ')}) including workflow records. Modules may read each other's files
 as context, but each file has only one owner for findings. Keep modules small enough
 for an independent review. Do not review the modules yet.${context}
 
 ${readOnlyInstructions}`
-  const directory = resolve(options.workflowDirectory ?? resolve(cwd, '.anureo/workflows'))
+  const directory = resolve(options.workflowDirectory ?? resolve(cwd, DEFAULT_WORKFLOW_DIRECTORY))
+  // revision '4': bump when the persisted input/checkpoint shape changes so old
+  // run directories are not resumed. sourceVersion/backendConfiguration are
+  // reserved for future fingerprinting and intentionally null (see reuse note).
   const completed = await workflow({
     name: 'code-review', revision: '4', directory,
     input: {
@@ -237,7 +259,7 @@ risks. State required preconditions; do not claim an unperformed test or invente
 measurement. Check existing guards, documented tradeoffs, and consumers before
 reporting. Consolidate instances of the same root cause and remedy into one finding;
 do not repeat it merely because several checklist items apply.
-Severity: P0 critical, P1 high, P2 medium, P3 low. Prioritize demonstrated impact
+Severity: ${findingSeverities.join(', ')}. Prioritize demonstrated impact
 and scope rather than code size, pattern names, or the number of affected lines.
 Return an empty findings array if no supported issues are found.${context}${recheck}
 
@@ -259,13 +281,17 @@ ${readOnlyInstructions}`
           options.onProgress?.({ ...progress, status: result.status === 'completed' ? 'completed' : 'failed' })
           return result
         })))
+        // parallel() preserves input order; a null slot means that callback failed,
+        // so fall back by index into the matching input array (hence the assertions).
         return { module, angles: results.map((result, index) => result ?? {
-          angle: angles[index]!, status: 'failed', error: failure(new Error('Review task failed before producing a result')),
+          angle: angles[index]!, status: 'failed',
+          error: failure(new Error(`Angle task for ${angles[index]!.id} failed before producing a result`)),
         }) }
       }))
       return modules.map((result, index): ModuleReview => result ?? {
         module: selectedModules[index]!,
-        angles: angles.map(angle => ({ angle, status: 'failed', error: failure(new Error('Module review task failed')) })),
+        angles: angles.map(angle => ({ angle, status: 'failed',
+          error: failure(new Error(`Module task for ${selectedModules[index]!.id} failed before producing a result`)) })),
       })
     }
     const reviews = await runReviews('review')
@@ -274,12 +300,16 @@ ${readOnlyInstructions}`
       ...(options.fixPermissionMode !== undefined ? { permissionMode: options.fixPermissionMode } : {}),
       onProgress: status => options.onProgress?.({ stage: 'fix', status }),
     }) : null
-    if (fix?.status === 'applied') fix.verification = await runReviews('verification', reviews)
-    const complete = [...reviews, ...(fix?.verification ?? [])].every(module => module.angles.every(angle => angle.status === 'completed'))
+    const verification = fix?.status === 'applied' ? await runReviews('verification', reviews) : null
+    const complete = [...reviews, ...(verification ?? [])].every(module => module.angles.every(angle => angle.status === 'completed'))
+    const fixFailed = fix?.status === 'failed'
+    const findingCount = [...(verification ?? reviews)].reduce((count, module) =>
+      count + module.angles.reduce((sum, angle) => sum + (angle.status === 'completed' ? angle.findings.length : 0), 0), 0)
     return {
-      runId: run.runId, workflowDirectory: directory, cwd, plan, modules: reviews, fix,
+      runId: run.runId, workflowDirectory: directory, cwd, plan, modules: reviews, fix, verification,
       scope: { moduleIds: selectedModules.map(module => module.id), angleIds: angles.map(angle => angle.id) },
-      status: complete && fix?.status !== 'failed' ? 'completed' : 'incomplete',
+      status: complete && !fixFailed ? 'completed' : 'incomplete',
+      findingCount,
     }
   })
   return { ...completed.result, status: completed.status === 'incomplete' ? 'incomplete' : completed.result.status }

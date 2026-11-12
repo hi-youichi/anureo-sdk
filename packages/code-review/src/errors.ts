@@ -6,7 +6,9 @@ export interface ReviewFailure {
 }
 
 /** Normalize thrown values; retain only valid path/code pairs from details.issues.
- * Accept string paths (Ajv JSON pointers) and segment arrays (Zod).
+ * String paths are assumed to be trusted Ajv JSON pointers from the SDK's own
+ * validator and are passed through unchanged; only their shape-unknown array
+ * variant is strictly filtered.
  * Omit malformed issues, issue messages, and extra details to avoid exposing
  * private validation diagnostics. */
 export function reviewFailure(cause: unknown): ReviewFailure {

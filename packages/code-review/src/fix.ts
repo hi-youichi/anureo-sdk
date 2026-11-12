@@ -2,10 +2,11 @@ import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { promisify } from 'node:util'
 import { lstat, readFile, readlink, realpath } from 'node:fs/promises'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { relative, resolve, sep } from 'node:path'
 import { HarnessSdkError, type Client } from '@anureo/sdk'
 import { agent, type WorkflowContext } from '@anureo/workflow'
 import { reviewFailure, type ReviewFailure } from './errors'
+import { isInsideDirectory } from './paths'
 import { fixResultSchema } from './schema'
 import type { ModuleReview } from './review'
 
@@ -16,8 +17,9 @@ export interface FixReport {
   summary: string
   changedFiles: string[]
   error: ReviewFailure | null
-  verification: ModuleReview[] | null
 }
+// Post-fix verification reviews are owned by ReviewReport (src/review.ts),
+// not by this fix-specific record.
 
 /** One `git status --porcelain=v1 -z` entry with its path normalized relative to cwd. */
 interface TreeEntry {
@@ -32,7 +34,9 @@ interface TreeState {
 
 const fixInstructions = `Fix the findings by editing the listed source files directly in the working tree.
 Read the surrounding code, callers, and tests first, and run the project's typecheck and
-test commands when available to verify the changes. Only modify the listed source files;
+test commands when available to verify the changes, preferring read-only invocations
+such as --noEmit or dry-run flags; files that check commands write into the project
+directory are treated as scope violations. Only modify the listed source files;
 do not add, delete, or rename files, and do not mutate unrelated state such as
 dependencies or git history. Preserve existing uncommitted changes and leave every
 other path untouched. Do not require a clean working tree or ask to commit or stash.
@@ -74,7 +78,7 @@ async function storagePrefixes(cwd: string, directory: string): Promise<string[]
   const prefixes = new Set<string>()
   for (const candidate of candidates) {
     const local = relative(cwd, candidate)
-    if (local !== '' && !local.startsWith(`..${sep}`) && !isAbsolute(local)) prefixes.add(local.split(sep).join('/'))
+    if (isInsideDirectory(cwd, candidate, false)) prefixes.add(local.split(sep).join('/'))
   }
   return [...prefixes]
 }
@@ -128,7 +132,11 @@ async function reviewTree(cwd: string, root: string, allowed: readonly string[],
     const current = await fileState(cwd, file)
     if (current.fingerprint === (previous?.fingerprint ?? null)) continue
     if (scope.has(file) && previous?.regular && current.regular) changedFiles.push(file)
-    else violations.push(`${JSON.stringify(entries.get(file) ?? '  ')} ${file}`)
+    else {
+      // '  ' marks a fingerprint-only change (mode/symlink retarget) with no git status code.
+      const status = (entries.get(file) ?? '  ').trimEnd() || 'modified'
+      violations.push(`${status} ${file}`)
+    }
   }
   return { changedFiles: changedFiles.sort(), violations }
 }
@@ -142,10 +150,12 @@ export async function fixFindings(options: {
   model?: string
   /** Session permission mode enabling the fix agent to edit files and run checks. */
   permissionMode?: string
+  /** 'not-needed' and 'skipped' FixReport statuses are both reported as 'skipped';
+   * consult the returned report for the distinction. */
   onProgress?: (status: 'started' | 'completed' | 'failed' | 'skipped') => void
 }): Promise<FixReport> {
   const { run, cwd, modules } = options
-  const result: FixReport = { status: 'skipped', summary: '', changedFiles: [], error: null, verification: null }
+  const result: FixReport = { status: 'skipped', summary: '', changedFiles: [], error: null }
   if (modules.some(module => module.angles.some(angle => angle.status !== 'completed'))) {
     result.summary = 'Fix skipped because the selected review is incomplete.'
     options.onProgress?.('skipped')
@@ -171,6 +181,10 @@ the working tree against git afterwards, then independently reviews the selected
 
 ${fixInstructions}`
   options.onProgress?.('started')
+  // Set once the step body captures the tree; lets the failure path reconcile
+  // what the agent actually changed instead of reporting an empty list. Wrapped
+  // in an object because the assignment happens inside the step closure.
+  const tree: { reconcile: (() => Promise<{ changedFiles: string[]; violations: string[] }>) | null } = { reconcile: null }
   try {
     const outcome = await run.step({
       key: 'fix:apply', input: { prompt, instructions: fixInstructions, permissionMode: options.permissionMode ?? null },
@@ -178,13 +192,16 @@ ${fixInstructions}`
     }, async () => {
       const root = await repositoryRoot(cwd)
       const before = await captureTree(cwd, root, files, options.directory)
+      tree.reconcile = () => reviewTree(cwd, root, files, options.directory, before)
       const output = await agent(prompt, {
         client: options.client, cwd, model: options.model,
+        // Omit the key entirely when unset; agent() treats an absent permissionMode
+        // as the session default (the step input above normalizes to null for storage).
         ...(options.permissionMode !== undefined ? { permissionMode: options.permissionMode } : {}),
         schema: fixResultSchema,
       })
       if (output === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Fix agent returned no result')
-      const { changedFiles, violations } = await reviewTree(cwd, root, files, options.directory, before)
+      const { changedFiles, violations } = await tree.reconcile()
       if (violations.length > 0) {
         // The agent already wrote files, so the tree is in a real, possibly partial state
         // the caller must resolve manually with git; the fix is reported as failed and the
@@ -192,6 +209,7 @@ ${fixInstructions}`
         throw new HarnessSdkError('REVIEW_FIX_SCOPE',
           `Fix changed paths outside the selected source files; inspect the working tree and revert with git: ${violations.join(', ')}`)
       }
+      // The agent's changedFiles is advisory (see fixResultSchema); git reconciliation above is authoritative.
       return { summary: output.summary, changedFiles }
     })
     result.summary = outcome.summary
@@ -205,6 +223,14 @@ ${fixInstructions}`
   } catch (cause) {
     result.status = 'failed'
     result.error = reviewFailure(cause)
+    // Surface partial work: an empty changedFiles again means "no files touched".
+    const after = tree.reconcile === null ? null : await tree.reconcile().catch(() => null)
+    if (after) {
+      result.changedFiles = after.changedFiles
+      if (after.violations.length > 0 && result.error && cause instanceof HarnessSdkError && cause.code !== 'REVIEW_FIX_SCOPE') {
+        result.error = { ...result.error, message: `${result.error.message}; out-of-scope changes: ${after.violations.join(', ')}` }
+      }
+    }
     if (!result.summary) result.summary = 'Fix failed.'
     options.onProgress?.('failed')
   }

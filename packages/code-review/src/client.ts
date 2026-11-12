@@ -7,16 +7,40 @@ import { createClient, type Client, type HarnessAdapter } from '@anureo/sdk'
 export const reviewHarnesses = ['codex', 'claude', 'hermes', 'pi'] as const
 export type ReviewHarness = (typeof reviewHarnesses)[number]
 
-function createAdapter(cwd: string, harness: ReviewHarness): HarnessAdapter {
-  switch (harness) {
-    case 'codex': return createCodexAdapter({ command: process.env.CODEX_BIN ?? 'codex', cwd })
-    case 'claude': return createClaudeAdapter({ defaultHome: true, env: process.env, ...(process.env.CLAUDE_BIN ? { command: process.env.CLAUDE_BIN } : {}) })
-    case 'hermes': return createHermesAdapter(process.env.HERMES_BIN ? { command: process.env.HERMES_BIN } : {})
-    case 'pi': return createPiAdapter()
-  }
+/** Shared env-override rule: an exported-but-empty value falls back to the default. */
+function binaryOverride(name: string, fallback: string): string {
+  return process.env[name]?.trim() || fallback
 }
 
-/** The CLI owns this client; library callers may supply any structured-output client. */
+/** Single owner of per-harness knowledge: adapter construction (including the
+ * CODEX_BIN/CLAUDE_BIN/HERMES_BIN override convention) and the fix agent's
+ * permission mode. `satisfies` makes adding a harness without both arms a
+ * compile error instead of a silently degraded fix session. */
+const harnessConfig = {
+  codex: {
+    adapter: (cwd: string) => createCodexAdapter({ command: binaryOverride('CODEX_BIN', 'codex'), cwd }),
+    fix: 'agent',
+  },
+  claude: {
+    adapter: () => createClaudeAdapter({ defaultHome: true, env: process.env,
+      ...(process.env.CLAUDE_BIN?.trim() ? { command: process.env.CLAUDE_BIN } : {}) }),
+    fix: 'bypassPermissions',
+  },
+  hermes: {
+    adapter: () => createHermesAdapter(process.env.HERMES_BIN?.trim() ? { command: process.env.HERMES_BIN } : {}),
+    fix: undefined,
+  },
+  pi: { adapter: () => createPiAdapter(), fix: undefined },
+} satisfies Record<ReviewHarness, { adapter: (cwd: string) => HarnessAdapter; fix: string | undefined }>
+
+function createAdapter(cwd: string, harness: ReviewHarness): HarnessAdapter {
+  return harnessConfig[harness].adapter(cwd)
+}
+
+/** The CLI owns this client; library callers may supply any structured-output client.
+ * `harness` must describe the adapter actually installed (including `override`):
+ * identity.adapterId becomes the session binding, so a mismatched pair fails or
+ * mislabels every session open far from the construction site. */
 export async function createReviewClient(cwd: string, harness: ReviewHarness = 'codex', override?: HarnessAdapter): Promise<Client> {
   return createClient({
     adapter: override ?? createAdapter(cwd, harness),
@@ -34,9 +58,5 @@ export async function createReviewClient(cwd: string, harness: ReviewHarness = '
 /** Session permission mode for the fix agent, which edits sources and runs project
  * checks directly. Hermes rejects the field outright; Pi already defaults to full access. */
 export function fixPermissionMode(harness: ReviewHarness): string | undefined {
-  switch (harness) {
-    case 'codex': return 'agent'
-    case 'claude': return 'bypassPermissions'
-    default: return undefined
-  }
+  return harnessConfig[harness].fix
 }

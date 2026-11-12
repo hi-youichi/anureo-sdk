@@ -1,3 +1,7 @@
+import { getLogger } from '@logtape/logtape'
+
+const catalogLogger = getLogger(['anureo', 'catalog'])
+
 export interface CatalogProbeEvent {
   phase: 'spawn' | 'handshake' | 'models' | 'dispose'
   outcome: 'started' | 'success' | 'error' | 'cancelled'
@@ -21,7 +25,23 @@ export function safeCatalogErrorCode(cause: unknown): string {
   return typeof code === 'string' && publicCodes.has(code) ? code : 'CATALOG_QUERY_FAILED'
 }
 export function emitCatalogPhase(options: CatalogProbeOptions, event: CatalogProbeEvent): void {
+  logCatalogPhase(event)
   try { options.onPhase?.(event) } catch { /* Diagnostics never own execution. */ }
+}
+
+function logCatalogPhase(event: CatalogProbeEvent): void {
+  try {
+    const properties = {
+      phase: event.phase,
+      outcome: event.outcome,
+      ...(event.durationMs === undefined ? {} : { durationMs: Math.round(event.durationMs) }),
+      ...(event.errorCode === undefined ? {} : { errorCode: event.errorCode }),
+      ...(event.nativeRpcCode === undefined ? {} : { nativeRpcCode: event.nativeRpcCode }),
+    }
+    if (event.outcome === 'error') catalogLogger.error('catalog {phase} {outcome}', properties)
+    else if (event.outcome === 'cancelled') catalogLogger.warn('catalog {phase} {outcome}', properties)
+    else catalogLogger.debug('catalog {phase} {outcome}', properties)
+  } catch { /* Logging never owns execution either. */ }
 }
 export async function catalogPhase<T>(options: CatalogProbeOptions, phase: CatalogProbeEvent['phase'], work: () => Promise<T>): Promise<T> {
   const started = performance.now()

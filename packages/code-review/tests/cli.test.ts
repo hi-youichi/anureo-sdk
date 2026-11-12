@@ -3,14 +3,7 @@ import { HarnessSdkError } from '@anureo/sdk'
 import { createScriptedAdapter } from '@anureo/conformance'
 import { runCli } from '../src/cli'
 import { createReviewClient } from '../src/client'
-import { finding, fixture, plan } from './helpers'
-
-function output() {
-  const stdout: string[] = []
-  const stderr: string[] = []
-  return { stdout: (text: string) => { stdout.push(text) }, stderr: (text: string) => { stderr.push(text) },
-    read: () => ({ stdout: stdout.join(''), stderr: stderr.join('') }) }
-}
+import { finding, fixture, output, plan } from './helpers'
 
 test.each([false, true])('production client passes session config through and refuses approval (deny option: %s)', async withDeny => {
   const codex = createScriptedAdapter()
@@ -41,9 +34,12 @@ test.each([false, true])('production client passes session config through and re
   expect(codex.disposeCount).toBe(1)
 })
 
-test('production Claude client initializes with the existing login home', async () => {
-  const client = await createReviewClient(process.cwd(), 'claude')
+test('production Claude client construction and disposal work with an injected adapter', async () => {
+  // Injected adapter: do not touch the machine's real Claude login home.
+  const claude = createScriptedAdapter()
+  const client = await createReviewClient(process.cwd(), 'claude', claude)
   await client.dispose()
+  expect(claude.disposeCount).toBe(1)
 })
 
 test('help and argument errors never initialize a backend', async () => {

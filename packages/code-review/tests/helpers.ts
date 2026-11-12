@@ -11,9 +11,28 @@ import type { ModulePlan } from '../src/schema'
 const clients: Client[] = []
 const directories: string[] = []
 afterEach(async () => {
-  await Promise.all(clients.splice(0).map(client => client.dispose()))
-  await Promise.all(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true })))
+  // Dispose failures must neither skip directory cleanup nor mask the test's result.
+  const disposed = await Promise.allSettled(clients.splice(0).map(client => client.dispose()))
+  await Promise.allSettled(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true })))
+  const failed = disposed.filter(result => result.status === 'rejected')
+  if (failed.length > 0) console.error('cleanup dispose failures:', failed.map(result => String(result.reason)))
 })
+
+/** Routing convention for scripted responses: `respond` receives the full prompt
+ * text; route on the stage prefixes below (stages.analyze / stages.fix /
+ * stages.verify) and on the module's compact JSON marker via isModule(id).
+ * Prompt-building changes in src must update these keys. */
+export const stages = { analyze: 'Analyze', fix: 'Fix these review findings', verify: 'Verify' } as const
+export const isAnalysis = (prompt: string) => prompt.startsWith(stages.analyze)
+export const isModule = (id: string) => (prompt: string) => prompt.includes(`"id":"${id}"`)
+
+/** Captured-IO recorder matching the CliDependencies stdout/stderr seam. */
+export function output() {
+  const stdout: string[] = []
+  const stderr: string[] = []
+  return { stdout: (text: string) => { stdout.push(text) }, stderr: (text: string) => { stderr.push(text) },
+    read: () => ({ stdout: stdout.join(''), stderr: stderr.join('') }) }
+}
 
 export const plan: ModulePlan = {
   summary: 'Two independent modules.',
@@ -29,8 +48,11 @@ export const finding = {
   file: 'a.ts', lineStart: 1, lineEnd: 1,
 }
 
+// respond is invoked only after fixture() returns (prompts are captured and
+// answered as turns are submitted), so callers may reference their own result
+// variable inside the callback.
 export async function fixture(
-  respond: (prompt: string) => unknown | Promise<unknown> = prompt => prompt.startsWith('Analyze') ? plan : { findings: [] },
+  respond: (prompt: string) => unknown | Promise<unknown> = prompt => isAnalysis(prompt) ? plan : { findings: [] },
   hooks: Omit<FakeAdapterOptions, 'execute'> = {},
 ) {
   const cwd = await mkdtemp(join(tmpdir(), 'anureo-review-'))

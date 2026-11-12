@@ -6,6 +6,7 @@ import { defaultAngles } from './angles'
 import { createReviewClient, fixPermissionMode, reviewHarnesses } from './client'
 import { formatFailure } from './errors'
 import { formatReport } from './report'
+import { DEFAULT_WORKFLOW_DIRECTORY } from './paths'
 import { DEFAULT_REVIEW_CONCURRENCY, reviewCode } from './review'
 
 const help = `Usage: anureo-review [directory] [options]
@@ -25,7 +26,7 @@ Options:
   --focus <text>          Additional focus for module analysis and review
   --fix                  Let an agent edit selected sources directly to fix findings,
                          then review again; existing uncommitted changes are allowed
-  --workflow-dir <path>   Durable run storage (default: <directory>/.anureo/workflows)
+  --workflow-dir <path>   Durable run storage (default: <directory>/${DEFAULT_WORKFLOW_DIRECTORY})
   --json                 Print the structured report as JSON
   --help, -h             Show this help
 
@@ -36,9 +37,13 @@ interface CliDependencies {
   createClient?: (cwd: string, harness: typeof reviewHarnesses[number]) => Promise<Client>
   stdout?: (text: string) => void
   stderr?: (text: string) => void
+  /** Ambient values overridable for tests; default to the process environment. */
+  cwd?: string
+  env?: Record<string, string | undefined>
 }
 
 export async function runCli(args: string[], dependencies: CliDependencies = {}): Promise<number> {
+  const env = dependencies.env ?? process.env
   const stdout = dependencies.stdout ?? (text => { process.stdout.write(text) })
   const stderr = dependencies.stderr ?? (text => { process.stderr.write(text) })
   try {
@@ -54,6 +59,8 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
     if (positionals.length > 1) throw new Error('Expected at most one review directory')
     const harness = values.harness === undefined ? 'codex' : reviewHarnesses.find(id => id === values.harness)
     if (!harness) throw new Error(`Unknown harness: ${values.harness}. Available: ${reviewHarnesses.join(', ')}`)
+    // The next three checks mirror reviewCode's validation in src/review.ts so
+    // flag-shaped errors name the flag; update both sites together.
     const concurrency = values.concurrency === undefined ? DEFAULT_REVIEW_CONCURRENCY : Number(values.concurrency)
     if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error('--concurrency must be a positive safe integer')
     const maxModules = values['max-modules'] === undefined ? undefined : Number(values['max-modules'])
@@ -67,13 +74,13 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
       if (!angle) throw new Error(`Unknown angle: ${id}. Available: ${defaultAngles.map(angle => angle.id).join(', ')}`)
       return angle
     })
-    const cwd = await realpath(resolve(positionals[0] ?? process.cwd()))
+    const cwd = await realpath(resolve(positionals[0] ?? dependencies.cwd ?? process.cwd()))
     if (!(await stat(cwd)).isDirectory()) throw new Error(`Review directory is not a directory: ${cwd}`)
     const client = await (dependencies.createClient ?? createReviewClient)(cwd, harness)
     let executionFailed = false
     try {
       const report = await reviewCode({
-        client, cwd, concurrency, focus: values.focus, model: values.model ?? process.env.CODEX_MODEL,
+        client, cwd, concurrency, focus: values.focus, model: values.model ?? env.CODEX_MODEL,
         angles, moduleIds: values.module, maxModules, fix: values.fix,
         ...(values.fix ? { fixPermissionMode: fixPermissionMode(harness) } : {}),
         workflowDirectory: values['workflow-dir'],
@@ -86,8 +93,9 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
       })
       stdout(values.json ? `${JSON.stringify(report, null, 2)}\n` : formatReport(report))
       if (report.status === 'incomplete') return 2
-      const finalModules = report.fix?.verification ?? report.modules
-      return finalModules.some(module => module.angles.some(angle => angle.status === 'completed' && angle.findings.length > 0)) ? 1 : 0
+      // findingCount comes from the authoritative pass: post-fix verification
+      // replaces the original review when a fix was applied (see reviewCode).
+      return report.findingCount > 0 ? 1 : 0
     } catch (cause) {
       executionFailed = true
       throw cause

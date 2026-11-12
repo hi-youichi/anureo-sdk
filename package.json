@@ -30,19 +30,19 @@
     "example:hermes": "bun examples/hermes.ts"
   },
   "devDependencies": {
-    "@anureo/sdk": "workspace:*",
-    "@anureo/conformance": "workspace:*",
-    "@anureo/adapter-codex": "workspace:*",
+    "@anureo/adapter-acp": "workspace:*",
     "@anureo/adapter-claude": "workspace:*",
+    "@anureo/adapter-codex": "workspace:*",
+    "@anureo/adapter-hermes": "workspace:*",
+    "@anureo/adapter-pi": "workspace:*",
+    "@anureo/code-review": "workspace:*",
+    "@anureo/conformance": "workspace:*",
+    "@anureo/protocol": "workspace:*",
+    "@anureo/sdk": "workspace:*",
+    "@anureo/workflow": "workspace:*",
     "@types/bun": "1.4.0",
     "@types/node": "22.15.3",
     "typescript": "5.8.3",
-    "@anureo/protocol": "workspace:*",
-    "@anureo/adapter-acp": "workspace:*",
-    "@anureo/adapter-pi": "workspace:*",
-    "@anureo/workflow": "workspace:*",
-    "@anureo/code-review": "workspace:*",
-    "zod": "4.6.7",
-    "@anureo/adapter-hermes": "workspace:*"
+    "zod": "4.6.7"
   }
 }

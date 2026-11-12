@@ -5,6 +5,8 @@ import { HarnessSdkError } from '@anureo/sdk'
 import { correctnessAngle, defaultAngles, designAngle, formatReport, reviewCode, type ReviewProgress } from '../src'
 import { reviewFailure } from '../src/errors'
 import { createReviewClient } from '../src/client'
+// Cross-package test dependency: hermes fake MCP server; coordinate changes
+// with packages/hermes/tests/helpers.ts.
 import { startFake } from '../../hermes/tests/helpers'
 import { finding, fixture, plan } from './helpers'
 

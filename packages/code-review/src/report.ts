@@ -19,9 +19,10 @@ function appendReviews(lines: string[], modules: readonly ModuleReview[]): void 
       } else if (result.findings.length === 0) {
         lines.push('No findings.')
       } else {
+        const indent = (text: string) => text.replace(/\n/g, '\n  ')
         for (const finding of result.findings) {
-          lines.push(`- [${finding.severity}] ${finding.title} (${finding.file}:${finding.lineStart}-${finding.lineEnd})`, `  ${finding.body}`,
-            `  Suggestion: ${finding.suggestion}`)
+          lines.push(`- [${finding.severity}] ${finding.title} (${finding.file}:${finding.lineStart}-${finding.lineEnd})`, `  ${indent(finding.body)}`,
+            `  Suggestion: ${indent(finding.suggestion)}`)
         }
       }
     }
@@ -38,13 +39,14 @@ export function formatReport(report: ReviewReport): string {
     lines.push('', `## Fix: ${report.fix.status}`, report.fix.summary)
     if (report.fix.changedFiles.length > 0) lines.push(`Changed files: ${report.fix.changedFiles.join(', ')}`)
     if (report.fix.error) {
-      lines.push(`Fix failed: ${report.fix.error.message} [${report.fix.error.code ?? 'UNKNOWN'}]`)
+      lines.push(`Fix failed: ${report.fix.error.message}${report.fix.error.code ? ` [${report.fix.error.code}]` : ''}`)
       appendIssues(lines, report.fix.error)
+      if (report.fix.error.outcomeUnknown) lines.push('Fix execution outcome is unknown; the working tree may contain partial changes.')
     }
-    if (report.fix.verification) {
-      lines.push('', '## Review after fixes')
-      appendReviews(lines, report.fix.verification)
-    }
+  }
+  if (report.verification) {
+    lines.push('', '## Review after fixes')
+    appendReviews(lines, report.verification)
   }
   return `${lines.join('\n')}\n`
 }

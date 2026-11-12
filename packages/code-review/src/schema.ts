@@ -12,8 +12,12 @@ export const modulePlanSchema = z.strictObject({
   modules: z.array(moduleSchema).min(1),
 })
 
+/** Authoritative severity vocabulary; review prompts derive their severity
+ * wording from this list — update them together. */
+export const findingSeverities = ['P0', 'P1', 'P2', 'P3'] as const
+
 export const findingSchema = z.strictObject({
-  severity: z.enum(['P0', 'P1', 'P2', 'P3']),
+  severity: z.enum(findingSeverities),
   title: z.string().min(1),
   body: z.string().min(1),
   suggestion: z.string().min(1),

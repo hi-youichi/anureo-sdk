@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 import { correctnessAngle, formatReport, reviewCode, type ReviewProgress } from '../src'
 import { runCli } from '../src/cli'
-import { finding, fixture, plan } from './helpers'
+import { finding, fixture, output, plan, stages } from './helpers'
 
 const exec = promisify(execFile)
 
@@ -30,14 +30,16 @@ async function fixFixture(options: {
   verify?: unknown
   review?: unknown
 } = {}) {
+  // Safe: fixture() only invokes respond after it returns, so context is
+  // assigned before any prompt is answered.
   const context = await fixture(async prompt => {
-    if (prompt.startsWith('Analyze')) return plan
-    if (prompt.startsWith('Fix these review findings')) {
+    if (prompt.startsWith(stages.analyze)) return plan
+    if (prompt.startsWith(stages.fix)) {
       if (options.fix) return options.fix(context.cwd)
       await writeFile(join(context.cwd, 'a.ts'), fixed)
       return fixResult
     }
-    if (prompt.startsWith('Verify')) return options.verify ?? { findings: [] }
+    if (prompt.startsWith(stages.verify)) return options.verify ?? { findings: [] }
     return options.review ?? { findings: [finding] }
   })
   return context
@@ -65,7 +67,7 @@ test('fix edits sources directly, reconciles changes from git, then reviews the 
   expect(report.status).toBe('completed')
   expect(report.fix).toMatchObject({ status: 'applied', changedFiles: ['a.ts'], error: null })
   expect(report.modules[0]?.angles[0]).toMatchObject({ findings: [finding] })
-  expect(report.fix?.verification?.[0]).toMatchObject({ module: { id: 'a' }, angles: [{ angle: { id: 'correctness' }, status: 'completed', findings: [] }] })
+  expect(report.verification?.[0]).toMatchObject({ module: { id: 'a' }, angles: [{ angle: { id: 'correctness' }, status: 'completed', findings: [] }] })
   expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe(fixed)
   expect(await readFile(join(cwd, 'b.ts'), 'utf8')).toContain('n || 1')
   expect(prompts).toHaveLength(4)
@@ -89,7 +91,7 @@ test('fix outside a git repository fails before dispatching a fix agent', async 
   const before = await readFile(join(cwd, 'a.ts'))
   const report = await reviewCode({ client, cwd, ...single, fix: true })
   expect(report.status).toBe('incomplete')
-  expect(report.fix).toMatchObject({ status: 'failed', changedFiles: [], verification: null, error: { code: 'REVIEW_FIX_INVALID', outcomeUnknown: false } })
+  expect(report.fix).toMatchObject({ status: 'failed', changedFiles: [], error: { code: 'REVIEW_FIX_INVALID', outcomeUnknown: false } })
   expect(report.fix?.error?.message).toContain('git repository')
   expect(await readFile(join(cwd, 'a.ts'))).toEqual(before)
   expect(prompts).toHaveLength(2)
@@ -136,7 +138,7 @@ test('existing changes are not reported as applied when the fix agent changes no
   await writeFile(join(cwd, 'a.ts'), existing)
   await writeFile(join(cwd, 'b.ts'), 'existing unrelated changes\n')
   const report = await reviewCode({ client, cwd, ...single, fix: true })
-  expect(report.fix).toMatchObject({ status: 'skipped', changedFiles: [], verification: null, error: null })
+  expect(report.fix).toMatchObject({ status: 'skipped', changedFiles: [], error: null })
   expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe(existing)
 })
 
@@ -167,24 +169,25 @@ test('further edits to an already dirty out-of-scope file still fail scope valid
 })
 
 test.each([
-  { name: 'edits an unselected module file', edit: async (cwd: string) => {
+  { name: 'edits an unselected module file', changed: ['a.ts'], edit: async (cwd: string) => {
     await writeFile(join(cwd, 'a.ts'), fixed)
     await writeFile(join(cwd, 'b.ts'), fixed)
   } },
-  { name: 'creates a new file', edit: async (cwd: string) => {
+  { name: 'creates a new file', changed: ['a.ts'], edit: async (cwd: string) => {
     await writeFile(join(cwd, 'a.ts'), fixed)
     await writeFile(join(cwd, 'new.ts'), 'new\n')
   } },
-  { name: 'deletes a selected source file', edit: async (cwd: string) => {
+  { name: 'deletes a selected source file', changed: [], edit: async (cwd: string) => {
     await writeFile(join(cwd, 'a.ts'), fixed)
     await unlink(join(cwd, 'a.ts'))
   } },
-])('out-of-scope fix changes fail-stop with the paths listed: $name', async ({ edit }) => {
+])('out-of-scope fix changes fail-stop with the paths listed: $name', async ({ changed, edit }) => {
   const { client, cwd, prompts } = await fixFixture({ fix: async directory => { await edit(directory); return fixResult } })
   await commitFixture(cwd)
   const report = await reviewCode({ client, cwd, ...single, fix: true })
   expect(report.status).toBe('incomplete')
-  expect(report.fix).toMatchObject({ status: 'failed', changedFiles: [], verification: null,
+  // In-scope edits made before the violation are still surfaced as changedFiles.
+  expect(report.fix).toMatchObject({ status: 'failed', changedFiles: changed,
     error: { code: 'REVIEW_FIX_SCOPE', outcomeUnknown: false } })
   expect(report.fix?.error?.message).toContain('revert with git')
   expect(prompts).toHaveLength(3)
@@ -195,7 +198,7 @@ test('a fix agent that changes nothing on disk stays skipped without verificatio
   await commitFixture(cwd)
   const events: ReviewProgress[] = []
   const report = await reviewCode({ client, cwd, ...single, fix: true, onProgress: event => events.push(event) })
-  expect(report.fix).toMatchObject({ status: 'skipped', changedFiles: [], verification: null })
+  expect(report.fix).toMatchObject({ status: 'skipped', changedFiles: [] })
   expect(report.modules[0]?.angles[0]).toMatchObject({ findings: [finding] })
   expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toContain('n || 1')
   expect(prompts).toHaveLength(3)
@@ -272,12 +275,12 @@ test.each([
 ])('CLI --fix uses post-fix review outcomes for exit status: %j', async ({ verify, code }) => {
   const { client, cwd, adapter } = await fixFixture({ verify })
   await commitFixture(cwd)
-  let stdout = '', stderr = ''
+  const io = output()
   expect(await runCli([cwd, '--max-modules', '1', '--angle', 'correctness', '--fix', '--json'], {
-    createClient: async () => client, stdout: text => { stdout += text }, stderr: text => { stderr += text },
+    ...io, createClient: async () => client,
   })).toBe(code)
-  expect(JSON.parse(stdout).fix.status).toBe('applied')
-  expect(stderr).toContain('[fix] completed')
-  expect(stderr).toContain('[verification/a/correctness]')
+  expect(JSON.parse(io.read().stdout).fix.status).toBe('applied')
+  expect(io.read().stderr).toContain('[fix] completed')
+  expect(io.read().stderr).toContain('[verification/a/correctness]')
   expect(adapter.disposeCount).toBe(1)
 })
