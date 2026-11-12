@@ -1,0 +1,792 @@
+{
+  "provenance": {
+    "piVersion": "1.5.2",
+    "model": "zai/glm-5.3-flash",
+    "recordedAt": "2026-11-11T12:08:46.801Z"
+  },
+  "events": [
+    {
+      "type": "agent_start"
+    },
+    {
+      "type": "message_start",
+      "message": {
+        "role": "system",
+        "content": "",
+        "timestamp": 1794398918837
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "system",
+        "content": "",
+        "timestamp": 1794398918837
+      }
+    },
+    {
+      "type": "message_start",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Run `echo hello` with the bash tool, then say done."
+          }
+        ],
+        "timestamp": 1794398918836
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Run `echo hello` with the bash tool, then say done."
+          }
+        ],
+        "timestamp": 1794398918836
+      }
+    },
+    {
+      "type": "message_start",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "start",
+        "index": 0
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": ""
+            }
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "delta",
+        "index": 0,
+        "delta": "{\""
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": ""
+            }
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "delta",
+        "index": 0,
+        "delta": "command"
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": ""
+            }
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "delta",
+        "index": 0,
+        "delta": "\":\""
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": "echo hello"
+            }
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "delta",
+        "index": 0,
+        "delta": "echo"
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": "echo hello"
+            }
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "delta",
+        "index": 0,
+        "delta": " hello"
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": "echo hello"
+            }
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "delta",
+        "index": 0,
+        "delta": "\""
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": "echo hello"
+            }
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "delta",
+        "index": 0,
+        "delta": ",\""
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": "echo hello"
+            }
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "delta",
+        "index": 0,
+        "delta": "timeout"
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": "echo hello",
+              "timeout": 10
+            }
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "delta",
+        "index": 0,
+        "delta": "\":"
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": "echo hello",
+              "timeout": 10
+            }
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "delta",
+        "index": 0,
+        "delta": "10"
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": "echo hello",
+              "timeout": 10
+            }
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "delta",
+        "index": 0,
+        "delta": ""
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": "echo hello",
+              "timeout": 10
+            }
+          }
+        ],
+        "stopReason": "toolUse",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 3326,
+          "output": 18,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 3344
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "delta",
+        "index": 0,
+        "delta": "}"
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": "echo hello",
+              "timeout": 10
+            }
+          }
+        ],
+        "stopReason": "toolUse",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 3326,
+          "output": 18,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 3344
+        }
+      },
+      "update": {
+        "kind": "toolcall",
+        "phase": "end",
+        "index": 0
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_267fcdea3dbc4a7891f7f7a3",
+            "name": "bash",
+            "arguments": {
+              "command": "echo hello",
+              "timeout": 10
+            }
+          }
+        ],
+        "stopReason": "toolUse",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398918869,
+        "usage": {
+          "input": 3326,
+          "output": 18,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 3344
+        }
+      }
+    },
+    {
+      "type": "tool_start",
+      "id": "call_267fcdea3dbc4a7891f7f7a3",
+      "name": "bash",
+      "args": {
+        "command": "echo hello",
+        "timeout": 10
+      }
+    },
+    {
+      "type": "tool_update",
+      "id": "call_267fcdea3dbc4a7891f7f7a3",
+      "name": "bash",
+      "partial": {
+        "content": []
+      }
+    },
+    {
+      "type": "tool_update",
+      "id": "call_267fcdea3dbc4a7891f7f7a3",
+      "name": "bash",
+      "partial": {
+        "content": [
+          {
+            "type": "text",
+            "text": "hello\n"
+          }
+        ],
+        "details": {}
+      }
+    },
+    {
+      "type": "tool_end",
+      "id": "call_267fcdea3dbc4a7891f7f7a3",
+      "name": "bash",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "hello\n"
+          }
+        ],
+        "structuredContent": {
+          "output": "hello\n",
+          "truncated": false,
+          "exit_code": 0,
+          "wall_time_seconds": 0
+        }
+      },
+      "isError": false
+    },
+    {
+      "type": "message_start",
+      "message": {
+        "role": "toolResult",
+        "content": [
+          {
+            "type": "text",
+            "text": "hello\n"
+          }
+        ],
+        "toolCallId": "call_267fcdea3dbc4a7891f7f7a3",
+        "toolName": "bash",
+        "isError": false,
+        "timestamp": 1794398924506
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "toolResult",
+        "content": [
+          {
+            "type": "text",
+            "text": "hello\n"
+          }
+        ],
+        "toolCallId": "call_267fcdea3dbc4a7891f7f7a3",
+        "toolName": "bash",
+        "isError": false,
+        "timestamp": 1794398924506
+      }
+    },
+    {
+      "type": "message_start",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Done"
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398924509,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Done"
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398924509,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "text",
+        "phase": "start",
+        "index": 0
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Done"
+          }
+        ],
+        "stopReason": "pending",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398924509,
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0
+        }
+      },
+      "update": {
+        "kind": "text",
+        "phase": "delta",
+        "index": 0,
+        "delta": "Done"
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Done"
+          }
+        ],
+        "stopReason": "stop",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398924509,
+        "usage": {
+          "input": 3094,
+          "output": 3,
+          "cacheRead": 256,
+          "cacheWrite": 0,
+          "totalTokens": 3353
+        }
+      },
+      "update": {
+        "kind": "text",
+        "phase": "end",
+        "index": 0
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Done"
+          }
+        ],
+        "stopReason": "stop",
+        "model": "glm-5.3-flash",
+        "provider": "zai",
+        "timestamp": 1794398924509,
+        "usage": {
+          "input": 3094,
+          "output": 3,
+          "cacheRead": 256,
+          "cacheWrite": 0,
+          "totalTokens": 3353
+        }
+      }
+    },
+    {
+      "type": "agent_end",
+      "willRetry": false
+    },
+    {
+      "type": "settled",
+      "aborted": false
+    }
+  ]
+}

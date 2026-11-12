@@ -22,6 +22,7 @@
     "example:dsh": "bun examples/dsh.ts",
     "example:workflow": "bun examples/workflow.ts",
     "example:workflow-schema": "bun examples/workflow-structured.ts",
+    "example:workflow-persistence": "bun examples/workflow-persistence.ts",
     "review": "bun packages/code-review/bin/anureo-review.ts",
     "review:readability": "bun packages/code-review/bin/anureo-review.ts --dimension D12",
     "fix:readability": "bun packages/code-review/bin/anureo-review.ts fix",
@@ -39,6 +40,7 @@
     "typescript": "5.8.3",
     "@anureo/protocol": "workspace:*",
     "@anureo/adapter-acp": "workspace:*",
+    "@anureo/adapter-pi": "workspace:*",
     "@anureo/workflow": "workspace:*",
     "zod": "4.6.7",
     "@anureo/adapter-hermes": "workspace:*"

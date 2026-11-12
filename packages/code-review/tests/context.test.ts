@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { parseReport } from '../src/fix'
 import { discoverPackages } from '../src/io'
-import { hash, ReviewContext } from '../src/context'
+import { hash, ReviewContext, SnapshotIntegrityError, mergePromptSources } from '../src/context'
 import { createDesignPlan } from '../src/review'
 import { readDesignConfig } from '../src/project'
 import type { LanguageAdapter } from '../src/language'
@@ -150,6 +150,45 @@ test('ignored contract references are independent of project documentation direc
   expect(context.baseline.has('specifications/state.adoc')).toBe(false)
 })
 
+test('UTF-8 BOM snapshots retain their exact bytes through text and evidence validation', async () => {
+  const text = '\ufeffexport const value = 1\n'
+  const cwd = await fixture({ 'bom.ts': text })
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  const snapshot = context.baseline.get('bom.ts')!
+  expect(snapshot.kind).toBe('text')
+  expect(snapshot.text).toBe(text)
+  expect(hash(snapshot.text)).toBe(snapshot.sha256!)
+  expect(() => context.validateEvidence([{ path: snapshot.path, snapshotId: snapshot.id, sha256: snapshot.sha256!,
+    symbol: 'value', startLine: 1, endLine: 1, quote: 'export const value = 1', role: 'declaration' }], new Set([snapshot.id]))).not.toThrow()
+})
+
+test('contract references cannot clamp escaped relative links into unrelated in-project files', async () => {
+  const cwd = await fixture({ '.gitignore': 'contract.md\nlocal.md\n', 'contract.md': 'unrelated internal contract',
+    'local.md': 'valid internal contract', 'README.md': '[escape](../contract.md)\n[encoded](%2e%2e/contract.md)\n[absolute](/contract.md)\n[valid](guide/../local.md)\n',
+    'docs/page.md': '[escape](../../contract.md)\n' })
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  expect(await context.contractReferences()).toEqual([{ path: 'local.md', kind: 'contract_reference', sha256: null }])
+})
+
+test('symbol evidence preserves repository context for baseline and reread language adapters', async () => {
+  const cwd = await fixture({ 'a.custom': 'step calculate = 1', 'registry.meta': 'calculate alternate' })
+  const adapter: LanguageAdapter = { id: 'cross-file-v1', supports: source => source.path.endsWith('.custom'),
+    index: (sources, _, repository) => sources.map(source => {
+      const name = /step (\w+)/.exec(source.text)?.[1] ?? ''
+      const registered = repository.some(file => file.path === 'registry.meta' && file.text.includes(name))
+      return { path: source.path, language: 'custom', adapter: 'cross-file-v1', capabilities: ['symbols'],
+        symbols: registered ? [{ name, startLine: 1, endLine: 1, column: 1, kind: 'step' }] : [],
+        imports: [], exports: [], calls: [], unknowns: [] }
+    }) }
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd), [adapter])
+  for (const name of ['calculate', 'alternate']) {
+    if (name === 'alternate') await writeFile(join(cwd, 'a.custom'), 'step alternate = 1')
+    const snapshot = name === 'calculate' ? context.baseline.get('a.custom')! : await context.acquire('a.custom')
+    expect(() => context.validateEvidence([{ path: snapshot.path, snapshotId: snapshot.id, sha256: snapshot.sha256!,
+      symbol: name, startLine: 1, endLine: 1, quote: `step ${name}`, role: 'step' }], new Set([snapshot.id]))).not.toThrow()
+  }
+})
+
 
 test('language navigation resolves declared package entries without assuming a source directory convention', async () => {
   const cwd = await fixture({ 'lib/package.json': JSON.stringify({ name: 'numbers', exports: './public.ts' }),
@@ -161,4 +200,177 @@ test('language navigation resolves declared package entries without assuming a s
   context = await ReviewContext.create(cwd, await discoverPackages(cwd))
   expect(context.index.find(i => i.path === 'caller.ts')!.imports[0]!.target).toBeNull()
   expect(context.index.find(i => i.path === 'caller.ts')!.unknowns.join()).toContain('Unresolved')
+})
+
+
+test('a rejected supplemental batch drains reads without registering partial snapshots', async () => {
+  const cwd = await fixture()
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  const original = context.currentSnapshot.bind(context)
+  let release!: () => void
+  let started!: () => void
+  let finished!: () => void
+  const readFinished = new Promise<void>(resolve => { finished = resolve })
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  const reading = new Promise<void>(resolve => { started = resolve })
+  context.currentSnapshot = async path => {
+    if (path === 'a.ts') {
+      started(); await waiting
+      try { return await original(path) } finally { finished() }
+    }
+    return original(path)
+  }
+  const before = [...context.snapshots.keys()]
+  const batch = context.resolveRequests([
+    { path: 'a.ts', symbol: null, query: null, reason: 'slow valid source' },
+    { path: 'missing.md', symbol: null, query: null, reason: 'missing source' },
+  ], 2)
+  // Observe rejection immediately, while still allowing the other read to drain.
+  const observed = batch.then(() => null, error => error)
+  await reading
+  release()
+  expect(await observed).toBeInstanceOf(Error)
+  await readFinished
+  await new Promise<void>(resolve => setImmediate(resolve))
+  expect([...context.snapshots.keys()]).toEqual(before)
+})
+
+test('long call-chain navigation stays bounded and preserves exact source locations', async () => {
+  const text = `const emoji = "😀"; const result = client${'.next()'.repeat(140)}\n`
+  const cwd = await fixture({ 'chain.ts': text })
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  const calls = context.index.find(item => item.path === 'chain.ts')!.calls
+  expect(calls).toHaveLength(140)
+  expect(calls.every(call => call.expression.length <= 513)).toBe(true)
+  expect(calls.some(call => call.expressionTruncated)).toBe(true)
+  for (const call of calls) {
+    const range = call.sourceRange!
+    const original = text.slice(range.start, range.end)
+    expect(original.startsWith('client')).toBe(true)
+    if (call.expressionTruncated) expect(call.expression).toBe(`${original.slice(0, 512)}…`)
+    else expect(call.expression).toBe(original)
+    expect(call.line).toBe(1)
+    expect(call.target).toBeNull()
+  }
+  expect(context.index[0]!.unknowns.join(' ')).toContain('truncated')
+})
+
+test('bare-package root entries cannot resolve sibling files outside the package', async () => {
+  for (const entry of [{ main: '.' }, { exports: './' }]) {
+    const files = { 'consumer.ts': "import { value } from 'widget'\nvalue()\n", 'pkg/package.json': JSON.stringify({ name: 'widget', ...entry }),
+      'pkg.ts': 'export function value() { return "outside" }\n', 'pkg/index.ts': 'export function value() { return "inside" }\n' }
+    const cwd = await fixture(files)
+    const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+    const consumer = context.index.find(item => item.path === 'consumer.ts')!
+    expect(consumer.imports[0]!.target).toBe('pkg/index.ts')
+    expect(consumer.calls[0]!.target?.path).toBe('pkg/index.ts')
+    await rm(join(cwd, 'pkg/index.ts'))
+    const missing = await ReviewContext.create(cwd, await discoverPackages(cwd))
+    const unresolved = missing.index.find(item => item.path === 'consumer.ts')!
+    expect(unresolved.imports[0]!.target).toBeNull()
+    expect(unresolved.calls[0]!.target).toBeNull()
+  }
+})
+
+
+test('snapshot adoption stages business evidence and rolls back registry and symbol state on rejection', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n', '.gitignore': 'contract.md\n', 'contract.md': 'old' })
+  const adapter: LanguageAdapter = { id: 'contract-test', supports: source => source.path === 'contract.md',
+    index: sources => sources.map(source => ({ path: source.path, language: 'contract', adapter: 'contract-test', capabilities: ['symbols'],
+      symbols: [{ name: source.text, startLine: 1, endLine: 1, column: 1, kind: 'contract' }], imports: [], exports: [], calls: [], unknowns: [] })) }
+  const packages = await discoverPackages(cwd)
+  const producer = await ReviewContext.create(cwd, packages, [adapter])
+  const saved = { ...await producer.acquire('contract.md'), id: 'historical-contract' }
+  const context = await ReviewContext.create(cwd, packages, [adapter])
+  const before = [...context.snapshots.keys()]
+  const citation = (snapshot: typeof saved) => [{ path: snapshot.path, snapshotId: snapshot.id, sha256: snapshot.sha256!,
+    symbol: snapshot.text, startLine: 1, endLine: 1, quote: snapshot.text, role: 'contract' }]
+  expect(() => context.adoptSnapshots([saved], () => {
+    context.validateEvidence(citation(saved), new Set([saved.id]))
+    throw new Error('business rejection')
+  })).toThrow('business rejection')
+  expect([...context.snapshots.keys()]).toEqual(before)
+  await writeFile(join(cwd, 'contract.md'), 'new')
+  const incoming = { ...saved, text: 'new', sha256: hash('new') }
+  expect(await context.matchesSavedSnapshots([incoming])).toBe(true)
+  context.adoptSnapshots([incoming], () => {
+    context.validateEvidence(citation(incoming), new Set([incoming.id]))
+    return true
+  })
+  expect(Object.isFrozen(context.snapshots.get(incoming.id))).toBe(true)
+  incoming.text = 'caller mutation'
+  expect(context.snapshots.get(incoming.id)!.text).toBe('new')
+})
+
+test('snapshot admission rejects corrupt batches and conflicting identities without partial registration', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n' })
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  const source = context.baseline.get('a.ts')!
+  const saved = { ...source, id: `${source.id}:saved` }
+  const before = [...context.snapshots.keys()]
+  expect(() => context.adoptSnapshots([saved, { ...saved, id: 'corrupt', text: 'changed without digest' }], () => true)).toThrow(SnapshotIntegrityError)
+  expect([...context.snapshots.keys()]).toEqual(before)
+  await expect(context.matchesSavedSnapshots([saved, saved])).rejects.toBeInstanceOf(SnapshotIntegrityError)
+  context.adoptSnapshots([saved], () => true)
+  const conflicting = { ...saved, text: 'different', sha256: hash('different') }
+  expect(() => context.adoptSnapshots([conflicting], () => true)).toThrow(SnapshotIntegrityError)
+  expect(context.snapshots.get(saved.id)!.text).toBe(source.text)
+})
+
+test('changed and missing saved sources are cache misses without granting evidence access', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n', '.gitignore': 'contract.md\n', 'contract.md': 'original' })
+  const packages = await discoverPackages(cwd)
+  const producer = await ReviewContext.create(cwd, packages)
+  const saved = await producer.acquire('contract.md')
+  const context = await ReviewContext.create(cwd, packages)
+  expect(await context.matchesSavedSnapshots([saved])).toBe(true)
+  await writeFile(join(cwd, 'contract.md'), 'changed')
+  expect(await context.matchesSavedSnapshots([saved])).toBe(false)
+  await rm(join(cwd, 'contract.md'))
+  expect(await context.matchesSavedSnapshots([saved])).toBe(false)
+  expect(context.snapshots.has(saved.id)).toBe(false)
+})
+
+
+test('prompt source compaction keeps supplied IDs and all distinct versions without losing read history', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n' })
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  const original = context.baseline.get('a.ts')!
+  const repeated = await context.acquire('a.ts')
+  let sources = mergePromptSources([original], [repeated])
+  expect(sources.map(source => source.id)).toEqual([original.id])
+  expect(context.snapshots.has(repeated.id)).toBe(true)
+  await writeFile(join(cwd, 'a.ts'), 'export const a = 2\n')
+  const changed = await context.acquire('a.ts')
+  sources = mergePromptSources(sources, [changed, repeated])
+  expect(sources.map(source => source.id)).toEqual([original.id, changed.id])
+  await writeFile(join(cwd, 'a.ts'), original.text)
+  const restored = await context.acquire('a.ts')
+  expect(mergePromptSources(sources, [restored]).map(source => source.id)).toEqual([original.id, changed.id])
+  expect(context.snapshots.has(restored.id)).toBe(true)
+  expect(await context.changes()).toEqual(['a.ts'])
+})
+
+test('different unavailable-source diagnostics remain distinct prompt facts', () => {
+  const first = { id: 'first', path: 'a.ts', kind: 'unavailable' as const, sha256: null, text: '', error: 'missing' }
+  const second = { ...first, id: 'second', error: 'access denied' }
+  expect(mergePromptSources([first], [second])).toEqual([first, second])
+})
+
+test('non-text-only scope fails locally while mixed text and metadata remain reviewable', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n', 'data.bin': '\0binary' })
+  await symlink('a.ts', join(cwd, 'link.ts'))
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  expect(() => createDesignPlan(context, { scope: ['data.bin', 'link.ts'] })).toThrow('Scope must include readable source text')
+  expect(createDesignPlan(context, { scope: ['a.ts', 'data.bin', 'link.ts'] }).primaryFiles).toEqual(['a.ts', 'data.bin', 'link.ts'])
+})
+
+test('BOM package manifests retain byte identity and resolve their exported entry', async () => {
+  const cwd = await fixture({ 'pkg/package.json': '\uFEFF{"name":"bom-package","exports":"./entry.ts"}',
+    'pkg/entry.ts': 'export const a = 1\n', 'consumer.ts': "import { a } from 'bom-package'\nconsole.log(a)\n" })
+  const context = await ReviewContext.create(cwd, await discoverPackages(cwd))
+  const manifest = context.baseline.get('pkg/package.json')!
+  expect(manifest.text.startsWith('\uFEFF')).toBe(true)
+  expect(hash(manifest.text)).toBe(manifest.sha256!)
+  expect(context.index.find(item => item.path === 'consumer.ts')!.imports[0]!.target).toBe('pkg/entry.ts')
 })

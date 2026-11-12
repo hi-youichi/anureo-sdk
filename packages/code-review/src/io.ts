@@ -1,11 +1,12 @@
 import { execFileSync } from 'node:child_process'
-import { lstat, mkdir, readFile, realpath, writeFile, rename } from 'node:fs/promises'
+import { lstat, mkdir, readFile, realpath, writeFile, rename, rm } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { isProjectMarker, type DesignConfig } from './project'
+import { HarnessSdkError } from '@anureo/sdk'
 
 export type Package = { path: string; name: string; files: string[] }
-export const reportRoots = ['.anureo/reviews', '.anureo/fixes', 'draft/docs/readability-review', 'draft/docs/readability-fix', 'draft/docs/design-review']
+export const reportRoots = ['.anureo/reviews', '.anureo/fixes', '.anureo/workflows', 'draft/docs/readability-review', 'draft/docs/readability-fix', 'draft/docs/design-review']
 export function isReviewOutput(path: string, exclusions: readonly string[] = []) {
   return [...reportRoots, ...exclusions].some(root => path === root || path.startsWith(`${root}/`))
 }
@@ -65,11 +66,30 @@ export function createGate(concurrency: number) {
 
 /** Unique temp paths avoid torn records; each logical artifact has one writer. */
 export async function saveJson(path: string, value: unknown) {
-  await mkdir(dirname(path), { recursive: true })
-  const temp = `${path}.${randomUUID()}.tmp`
-  await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`)
-  await rename(temp, path)
+  let temp: string | undefined
+  try {
+    const text = `${JSON.stringify(value, null, 2)}\n`
+    await mkdir(dirname(path), { recursive: true })
+    temp = `${path}.${randomUUID()}.tmp`
+    await writeFile(temp, text, { mode: 0o600 })
+    await rename(temp, path)
+  } catch {
+    if (temp) await rm(temp, { force: true }).catch(() => {})
+    throw new HarnessSdkError('WORKFLOW_STORAGE_FAILED')
+  }
 }
 export function errorText(error: unknown): string {
-  return error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+  const messages: string[] = [], pending: unknown[] = [error]
+  const seen = new Set<Error>()
+  while (pending.length) {
+    const current = pending.pop()
+    if (!(current instanceof Error)) { messages.push(String(current)); continue }
+    if (seen.has(current)) { messages.push('[Repeated error]'); continue }
+    seen.add(current)
+    messages.push(`${current.name}: ${current.message}`)
+    if (current instanceof AggregateError) {
+      for (let i = current.errors.length - 1; i >= 0; i--) pending.push(current.errors[i])
+    }
+  }
+  return messages.join('; ')
 }

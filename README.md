@@ -73,13 +73,14 @@ capability checks, and resource ownership.
 
 ## Workflow
 
-`@anureo/workflow` provides three primitives for ordinary TypeScript functions:
+`@anureo/workflow` provides composition and optional persistence for ordinary TypeScript functions:
 
 | Primitive | Purpose |
 | --- | --- |
 | `agent(prompt, { client, cwd })` | Run a fresh Session and return text or typed Zod data, with designated failures as `null`. |
 | `parallel(tasks)` | Start callbacks concurrently, wait for all to settle, and return results in input order. |
 | `pipeline(items, ...stages)` | Advance each item independently through its sequential stages and return results in input order. |
+| `workflow(options, body)` | Persist a run ID and explicit step results, then recover compatible work with `resumeFrom`. |
 
 Direct `agent()` calls return `null` for designated confirmed terminal failures;
 other failures throw. Pass a Zod object as `schema` to infer structured results.
@@ -90,6 +91,7 @@ Start with the [workflow package guide](packages/workflow/README.md). The
 [authoring guide](docs/workflow/SKILL.md) covers composition patterns and recovery;
 the [primitives reference](docs/workflow/README.md) documents parameters, results,
 and supported behavior, including differences from the Claude Code reference.
+The [persistence reference](docs/workflow/persistence.md) covers `run.step()` and failure recovery.
 
 ## Packages
 
@@ -102,9 +104,10 @@ composition, or `@anureo/protocol` for direct access to the wire contract.
 | [@anureo/adapter-codex](packages/codex/README.md) | Codex app-server adapter |
 | [@anureo/adapter-claude](packages/claude/README.md) | Claude Agent SDK adapter |
 | [@anureo/adapter-acp](packages/acp/README.md) | Standard ACP agents, including DSH |
+| [@anureo/adapter-pi](packages/pi/README.md) | Pi coding agent, embedded in-process through its TypeScript SDK |
 | [@anureo/adapter-ahp](packages/ahp/README.md) | External AHP harnesses over stdio or WebSocket |
 | [@anureo/adapter-hermes](docs/hermes-adapter.md) | Hermes canonical gateway through ticketed local WebSocket |
-| [@anureo/workflow](packages/workflow/README.md) | Agent calls, parallel tasks, and per-item pipelines |
+| [@anureo/workflow](packages/workflow/README.md) | Agent calls, parallel tasks, pipelines, and durable workflow steps |
 | [@anureo/code-review](docs/code-review-cli.md) | `anureo-review` CLI for code design and readability reviews |
 | [@anureo/protocol](packages/protocol/README.md) | AHP v1 JSON Schema, TypeScript types, and validation |
 | [@anureo/conformance](packages/conformance/README.md) | Shared conformance tests and scripted fixtures |
@@ -119,6 +122,7 @@ Every example uses a real backend and requires its credentials.
 | [Greeting](examples/greeting.ts) | `bun run example` | Authenticated Codex CLI; streams a greeting. |
 | [Workflow](examples/workflow.ts) | `bun run example:workflow` | Authenticated Codex CLI; prints arithmetic agent inputs, outputs, and a checked summary. |
 | [Zod workflow](examples/workflow-structured.ts) | `bun run example:workflow-schema all` | Authenticated Codex and Claude CLIs; returns typed `{ sum: 42 }` from the same Zod schema. Select `codex` or `claude` to run one backend. |
+| [Persistent workflow](examples/workflow-persistence.ts) | `bun run example:workflow-persistence [runId]` | Deterministic callbacks; saves a run ID and resumes completed steps without model requests. |
 | [Structured output](examples/structured-output.ts) | `bun run example:schema codex` | Authenticated Codex CLI; prints a parsed JSON result for `17 + 25`. Use `claude` for Claude, or omit the argument to run both backends. |
 | [DSH over ACP](examples/dsh.ts) | `bun run example:dsh` | DSH 0.2.2+ on PATH, Node.js 24.9+ for DSH, and configured DSH credentials; streams a reply and handles per-call approvals. |
 | [Hermes gateway](examples/hermes.ts) | `bun run example:hermes` | Configured Hermes with canonical gateway attach (v0.23.1 contract); runs arithmetic through the selected profile. See the [verification scope](docs/hermes-adapter.md#requirements-and-verification). |

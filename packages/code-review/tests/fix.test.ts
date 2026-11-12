@@ -1,17 +1,19 @@
+import { cleanupFixtures } from './fixtures/cleanup'
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID, createHash } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createClient, HarnessSdkError, type Client } from '@anureo/sdk'
 import { createScriptedAdapter } from '@anureo/conformance'
+import { fileURLToPath } from 'node:url'
+import { candidate as reviewCandidate, defaultOutput } from './fixtures/review-responses'
 import { fixReadability, parseReport, type Finding } from '../src/fix'
 
 const clients: Client[] = []
 const directories: string[] = []
 afterEach(async () => {
-  await Promise.all(clients.splice(0).map(client => client.dispose()))
-  await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true })))
+  await cleanupFixtures(clients, directories)
 })
 
 async function fixture(paths = ['a.ts', 'b.ts']) {
@@ -125,13 +127,23 @@ test('a false changed claim stops later findings in that file without dropping o
 
 test('an unknown native outcome prevents queued sessions and is never retried', async () => {
   const cwd = await fixture()
-  const harness = await backend(async () => { throw new HarnessSdkError('SOURCE_LOST', 'Unknown writer state', false, true) })
+  const harness = await backend(async input => {
+    await writeFile(join(cwd, input.finding.path), 'partial write before losing observation\n')
+    throw new HarnessSdkError('SOURCE_LOST', 'Unknown writer state', false, true)
+  })
   const result = await fixReadability({ ...harness, cwd, findings: [finding('a.ts'), finding('b.ts'), finding('a.ts', 2)],
     outputDir: join(cwd, 'out'), concurrency: 1,
   })
   expect(harness.calls).toHaveLength(1)
   expect(result.stopReason).toContain('Uncertain execution')
   expect(result.results.map(item => item.status)).toEqual(['failed', 'not_started', 'not_started'])
+  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('partial write before losing observation\n')
+  expect(result.results[0]!.changesKnown).toBe(false)
+  expect(result.results[0]!.unknownFiles.map(file => file.path)).toEqual(['a.ts'])
+  expect(result.results.slice(1).every(item => item.changesKnown)).toBe(true)
+  const saved = JSON.parse(await readFile(join(cwd, 'out/results.json'), 'utf8'))
+  expect(saved.results[0].changesKnown).toBe(false)
+  expect(saved.results[0].unknownFiles.map((file: { path: string }) => file.path)).toEqual(['a.ts'])
 })
 
 test('validates paths and concurrency before starting any agent', async () => {
@@ -143,4 +155,145 @@ test('validates paths and concurrency before starting any agent', async () => {
   await symlink(join(cwd, 'a.ts'), join(cwd, 'link.ts'))
   await expect(fixReadability({ ...options, findings: [finding('link.ts')] })).rejects.toThrow('regular project file')
   expect(harness.calls).toHaveLength(0)
+})
+
+
+test('fix CLI reports unknown changes after an editing observation fails', async () => {
+  const cwd = await fixture(['a.ts'])
+  const taskId = 'module:a:angle:D12'
+  const source = { id: 'snapshot:fixture', path: 'a.ts', sha256: finding('a.ts').sha256, kind: 'text', source: '1: original' }
+  const candidate = { ...reviewCandidate('D12', [source]), category: 'readability' as const, decision: 'local_refactor' as const, id: `${taskId}#1`, taskId }
+  const verification = defaultOutput({ task: 'design-verification', findings: [candidate] }) as { decisions: object[] }
+  const report = { reportKind: 'design-review', formatVersion: 2, cwd, changedPaths: [],
+    findings: [{ ...candidate, stale: false, canonicalId: candidate.id, review: verification.decisions[0] }],
+    tasks: [{ task: { id: taskId, level: 'module', primaryFiles: ['a.ts'], dimensions: ['D12'] },
+      status: 'completed', error: null, analysis: { summary: 'fixture', designContext: [] } }],
+  }
+  const reportPath = join(cwd, 'input.json'), outputDir = join(cwd, 'out')
+  await writeFile(reportPath, JSON.stringify(report))
+  const entry = fileURLToPath(new URL('./fixtures/review-cli.ts', import.meta.url))
+  const child = Bun.spawn([process.execPath, entry, 'fix', cwd, '--report', reportPath, '--output', outputDir], {
+    cwd, env: { ...process.env, FIX_UNKNOWN: '1' }, stdout: 'pipe', stderr: 'pipe',
+  })
+  const [code, stdout] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
+  expect(code).toBe(1)
+  expect(stdout).toContain('修改文件：未知')
+  expect(stdout).toContain('未观察：a.ts')
+  expect(stdout).not.toContain('修改文件：无')
+  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('partial write before losing observation\n')
+  const saved = JSON.parse(await readFile(join(outputDir, 'report.json'), 'utf8'))
+  expect(saved.complete).toBe(false)
+  expect(saved.results[0].changesKnown).toBe(false)
+  expect(saved.results[0].unknownFiles.map((file: { path: string }) => file.path)).toEqual(['a.ts'])
+})
+
+test('rejects pre-existing report drift before starting any repair session', async () => {
+  const cwd = await fixture()
+  await writeFile(join(cwd, 'b.ts'), 'unreviewed current content\n')
+  const harness = await backend(async () => { throw new Error('must not dispatch') })
+  await expect(fixReadability({ ...harness, cwd, findings: [finding('a.ts'), finding('b.ts')],
+    outputDir: join(cwd, 'out'), concurrency: 2,
+  })).rejects.toThrow('Report source changed before repair: b.ts')
+  expect(harness.adapter.opened).toHaveLength(0)
+  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('original\n')
+  expect(await readFile(join(cwd, 'b.ts'), 'utf8')).toBe('unreviewed current content\n')
+})
+
+
+test('repair groups choose an eligible accepted member when the report representative is pending or requires design work', async () => {
+  const taskId = 'module:a:angle:D12'
+  const source = { id: 'snapshot:fixture', path: 'a.ts', sha256: finding('a.ts').sha256, kind: 'text', source: '1: original' }
+  const base = { ...reviewCandidate('D12', [source]), category: 'readability' as const, decision: 'local_refactor' as const, taskId, stale: false }
+  const ids = [1, 2, 3].map(n => `${taskId}#${n}`)
+  const findings = ids.map(id => ({ ...base, id, canonicalId: ids[0]!, review: null as unknown }))
+  for (const value of findings) value.review = (defaultOutput({ task: 'design-verification', findings: [value] }) as { decisions: object[] }).decisions[0]
+  const report = { reportKind: 'design-review', formatVersion: 2, cwd: '/unused', changedPaths: [], findings,
+    tasks: [{ task: { id: taskId, level: 'module', primaryFiles: ['a.ts'], dimensions: ['D12'] }, status: 'completed', error: null, analysis: null }] }
+  const firstReview = findings[0]!.review as { verdict: string }
+  firstReview.verdict = 'pending'
+  expect(parseReport(JSON.stringify(report)).findings.map(f => f.id)).toEqual([ids[1]!])
+  firstReview.verdict = 'accepted'
+  findings[0]!.decision = 'structural_refactor' as typeof base.decision
+  expect(parseReport(JSON.stringify(report)).findings.map(f => f.id)).toEqual([ids[1]!])
+  findings[0]!.decision = 'local_refactor'
+  expect(parseReport(JSON.stringify(report)).findings.map(f => f.id)).toEqual([ids[0]!])
+})
+
+
+test('a stop requested during file preparation prevents session dispatch and persists not_started', async () => {
+  const cwd = await fixture(['a.ts'])
+  const harness = await backend(async () => { throw new Error('must not dispatch') })
+  let stopped = false
+  const report = await fixReadability({ ...harness, cwd, findings: [finding('a.ts')], outputDir: join(cwd, 'out'), concurrency: 1,
+    shouldStop: () => stopped, progress: message => { if (message.startsWith('start ')) stopped = true },
+  })
+  expect(harness.adapter.opened).toHaveLength(0)
+  expect(report.results[0]!.status).toBe('not_started')
+  expect(JSON.parse(await readFile(join(cwd, 'out/results.json'), 'utf8')).results[0].status).toBe('not_started')
+  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('original\n')
+})
+
+test('fix CLI waits for Client cleanup and records its failure before publishing completion', async () => {
+  const cwd = await fixture(['a.ts'])
+  const taskId = 'module:a:angle:D12'
+  const source = { id: 'snapshot:fixture', path: 'a.ts', sha256: finding('a.ts').sha256, kind: 'text', source: '1: original' }
+  const candidate = { ...reviewCandidate('D12', [source]), category: 'readability' as const, decision: 'local_refactor' as const, id: `${taskId}#1`, taskId }
+  const verification = defaultOutput({ task: 'design-verification', findings: [candidate] }) as { decisions: object[] }
+  const report = { reportKind: 'design-review', formatVersion: 2, cwd, changedPaths: [],
+    findings: [{ ...candidate, stale: false, canonicalId: candidate.id, review: verification.decisions[0] }],
+    tasks: [{ task: { id: taskId, level: 'module', primaryFiles: ['a.ts'], dimensions: ['D12'] },
+      status: 'completed', error: null, analysis: { summary: 'fixture', designContext: [] } }],
+  }
+  const reportPath = join(cwd, 'input.json')
+  await writeFile(reportPath, JSON.stringify(report))
+  for (const [cleanupFails, publishFails] of [[true, false], [false, false], [true, true]] as const) {
+    const outputDir = join(cwd, `out-${cleanupFails}-${publishFails}`)
+    const disposals = join(cwd, `disposals-${cleanupFails}-${publishFails}.json`)
+    const entry = fileURLToPath(new URL('./fixtures/fix-cleanup.ts', import.meta.url))
+    const child = Bun.spawn([process.execPath, entry, 'fix', cwd, '--report', reportPath, '--output', outputDir, '--format', 'json'], {
+      cwd, env: { ...process.env, FIX_REPORT: join(outputDir, 'report.json'), FIX_DISPOSALS: disposals, FIX_CLEANUP_FAIL: cleanupFails ? '1' : '0', FIX_PUBLISH_BLOCK: publishFails ? join(outputDir, 'report.md') : '' }, stdout: 'pipe', stderr: 'pipe',
+    })
+    const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
+    expect(code).toBe(cleanupFails ? 1 : 0)
+    expect(JSON.parse(await readFile(disposals, 'utf8'))).toEqual({ disposals: 1, reportExisted: false })
+    const saved = JSON.parse(await readFile(join(outputDir, 'report.json'), 'utf8'))
+    expect(saved.complete).toBe(!cleanupFails)
+    expect(saved.results[0].status).toBe('already_satisfied')
+    if (cleanupFails) expect(saved.errors.join(' ')).toContain('fixture client cleanup failure')
+    else expect(saved.errors).toEqual([])
+    if (publishFails) {
+      expect(stdout).toBe('')
+      expect(stderr).toContain('EISDIR')
+    } else {
+      expect(JSON.parse(stdout).complete).toBe(!cleanupFails)
+      expect(await readFile(join(outputDir, 'report.md'), 'utf8')).toContain(cleanupFails ? '本次修复未完整结束' : '选定局部建议已处理')
+    }
+    if (cleanupFails) expect(stderr).toContain('fixture client cleanup failure')
+    else expect(stderr).not.toContain('fixture client cleanup failure')
+    expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('original\n')
+    await expect(access(join(outputDir, 'writer.lock'))).rejects.toMatchObject({ code: 'ENOENT' })
+  }
+})
+
+
+test('failed group observation retains confirmed changes and the path-specific unreadable reason', async () => {
+  const cwd = await fixture()
+  const harness = await backend(async () => {
+    await writeFile(join(cwd, 'a.ts'), 'observed change\n')
+    await rm(join(cwd, 'b.ts'))
+    return { status: 'changed', summary: 'controlled edits', checks: [] }
+  })
+  const report = await fixReadability({ ...harness, cwd, findings: [finding('a.ts')],
+    writeGroups: [['a.ts', 'b.ts']], outputDir: join(cwd, 'out'), concurrency: 1,
+  })
+  const result = report.results[0]!
+  expect(result.status).toBe('failed')
+  expect(result.changedFiles).toEqual(['a.ts'])
+  expect(result.changesKnown).toBe(false)
+  expect(result.unknownFiles.map(file => file.path)).toEqual(['b.ts'])
+  expect(result.unknownFiles[0]!.error).toContain('ENOENT')
+  expect(harness.calls).toHaveLength(1)
+  const saved = JSON.parse(await readFile(join(cwd, 'out/results.json'), 'utf8'))
+  expect(saved.results[0].unknownFiles).toEqual(result.unknownFiles)
+  expect(saved.results[0].changedFiles).toEqual(['a.ts'])
 })

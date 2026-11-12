@@ -8,6 +8,53 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- Retain per-file unreadable paths and observation errors in repair JSON and Markdown.
+
+- Publish readability repair reports after Client cleanup; retain successful findings
+  alongside lifecycle failures and preserve report publication errors.
+
+- Identify changed resume configuration in review progress without restoring old defaults.
+
+- Retain structured call failure certainty, stop repair dispatch after interrupted
+  file preparation, and drain fixture releases before cleaning temporary resources.
+
+- Reject stale repair inputs and scopes without readable text, choose eligible repair
+  group representatives, clean failed JSON write temporaries, and preserve BOM
+  package entry resolution.
+
+- Add optional workflow persistence: `workflow(options, body)` provides a durable
+  run ID and explicit, schema-inferred `run.step()` checkpoints. Resume creates a
+  new run, validates and imports compatible results, and preserves effective
+  history across branches. Storage and unknown execution failures stop dispatch.
+  Code-review persists accepted plans and task evidence independently of final
+  reports; `--resume` can recover failed runs with an explicit backend configuration
+  fingerprint. Add deterministic persistence and process-crash recovery examples/tests.
+  Bound complete review tasks so checkpoints publish promptly; preserve UTF-8 BOM
+  hashes and repository-aware evidence validation. Legacy report reuse requires
+  matching backend provenance. Editing runs exclusively claim their output directories.
+  Keep long call-chain navigation bounded while retaining exact source ranges.
+  Validate duplicate roots before checkpoint/repair admission and compare restored
+  findings by value, independent of JSON object key ordering. Keep cross-task
+  grouping in the final summary so earlier task results cannot become hidden
+  verification inputs during recovery. Compact unrelated consumer navigation in
+  task prompts while retaining complete primary navigation and source snapshots.
+  Centralize snapshot adoption, validate immutable source identities, and roll back
+  provisional evidence when business validation rejects a restored result. Avoid
+  resending identical source copies while preserving distinct versions and read history.
+
+- Code-review repair reports expose `changesKnown`; uncertain native outcomes no
+  longer display an empty change set as no changes. Keep bare-package import
+  navigation candidates inside their package roots. Retain operation and cleanup
+  causes together in CLI diagnostics.
+
+- Add `@anureo/adapter-pi`, an in-process adapter for the Pi coding agent
+  (`@earendil-works/pi-coding-agent`, verified against 1.5.2). Supports submit,
+  steer/follow-up, interrupt, history, fork, resume and compaction, plus model,
+  thinking-level and `read-only`/`agent-full-access` permission configuration.
+  Pi has no approval gate, so permissions are enforced with tool allowlists and no
+  interactions, revert, goal or review are advertised. Pi runs inside the host
+  process with the host's credentials and file access; see the package README.
+
 - **BREAKING:** workflow `agent` supports Zod object schemas and infers
   `z.output<S> | null`; text mode now returns `string | null`. Convert schemas to
   native JSON Schema before submission, validate raw JSON and the original Zod

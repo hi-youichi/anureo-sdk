@@ -7,7 +7,11 @@ export type SourceSymbol = { name: string; startLine: number; endLine: number; c
 export type SourceIndex = {
   path: string; language: string; adapter: string; capabilities: Array<'symbols' | 'imports' | 'static_calls'>
   symbols: SourceSymbol[]; imports: Array<{ specifier: string; target: string | null }>
-  exports: string[]; calls: Array<{ expression: string; line: number; target: { path: string; line: number } | null }>
+  exports: string[]; calls: Array<{
+    expression: string; line: number; target: { path: string; line: number } | null
+    /** Zero-based UTF-16 offsets into the complete source snapshot, with an exclusive end. */
+    sourceRange?: { start: number; end: number }; expressionTruncated?: boolean
+  }>
   unknowns: string[]
 }
 /** Adapters supply navigation, never design judgements or runtime guarantees. IDs must version their semantics. */
@@ -25,7 +29,7 @@ const languages: Record<string, string> = {
   '.vue': 'vue', '.svelte': 'svelte', '.lua': 'lua', '.dart': 'dart', '.r': 'r',
 }
 const typescript: LanguageAdapter = {
-  id: 'typescript-compiler-v1', supports: source => /\.[cm]?[jt]sx?$/i.test(source.path), index: indexTypeScript,
+  id: 'typescript-compiler-v2', supports: source => /\.[cm]?[jt]sx?$/i.test(source.path), index: indexTypeScript,
 }
 
 /** Every text file remains reviewable, including extensionless code and an unknown DSL. */
@@ -47,5 +51,19 @@ export function buildIndex(snapshots: Snapshot[], packages: Package[], adapters:
     path: source.path, language: languages[extname(source.path).toLowerCase()] ?? 'unknown', adapter: 'text-v1', capabilities: [],
     symbols: [], imports: [], exports: [], calls: [],
     unknowns: ['No syntax adapter: full source, literal search and exact quotes are available. Empty symbols/imports/calls mean unindexed, never absent. Use explicit paths or literal queries; evidence.symbol must be empty.'],
+  })
+}
+
+/** Consumer hints are explicitly partial; only complete source snapshots authorize evidence. */
+export function taskNavigation(index: readonly SourceIndex[], primaryFiles: readonly string[]) {
+  const primary = new Set(primaryFiles)
+  return index.map(item => {
+    if (primary.has(item.path)) return item
+    const calls = item.calls.filter(call => call.target && primary.has(call.target.path))
+    return { ...item, navigationScope: 'inbound-only',
+      imports: item.imports.filter(link => link.target && primary.has(link.target)), calls,
+      symbols: item.symbols.filter(symbol => calls.some(call => symbol.startLine <= call.line && symbol.endLine >= call.line)),
+      exports: [], unknowns: ['This is a partial inbound navigation view. Other consumer symbols, calls and exports are not included; request the complete source when needed. Unresolved or dynamic relations remain unknown.'],
+    }
   })
 }

@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
+import { z } from 'zod'
 import { execFileSync } from 'node:child_process'
 import { lstat, readFile, readlink, realpath } from 'node:fs/promises'
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
@@ -8,10 +10,16 @@ export type { SourceIndex, SourceSymbol } from './language'
 import { discoverPackages, isReviewOutput, saveJson, type Package } from './io'
 import type { ContextRequest, Evidence } from './schema'
 
-export type Snapshot = {
-  id: string; path: string; sha256: string | null; kind: 'text' | 'binary' | 'symlink' | 'unavailable'
-  text: string; error: string | null
+export const snapshotSchema = z.strictObject({
+  id: z.string(), path: z.string(), sha256: z.string().nullable(),
+  kind: z.enum(['text', 'binary', 'symlink', 'unavailable']),
+  text: z.string(), error: z.string().nullable(),
+})
+export type Snapshot = Readonly<z.output<typeof snapshotSchema>>
+export class SnapshotIntegrityError extends Error {
+  constructor() { super('Invalid source snapshot') }
 }
+
 export function hash(value: string | Uint8Array) { return createHash('sha256').update(value).digest('hex') }
 export class ContextSelectionRequired extends Error {
   constructor(readonly paths: string[], readonly limit: number) { super(`Context file budget exceeded: ${paths.length} > ${limit}; choose explicit paths from candidates`) }
@@ -39,19 +47,28 @@ export async function readSnapshot(cwd: string, path: string, exclusions: readon
   let text: string
   try {
     if (bytes.includes(0)) throw new Error('Binary data')
-    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    // Preserve the BOM so decoded text round-trips to the bytes named by sha256.
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
   } catch { return { id: `snapshot:${hash(`${path}\0${sha256}`)}`, path, sha256, kind: 'binary', text: '', error: null } }
   return { id: `snapshot:${hash(`${path}\0${sha256}`)}`, path, sha256, kind: 'text', text, error: null }
 }
 
 export class ReviewContext {
-  readonly snapshots = new Map<string, Snapshot>()
-  readonly baseline = new Map<string, Snapshot>()
+  private readonly recordedSnapshots = new Map<string, Snapshot>()
+  get snapshots(): ReadonlyMap<string, Snapshot> { return this.recordedSnapshots }
+  private readonly primarySnapshots = new Map<string, Snapshot>()
+  get baseline(): ReadonlyMap<string, Snapshot> { return this.primarySnapshots }
   readonly index: SourceIndex[]
   private readonly evidenceSymbols = new Map<string, SourceSymbol[]>()
+  private readonly indexByPath: Map<string, SourceIndex>
   private constructor(readonly cwd: string, readonly packages: Package[], initial: Snapshot[], readonly adapters: readonly LanguageAdapter[], readonly exclusions: readonly string[]) {
-    for (const s of initial) { this.baseline.set(s.path, s); this.snapshots.set(s.id, s) }
-    this.index = buildIndex(initial, packages, adapters)
+    for (const source of initial) {
+      const snapshot = Object.freeze({ ...source })
+      this.primarySnapshots.set(snapshot.path, snapshot)
+      this.recordedSnapshots.set(snapshot.id, snapshot)
+    }
+    this.index = buildIndex([...this.baseline.values()], packages, adapters)
+    this.indexByPath = new Map(this.index.map(item => [item.path, item]))
   }
 
   static async create(cwd: string, packages: Package[], adapters: readonly LanguageAdapter[] = [], exclusions: readonly string[] = []) {
@@ -89,9 +106,56 @@ export class ReviewContext {
   async acquire(path: string): Promise<Snapshot> {
     const read = await this.currentSnapshot(path)
     if (read.kind !== 'text') throw new Error(`Context is not source text: ${path}`)
-    const snapshot = { ...read, id: `${read.id}:read-${randomUUID()}` }
-    this.snapshots.set(snapshot.id, snapshot)
+    return this.registerRead(read)
+  }
+
+  private registerRead(read: Snapshot): Snapshot {
+    const snapshot = Object.freeze({ ...read, id: `${read.id}:read-${randomUUID()}` })
+    this.recordedSnapshots.set(snapshot.id, snapshot)
     return snapshot
+  }
+
+  private decodeSavedSnapshots(values: readonly unknown[]): Snapshot[] {
+    let snapshots: Snapshot[]
+    try { snapshots = snapshotSchema.array().parse(values) }
+    catch { throw new SnapshotIntegrityError() }
+    const ids = new Set<string>()
+    for (const snapshot of snapshots) {
+      if (!snapshot.id || ids.has(snapshot.id) || (snapshot.kind === 'text' && hash(snapshot.text) !== snapshot.sha256)) throw new SnapshotIntegrityError()
+      ids.add(snapshot.id)
+      const existing = this.recordedSnapshots.get(snapshot.id)
+      if (existing && !isDeepStrictEqual(existing, snapshot)) throw new SnapshotIntegrityError()
+    }
+    return snapshots
+  }
+
+  /** A changed or missing source is a cache miss; malformed saved evidence is an error. */
+  async matchesSavedSnapshots(values: readonly unknown[]): Promise<boolean> {
+    const snapshots = this.decodeSavedSnapshots(values)
+    for (const snapshot of snapshots) {
+      let current: Snapshot
+      try { current = await this.currentSnapshot(snapshot.path) }
+      catch (cause) { if ((cause as NodeJS.ErrnoException).code === 'ENOENT') return false; throw cause }
+      if (current.kind !== snapshot.kind || current.sha256 !== snapshot.sha256) return false
+    }
+    return true
+  }
+
+  /** Stage immutable source facts for synchronous business checks; reject without leaking them. */
+  adoptSnapshots(values: readonly unknown[], validate: () => true): void {
+    const snapshots = this.decodeSavedSnapshots(values)
+    for (const snapshot of snapshots) if (!this.recordedSnapshots.has(snapshot.id)) this.assertContextPath(snapshot.path)
+    const staged: string[] = []
+    try {
+      for (const snapshot of snapshots) if (!this.recordedSnapshots.has(snapshot.id)) {
+        this.recordedSnapshots.set(snapshot.id, Object.freeze({ ...snapshot }))
+        staged.push(snapshot.id)
+      }
+      if (validate() !== true) throw new Error('Snapshot validation must explicitly accept synchronously')
+    } catch (cause) {
+      for (const id of staged) { this.recordedSnapshots.delete(id); this.evidenceSymbols.delete(id) }
+      throw cause
+    }
   }
 
   async contractReferences() {
@@ -102,7 +166,12 @@ export class ReviewContext {
         const target = match[1]!.replace(/^<|>$/g, '').split('#')[0]!
         if (!target || /^[a-z]+:/i.test(target)) continue
         let path: string
-        try { path = posix.resolve('/', posix.dirname(source.path), decodeURIComponent(target)).slice(1); this.assertContextPath(path) } catch { continue }
+        try {
+          const decoded = decodeURIComponent(target)
+          if (posix.isAbsolute(decoded) || /^[a-z][a-z0-9+.-]*:/i.test(decoded)) continue
+          path = posix.normalize(posix.join(posix.dirname(source.path), decoded))
+          this.assertContextPath(path)
+        } catch { continue }
         if (this.baseline.has(path)) continue
         try {
           const root = await realpath(this.cwd)
@@ -119,7 +188,9 @@ export class ReviewContext {
     const searches: Array<{ request: ContextRequest; matchedPaths: string[]; definitionPaths: string[]; candidateConsumerPaths: string[] }> = []
     for (const request of requests) {
       if (!request.path && !request.symbol && !request.query) throw new Error('Empty context request')
-      const definitions = request.symbol ? this.index.filter(item => item.symbols.some(s => s.name === request.symbol || s.name.endsWith(`.${request.symbol}`))).map(item => item.path) : []
+      const symbol = request.symbol
+      const definitions = symbol ? this.index.filter(item => item.symbols.some(s => s.name === symbol || s.name.endsWith(`.${symbol}`))).map(item => item.path) : []
+      const definitionPaths = new Set(definitions)
       let matched: string[]
       if (request.path) {
         this.assertContextPath(request.path)
@@ -128,17 +199,23 @@ export class ReviewContext {
       } else {
         const matches = [...this.baseline.values()].filter(source => source.kind === 'text'
           && (request.symbol
-            ? this.index.find(item => item.path === source.path)?.symbols.some(s => s.name === request.symbol || s.name.endsWith(`.${request.symbol}`))
+            ? definitionPaths.has(source.path)
               || source.text.includes(request.symbol)
             : !request.query || source.text.includes(request.query)))
         matched = matches.map(source => source.path)
         for (const match of matches) paths.add(match.path)
       }
       searches.push({ request, matchedPaths: matched, definitionPaths: definitions,
-        candidateConsumerPaths: matched.filter(path => !definitions.includes(path)) })
+        candidateConsumerPaths: matched.filter(path => !definitionPaths.has(path)) })
     }
     if (paths.size > maxFiles) throw new ContextSelectionRequired([...paths], maxFiles)
-    const snapshots = await Promise.all([...paths].map(path => this.acquire(path)))
+    // Drain all reads and validate the whole batch before publishing shared evidence.
+    const reads = await Promise.allSettled([...paths].map(path => this.currentSnapshot(path)))
+    const snapshots = reads.map(read => {
+      if (read.status === 'rejected') throw read.reason
+      if (read.value.kind !== 'text') throw new Error(`Context is not source text: ${read.value.path}`)
+      return read.value
+    }).map(read => this.registerRead(read))
     return { snapshots, resolution: { status: 'resolved', searches, searchedPaths: [...this.baseline.keys()],
       limitations: 'This is a static inventory search. Candidate consumers are navigation matches, not proven runtime calls. Zero matches means no match in this inventory, not no possible external consumer.',
       instruction: '若只命中已经提供的定义，仓库未提供更多对应实现/候选消费者；不要重复请求同一符号。结合已读契约审查接口与不变量，将外部运行事实标为假设或待验证。确实缺少必要源码时只将相应维度标 incomplete。' } }
@@ -148,19 +225,30 @@ export class ReviewContext {
     return (await this.resolveRequestsDetailed(requests, maxFiles)).snapshots
   }
 
-  validateEvidence(evidence: Evidence[], allowed: Set<string>) {
+  validateEvidence(evidence: Evidence[], allowed: Set<string>, linesBySnapshot = new Map<string, string[]>()) {
     for (const e of evidence) {
       const snapshot = this.snapshots.get(e.snapshotId)
       if (!snapshot || !allowed.has(e.snapshotId) || snapshot.kind !== 'text' || snapshot.path !== e.path || snapshot.sha256 !== e.sha256) {
         throw new Error(`Invalid evidence snapshot: ${e.path}`)
       }
-      const lines = snapshot.text.split('\n')
+      let lines = linesBySnapshot.get(snapshot.id)
+      if (!lines) { lines = snapshot.text.split('\n'); linesBySnapshot.set(snapshot.id, lines) }
       if (e.endLine < e.startLine || e.endLine > lines.length || !lines.slice(e.startLine - 1, e.endLine).join('\n').includes(e.quote)) {
         throw new Error(`Invalid source evidence: ${e.path}:${e.startLine}-${e.endLine}`)
       }
       if (e.symbol) {
         let symbols = this.evidenceSymbols.get(snapshot.id)
-        if (!symbols) { symbols = buildIndex([snapshot], this.packages, this.adapters)[0]?.symbols ?? []; this.evidenceSymbols.set(snapshot.id, symbols) }
+        if (!symbols) {
+          const baseline = this.baseline.get(snapshot.path)
+          if (baseline?.kind === snapshot.kind && baseline.sha256 === snapshot.sha256) {
+            symbols = this.indexByPath.get(snapshot.path)?.symbols ?? []
+          } else {
+            // Recheck this historical file in the repository view used for navigation.
+            const repository = [...this.baseline.values()].filter(source => source.path !== snapshot.path).concat(snapshot)
+            symbols = buildIndex(repository, this.packages, this.adapters).find(item => item.path === snapshot.path)?.symbols ?? []
+          }
+          this.evidenceSymbols.set(snapshot.id, symbols)
+        }
         if (!symbols.some(s => (s.name === e.symbol || s.name.endsWith(`.${e.symbol}`)) && s.startLine <= e.endLine && s.endLine >= e.startLine)) {
           throw new Error(`Invalid evidence symbol: ${e.symbol}; unindexed source must use an empty symbol and exact line/quote evidence`)
         }
@@ -171,13 +259,20 @@ export class ReviewContext {
   async changes() {
     const current = (await discoverPackages(this.cwd, [], this.exclusions)).flatMap(pkg => pkg.files)
     const changed = new Set(current.filter(path => !this.baseline.has(path)))
+    const histories = new Map<string, Snapshot[]>()
     for (const snapshot of this.snapshots.values()) {
-      try {
-        const actual = await readSnapshot(this.cwd, snapshot.path, this.exclusions)
-        if (snapshot.sha256 !== actual.sha256 || snapshot.kind !== actual.kind) changed.add(snapshot.path)
-      } catch { changed.add(snapshot.path) }
+      const versions = histories.get(snapshot.path) ?? []
+      versions.push(snapshot)
+      histories.set(snapshot.path, versions)
     }
-    for (const path of this.baseline.keys()) if (!current.includes(path)) changed.add(path)
+    for (const [path, versions] of histories) {
+      try {
+        const actual = await readSnapshot(this.cwd, path, this.exclusions)
+        if (versions.some(snapshot => snapshot.sha256 !== actual.sha256 || snapshot.kind !== actual.kind)) changed.add(path)
+      } catch { changed.add(path) }
+    }
+    const currentPaths = new Set(current)
+    for (const path of this.baseline.keys()) if (!currentPaths.has(path)) changed.add(path)
     return [...changed].sort()
   }
 
@@ -189,4 +284,17 @@ export class ReviewContext {
 
 export function sourceInput(snapshot: Snapshot) {
   return { ...snapshot, text: undefined, source: snapshot.text.split('\n').map((line, index) => `${index + 1}: ${line}`).join('\n') }
+}
+
+/** Preserve observed content versions; identical rereads retain the already supplied evidence ID. */
+export function mergePromptSources(current: readonly Snapshot[], added: readonly Snapshot[]): Snapshot[] {
+  const seen = new Set<string>()
+  const sources: Snapshot[] = []
+  for (const snapshot of [...current, ...added]) {
+    const key = JSON.stringify([snapshot.path, snapshot.kind, snapshot.sha256, snapshot.error])
+    if (seen.has(key)) continue
+    seen.add(key)
+    sources.push(snapshot)
+  }
+  return sources
 }

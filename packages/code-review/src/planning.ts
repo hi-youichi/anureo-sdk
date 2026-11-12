@@ -1,9 +1,10 @@
 import { z } from 'zod'
-import { ContextSelectionRequired, hash, sourceInput, type ReviewContext, type Snapshot } from './context'
+import { ContextSelectionRequired, hash, sourceInput, mergePromptSources, type ReviewContext, type Snapshot } from './context'
 import { dimensionSchema, dimensions, evidenceSchema, type ContextRequest, type DesignTask } from './schema'
 import { analysisSchema } from './schema'
 import { isEntryContract } from './project'
 import { errorText } from './io'
+import { contextRequestIssues } from './validation'
 
 export const planningSchema = z.strictObject({
   status: z.enum(['planned', 'needs_context', 'incomplete']), summary: z.string().min(1),
@@ -18,7 +19,7 @@ export const planningSchema = z.strictObject({
   contextRequests: analysisSchema.shape.contextRequests, gaps: z.array(z.string()),
 })
 export type Planning = z.output<typeof planningSchema>
-export type PlanningOptions = { scope?: string[]; dimensions?: string[]; contracts?: string[]; flows?: Array<{ id: string; purpose: string; paths: string[]; symbols: string[] }>; contextRounds?: number; contextFiles?: number; planningCorrections?: number; maxInputBytes?: number }
+export type PlanningOptions = { scope?: string[]; dimensions?: string[]; contracts?: string[]; flows?: Array<{ id: string; purpose: string; paths: string[]; symbols: string[] }>; contextRounds?: number; contextFiles?: number; planningCorrections?: number; responseCorrections?: number; maxInputBytes?: number }
 export type PlanningIssue = { path: string; message: string }
 export type PlanningAttempt = {
   callId: string; stage: string; outcome: 'accepted' | 'invalid' | 'needs_context' | 'incomplete'
@@ -39,12 +40,15 @@ export class PlanningValidationError extends Error {
 export function inventoryPlan(context: ReviewContext, options: PlanningOptions = {}) {
   const contextRounds = options.contextRounds ?? 2, contextFiles = options.contextFiles ?? 10, maxInputBytes = options.maxInputBytes ?? 256_000
   const planningCorrections = options.planningCorrections ?? 2
+  const responseCorrections = options.responseCorrections ?? 2
   if (!Number.isInteger(contextRounds) || contextRounds < 0 || contextRounds > 4) throw new Error('contextRounds must be 0..4')
   if (!Number.isInteger(contextFiles) || contextFiles < 1 || contextFiles > 50) throw new Error('contextFiles must be 1..50')
   if (!Number.isSafeInteger(maxInputBytes) || maxInputBytes < 1024) throw new Error('maxInputBytes must be >= 1024')
   if (!Number.isInteger(planningCorrections) || planningCorrections < 0 || planningCorrections > 4) throw new Error('planningCorrections must be 0..4')
+  if (!Number.isInteger(responseCorrections) || responseCorrections < 0 || responseCorrections > 4) throw new Error('responseCorrections must be 0..4')
   const primaryFiles = [...new Set(options.scope ?? context.baseline.keys())].sort()
   if (!primaryFiles.length || primaryFiles.some(path => !context.baseline.has(path))) throw new Error('Scope must name existing Git-visible files')
+  if (!primaryFiles.some(path => context.baseline.get(path)?.kind === 'text')) throw new Error('Scope must include readable source text; binary and symlink metadata cannot be reviewed')
   const contractPaths = [...new Set(options.contracts ?? [])].sort()
   contractPaths.forEach(path => context.assertContextPath(path))
   options.dimensions?.forEach(id => dimensionSchema.parse(id))
@@ -53,7 +57,7 @@ export function inventoryPlan(context: ReviewContext, options: PlanningOptions =
     inventoryFiles: [...context.baseline.keys()], primaryFiles, contractPaths,
     packages: context.packages, requestedDimensions: options.dimensions ?? null,
     flowHints: options.flows ?? [],
-    budgets: { contextRounds, contextFiles, planningCorrections, maxInputBytes, baseCalls: 5, maxCalls: 5 + contextRounds + planningCorrections },
+    budgets: { contextRounds, contextFiles, planningCorrections, responseCorrections, maxInputBytes, baseCalls: 5, maxCalls: 5 + contextRounds + planningCorrections + responseCorrections },
     navigation: context.index.map(i => ({ path: i.path, language: i.language, adapter: i.adapter, capabilities: i.capabilities, unknowns: i.unknowns })),
     note: 'One planner agent discovers modules and angles before module × angle analysis. Task count is unknown until planning completes.',
   }
@@ -65,9 +69,11 @@ export function validatePlanning(context: ReviewContext, inventory: InventoryPla
   const issues: PlanningIssue[] = []
   const check = (invalid: boolean, path: string, message: string) => { if (invalid) issues.push({ path, message }) }
   const allowed = new Set(snapshotIds)
+  const linesBySnapshot = new Map<string, string[]>()
+  issues.push(...contextRequestIssues(context, discovery.contextRequests))
   discovery.modules.forEach((module, i) => {
     module.evidence.forEach((evidence, j) => {
-      try { context.validateEvidence([evidence], allowed) }
+      try { context.validateEvidence([evidence], allowed, linesBySnapshot) }
       catch (error) { issues.push({ path: `modules[${i}].evidence[${j}]`, message: errorText(error) }) }
     })
     check(!module.evidence.some(e => module.paths.includes(e.path)), `modules[${i}].evidence`, `Module lacks implementation evidence: ${module.id}`)
@@ -89,13 +95,14 @@ export function validatePlanning(context: ReviewContext, inventory: InventoryPla
       || (c.decision === 'not_applicable' ? c.angleIds.length !== 0 : c.angleIds.length === 0)), 'referenceCoverage', 'Reference angle applicability coverage mismatch')
   const paths = discovery.modules.flatMap(m => m.paths)
   const excluded = discovery.excludedFiles.map(e => e.path)
-  check(new Set(paths).size !== paths.length || new Set(excluded).size !== excluded.length || paths.some(p => excluded.includes(p)), 'modules', 'Duplicate primary module ownership')
-  check([...paths, ...excluded].length !== inventory.primaryFiles.length || [...paths, ...excluded].some(p => !inventory.primaryFiles.includes(p)), 'modules', 'Planner file coverage mismatch')
+  const pathSet = new Set(paths), excludedSet = new Set(excluded), primarySet = new Set(inventory.primaryFiles)
+  check(pathSet.size !== paths.length || excludedSet.size !== excluded.length || paths.some(p => excludedSet.has(p)), 'modules', 'Duplicate primary module ownership')
+  check([...paths, ...excluded].length !== inventory.primaryFiles.length || [...paths, ...excluded].some(p => !primarySet.has(p)), 'modules', 'Planner file coverage mismatch')
   check(paths.some(p => context.baseline.get(p)?.kind !== 'text'), 'modules', 'Module sources must be readable text; unavailable input is a planning gap')
   check(excluded.some(p => !context.baseline.has(p) || context.baseline.get(p)?.kind === 'text' || context.baseline.get(p)?.kind === 'unavailable'), 'excludedFiles', 'Planner cannot exclude text, unknown or unavailable input')
   const supplied = new Set(snapshotIds.map(id => context.snapshots.get(id)?.path))
   check(paths.some(p => !supplied.has(p)) || discovery.reviewedFiles.length !== paths.length || new Set(discovery.reviewedFiles).size !== paths.length
-    || discovery.reviewedFiles.some(p => !paths.includes(p)), 'reviewedFiles', 'Planner must read and account for all module sources')
+    || discovery.reviewedFiles.some(p => !pathSet.has(p)), 'reviewedFiles', 'Planner must read and account for all module sources')
   check(!!inventory.requestedDimensions?.some(id => !discovery.angles.some(a => a.id === id)), 'angles', 'Requested angle is absent from planner output')
   return issues
 }
@@ -116,6 +123,7 @@ export function createModulePlan(context: ReviewContext, inventory: InventoryPla
     purpose: `${module.name}：${module.purpose}\n审查角度：${angle.title}；${angle.question}`, dependsOn: [],
   })))
   const count = tasks.length
+  const maximumCalls = 4 + inventory.budgets.responseCorrections + (inventory.budgets.contextRounds + 1) * (1 + count * 2 * (1 + inventory.budgets.responseCorrections)) + inventory.budgets.planningCorrections
   return { ...inventory, planning: planningProgress(), modules, angles: catalog, selectedDimensions: angles.map(a => a.id), referenceCoverage: discovery?.referenceCoverage ?? [],
     dimensions: angles.map(a => [a.id, a.title, a.question] as const),
     discovery: { status: (discovery?.status ?? 'pending') as Planning['status'] | 'pending' | 'failed', summary: discovery?.summary ?? 'Modules and angles have not been discovered',
@@ -123,16 +131,17 @@ export function createModulePlan(context: ReviewContext, inventory: InventoryPla
     planningHash: hash(JSON.stringify({ modules: modules.map(m => ({ ...m, evidence: m.evidence.map(e => [e.path, e.sha256]) })), angles: catalog, selected: angles.map(a => a.id) })),
     tasks, summaryIds: ['project-summary'],
     callEstimate: { planningBase: 1, planningMax: inventory.budgets.contextRounds + 1 + inventory.budgets.planningCorrections, analysisTasks: discovery ? count : null,
-      totalMaximum: discovery ? 4 + (inventory.budgets.contextRounds + 1) * (1 + count * 2) + inventory.budgets.planningCorrections : null },
+      totalMaximum: discovery ? maximumCalls : null },
     applicability: tasks.map(t => ({ unitId: t.unitId, dimension: t.angleId, taskId: t.id, status: 'pending' as const, reason: 'One owner per module/angle pair' })),
     continuationTasks: [] as Array<{ id: string; parentTaskId: string; stage: string; sourceSnapshotIds: string[]; sourcePaths: string[] }>,
-    budgets: { ...inventory.budgets, baseCalls: 5 + count, maxCalls: 4 + (inventory.budgets.contextRounds + 1) * (1 + count * 2) + inventory.budgets.planningCorrections },
+    budgets: { ...inventory.budgets, baseCalls: 5 + count, maxCalls: maximumCalls },
   }
 }
 
 export async function discoverModules(context: ReviewContext, inventory: InventoryPlan, contracts: Snapshot[],
   invoke: (stage: string, input: object) => Promise<{ callId: string; value: Planning }>,
-  onAttempt?: (attempt: PlanningAttempt, state: PlanningProgress) => Promise<void>) {
+  onAttempt?: (attempt: PlanningAttempt, state: PlanningProgress) => Promise<void>,
+  measureInput: (input: object) => number = input => Buffer.byteLength(JSON.stringify(input))) {
   const catalog = [...context.baseline.values()].map(s => ({ path: s.path, kind: s.kind, sha256: s.sha256 }))
   const index = context.index.map(i => ({ path: i.path, language: i.language, capabilities: i.capabilities, symbols: i.symbols, imports: i.imports, exports: i.exports, unknowns: i.unknowns }))
   const base = { task: 'design-planning', primaryFiles: inventory.primaryFiles, catalog, index, referenceAngles: dimensions,
@@ -148,19 +157,22 @@ export async function discoverModules(context: ReviewContext, inventory: Invento
       'validationFeedback 是宿主对上次响应的校验错误；基于相同快照修正完整响应。逐条核对引文首尾行，不得省略错误证据、文件或参考角度来绕过覆盖约束。',
       '缺少必要实现时 status=needs_context，通过 contextRequests 请求明确路径；不能执行工具或命令。最终 planned 不得有 contextRequests/gaps。',
     ] }
-  const all = [...new Map([...inventory.primaryFiles.map(p => context.baseline.get(p)!), ...contracts].map(s => [s.path, s])).values()]
-  let sources = Buffer.byteLength(JSON.stringify({ ...base, sources: all.map(sourceInput) })) <= inventory.budgets.maxInputBytes
-    ? all : [...new Map([...all.filter(s => isEntryContract(s.path)), ...contracts].map(s => [s.path, s])).values()]
+  const all = mergePromptSources(inventory.primaryFiles.map(p => context.baseline.get(p)!), contracts)
+  let sources = all
   const state = planningProgress()
   let previous: Planning | null = null
   let resolution: object | null = null
   let round = 0, corrections = 0, attemptNumber = 0
+  const input = () => ({ ...base, sources: sources.map(sourceInput),
+    unreadFiles: inventory.primaryFiles.filter(p => !sources.some(s => s.path === p)), previous,
+    contextResolution: resolution, round, corrections, validationFeedback: state.validationIssues })
+  if (measureInput(input()) > inventory.budgets.maxInputBytes) {
+    sources = [...new Map([...all.filter(s => isEntryContract(s.path)), ...contracts].map(s => [s.path, s])).values()]
+  }
   while (true) {
     const stage = `planning-${attemptNumber++}`
     // Invocation errors propagate directly: only returned, schema-valid proposals can be corrected.
-    const { callId, value } = await invoke(stage, { ...base, sources: sources.map(sourceInput),
-      unreadFiles: inventory.primaryFiles.filter(p => !sources.some(s => s.path === p)), previous,
-      contextResolution: resolution, round, corrections, validationFeedback: state.validationIssues })
+    const { callId, value } = await invoke(stage, input())
     const snapshotIds = sources.map(s => s.id)
     const issues = validatePlanning(context, inventory, value, snapshotIds)
     const outcome = value.status === 'incomplete' ? 'incomplete' : issues.length ? 'invalid'
@@ -182,7 +194,7 @@ export async function discoverModules(context: ReviewContext, inventory: Invento
     if (round === inventory.budgets.contextRounds) throw new Error('Planning context budget exhausted')
     try {
       const added = await context.resolveRequestsDetailed(value.contextRequests as ContextRequest[], inventory.budgets.contextFiles)
-      sources = [...new Map([...sources, ...added.snapshots].map(s => [s.id, s])).values()]; resolution = added.resolution
+      sources = mergePromptSources(sources, added.snapshots); resolution = added.resolution
     } catch (error) {
       if (!(error instanceof ContextSelectionRequired)) throw error
       resolution = { status: 'selection_required', candidates: error.paths, message: error.message }

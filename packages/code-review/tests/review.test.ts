@@ -1,24 +1,25 @@
+import { cleanupFixtures } from './fixtures/cleanup'
 import { afterEach, expect, test } from 'bun:test'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { cp, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createClient, HarnessSdkError, type Client } from '@anureo/sdk'
 import { createScriptedAdapter } from '@anureo/conformance'
 import { parseReport } from '../src/fix'
-import { discoverPackages } from '../src/io'
+import { discoverPackages, saveJson } from '../src/io'
 import { hash, ReviewContext } from '../src/context'
 import { createDesignPlan, reviewDesign, type DesignOptions } from '../src/review'
 import { analysisSchema, dimensions, type Analysis, type DesignTask, type Evidence, type Finding } from '../src/schema'
 import { readDesignConfig } from '../src/project'
 import { planningSchema } from '../src/planning'
+import { candidate, defaultOutput, evidence, type Request, type Source } from './fixtures/review-responses'
 
 const directories: string[] = []
 const clients: Client[] = []
 afterEach(async () => {
-  await Promise.all(clients.splice(0).map(client => client.dispose()))
-  await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true })))
+  await cleanupFixtures(clients, directories)
 })
 async function fixture(files: Record<string, string> = { 'a.ts': 'export const a = 1\n', 'b.ts': 'export const b = 2\n' }) {
   const cwd = await mkdtemp(join(tmpdir(), 'anureo-design-'))
@@ -29,61 +30,6 @@ async function fixture(files: Record<string, string> = { 'a.ts': 'export const a
     await writeFile(join(cwd, path), text)
   }
   return cwd
-}
-type Source = { id: string; path: string; sha256: string; kind: string; source: string }
-type Request = {
-  task: string; primaryFiles?: string[]; kind?: string; id?: string; assignment?: DesignTask; round?: number
-  sources?: Source[]; findings?: Finding[]; candidates?: Finding[]
-  dependencies?: Array<{ status: string }>
-  contextResolution?: { candidates: string[] }
-  validationFeedback?: Array<{ path: string; message: string }>
-  previous?: unknown
-}
-function evidence(source: Source): Evidence {
-  return { path: source.path, snapshotId: source.id, sha256: source.sha256, symbol: '',
-    startLine: 1, endLine: 1, quote: source.source.split('\n')[0]!.replace(/^1: /, ''), role: '原始实现' }
-}
-function candidate(dimension: DesignTask['dimensions'][number], sources: Source[]): Analysis['findings'][number] {
-  return {
-    primaryDimension: dimension, relatedDimensions: [], category: 'structural_design', priority: 'medium',
-    title: '状态归属重复', decision: 'structural_refactor', collaboration: '入口与消费者共同维护同一事实。',
-    problem: '规则分散。', cause: '状态写入分属两个所有者。', impact: '增加状态时需要同步修改两个实现。',
-    contract: '一个事实有一个权威所有者。', scenario: '新增一个阶段时必须修改两处。', currentOwner: 'a 与 b', targetOwner: 'a',
-    consumers: ['b'], evidence: sources.filter(s => s.kind === 'text').map(evidence),
-    localAlternative: '保持当前结构，集中一处写入。', alternative: '调整状态归属。', proposal: '消费者读取权威状态。',
-    benefit: '减少重复决策。', cost: '调用方需要传入权威状态。', compatibility: '保留公开接口。', verification: '验证增加状态只修改一个所有者。', pattern: null,
-  }
-}
-function defaultOutput(input: Request): unknown {
-  if (input.task === 'design-planning') {
-    const sources = input.sources!.filter(s => input.primaryFiles!.includes(s.path))
-    return { status: 'planned', summary: '按源码职责分为两个模块，按项目选择两个角度。',
-      modules: sources.map((source, i) => ({ id: `m${i}`, name: source.path, purpose: '独立源码职责', paths: [source.path], evidence: [evidence(source)] })),
-      angles: [{ id: 'D3', title: '契约', question: '输入输出与承诺一致吗？', reason: '公开函数边界' },
-        { id: 'D12', title: '可读性', question: '能否直接理解意图？', reason: '代码表达' }],
-      referenceCoverage: dimensions.map(d => ({ id: d[0], decision: ['D3', 'D12'].includes(d[0]) ? 'included' : 'not_applicable', angleIds: ['D3', 'D12'].includes(d[0]) ? [d[0]] : [], reason: 'Fixture applicability only' })),
-      reviewedFiles: sources.map(s => s.path), excludedFiles: [], contextRequests: [], gaps: [] }
-  }
-  if (input.task === 'design-preflight') {
-    if (input.kind === 'analysis') return { status: 'incomplete', summary: '预检', contextRequests: [], coverage: [], designContext: [], observations: [], findings: [], gaps: [] }
-    if (input.kind === 'verification') return { status: 'incomplete', summary: '预检', contextRequests: [], decisions: [], gaps: [] }
-    return { summary: '预检', groups: [], gaps: [] }
-  }
-  if (input.task === 'design-analysis') {
-    const text = input.sources!.filter(s => s.kind === 'text')
-    return { status: text.length ? 'reviewed' : 'not_applicable', summary: '实际源码已审查，零候选。', contextRequests: [],
-      designContext: text.length ? [{ form: '直接模块协作', participants: text.map(s => s.path), collaboration: '按给定源代码表达转换与依赖。', stateAndEffects: '仅对本次源码中的可见读写作判断。', invariants: ['输入输出以源码为边界'], evidence: [evidence(text[0]!)], uncertainties: ['运行时行为未执行'] }] : [],
-      coverage: input.assignment!.dimensions.map(dimension => ({ dimension, status: text.length ? 'reviewed' : 'not_applicable',
-        reason: text.length ? '已检查源码。' : '非文本资产。', evidence: text.length ? [evidence(text[0]!)] : [] })),
-      observations: [], findings: [], gaps: [] }
-  }
-  if (input.task === 'design-verification') return { status: 'reviewed', summary: '独立源码复核完成。', contextRequests: [],
-    decisions: input.findings!.map(f => ({ findingId: f.id, verdict: 'accepted', reason: '源码和消费者支持责任调整。',
-      evidence: f.evidence, improves: [f.primaryDimension], regresses: [], invariants: ['保留公开契约'], evidenceLevel: 'contract_analysis', duplicateOf: null })), gaps: [] }
-  if (input.task === 'design-summary') return { summary: '汇总已复核结论。', groups: input.candidates!.length ? [{
-    title: '集中权威状态', findingIds: input.candidates!.map(f => f.id), priority: 'medium', proposal: '按已复核方案实施。', tradeoffs: '保留后端差异。',
-  }] : [], gaps: [] }
-  throw new Error(`Unexpected task: ${input.task}`)
 }
 
 async function backend(hook: (input: Request, output: unknown) => unknown | Promise<unknown> = (_, output) => output) {
@@ -108,7 +54,8 @@ async function backend(hook: (input: Request, output: unknown) => unknown | Prom
   return { client, adapter, calls, peak: () => peak }
 }
 async function options(cwd: string, client: Client, extra: Partial<DesignOptions> = {}): Promise<DesignOptions> {
-  return { cwd, client, packages: await discoverPackages(cwd), outputDir: join(cwd, 'draft/docs/design-review/run'), concurrency: 2, ...extra }
+  return { cwd, client, packages: await discoverPackages(cwd), outputDir: join(cwd, 'draft/docs/design-review/run'),
+    concurrency: 2, backendConfigDigest: 'scripted-v1', repeatable: true, ...extra }
 }
 
 
@@ -128,6 +75,23 @@ test('a planner precedes every module-angle worker and every worker owns exactly
   expect(report.coverage.modules).toEqual({ total: 2, reviewed: 2, notApplicable: 0, incomplete: 0 })
   expect(harness.peak()).toBeLessThanOrEqual(2)
   expect(harness.calls.at(-1)!.task).toBe('design-summary')
+})
+
+test('task admission lets a completed checkpoint publish before the next task starts', async () => {
+  const cwd = await fixture()
+  const outputDir = join(cwd, 'draft/docs/design-review/run')
+  const completedBeforeAnalysis: number[] = []
+  const harness = await backend(async (input, output) => {
+    if (input.task === 'design-analysis') {
+      const files = (await readdir(join(outputDir, 'checkpoints'))).filter(name => /^[a-f0-9]{64}\.json$/.test(name))
+      const markers = await Promise.all(files.map(name => readFile(join(outputDir, 'checkpoints', name), 'utf8').then(JSON.parse)))
+      completedBeforeAnalysis.push(markers.filter(marker => marker.stepKey.startsWith('task:')).length)
+    }
+    return output
+  })
+  const report = await reviewDesign(await options(cwd, harness.client, { concurrency: 1, outputDir }))
+  expect(report.complete).toBe(true)
+  expect(completedBeforeAnalysis).toEqual([0, 1, 2, 3])
 })
 
 test('invalid module coverage or duplicate angles exhaust correction budgets without dispatch', async () => {
@@ -214,6 +178,43 @@ test('disabling corrections rejects invalid evidence immediately', async () => {
   expect(report.tasks).toHaveLength(0)
 })
 
+test('analysis, verification and summary corrections retain task ownership and revalidate responses', async () => {
+  const cwd = await fixture()
+  let analyses = 0, verifications = 0, summaries = 0
+  const harness = await backend((input, output) => {
+    if (input.task === 'design-analysis' && input.assignment!.moduleId === 'm0' && input.assignment!.angleId === 'D3') {
+      const value = analysisSchema.parse(output)
+      value.findings = [candidate('D3', input.sources!)]
+      if (++analyses === 1) {
+        value.coverage[0]!.evidence[0]!.quote = 'invented coverage'
+        value.designContext[0]!.evidence[0]!.quote = 'invented collaboration'
+      } else {
+        expect(input.validationFeedback).toHaveLength(2)
+        expect(input.previousResponse).not.toBeNull()
+      }
+      return value
+    }
+    if (input.task === 'design-verification') {
+      const value = output as { decisions: Array<{ findingId: string; invariants: string[] }> }
+      if (++verifications === 1) value.decisions[0]!.invariants = []
+      else expect(input.validationFeedback![0]!.message).toContain('invariant')
+      return value
+    }
+    if (input.task === 'design-summary') {
+      if (++summaries === 1) return { summary: '漏掉候选的响应', groups: [], gaps: [] }
+      expect(input.validationFeedback![0]!.message).toContain('coverage')
+    }
+    return output
+  })
+  const report = await reviewDesign(await options(cwd, harness.client, { contextRounds: 0, responseCorrections: 1 }))
+  expect(report.complete).toBe(true)
+  expect([analyses, verifications, summaries]).toEqual([2, 2, 2])
+  expect(report.tasks).toHaveLength(4)
+  expect(report.findingCounts.accepted).toBe(1)
+  expect(report.findings[0]!.taskId).toBe('module:m0:angle:D3')
+  expect(report.calls.actual).toBeLessThanOrEqual(report.plan.budgets.maxCalls)
+})
+
 test('incomplete planning and invocation failures never enter the correction loop', async () => {
   for (const failure of ['incomplete', 'invocation'] as const) {
     const cwd = await fixture()
@@ -225,10 +226,15 @@ test('incomplete planning and invocation failures never enter the correction loo
       plan.gaps = ['Required semantics unavailable']
       return plan
     })
-    const report = await reviewDesign(await options(cwd, harness.client))
-    expect(report.complete).toBe(false)
+    const input = await options(cwd, harness.client)
+    if (failure === 'invocation') {
+      await expect(reviewDesign(input)).rejects.toMatchObject({ outcomeUnknown: true, details: { runId: 'run' } })
+    } else {
+      const report = await reviewDesign(input)
+      expect(report.complete).toBe(false)
+      expect(report.tasks).toHaveLength(0)
+    }
     expect(harness.calls).toHaveLength(1)
-    expect(report.tasks).toHaveLength(0)
   }
 })
 
@@ -307,16 +313,18 @@ test('forged source quotes and omitted angle coverage cannot complete a worker',
   }
 })
 
-test('unchanged module plans can reuse worker results while replanning stays explicit', async () => {
+test('unchanged plans and workers resume without depending on the final report', async () => {
   const cwd = await fixture()
   const first = await backend()
   const source = await options(cwd, first.client)
   await reviewDesign(source)
+  await rm(join(source.outputDir, 'report.json'))
   const next = await backend()
   const report = await reviewDesign(await options(cwd, next.client, { resumeFrom: source.outputDir, outputDir: join(cwd, 'draft/docs/design-review/resumed') }))
   expect(report.complete).toBe(true)
   expect(report.calls.reusedTasks).toBe(4)
-  expect(next.calls[0]!.task).toBe('design-planning')
+  expect(next.calls[0]!.task).toBe('design-preflight')
+  expect(next.calls.some(c => c.task === 'design-planning')).toBe(false)
   expect(next.calls.some(c => c.task === 'design-analysis')).toBe(false)
 })
 
@@ -333,4 +341,438 @@ test('context requests keep each worker assigned to its original module and angl
   const report = await reviewDesign(await options(cwd, harness.client))
   expect(report.complete).toBe(true)
   expect(report.plan.continuationTasks).toHaveLength(2)
+})
+
+test('invalid planning request selectors are corrected before context retrieval', async () => {
+  const cwd = await fixture()
+  let planning = 0
+  const harness = await backend((input, output) => {
+    if (input.task === 'design-planning' && planning++ === 0) return {
+      ...planningSchema.parse(output), status: 'needs_context',
+      contextRequests: [{ path: null, symbol: null, query: null, reason: 'Missing selector' }],
+    }
+    return output
+  })
+  const report = await reviewDesign(await options(cwd, harness.client, { planningCorrections: 1, contextRounds: 0 }))
+  expect(report.complete).toBe(true)
+  expect(report.plan.planning.attempts.map(attempt => attempt.outcome)).toEqual(['invalid', 'accepted'])
+  expect(harness.calls.filter(call => call.task === 'design-planning')).toHaveLength(2)
+})
+
+test('unchanged BOM sources can resume their accepted plan and task evidence', async () => {
+  const cwd = await fixture({ 'a.ts': '\ufeffexport const a = 1\n', 'b.ts': 'export const b = 2\n' })
+  const first = await backend()
+  const source = await options(cwd, first.client)
+  expect((await reviewDesign(source)).complete).toBe(true)
+  const next = await backend()
+  const report = await reviewDesign(await options(cwd, next.client, { resumeFrom: source.outputDir,
+    outputDir: join(cwd, 'draft/docs/design-review/bom-resume') }))
+  expect(report.complete).toBe(true)
+  expect(report.calls.reusedTasks).toBe(4)
+  expect(next.calls.some(call => call.task === 'design-planning' || call.task === 'design-analysis')).toBe(false)
+})
+
+test('partial completed tasks recover while only the failed task runs again', async () => {
+  const cwd = await fixture()
+  const first = await backend((input, output) => {
+    if (input.task === 'design-analysis' && input.assignment!.moduleId === 'm0' && input.assignment!.angleId === 'D12') {
+      throw new HarnessSdkError('FIXTURE_FAILURE')
+    }
+    return output
+  })
+  const source = await options(cwd, first.client)
+  expect((await reviewDesign(source)).complete).toBe(false)
+  await rm(join(source.outputDir, 'report.json'))
+  const next = await backend()
+  const report = await reviewDesign(await options(cwd, next.client, { resumeFrom: source.outputDir,
+    outputDir: join(cwd, 'draft/docs/design-review/recovered') }))
+  expect(report.complete).toBe(true)
+  expect(report.calls.reusedTasks).toBe(3)
+  expect(next.calls.filter(c => c.task === 'design-analysis')).toHaveLength(1)
+  expect(next.calls.some(c => c.task === 'design-planning')).toBe(false)
+})
+
+test('unknown backend configuration disables automatic result reuse', async () => {
+  const cwd = await fixture()
+  const first = await backend()
+  const source = await options(cwd, first.client, { backendConfigDigest: undefined })
+  await reviewDesign(source)
+  const next = await backend()
+  const report = await reviewDesign(await options(cwd, next.client, { backendConfigDigest: undefined,
+    resumeFrom: source.outputDir, outputDir: join(cwd, 'draft/docs/design-review/no-config') }))
+  expect(report.complete).toBe(true)
+  expect(report.calls.reusedTasks).toBe(0)
+  expect(next.calls.filter(c => c.task === 'design-planning')).toHaveLength(1)
+  expect(next.calls.filter(c => c.task === 'design-analysis')).toHaveLength(4)
+})
+
+test('legacy v2 reports import validated tasks into new workflow checkpoints', async () => {
+  const cwd = await fixture()
+  const first = await backend(duplicateCandidates)
+  const source = await options(cwd, first.client)
+  await reviewDesign(source)
+  const legacy = join(cwd, 'draft/docs/design-review/legacy')
+  await mkdir(legacy)
+  await cp(join(source.outputDir, 'report.json'), join(legacy, 'report.json'))
+  await cp(join(source.outputDir, 'snapshots'), join(legacy, 'snapshots'), { recursive: true })
+  const next = await backend()
+  const report = await reviewDesign(await options(cwd, next.client, { resumeFrom: legacy,
+    outputDir: join(cwd, 'draft/docs/design-review/imported') }))
+  expect(report.complete).toBe(true)
+  expect(report.calls.reusedTasks).toBe(4)
+  expect(report.findings).toHaveLength(3)
+  expect(next.calls.some(c => c.task === 'design-analysis')).toBe(false)
+})
+
+test('changed supplemental context invalidates its task while the unchanged plan is reused', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n', 'b.ts': 'export const b = 2\n',
+    '.gitignore': 'extra.md\n', 'extra.md': 'original contract\n' })
+  const hook = (input: Request, output: unknown) => {
+    if (input.task === 'design-analysis' && input.assignment!.moduleId === 'm0' && input.assignment!.angleId === 'D3' && input.round === 0) {
+      return { ...(output as Analysis), status: 'needs_context', findings: [], contextRequests: [
+        { path: 'extra.md', symbol: null, query: null, reason: 'Read supplemental contract' },
+      ] }
+    }
+    return output
+  }
+  const first = await backend(hook)
+  const source = await options(cwd, first.client)
+  const initial = await reviewDesign(source)
+  expect(initial.complete).toBe(true)
+  await writeFile(join(cwd, 'extra.md'), 'changed contract\n')
+  const next = await backend(hook)
+  const report = await reviewDesign(await options(cwd, next.client, { resumeFrom: source.outputDir,
+    outputDir: join(cwd, 'draft/docs/design-review/context-changed') }))
+  expect(report.complete).toBe(true)
+  expect(report.calls.reusedTasks).toBe(initial.tasks.length - 1)
+  expect(next.calls.some(c => c.task === 'design-planning')).toBe(false)
+})
+
+
+test('a summary selects a fresh accepted representative before a pending finding', async () => {
+  const cwd = await fixture()
+  const harness = await backend((input, output) => {
+    if (input.task === 'design-analysis' && input.assignment!.angleId === 'D12') {
+      const result = analysisSchema.parse(output)
+      result.findings = [{ ...candidate('D12', input.sources!), category: 'readability', decision: 'local_refactor' }]
+      return result
+    }
+    if (input.task === 'design-verification') {
+      const result = output as { decisions: Array<{ findingId: string; verdict: string }> }
+      if (input.findings![0]!.taskId.includes('m0')) result.decisions[0]!.verdict = 'pending'
+      return result
+    }
+    return output
+  })
+  const report = await reviewDesign(await options(cwd, harness.client, { concurrency: 1 }))
+  expect(report.complete).toBe(true)
+  const accepted = report.findings.find(finding => finding.review?.verdict === 'accepted')!
+  expect(report.rootGroups[0]!.canonicalId).toBe(accepted.id)
+  expect(parseReport(JSON.stringify(report)).findings.map(f => f.id)).toEqual([accepted.id])
+})
+
+
+test('legacy reports without matching backend provenance cannot reuse results', async () => {
+  const cwd = await fixture()
+  const first = await backend()
+  const source = await options(cwd, first.client)
+  const original = await reviewDesign(source)
+  for (const provenance of [undefined, 'different-backend']) {
+    const legacy = join(cwd, `draft/docs/design-review/legacy-${provenance ?? 'unknown'}`)
+    await mkdir(legacy)
+    const report = { ...original, backendConfigDigest: provenance }
+    await writeFile(join(legacy, 'report.json'), JSON.stringify(report))
+    await cp(join(source.outputDir, 'snapshots'), join(legacy, 'snapshots'), { recursive: true })
+    const next = await backend()
+    const resumed = await reviewDesign(await options(cwd, next.client, { resumeFrom: legacy,
+      outputDir: `${legacy}-imported` }))
+    expect(resumed.complete).toBe(true)
+    expect(resumed.calls.reusedTasks).toBe(0)
+    expect(next.calls.filter(c => c.task === 'design-analysis')).toHaveLength(4)
+  }
+})
+
+
+test('the input byte limit includes instructions and the output schema', async () => {
+  const cwd = await fixture()
+  const first = await backend()
+  const source = await options(cwd, first.client)
+  await reviewDesign(source)
+  const inputName = (await readdir(join(source.outputDir, 'calls'))).find(name => name.endsWith('-planning-0.input.json'))!
+  const record = JSON.parse(await readFile(join(source.outputDir, 'calls', inputName), 'utf8'))
+  const promptBytes = Buffer.byteLength(JSON.stringify(record.input))
+  const next = await backend()
+  const report = await reviewDesign(await options(cwd, next.client, {
+    outputDir: `${source.outputDir}-bounded`, maxInputBytes: promptBytes + 1,
+  }))
+  expect(report.complete).toBe(false)
+  expect(next.calls).toHaveLength(0)
+  expect(report.errors.join(' ')).toContain('Input budget exceeded')
+})
+
+async function duplicateCandidates(input: Request, output: unknown) {
+  if (input.task !== 'design-analysis' || input.assignment!.angleId !== 'D12') return output
+  const result = analysisSchema.parse(output)
+  const finding = { ...candidate('D12', input.sources!), category: 'readability' as const, decision: 'local_refactor' as const }
+  result.findings = input.assignment!.moduleId === 'm0' ? [finding, { ...finding, title: '另一条局部建议' }] : [finding]
+  return result
+}
+
+test('cyclic verification cannot publish a completed task or repair root', async () => {
+  const cwd = await fixture()
+  const harness = await backend(async (input, output) => {
+    output = await duplicateCandidates(input, output)
+    if (input.task === 'design-verification' && input.assignment!.moduleId === 'm0') {
+      const result = output as { decisions: Array<{ findingId: string; duplicateOf: string | null }> }
+      result.decisions[0]!.duplicateOf = result.decisions[1]!.findingId
+      result.decisions[1]!.duplicateOf = result.decisions[0]!.findingId
+    }
+    return output
+  })
+  const source = await options(cwd, harness.client, { concurrency: 1, responseCorrections: 0 })
+  const report = await reviewDesign(source)
+  expect(report.complete).toBe(false)
+  const invalid = report.tasks.find(task => task.task.moduleId === 'm0' && task.task.angleId === 'D12')!
+  expect(invalid.status).toBe('failed')
+  expect(invalid.error).toContain('Invalid duplicate chain')
+  expect(report.rootGroups.flatMap(group => group.findingIds).every(id => !id.startsWith(invalid.task.id))).toBe(true)
+  expect(report.findingCounts.uniqueActionable).toBe(1)
+  const eligible = parseReport(JSON.stringify(report)).findings
+  expect(eligible).toHaveLength(1)
+  expect(eligible[0]!.id.startsWith('module:m1:')).toBe(true)
+  const markers = await Promise.all((await readdir(join(source.outputDir, 'checkpoints'))).filter(name => /^[a-f0-9]{64}\.json$/.test(name))
+    .map(name => readFile(join(source.outputDir, 'checkpoints', name), 'utf8').then(JSON.parse)))
+  expect(markers.some(marker => marker.stepKey === `task:${invalid.task.id}`)).toBe(false)
+  const next = await backend(duplicateCandidates)
+  const resumed = await reviewDesign(await options(cwd, next.client, { concurrency: 1, responseCorrections: 0,
+    resumeFrom: source.outputDir, outputDir: `${source.outputDir}-resumed` }))
+  expect(resumed.complete).toBe(true)
+  expect(resumed.calls.reusedTasks).toBe(3)
+  expect(next.calls.filter(call => call.task === 'design-analysis').map(call => call.assignment!.id)).toEqual([invalid.task.id])
+})
+
+test('repair parsing rejects cyclic legacy roots without discarding independent accepted findings', async () => {
+  const cwd = await fixture()
+  const harness = await backend(duplicateCandidates)
+  const report = await reviewDesign(await options(cwd, harness.client, { concurrency: 1 }))
+  expect(report.complete).toBe(true)
+  const [first, second, independent] = report.findings
+  first!.review!.duplicateOf = second!.id
+  second!.review!.duplicateOf = first!.id
+  for (const finding of report.findings) finding.canonicalId = finding.id
+  const parsed = parseReport(JSON.stringify(report))
+  expect(parsed.findings.map(finding => finding.id)).toEqual([independent!.id])
+  expect(parsed.skipped.filter(finding => finding.reason === 'Invalid duplicate chain').map(finding => finding.id)).toEqual([first!.id, second!.id])
+})
+
+test('an incomplete verification cannot supply a repair representative for completed tasks', async () => {
+  const cwd = await fixture()
+  const harness = await backend(async (input, output) => {
+    output = await duplicateCandidates(input, output)
+    if (input.task === 'design-verification' && input.assignment!.moduleId === 'm0') return { ...(output as object), status: 'incomplete' }
+    return output
+  })
+  const report = await reviewDesign(await options(cwd, harness.client, { concurrency: 1, responseCorrections: 0 }))
+  expect(report.complete).toBe(false)
+  expect(report.rootGroups.flatMap(group => group.findingIds)).toEqual(['module:m1:angle:D12#1'])
+  expect(parseReport(JSON.stringify(report)).findings.map(finding => finding.id)).toEqual(['module:m1:angle:D12#1'])
+})
+
+test('completed findings and verification survive canonical checkpoint key ordering', async () => {
+  const cwd = await fixture()
+  const first = await backend(duplicateCandidates)
+  const source = await options(cwd, first.client, { concurrency: 1 })
+  const initial = await reviewDesign(source)
+  expect(initial.complete).toBe(true)
+  expect(initial.findings).toHaveLength(3)
+  const next = await backend(duplicateCandidates)
+  const report = await reviewDesign(await options(cwd, next.client, { concurrency: 1,
+    resumeFrom: source.outputDir, outputDir: `${source.outputDir}-resumed` }))
+  expect(report.complete).toBe(true)
+  expect(report.calls.reusedTasks).toBe(4)
+  expect(next.calls.some(call => ['design-analysis', 'design-verification'].includes(call.task))).toBe(false)
+  expect(report.findings).toEqual(initial.findings)
+})
+
+
+test('changed supplemental context cannot preserve a stale cross-task alias during recovery', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n', 'b.ts': 'export const b = "old"\n',
+    '.gitignore': 'extra.md\n', 'extra.md': 'old contract\n' })
+  const hook = (input: Request, output: unknown) => {
+    const paths = input.assignment?.primaryFiles ?? []
+    if (input.task === 'design-analysis' && input.assignment!.angleId === 'D12' && (paths.includes('a.ts') || paths.includes('b.ts'))) {
+      const result = analysisSchema.parse(output)
+      if (paths.includes('a.ts') && input.round === 0) return { ...result, status: 'needs_context', contextRequests: [
+        { path: 'extra.md', symbol: null, query: null, reason: 'Read the current contract' },
+      ] }
+      const cause = paths.includes('a.ts') && input.sources!.some(source => source.path === 'extra.md' && source.source.includes('new')) ? 'new' : 'old'
+      result.findings = [{ ...candidate('D12', input.sources!), title: `${cause} contract`, cause }]
+      return result
+    }
+    if (input.task === 'design-verification' && paths.includes('b.ts')) {
+      const root = input.knownFindings?.find(finding => finding.title === 'old contract')
+      if (root) (output as { decisions: Array<{ duplicateOf: string | null }> }).decisions[0]!.duplicateOf = root.id
+    }
+    if (input.task === 'design-summary') {
+      const groups = new Map<string, Finding[]>()
+      for (const finding of input.candidates!) groups.set(finding.cause, [...(groups.get(finding.cause) ?? []), finding])
+      return { summary: 'Group only matching current causes', groups: [...groups].map(([cause, findings]) => ({
+        title: cause, findingIds: findings.map(finding => finding.id), priority: 'medium', proposal: 'Preserve current evidence', tradeoffs: 'Different causes remain separate',
+      })), gaps: [] }
+    }
+    return output
+  }
+  const first = await backend(hook)
+  const source = await options(cwd, first.client, { concurrency: 1, responseCorrections: 0 })
+  const initial = await reviewDesign(source)
+  expect(initial.complete).toBe(true)
+  expect(initial.rootGroups).toHaveLength(1)
+  await writeFile(join(cwd, 'extra.md'), 'new contract\n')
+  const next = await backend(hook)
+  const report = await reviewDesign(await options(cwd, next.client, { concurrency: 1, responseCorrections: 0,
+    resumeFrom: source.outputDir, outputDir: `${source.outputDir}-resumed` }))
+  expect(report.complete).toBe(true)
+  expect(report.rootGroups).toHaveLength(2)
+  expect(report.tasks.find(task => task.task.primaryFiles.includes('b.ts') && task.task.angleId === 'D12')!.reused).toBe(true)
+  expect([...first.calls, ...next.calls].filter(call => call.task === 'design-verification').every(call => call.knownFindings === undefined)).toBe(true)
+})
+
+
+test('task prompts keep complete primary navigation and only relevant inbound consumer navigation', async () => {
+  const cwd = await fixture({ 'a.ts': 'export function a() { return 1 }\n',
+    'b.ts': `import { a } from './a.js'\nexport function related() { a() }\nfunction unrelated() { return client${'.next()'.repeat(140)} }\n` })
+  let inbound: NonNullable<Request['index']>[number] | undefined
+  let primary: NonNullable<Request['index']>[number] | undefined
+  const harness = await backend((input, output) => {
+    if (input.task === 'design-analysis' && input.assignment!.primaryFiles.includes('a.ts')) inbound = input.index!.find(item => item.path === 'b.ts')
+    if (input.task === 'design-analysis' && input.assignment!.primaryFiles.includes('b.ts')) primary = input.index!.find(item => item.path === 'b.ts')
+    return output
+  })
+  const report = await reviewDesign(await options(cwd, harness.client))
+  expect(report.complete).toBe(true)
+  expect(inbound!.navigationScope).toBe('inbound-only')
+  expect(inbound!.calls.map(call => call.expression)).toEqual(['a'])
+  expect(inbound!.imports.map(item => item.target)).toEqual(['a.ts'])
+  expect(inbound!.symbols.map(symbol => symbol.name)).toEqual(['related'])
+  expect(inbound!.unknowns.join(' ')).toContain('partial')
+  expect(primary!.calls).toHaveLength(141)
+  expect(primary!.symbols.some(symbol => symbol.name === 'unrelated')).toBe(true)
+})
+
+
+test('failed JSON rename removes only its temporary file and preserves the destination', async () => {
+  const cwd = await fixture()
+  const destination = join(cwd, 'artifact.json')
+  await mkdir(destination)
+  await writeFile(join(destination, 'existing'), 'keep')
+  await expect(saveJson(destination, { report: 'new' })).rejects.toMatchObject({ code: 'WORKFLOW_STORAGE_FAILED' })
+  expect((await readdir(cwd)).filter(path => path.endsWith('.tmp'))).toEqual([])
+  expect(await readFile(join(destination, 'existing'), 'utf8')).toBe('keep')
+  await saveJson(join(cwd, 'success.json'), { report: 'new' })
+  expect(JSON.parse(await readFile(join(cwd, 'success.json'), 'utf8'))).toEqual({ report: 'new' })
+  const circular: { self?: unknown } = {}; circular.self = circular
+  await expect(saveJson(join(cwd, 'circular.json'), circular)).rejects.toMatchObject({ code: 'WORKFLOW_STORAGE_FAILED' })
+  expect((await readdir(cwd)).filter(path => path.endsWith('.tmp'))).toEqual([])
+})
+
+
+test('call artifacts retain known, unknown and unspecified outcomes without serializing arbitrary error details', async () => {
+  const cwd = await fixture()
+  const cases = [
+    { error: new HarnessSdkError('AUDIT_FAULT', 'same message', false, false), code: 'AUDIT_FAULT', unknown: false, fatal: false, cleanup: 0 },
+    { error: new HarnessSdkError('AUDIT_FAULT', 'same message', false, true), code: 'AUDIT_FAULT', unknown: true, fatal: true, cleanup: 0 },
+    { error: new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'same message', false, false, { cleanupErrors: [{ secret: 'not for artifacts' }] }), code: 'RESOURCE_RELEASE_FAILED', unknown: false, fatal: true, cleanup: 1 },
+    { error: new HarnessSdkError('AGENT_STARTUP_BLOCKED', 'same message', false, false, { workflowDisposition: 'startup_blocked' }), code: null, unknown: null, fatal: false, cleanup: 0 },
+  ]
+  for (const [index, expected] of cases.entries()) {
+    const harness = await backend(() => { throw expected.error })
+    const config = await options(cwd, harness.client, { outputDir: join(cwd, `out-${index}`) })
+    await reviewDesign(config).catch(() => {})
+    const errors = (await readdir(join(config.outputDir, 'calls'))).filter(name => name.endsWith('.error.json'))
+    expect(errors).toHaveLength(1)
+    const text = await readFile(join(config.outputDir, 'calls', errors[0]!), 'utf8')
+    expect(JSON.parse(text)).toMatchObject({ code: expected.code, outcomeUnknown: expected.unknown, fatal: expected.fatal, cleanupErrorCount: expected.cleanup })
+    expect(text).not.toContain('not for artifacts')
+  }
+})
+
+test('deleted supplemental context invalidates a legacy task while independent tasks remain reusable', async () => {
+  const cwd = await fixture({ 'a.ts': 'export const a = 1\n', 'b.ts': 'export const b = 2\n',
+    '.gitignore': 'extra.md\n', 'extra.md': 'old supplemental contract\n' })
+  const first = await backend((input, output) => {
+    if (input.task === 'design-analysis' && input.assignment!.angleId === 'D12'
+      && input.assignment!.primaryFiles.includes('a.ts') && input.round === 0) {
+      return { ...analysisSchema.parse(output), status: 'needs_context', contextRequests: [
+        { path: 'extra.md', symbol: null, query: null, reason: 'Read supplemental contract' },
+      ] }
+    }
+    return output
+  })
+  const source = await options(cwd, first.client)
+  const original = await reviewDesign(source)
+  expect(original.complete).toBe(true)
+  const legacy = join(cwd, 'draft/docs/design-review/legacy-deleted')
+  await mkdir(legacy)
+  await writeFile(join(legacy, 'report.json'), JSON.stringify(original))
+  await cp(join(source.outputDir, 'snapshots'), join(legacy, 'snapshots'), { recursive: true })
+  await rm(join(cwd, 'extra.md'))
+  const next = await backend()
+  const resumed = await reviewDesign(await options(cwd, next.client, { resumeFrom: legacy, outputDir: `${legacy}-imported` }))
+  expect(resumed.complete).toBe(true)
+  expect(resumed.calls.reusedTasks).toBe(original.tasks.length - 1)
+  expect(next.calls.filter(call => call.task === 'design-analysis').map(call => call.assignment!.primaryFiles)).toEqual([['a.ts']])
+})
+
+test('a 73-of-100 code review resumes 27 tasks without a final report or another planning call', async () => {
+  const files = Object.fromEntries(Array.from({ length: 50 }, (_, index) => [
+    `file-${String(index).padStart(2, '0')}.ts`, `export const value${index} = ${index}\n`,
+  ]))
+  const cwd = await fixture(files)
+  const first = await backend()
+  let completed = 0
+  const source = await options(cwd, first.client, { concurrency: 1,
+    shouldStop: () => completed === 73,
+    progress: message => { if (message.startsWith('task end:') && message.endsWith('(completed)')) completed++ },
+  })
+  const interrupted = await reviewDesign(source)
+  expect(interrupted.plan.tasks).toHaveLength(100)
+  expect(interrupted.complete).toBe(false)
+  expect(interrupted.tasks.filter(task => task.status === 'completed')).toHaveLength(73)
+  expect(first.calls.filter(call => call.task === 'design-analysis')).toHaveLength(73)
+  expect((await readdir(join(source.outputDir, 'checkpoints'))).filter(name => /^[a-f0-9]{64}\.json$/.test(name))).toHaveLength(74)
+  await rm(join(source.outputDir, 'report.json'))
+  await rm(join(source.outputDir, 'report.md'))
+  const originalManifest = await readFile(join(source.outputDir, 'run.json'), 'utf8')
+  const next = await backend()
+  const resumed = await reviewDesign(await options(cwd, next.client, { concurrency: 4,
+    resumeFrom: source.outputDir, outputDir: `${source.outputDir}-recovered`,
+  }))
+  expect(resumed.complete).toBe(true)
+  expect(resumed.calls.reusedTasks).toBe(73)
+  expect(resumed.tasks).toHaveLength(100)
+  expect(resumed.tasks.every(task => task.status === 'completed')).toBe(true)
+  expect(next.calls.filter(call => call.task === 'design-planning')).toHaveLength(0)
+  const retried = next.calls.filter(call => call.task === 'design-analysis').map(call => call.assignment!.id).sort()
+  expect(retried).toHaveLength(27)
+  expect(retried).toEqual(interrupted.tasks.filter(task => task.status !== 'completed').map(task => task.task.id).sort())
+  expect(await readFile(join(source.outputDir, 'run.json'), 'utf8')).toBe(originalManifest)
+}, 30000)
+
+
+test('resume progress identifies changed configuration without restoring old defaults', async () => {
+  const cwd = await fixture()
+  const first = await backend()
+  const source = await options(cwd, first.client, { contextRounds: 1 })
+  await reviewDesign(source)
+  const messages: string[] = []
+  const next = await backend()
+  const resumed = await reviewDesign(await options(cwd, next.client, { contextRounds: 2,
+    resumeFrom: source.outputDir, outputDir: `${source.outputDir}-different-config`, progress: message => messages.push(message),
+  }))
+  expect(resumed.complete).toBe(true)
+  expect(resumed.plan.budgets.contextRounds).toBe(2)
+  expect(resumed.calls.reusedTasks).toBe(0)
+  expect(messages.some(message => message.includes('Resume configuration changed: contextRounds.'))).toBe(true)
+  expect(next.calls.filter(call => call.task === 'design-planning')).toHaveLength(1)
+  expect(next.calls.filter(call => call.task === 'design-analysis')).toHaveLength(4)
 })

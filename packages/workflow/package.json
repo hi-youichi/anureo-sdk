@@ -1,7 +1,7 @@
 {
   "name": "@anureo/workflow",
   "version": "0.2.0",
-  "description": "Agent, parallel, and pipeline primitives for TypeScript workflows over the Anureo SDK",
+  "description": "Agent execution, composition, and durable workflow steps over the Anureo SDK",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "git+https://github.com/hi-youichi/anureo-sdk.git", "directory": "packages/workflow" },
   "publishConfig": { "access": "public" },

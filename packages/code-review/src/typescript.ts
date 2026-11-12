@@ -13,7 +13,7 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
   for (const snapshot of repository) {
     if (snapshot.kind !== 'text' || !/(^|\/)package\.json$/.test(snapshot.path)) continue
     try {
-      const manifest = JSON.parse(snapshot.text)
+      const manifest = JSON.parse(snapshot.text.replace(/^\uFEFF/, ''))
       if (typeof manifest.name !== 'string') continue
       // Ambiguous package identities cannot identify a static target.
       if (ambiguousNames.has(manifest.name)) continue
@@ -21,6 +21,7 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
       byName.set(manifest.name, { root: `/${dirname(snapshot.path) === '.' ? '' : dirname(snapshot.path)}`, manifest })
     } catch { /* An invalid manifest is not an import-resolution contract. */ }
   }
+  const packageNames = [...byName.keys()].sort((a, b) => b.length - a.length)
   function exportTarget(value: unknown): string | null {
     if (typeof value === 'string') return value.startsWith('./') ? value : null
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -31,11 +32,13 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
   }
   function resolveImport(specifier: string, from: string): string | null {
     let base: string
+    let packageRoot: string | undefined
     if (specifier.startsWith('.')) base = resolve(dirname(from), specifier)
     else {
-      const pkg = [...byName.keys()].sort((a, b) => b.length - a.length).find(name => specifier === name || specifier.startsWith(`${name}/`))
+      const pkg = packageNames.find(name => specifier === name || specifier.startsWith(`${name}/`))
       if (!pkg) return null
       const { root, manifest } = byName.get(pkg)!
+      packageRoot = root
       const suffix = specifier.slice(pkg.length)
       const key = suffix ? `.${suffix}` : '.'
       let entry: string | null
@@ -54,7 +57,8 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
     }
     const sourceEquivalent = base.replace(/\.mjs$/, '.mts').replace(/\.cjs$/, '.cts').replace(/\.jsx$/, '.tsx').replace(/\.js$/, '.ts')
     return [base, sourceEquivalent, `${base}.ts`, `${base}.tsx`, `${base}.js`, `${base}/index.ts`, `${base}/index.js`, `${base}.d.ts`]
-      .find(candidate => sources.has(candidate)) ?? null
+      .find(candidate => sources.has(candidate) && (!packageRoot || candidate === packageRoot
+        || candidate.startsWith(packageRoot.endsWith('/') ? packageRoot : `${packageRoot}/`))) ?? null
   }
   const compilerOptions: ts.CompilerOptions = { target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext, allowJs: true, noLib: true }
   const host: ts.CompilerHost = {
@@ -71,7 +75,7 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
   const checker = program.getTypeChecker()
   return [...sources.keys()].map(path => {
     const source = program.getSourceFile(path)!
-    const item: SourceIndex = { path: path.slice(1), language: /\.[cm]?tsx?$/i.test(path) ? 'typescript' : 'javascript', adapter: 'typescript-compiler-v1', capabilities: ['symbols', 'imports', 'static_calls'], symbols: [], imports: [], exports: [], calls: [], unknowns: [] }
+    const item: SourceIndex = { path: path.slice(1), language: /\.[cm]?tsx?$/i.test(path) ? 'typescript' : 'javascript', adapter: 'typescript-compiler-v2', capabilities: ['symbols', 'imports', 'static_calls'], symbols: [], imports: [], exports: [], calls: [], unknowns: [] }
     function visit(node: ts.Node) {
       const named = node as ts.Node & { name?: ts.Node; body?: ts.Node }
       if (named.name && (ts.isFunctionLike(node) || ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node)
@@ -99,11 +103,16 @@ export function indexTypeScript(snapshots: Snapshot[], _packages: Package[], rep
         const concrete = declaration && 'body' in declaration && declaration.body
         const target = concrete && targetSource && sources.has(targetSource.fileName)
           ? { path: targetSource.fileName.slice(1), line: targetSource.getLineAndCharacterOfPosition(declaration.getStart()).line + 1 } : null
-        item.calls.push({ expression: node.expression.getText(source), line: source.getLineAndCharacterOfPosition(node.getStart()).line + 1, target })
+        const start = node.expression.getStart(source), end = node.expression.getEnd()
+        const expressionTruncated = end - start > 512
+        const expression = source.text.slice(start, Math.min(end, start + 512)) + (expressionTruncated ? '…' : '')
+        item.calls.push({ expression, sourceRange: { start, end }, expressionTruncated,
+          line: source.getLineAndCharacterOfPosition(node.getStart()).line + 1, target })
       }
       ts.forEachChild(node, visit)
     }
     visit(source)
+    if (item.calls.some(call => call.expressionTruncated)) item.unknowns.push('Long call expression navigation is truncated; sourceRange locates the complete expression in the original snapshot.')
     if (item.calls.some(call => !call.target)) item.unknowns.push('Dynamic/injected/external calls need implementation context; a signature does not establish the runtime target.')
     return item
   })

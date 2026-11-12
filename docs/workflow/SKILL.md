@@ -1,6 +1,6 @@
 ---
 name: workflow-authoring
-description: Author ordinary TypeScript workflows with Anureo's agent, parallel, and pipeline primitives, explicit Clients, and application-owned progress and recovery.
+description: Author ordinary TypeScript workflows with Anureo's agent, parallel, pipeline, and optional durable workflow primitive, explicit Clients, and business-owned validation.
 ---
 
 # Workflow authoring reference
@@ -9,6 +9,8 @@ An Anureo workflow is an ordinary TypeScript function that coordinates independe
 agent sessions and application code. Import `agent`, `parallel`, and `pipeline`
 from `@anureo/workflow`, pass an initialized SDK Client and working directory,
 and await the function's result.
+For durable execution identity and explicit step checkpoints, wrap the function
+with optional `workflow()`. See the [persistence contract](persistence.md).
 
 This guide describes the current workspace implementation. The [agent contract](README.md#agent) documents supported options, Zod output
 constraints and differences from Claude Code's host.
@@ -247,15 +249,19 @@ Include the item and stage in each event so concurrent callbacks remain
 attributable. For per-agent events or usage, use the SDK Session/Turn APIs directly;
 the workflow `agent()` returns only final text or validated Zod data, or `null`.
 
-The application owns script files, arguments, result storage, checkpoints, and
-resumption. There is no required `meta` literal, injected `args`, `phase()`,
-`log()`, `budget`, workflow registry, run ID, or journal replay in this package.
-TypeScript, filesystem APIs, timestamps, and randomness follow the host runtime's
-ordinary rules; the package does not execute source strings in a restricted VM.
+The application owns script files, arguments, Clients and business validation.
+Optional `workflow()` manages a durable run ID and explicitly registered `run.step()`
+results. Resume supplies the current function and inputs again; matching steps
+reuse saved values. Input declarations must include actual prompts, relevant options,
+source versions and dependencies. Unknown configuration must disable automatic reuse.
+There is no required meta literal, injected args, phase/log API, registry or VM.
+Direct three-primitive functions remain ordinary TypeScript without persistence.
 
-For recoverable read-only work, persist each completed item's input identity,
-source version, relevant options, and validated result. Reuse a result only when
-those inputs still match. SDK session resume restores a backend conversation;
+For recoverable read-only work, checkpoint each completed item's input identity,
+source version, relevant options, and validated result. Use `reuse` to recheck
+additional context and external artifacts. Declare `recovery: 'repeatable'` only
+for operations safe to repeat; the default requires manual reconciliation when an
+old attempt has no reusable result. SDK session resume restores a backend conversation;
 it does not replay a workflow's control flow or restore application checkpoints.
 For mutations or uncertain execution outcomes, inspect the resulting state before
 deciding whether any work is safe to repeat.
@@ -266,6 +272,8 @@ deciding whether any work is safe to repeat.
   and parallel summary calls through a real Codex Client.
 - [Zod workflow example](../../examples/workflow-structured.ts): inferred object
   results from both Codex and Claude using the same schema.
+- [Persistence example](../../examples/workflow-persistence.ts): run IDs and step
+  replay with deterministic callbacks and no model calls.
 - [Package guide](../../packages/workflow/README.md): supported interface and
   resource ownership.
 - [agent implementation](../../packages/workflow/src/agent.ts),

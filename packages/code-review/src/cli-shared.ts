@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { EventEmitter } from 'node:events'
-import { lstat, readdir, realpath } from 'node:fs/promises'
+import { lstat, mkdir, open, readdir, realpath, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createClient, type Client } from '@anureo/sdk'
 import { createCodexAdapter } from '@anureo/adapter-codex'
@@ -38,11 +38,39 @@ export async function chooseOutput(cwd: string, input: string | undefined, kind:
   return { outputDir, outputExclusions: outside(path) ? [] : [repoPath(path)] }
 }
 
+/** Claim the entire editing run, including final reports; a nonempty prior run is never overwritten. */
+export async function withOutputClaim<T>(outputDir: string, run: () => Promise<T>): Promise<T> {
+  await mkdir(outputDir, { recursive: true })
+  const lock = join(outputDir, 'writer.lock')
+  const handle = await open(lock, 'wx', 0o600)
+  let owner: { dev: number; ino: number } | undefined
+  let operationFailed = false
+  let operationFailure: unknown
+  try {
+    owner = await handle.stat()
+    if ((await readdir(outputDir)).some(name => name !== 'writer.lock')) throw new Error('Output directory must be empty; choose a new directory')
+    return await run()
+  } catch (error) { operationFailed = true; operationFailure = error; throw error }
+  finally {
+    try {
+      await handle.close()
+      if (owner) {
+        const current = await lstat(lock)
+        if (current.dev !== owner.dev || current.ino !== owner.ino) throw new Error('Output ownership changed')
+        await unlink(lock)
+      }
+    } catch (error) {
+      if (operationFailed) throw new AggregateError([operationFailure, error], 'Operation and output cleanup failed')
+      throw error
+    }
+  }
+}
+
 export async function withClient<T>(cwd: string, maxOutputBytes: number, editing: boolean,
   run: (client: Client, shouldStop: () => boolean) => Promise<T>): Promise<T> {
   const client = await createClient({
     adapter: createCodexAdapter({ command: process.env.CODEX_BIN ?? 'codex', cwd,
-      ...(editing ? { args: ['app-server', '-c', 'sandbox_mode="workspace-write"', '-c', 'approval_policy="never"'] } : {}),
+      args: ['app-server', '-c', `sandbox_mode="${editing ? 'workspace-write' : 'read-only'}"`, '-c', 'approval_policy="never"'],
     }),
     identity: { adapterId: 'codex', runtimeConfigId: editing ? 'code-review-fix' : 'code-review' },
     limits: { maxResultBytes: maxOutputBytes },
@@ -64,10 +92,12 @@ export async function withClient<T>(cwd: string, maxOutputBytes: number, editing
   try { value = await run(client, () => stopping) }
   catch (error) { failed = true; failure = error }
   finally {
-    signals.removeListener('SIGINT', stop)
-    signals.removeListener('SIGTERM', stop)
     try { await (cleanup ??= client.dispose()) }
     catch (error) { failure = failed ? new AggregateError([failure, error], 'Operation and cleanup failed') : error; failed = true }
+    finally {
+      signals.removeListener('SIGINT', stop)
+      signals.removeListener('SIGTERM', stop)
+    }
   }
   if (failed) throw failure
   return value as T

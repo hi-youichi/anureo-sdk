@@ -5,6 +5,7 @@ import { z } from 'zod'
 import type { Client } from '@anureo/sdk'
 import { agent, parallel } from '@anureo/workflow'
 import { createGate, errorText, saveJson } from './io'
+import { resolveDuplicateRoots } from './duplicates'
 import { analysisSchema, dimensionSchema, verificationSchema } from './schema'
 
 const resultSchema = z.strictObject({
@@ -27,6 +28,8 @@ type Result = {
   summary: string
   checks: string[]
   changedFiles: string[]
+  changesKnown: boolean
+  unknownFiles: Array<{ path: string; error: string }>
 }
 type FixOptions = {
   client: Client
@@ -63,6 +66,8 @@ export function parseReport(text: string) {
   if (new Set(report.findings.map(f => f.id)).size !== report.findings.length
     || new Set(report.tasks.map(t => t.task.id)).size !== report.tasks.length) throw new Error('Invalid or duplicate finding/task IDs')
   const tasks = new Map(report.tasks.map(task => [task.task.id, task]))
+  const duplicateRoots = resolveDuplicateRoots(report.findings.map(finding => ({ id: finding.id, duplicateOf: finding.review?.duplicateOf ?? null })))
+  const reviewedFindings = new Map(report.findings.map(finding => [finding.id, finding]))
   const findings: Finding[] = []
   const skipped: Array<{ id: string; reason: string }> = []
   for (const finding of report.findings) {
@@ -70,10 +75,13 @@ export function parseReport(text: string) {
     const task = tasks.get(finding.taskId)
     if (!task || !task.task.dimensions.includes(finding.primaryDimension)
       || !finding.id.startsWith(`${task.task.id}#`) || !/^[1-9]\d*$/.test(finding.id.slice(task.task.id.length + 1))) throw new Error(`Invalid finding ownership: ${finding.id}`)
+    const rootId = duplicateRoots.get(finding.id)
+    const rootReview = rootId ? reviewedFindings.get(rootId)?.review : null
     let reason: string | undefined
     if (finding.stale || task.status !== 'completed' || finding.evidence.some(e => report.changedPaths.includes(e.path))) reason = 'Source or analysis is stale/incomplete'
     else if (finding.review?.verdict !== 'accepted') reason = 'Finding was not accepted by independent verification'
-    else if (finding.canonicalId !== finding.id) reason = 'Duplicate of another root finding'
+    else if (rootId === null) reason = 'Invalid duplicate chain'
+    else if (rootId !== finding.id && (!rootReview || rootReview.verdict === 'rejected')) reason = 'Duplicate root is not actionable'
     else if (finding.category !== 'readability' || finding.decision !== 'local_refactor') reason = 'Requires a separate design or behavior change plan'
     else if (task.task.primaryFiles.length !== 1) reason = 'Requires an explicit multi-file change plan'
     const path = task.task.primaryFiles[0]!
@@ -85,10 +93,25 @@ export function parseReport(text: string) {
       detail: JSON.stringify(finding), context: JSON.stringify({ summary: task.analysis?.summary, designContext: task.analysis?.designContext, review: finding.review }),
     })
   }
-  return { cwd: report.cwd, findings, skipped, coverageGaps: report.tasks.filter(t => t.status !== 'completed').map(t => t.task.id) }
+  // Statistical representatives may be pending or require design changes. Choose
+  // among independently eligible repairs, preserving each member's own write scope.
+  const representatives = new Map<string, Finding>()
+  for (const finding of findings) {
+    const canonicalId = reviewedFindings.get(finding.id)!.canonicalId
+    const canonical = reviewedFindings.get(canonicalId)
+    if (!canonical || canonical.canonicalId !== canonicalId) throw new Error(`Invalid root group: ${finding.id}`)
+    const prior = representatives.get(canonicalId)
+    if (!prior || finding.id === canonicalId || (prior.id !== canonicalId && finding.id.localeCompare(prior.id) < 0)) representatives.set(canonicalId, finding)
+  }
+  const selected = findings.filter(finding => {
+    if (representatives.get(reviewedFindings.get(finding.id)!.canonicalId) === finding) return true
+    skipped.push({ id: finding.id, reason: 'Duplicate of another eligible repair finding' })
+    return false
+  })
+  return { cwd: report.cwd, findings: selected, skipped, coverageGaps: report.tasks.filter(t => t.status !== 'completed').map(t => t.task.id) }
 }
 
-function writeOwnership(groups: string[][]) {
+export function writeOwnership(groups: string[][]) {
   const owners = new Map<string, string[]>()
   for (const group of groups) {
     if (!group.length || new Set(group).size !== group.length) throw new Error('Write groups must contain unique paths')
@@ -122,6 +145,12 @@ export async function fileHash(cwd: string, path: string) {
   return createHash('sha256').update(await readFile(absolute)).digest('hex')
 }
 
+async function fileHashes(cwd: string, paths: readonly string[]): Promise<string[]> {
+  const hashes: string[] = []
+  for (const path of paths) hashes.push(await fileHash(cwd, path))
+  return hashes
+}
+
 const instructions = [
   '你是目标项目的代码修改者。每个独立 session 只处理输入中的一条 finding。',
   '使用文件编辑工具实际修改文件；不要仅输出建议。先完整阅读当前目标文件和适用的 AGENTS.md。',
@@ -147,7 +176,10 @@ export async function fixReadability(options: FixOptions) {
   let stopReason: string | undefined
 
   // Check all write targets before starting any model work.
-  for (const path of new Set(findings.flatMap(ownedFiles))) await fileHash(cwd, path)
+  const initialHashes = new Map<string, string>()
+  for (const path of new Set(findings.flatMap(ownedFiles))) initialHashes.set(path, await fileHash(cwd, path))
+  const drifted = findings.filter(finding => initialHashes.get(finding.path) !== finding.sha256)
+  if (drifted.length) throw new Error(`Report source changed before repair: ${[...new Set(drifted.map(finding => finding.path))].join(', ')}`)
   await saveJson(join(outputDir, 'plan.json'), {
     findings, agents: findings.length, concurrency: options.concurrency,
     groups: groups.map(group => ({ findingIds: group.map(finding => finding.id), ownedFiles: ownedFiles(group[0]!) })),
@@ -159,35 +191,51 @@ export async function fixReadability(options: FixOptions) {
     let result: Result
     let before: string[] | undefined
     try {
-      before = await Promise.all(paths.map(path => fileHash(cwd, path)))
-      const response = await agent(JSON.stringify({
-        task: 'fix-readability', finding, ownedFiles: paths,
-        currentSha256: await fileHash(cwd, finding.path),
-        sourceWarning: '报告行号和 evidence 属于旧快照；同一文件的前序修改已保留，请按当前符号与语义定位。',
-      }), { client, cwd, model, instructions, schema: resultSchema })
-      if (response === null) {
-        stopReason = `Agent returned null for ${finding.id}; no automatic retry`
-        throw new Error(stopReason)
+      before = await fileHashes(cwd, paths)
+      const currentSha256 = await fileHash(cwd, finding.path)
+      const reason = stopReason ?? (options.shouldStop?.() ? 'Repair interrupted by host' : undefined)
+      if (reason) {
+        result = { id: finding.id, status: 'not_started', summary: reason, checks: [], changedFiles: [], changesKnown: true, unknownFiles: [] }
+      } else {
+        const response = await agent(JSON.stringify({
+          task: 'fix-readability', finding, ownedFiles: paths,
+          currentSha256,
+          sourceWarning: '报告行号和 evidence 属于旧快照；同一文件的前序修改已保留，请按当前符号与语义定位。',
+        }), { client, cwd, model, instructions, schema: resultSchema })
+        if (response === null) {
+          stopReason = `Agent returned null for ${finding.id}; no automatic retry`
+          throw new Error(stopReason)
+        }
+        const after = await fileHashes(cwd, paths)
+        const changedFiles = paths.filter((_, index) => before?.[index] !== after[index])
+        if ((response.status === 'changed') !== (changedFiles.length > 0)) {
+          throw new Error(`Reported status ${response.status} does not match file changes`)
+        }
+        result = { id: finding.id, ...response, changedFiles, changesKnown: true, unknownFiles: [] }
       }
-      const after = await Promise.all(paths.map(path => fileHash(cwd, path)))
-      const changedFiles = paths.filter((_, index) => before?.[index] !== after[index])
-      if ((response.status === 'changed') !== (changedFiles.length > 0)) {
-        throw new Error(`Reported status ${response.status} does not match file changes`)
-      }
-      result = { id: finding.id, ...response, changedFiles }
     } catch (error) {
       // Observation/cleanup failure cannot prove a native writer stopped; launch no more jobs.
       const failure = error as { outcomeUnknown?: boolean; code?: string }
       if (failure?.outcomeUnknown || failure?.code === 'RESOURCE_RELEASE_FAILED') {
         stopReason = `Uncertain execution or cleanup at ${finding.id}: ${errorText(error)}`
       }
-      const observed = before && !stopReason
-        ? await Promise.allSettled(paths.map(path => fileHash(cwd, path))) : []
+      const observed: PromiseSettledResult<string>[] = []
+      if (before && !stopReason) for (const path of paths) {
+        try { observed.push({ status: 'fulfilled', value: await fileHash(cwd, path) }) }
+        catch (reason) { observed.push({ status: 'rejected', reason }) }
+      }
       const changedFiles = paths.filter((_, index) => {
         const after = observed[index]
         return after?.status === 'fulfilled' && after.value !== before?.[index]
       })
-      result = { id: finding.id, status: 'failed', summary: errorText(error), checks: [], changedFiles }
+      const unknownFiles = before ? paths.flatMap((path, index) => {
+        const observation = observed[index]
+        if (observation?.status === 'fulfilled') return []
+        return [{ path, error: observation?.status === 'rejected' ? errorText(observation.reason)
+          : `File observation skipped after stopping: ${stopReason ?? 'host failure'}` }]
+      }) : []
+      const changesKnown = !unknownFiles.length
+      result = { id: finding.id, status: 'failed', summary: errorText(error), checks: [], changedFiles, changesKnown, unknownFiles }
     }
     results.set(finding.id, result)
     try { await saveJson(join(outputDir, 'findings', `${encodeURIComponent(finding.id)}.json`), result) }
@@ -206,7 +254,7 @@ export async function fixReadability(options: FixOptions) {
       await gated(async () => {
         const reason = stopReason ?? groupFailure ?? (options.shouldStop?.() ? 'Repair interrupted by host' : undefined)
         if (reason) {
-          results.set(finding.id, { id: finding.id, status: 'not_started', summary: reason, checks: [], changedFiles: [] })
+          results.set(finding.id, { id: finding.id, status: 'not_started', summary: reason, checks: [], changedFiles: [], changesKnown: true, unknownFiles: [] })
           return
         }
         const result = await fixOne(finding)
@@ -218,7 +266,8 @@ export async function fixReadability(options: FixOptions) {
 
   // parallel converts unexpected host failures to null; missing entries remain explicit failures.
   const ordered = findings.map(finding => results.get(finding.id) ?? {
-    id: finding.id, status: 'failed' as const, summary: 'Host task failed before recording a result', checks: [], changedFiles: [],
+    id: finding.id, status: 'failed' as const, summary: 'Host task failed before recording a result', checks: [], changedFiles: [], changesKnown: false,
+    unknownFiles: ownedFiles(finding).map(path => ({ path, error: 'Host task failed before recording file observations' })),
   })
   const report = { createdAt: new Date().toISOString(), stopReason: stopReason ?? null, results: ordered }
   await saveJson(join(outputDir, 'results.json'), report)
