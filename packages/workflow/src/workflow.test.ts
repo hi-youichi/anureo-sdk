@@ -1,22 +1,44 @@
 import { afterEach, expect, test } from 'bun:test'
+import { randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { HarnessSdkError } from '@anureo/sdk'
+import { createClient, HarnessSdkError, type Client, type SessionEventSink } from '@anureo/sdk'
+import { createScriptedAdapter, type FakeAdapterOptions, type FakeCall } from '@anureo/conformance'
+import type { HarnessError } from '@anureo/protocol'
 import { z } from 'zod'
-import { workflow, pipeline, parallel, type WorkflowContext, type WorkflowOptions } from './index'
+import { workflow, pipeline, parallel, agent, type WorkflowOptions } from './index'
 import { canonicalJson, digest } from './persistence/json'
 
+const clients: Client[] = []
 const roots: string[] = []
-afterEach(async () => { await Promise.all(roots.splice(0).map(path => rm(path, { recursive: true, force: true }))) })
+afterEach(async () => {
+  await Promise.all(clients.splice(0).map(client => client.dispose()))
+  await Promise.all(roots.splice(0).map(path => rm(path, { recursive: true, force: true })))
+})
 async function setup() {
   const directory = await mkdtemp(join(tmpdir(), 'anureo-workflow-'))
   roots.push(directory)
   return { directory, name: 'test', revision: '1', input: {} }
 }
-const schema = z.strictObject({ value: z.number() })
-const step = { key: 'one', input: {}, schema, recovery: 'repeatable' as const }
+async function fixture(options?: FakeAdapterOptions) {
+  const adapter = createScriptedAdapter(options)
+  const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: randomUUID() } })
+  clients.push(client)
+  return { client, adapter }
+}
+/** Emits a failed terminal turn outcome, mirroring native failures. */
+function failingExecute(error: HarnessError): NonNullable<FakeAdapterOptions['execute']> {
+  return async (call, sink) => {
+    if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
+    const turnId = randomUUID()
+    await sink.emit({ type: 'turn/started', payload: { turnId } })
+    await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error } }, { turnId })
+    return { submissionId: (call.params as { submissionId: string }).submissionId,
+      accepted: true, disposition: 'started', turnId }
+  }
+}
 
 test('root runtime exports contain the four independently usable primitives', async () => {
   expect(Object.keys(await import('./index')).sort()).toEqual(['agent', 'parallel', 'pipeline', 'workflow'])
@@ -24,151 +46,195 @@ test('root runtime exports contain the four independently usable primitives', as
 
 test('run identity is durable before body, inputs are isolated, and results are persisted', async () => {
   const options = { ...await setup(), input: { values: [1] } }
+  const { client } = await fixture()
   const result = await workflow(options, async run => {
     const manifest = JSON.parse(await readFile(join(options.directory, run.runId, 'run.json'), 'utf8'))
     expect(manifest.identity.runId).toBe(run.runId)
     expect(manifest.status).toBe('running')
+    expect(manifest.checkpointFormatVersion).toBe(2)
     expect(Object.isFrozen(run.input.values)).toBe(true)
     expect(Object.isFrozen(options.input.values)).toBe(false)
-    return run.step(step, () => ({ value: 0 }))
+    return agent('hello', { client, cwd: options.directory })
   })
-  expect(result.result).toEqual({ value: 0 })
+  expect(result.result).toBe('hello')
   expect(result.status).toBe('completed')
-  expect(await readdir(join(options.directory, result.runId))).not.toContain('writer.lock')
-  expect(JSON.parse(await readFile(join(options.directory, result.runId, 'result.json'), 'utf8'))).toEqual(result.result)
+  const stored = await readdir(join(options.directory, result.runId))
+  expect(stored.sort()).toEqual(['journal.json', 'result.json', 'run.json'])
+  const journal = JSON.parse(await readFile(join(options.directory, result.runId, 'journal.json'), 'utf8'))
+  expect(journal).toHaveLength(2)
+  expect(journal[1]).toMatchObject({ type: 'result', result: 'hello' })
 })
 
-test('resumption validates and copies committed values without executing, and survives source deletion', async () => {
+test('resumed runs replay identical agent calls from the journal without new sessions', async () => {
   const options = await setup()
-  let calls = 0
-  const first = await workflow({ ...options, runId: 'first' }, run => run.step(step, () => ({ value: ++calls })))
-  let validations = 0
-  const second = await workflow({ ...options, runId: 'second', resumeFrom: first.runId }, run =>
-    run.step({ ...step, reuse: value => { validations++; return value.value === 1 } }, () => ({ value: ++calls })))
+  const { client, adapter } = await fixture()
+  const first = await workflow(options, async () =>
+    agent('{"value":1}', { client, cwd: options.directory, schema: z.strictObject({ value: z.number() }) }))
+  expect(adapter.opened).toHaveLength(1)
+  expect(first.result).toEqual({ value: 1 })
+  const second = await workflow({ ...options, resumeFrom: first.runId }, async () =>
+    agent('{"value":1}', { client, cwd: options.directory, schema: z.strictObject({ value: z.number() }) }))
+  expect(adapter.opened).toHaveLength(1)
+  expect(second.result).toEqual({ value: 1 })
+  // The resumed run carries its own journal copy; the source can be deleted.
   await rm(join(options.directory, first.runId), { recursive: true })
-  const third = await workflow({ ...options, resumeFrom: second.runId }, run => run.step(step, () => ({ value: ++calls })))
-  expect(calls).toBe(1)
-  expect(validations).toBe(1)
-  expect(third.result.value).toBe(1)
+  const third = await workflow({ ...options, resumeFrom: second.runId }, async () =>
+    agent('{"value":1}', { client, cwd: options.directory, schema: z.strictObject({ value: z.number() }) }))
+  expect(adapter.opened).toHaveLength(1)
+  expect(third.result).toEqual({ value: 1 })
 })
 
-test('input, root input, schema and revision changes invalidate repeatable steps', async () => {
+test('chained keys invalidate the downstream prefix when any call changes', async () => {
   const options = await setup()
-  let calls = 0
-  const first = await workflow(options, run => run.step(step, () => ({ value: ++calls })))
-  for (const update of [{ revision: '2' }, { input: { changed: true } }]) {
-    await workflow({ ...options, ...update, resumeFrom: first.runId }, run => run.step(step, () => ({ value: ++calls })))
-  }
-  await workflow({ ...options, resumeFrom: first.runId }, run => run.step({ ...step, input: { changed: true } }, () => ({ value: ++calls })))
-  await workflow({ ...options, resumeFrom: first.runId }, run => run.step({ ...step,
-    schema: z.strictObject({ value: z.number().min(0) }) }, () => ({ value: ++calls })))
-  expect(calls).toBe(5)
-})
-
-test('manual reconciliation and branch-skipped history persist across repeated recovery', async () => {
-  const options = await setup()
-  const first = await workflow(options, async run => {
-    try { await run.step(step, () => { throw new HarnessSdkError('KNOWN_FAILURE') }) } catch {}
-    return 'partial'
+  const { client, adapter } = await fixture()
+  const first = await workflow(options, async () => {
+    const a = await agent('a', { client, cwd: options.directory })
+    const b = await agent('b', { client, cwd: options.directory })
+    return `${a}${b}`
   })
-  const second = await workflow({ ...options, resumeFrom: first.runId }, () => 'branch skipped')
-  let calls = 0
-  await expect(workflow({ ...options, resumeFrom: second.runId }, run =>
-    run.step({ ...step, recovery: 'manual' }, () => ({ value: ++calls })))).rejects.toMatchObject({ code: 'WORKFLOW_RECONCILIATION_REQUIRED' })
-  expect(calls).toBe(0)
+  expect(first.result).toBe('ab')
+  expect(adapter.opened).toHaveLength(2)
+  const second = await workflow({ ...options, resumeFrom: first.runId }, async () => {
+    const a = await agent('a', { client, cwd: options.directory })
+    const changed = await agent('CHANGED', { client, cwd: options.directory })
+    const b = await agent('b', { client, cwd: options.directory })
+    return `${a}${changed}${b}`
+  })
+  expect(adapter.opened).toHaveLength(4)
+  expect(second.result).toBe('aCHANGEDb')
+})
+
+test('prompt, options, and client identity changes miss the cache', async () => {
+  const options = await setup()
+  const { client, adapter } = await fixture()
+  const other = await fixture()
+  const first = await workflow(options, () => agent('same', { client, cwd: options.directory, model: 'm1' }))
+  expect(adapter.opened).toHaveLength(1)
+  await workflow({ ...options, resumeFrom: first.runId }, () => agent('same', { client, cwd: options.directory, model: 'm2' }))
+  expect(adapter.opened).toHaveLength(2)
+  await workflow({ ...options, resumeFrom: first.runId }, () => agent('other', { client, cwd: options.directory, model: 'm1' }))
+  expect(adapter.opened).toHaveLength(3)
+  await workflow({ ...options, resumeFrom: first.runId }, () => agent('same', { client: other.client, cwd: options.directory, model: 'm1' }))
+  expect(adapter.opened).toHaveLength(3)
+  expect(other.adapter.opened).toHaveLength(1)
+})
+
+test('name or revision changes reject resume before the body runs', async () => {
+  const options = await setup()
+  const { client } = await fixture()
+  const first = await workflow(options, () => agent('a', { client, cwd: options.directory }))
+  for (const update of [{ revision: '2' }, { name: 'other' }]) {
+    let entered = false
+    await expect(workflow({ ...options, ...update, resumeFrom: first.runId }, () => {
+      entered = true; return 'bad'
+    })).rejects.toMatchObject({ code: 'WORKFLOW_INCOMPATIBLE_RUN' })
+    expect(entered).toBe(false)
+  }
+})
+
+test('dropped agents never cache and resume repeats them', async () => {
+  const options = await setup()
+  const { client, adapter } = await fixture({
+    execute: failingExecute({ code: 'RATE_LIMITED', message: 'limited', retryable: true, outcomeUnknown: false }),
+  })
+  const first = await workflow(options, async () =>
+    await agent('dropped', { client, cwd: options.directory }))
+  expect(first.result).toBeNull()
   expect(first.status).toBe('incomplete')
+  await workflow({ ...options, resumeFrom: first.runId }, () => agent('dropped', { client, cwd: options.directory }))
+  expect(adapter.opened).toHaveLength(2)
 })
 
-test('a newer failed attempt shadows an older successful result across resumes', async () => {
+test('failed agent outcomes stay incomplete through composition and re-execute on resume', async () => {
   const options = await setup()
-  const first = await workflow(options, run => run.step(step, () => ({ value: 1 })))
-  const second = await workflow({ ...options, resumeFrom: first.runId }, async run => {
-    try {
-      await run.step({ ...step, input: { changed: true } }, () => { throw new HarnessSdkError('KNOWN_FAILURE') })
-    } catch {}
-    return 'failed attempt'
+  const { client, adapter } = await fixture({
+    execute: failingExecute({ code: 'NATIVE_FAILED', message: 'failed', retryable: true, outcomeUnknown: false }),
   })
-  let calls = 0
-  await expect(workflow({ ...options, resumeFrom: second.runId }, run =>
-    run.step({ ...step, recovery: 'manual' }, () => ({ value: ++calls })))).rejects
-    .toMatchObject({ code: 'WORKFLOW_RECONCILIATION_REQUIRED' })
-  expect(calls).toBe(0)
-})
-
-test('null and caught failures remain incomplete through both composition primitives', async () => {
-  const options = await setup()
-  const result = await workflow(options, async run => {
-    const a = await pipeline([0, 1], index => run.step({ ...step, key: `pipe-${index}` }, () => index ? null : { value: 0 }))
-    const b = await parallel([() => run.step({ ...step, key: 'parallel' }, () => { throw new HarnessSdkError('KNOWN_FAILURE') })])
-    return { a, b }
-  })
+  const result = await workflow(options, async () =>
+    await parallel([() => agent('failing', { client, cwd: options.directory })]))
   expect(result.status).toBe('incomplete')
-  expect(result.result).toEqual({ a: [{ value: 0 }, null], b: [null] })
+  expect(result.result).toEqual([null])
+  await workflow({ ...options, resumeFrom: result.runId }, () =>
+    parallel([() => agent('failing', { client, cwd: options.directory })]))
+  expect(adapter.opened).toHaveLength(2)
 })
 
-test('duplicate keys never start a second callback, and late calls reject', async () => {
+test('unknown previous outcomes require reconciliation instead of silent re-execution', async () => {
   const options = await setup()
-  let calls = 0
-  let saved!: WorkflowContext<{}>
-  const result = await workflow(options, async run => {
-    saved = run
-    return parallel([() => run.step(step, () => ({ value: ++calls })), () => run.step(step, () => ({ value: ++calls }))])
+  const { client, adapter } = await fixture({
+    execute: failingExecute({ code: 'NATIVE_FAILED', message: 'unknown', retryable: false, outcomeUnknown: true }),
   })
-  expect(calls).toBe(1)
-  expect(result.status).toBe('incomplete')
-  await expect(saved.step({ ...step, key: 'late' }, () => ({ value: ++calls }))).rejects.toMatchObject({ code: 'WORKFLOW_CLOSED' })
+  const failure = await workflow(options, () => agent('unknown', { client, cwd: options.directory }))
+    .then(value => { throw new Error(`expected rejection, completed with ${JSON.stringify(value)}`) })
+    .catch(cause => cause as HarnessSdkError & { details: { runId: string } })
+  expect(failure).toBeInstanceOf(HarnessSdkError)
+  expect(failure.outcomeUnknown).toBe(true)
+  expect(adapter.opened).toHaveLength(1)
+  await expect(workflow({ ...options, resumeFrom: failure.details.runId }, () =>
+    agent('unknown', { client, cwd: options.directory })))
+    .rejects.toMatchObject({ code: 'WORKFLOW_RECONCILIATION_REQUIRED' })
+  expect(adapter.opened).toHaveLength(1)
 })
 
-test('unknown and attached cleanup failures stop dispatch even when caught by the body', async () => {
-  for (const failure of [new HarnessSdkError('LOST', 'lost', false, true),
-    new HarnessSdkError('PRIMARY', 'primary', false, false, { cleanupErrors: [{ code: 'CLEANUP', outcomeUnknown: false }] })]) {
-    const options = await setup()
-    let calls = 0
-    await expect(workflow(options, async run => {
-      try { await run.step(step, () => { throw failure }) } catch {}
-      try { await run.step({ ...step, key: 'next' }, () => ({ value: ++calls })) } catch {}
-      return 'caught'
-    })).rejects.toMatchObject({ code: failure.code, outcomeUnknown: failure.outcomeUnknown, details: { runId: expect.any(String) } })
-    expect(calls).toBe(0)
-  }
-})
-
-test('storage failure is sticky, creates no successful marker and blocks subsequent work', async () => {
+test('storage failure is sticky and blocks subsequent agent dispatch', async () => {
   const options = await setup()
-  let calls = 0
+  const { client, adapter } = await fixture()
   let id = ''
   await expect(workflow(options, async run => {
     id = run.runId
-    await rename(join(options.directory, id, 'results'), join(options.directory, id, 'old-results'))
-    try { await run.step(step, () => ({ value: ++calls })) } catch {}
-    try { await run.step({ ...step, key: 'later' }, () => ({ value: ++calls })) } catch {}
+    // Moving the run directory breaks every subsequent journal publication.
+    await rename(join(options.directory, id), join(options.directory, `${id}-moved`))
+    try { await agent('first', { client, cwd: options.directory }) } catch {}
+    try { await agent('second', { client, cwd: options.directory }) } catch {}
     return 'caught'
   })).rejects.toMatchObject({ code: 'WORKFLOW_STORAGE_FAILED' })
-  expect(calls).toBe(1)
-  expect(await readdir(join(options.directory, id, 'checkpoints'))).toEqual([])
+  // The started marker could not be published, so no session was ever opened.
+  expect(adapter.opened).toHaveLength(0)
 })
 
-test('body completion waits for already registered unawaited work', async () => {
+test('body completion waits for already registered unawaited agent work', async () => {
   const options = await setup()
+  const { client } = await fixture()
   let resolve!: () => void
   const wait = new Promise<void>(done => { resolve = done })
   let ended = false
-  const result = workflow(options, run => {
-    void run.step(step, async () => { await wait; ended = true; return { value: 1 } })
+  const result = workflow(options, () => {
+    void agent('slow', { client, cwd: options.directory }).then(() => { ended = true })
+    void wait.then(() => {})
     resolve()
     return 'body'
   })
+  await wait
   expect((await result).status).toBe('completed')
   expect(ended).toBe(true)
 })
 
+test('agent calls detached from the run context execute as ordinary unjournaled agents', async () => {
+  const options = await setup()
+  const { client, adapter } = await fixture()
+  let saved!: () => Promise<unknown>
+  await workflow(options, () => {
+    saved = () => agent('late', { client, cwd: options.directory })
+    return 'body'
+  })
+  // The closure escapes the run's async context, so no journal applies.
+  expect(await saved()).toBe('late')
+  expect(adapter.opened).toHaveLength(1)
+})
+
 test('source activity, target competition, and reused explicit ids reject before body', async () => {
   const options = await setup()
+  const { client } = await fixture()
   let release!: () => void
   let entered!: () => void
   const ready = new Promise<void>(done => { entered = done })
   const waiting = new Promise<void>(done => { release = done })
-  const first = workflow({ ...options, runId: 'owned' }, async () => { entered(); await waiting; return 'done' })
+  const first = workflow({ ...options, runId: 'owned' }, async () => {
+    entered()
+    await agent('held', { client, cwd: options.directory })
+    await waiting
+    return 'done'
+  })
   await ready
   try {
     await expect(workflow({ ...options, runId: 'owned' }, () => 'bad')).rejects.toMatchObject({ code: 'WORKFLOW_RUN_EXISTS' })
@@ -182,7 +248,8 @@ test('initialization rejects invalid identities and releases a failed target cla
   let entered = false
   await expect(workflow({ ...options, runId: '../escape' }, () => { entered = true; return {} }))
     .rejects.toMatchObject({ code: 'INVALID_PARAMS' })
-  const original = await workflow({ ...options, runId: 'source' }, () => ({}))
+  const { client } = await fixture()
+  const original = await workflow({ ...options, runId: 'source' }, () => agent('a', { client, cwd: options.directory }))
   await expect(workflow({ ...options, name: 'incompatible', runId: 'target', resumeFrom: original.runId }, () => {
     entered = true; return {}
   })).rejects.toMatchObject({ code: 'WORKFLOW_INCOMPATIBLE_RUN' })
@@ -192,30 +259,40 @@ test('initialization rejects invalid identities and releases a failed target cla
 
 test('preallocated Unicode and spaced output names resume without changing directory meaning', async () => {
   const options = await setup()
-  let calls = 0
-  const first = await workflow({ ...options, runId: '审查 output' }, run => run.step(step, () => ({ value: ++calls })))
-  const result = await workflow({ ...options, resumeFrom: first.runId }, run => run.step(step, () => ({ value: ++calls })))
+  const { client, adapter } = await fixture()
+  const first = await workflow({ ...options, runId: '审查 output' }, () => agent('同', { client, cwd: options.directory }))
+  const result = await workflow({ ...options, resumeFrom: first.runId }, () => agent('同', { client, cwd: options.directory }))
   expect(first.runId).toBe('审查 output')
-  expect(result.result.value).toBe(1)
-  expect(calls).toBe(1)
+  expect(result.result).toBe('同')
+  expect(adapter.opened).toHaveLength(1)
 })
 
 test('corrupt or missing recovery materials fail rather than execute', async () => {
   for (const variant of ['bad-json', 'missing', 'symlink'] as const) {
     const options = await setup()
-    const first = await workflow(options, run => run.step(step, () => ({ value: 1 })))
-    const path = join(options.directory, first.runId, 'results')
-    const filename = (await readdir(path))[0]!
-    if (variant === 'bad-json') await writeFile(join(path, filename), '{broken')
+    const { client, adapter } = await fixture()
+    const first = await workflow(options, () => agent('a', { client, cwd: options.directory }))
+    const path = join(options.directory, first.runId, 'journal.json')
+    if (variant === 'bad-json') await writeFile(path, '{broken')
     else {
-      await rm(join(path, filename))
-      if (variant === 'symlink') await symlink(join(options.directory, first.runId, 'result.json'), join(path, filename))
+      await rm(path)
+      if (variant === 'symlink') await symlink(join(options.directory, first.runId, 'run.json'), path)
     }
-    let calls = 0
-    await expect(workflow({ ...options, resumeFrom: first.runId }, run => run.step(step, () => ({ value: ++calls }))))
+    await expect(workflow({ ...options, resumeFrom: first.runId }, () => agent('a', { client, cwd: options.directory })))
       .rejects.toMatchObject({ code: 'WORKFLOW_CHECKPOINT_INVALID' })
-    expect(calls).toBe(0)
+    expect(adapter.opened).toHaveLength(1)
   }
+})
+
+test('format-v1 run directories are rejected on resume', async () => {
+  const options = await setup()
+  const { client } = await fixture()
+  const first = await workflow(options, () => agent('a', { client, cwd: options.directory }))
+  const manifestPath = join(options.directory, first.runId, 'run.json')
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+  await writeFile(manifestPath, JSON.stringify({ ...manifest, checkpointFormatVersion: 1 }))
+  await expect(workflow({ ...options, resumeFrom: first.runId }, () => 'bad'))
+    .rejects.toMatchObject({ code: 'WORKFLOW_CHECKPOINT_INVALID' })
 })
 
 test('strict JSON rejects lossy inputs and canonical hashes ignore object insertion order', () => {
@@ -228,8 +305,8 @@ test('strict JSON rejects lossy inputs and canonical hashes ignore object insert
   expect(digest({ a: 1, b: 2 })).toBe(digest({ b: 2, a: 1 }))
 })
 
-test('real process death at durable boundaries recovers committed work and repeats only uncommitted work', async () => {
-  for (const phase of ['before-started', 'after-execute', 'before-marker', 'after-marker', 'before-final']) {
+test('real process death at durable boundaries replays committed agent work only', async () => {
+  for (const phase of ['before-started', 'after-execute', 'before-final']) {
     const options = await setup()
     const child = Bun.spawn([process.execPath, fileURLToPath(new URL('./fixtures/workflow-crash.ts', import.meta.url)),
       options.directory, phase], { stdout: 'ignore', stderr: 'pipe' })
@@ -237,42 +314,50 @@ test('real process death at durable boundaries recovers committed work and repea
     expect(code).not.toBe(0)
     const error = await new Response(child.stderr).text()
     expect(error).toBe('')
-    let repeated = 0
-    const result = await workflow({ ...options, name: 'crash-test', resumeFrom: 'crashed' }, run =>
-      run.step({ ...step, key: 'work' }, () => { repeated++; return { value: 7 } }))
-    expect(result.result.value).toBe(7)
-    expect(repeated).toBe(['after-marker', 'before-final'].includes(phase) ? 0 : 1)
+    const adapter = createScriptedAdapter()
+    const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: 'crash-fixture' } })
+    clients.push(client)
+    const result = await workflow({ ...options, name: 'crash-test', resumeFrom: 'crashed' }, () =>
+      agent('work', { client, cwd: options.directory }))
+    expect(result.result).toBe('work')
+    expect(adapter.opened).toHaveLength(phase === 'before-final' ? 0 : 1)
+    await client.dispose()
   }
 }, 15000)
 
-test('a 73-of-100 interrupted run reuses 73 committed steps regardless of invocation order', async () => {
+test('an interrupted run reuses the unchanged call prefix in original order', async () => {
   const options = await setup()
-  await expect(workflow({ ...options, runId: 'partial' }, async run => {
-    for (let n = 0; n < 73; n++) await run.step({ ...step, key: `item-${n}`, input: { n } }, () => ({ value: n }))
+  const { client, adapter } = await fixture()
+  await expect(workflow({ ...options, runId: 'partial' }, async () => {
+    for (let n = 0; n < 3; n++) await agent(`item-${n}`, { client, cwd: options.directory })
     throw new HarnessSdkError('HOST_STOPPED')
   })).rejects.toMatchObject({ code: 'HOST_STOPPED' })
-  let executed = 0
-  const result = await workflow({ ...options, resumeFrom: 'partial' }, run =>
-    pipeline(Array.from({ length: 100 }, (_, i) => 99 - i), n =>
-      run.step({ ...step, key: `item-${n}`, input: { n } }, () => { executed++; return { value: n } })))
-  expect(executed).toBe(27)
+  expect(adapter.opened).toHaveLength(3)
+  const executed: number[] = []
+  const result = await workflow({ ...options, resumeFrom: 'partial' }, async () => {
+    for (let n = 0; n < 3; n++) await agent(`item-${n}`, { client, cwd: options.directory })
+    for (let n = 3; n < 5; n++) { await agent(`item-${n}`, { client, cwd: options.directory }); executed.push(n) }
+    return 'done'
+  })
+  expect(executed).toEqual([3, 4])
+  expect(adapter.opened).toHaveLength(5)
   expect(result.status).toBe('completed')
-  expect(result.result.map(value => value?.value)).toEqual(Array.from({ length: 100 }, (_, i) => 99 - i))
-}, 15000)
+})
 
 function typeChecks(options: WorkflowOptions<{ files: string[] }>) {
   const run = workflow(options, async context => {
     const file: string = context.input.files[0]!
-    const result = await context.step({ ...step, input: { file } }, () => ({ value: 1 }))
+    const result = await agent('review', {
+      client: {} as never, cwd: file, schema: z.strictObject({ value: z.number() }),
+    })
     // @ts-expect-error result is inferred from the schema.
     const invalid: string = result.value
-    // @ts-expect-error schema constrains the execution result.
-    await context.step({ ...step, key: 'invalid' }, () => ({ value: 'text' }))
-    return result.value
+    return result === null ? null : result.value
   })
-  const positive: Promise<{ runId: string; status: 'completed' | 'incomplete'; result: number }> = run
+  const positive: Promise<{ runId: string; status: 'completed' | 'incomplete'; result: number | null }> = run
   // @ts-expect-error body result inference is retained.
   const negative: Promise<{ result: string }> = run
+  void negative
   return positive
 }
 void typeChecks

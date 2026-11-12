@@ -252,21 +252,22 @@ attributable. For per-agent events or usage, use the SDK Session/Turn APIs direc
 the workflow `agent()` returns only final text or validated Zod data, or `null`.
 
 The application owns script files, arguments, Clients and business validation.
-Optional `workflow()` manages a durable run ID and explicitly registered `run.step()`
-results. Resume supplies the current function and inputs again; matching steps
-reuse saved values. Input declarations must include actual prompts, relevant options,
-source versions and dependencies. Unknown configuration must disable automatic reuse.
-There is no required meta literal, injected args, phase/log API, registry or VM.
-Direct three-primitive functions remain ordinary TypeScript without persistence.
+Optional `workflow()` manages a durable run ID and an automatic agent-call
+journal: every `agent()` call inside the body is checkpointed by its chained
+prompt-and-options key, and resume reuses the longest unchanged call prefix
+without opening sessions. Prompts must be deterministic for identical input and
+embed content fingerprints when answers depend on mutable state such as source
+files. There is no required meta literal, injected args, phase/log API,
+registry or VM. Direct three-primitive functions remain ordinary TypeScript
+without persistence.
 
-For recoverable read-only work, checkpoint each completed item's input identity,
-source version, relevant options, and validated result. Use `reuse` to recheck
-additional context and external artifacts. Declare `recovery: 'repeatable'` only
-for operations safe to repeat; the default requires manual reconciliation when an
-old attempt has no reusable result. SDK session resume restores a backend conversation;
-it does not replay a workflow's control flow or restore application checkpoints.
-For mutations or uncertain execution outcomes, inspect the resulting state before
-deciding whether any work is safe to repeat.
+For recoverable read-only work, make each agent call a pure function of its
+prompt: embed the item's input identity, source version, and relevant options,
+so a resume reuses completed items and re-executes only the rest. SDK session
+resume restores a backend conversation; it does not replay a workflow's control
+flow or restore application state. For mutations or uncertain execution
+outcomes, inspect the resulting state before deciding whether any work is safe
+to repeat; prior calls with unknown outcomes require reconciliation on resume.
 
 ## Further examples and implementation references
 
@@ -274,8 +275,8 @@ deciding whether any work is safe to repeat.
   and parallel summary calls through a real Codex Client.
 - [Zod workflow example](../../examples/workflow-structured.ts): inferred object
   results from both Codex and Claude using the same schema.
-- [Persistence example](../../examples/workflow-persistence.ts): run IDs and step
-  replay with deterministic callbacks and no model calls.
+- [Persistence example](../../examples/workflow-persistence.ts): run IDs and agent
+  journal replay with a scripted backend and no model calls.
 - [Package guide](../../packages/workflow/README.md): supported interface and
   resource ownership.
 - [agent implementation](../../packages/workflow/src/agent.ts),

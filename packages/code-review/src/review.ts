@@ -1,3 +1,6 @@
+import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { promisify } from 'node:util'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { HarnessSdkError, type Client } from '@anureo/sdk'
@@ -64,6 +67,19 @@ export interface ReviewOptions {
   /** Durable run storage. Defaults to <cwd>/.anureo/workflows. */
   workflowDirectory?: string
   onProgress?: (event: ReviewProgress) => void
+}
+
+const execReview = promisify(execFile)
+
+/** Content-state fingerprint (HEAD + porcelain status). Null outside a git repository. */
+async function sourceVersion(cwd: string): Promise<string | null> {
+  try {
+    const head = await execReview('git', ['-C', cwd, 'rev-parse', 'HEAD'], { maxBuffer: 1 << 24 })
+    const status = await execReview('git', ['-C', cwd, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], { maxBuffer: 1 << 24 })
+    return createHash('sha256').update(head.stdout).update('\0').update(status.stdout).digest('hex')
+  } catch {
+    return null
+  }
 }
 
 const readOnlyInstructions = `Read and analyze source code only. Do not modify files,
@@ -187,6 +203,10 @@ export async function reviewCode(options: ReviewOptions): Promise<ReviewReport> 
   if (!(await stat(cwd)).isDirectory()) throw new Error(`Review directory is not a directory: ${cwd}`)
   const agentOptions = { client: options.client, cwd, model: options.model }
   const context = options.focus ? `\nAdditional review focus: ${options.focus}` : ''
+  /** Journaled agent results are keyed by prompt; embedding the source state keeps
+   * cached reviews stale only when the repository content actually changed. */
+  const version = await sourceVersion(cwd)
+  const sourceState = version === null ? '' : `\nSource state fingerprint: ${version}\n`
   const analysisPrompt = `Analyze this codebase and split its source code into cohesive review modules.
 Inspect the directory structure, source files, package boundaries, callers, and tests.
 Return a summary and a nonempty module list with stable unique ids, names,
@@ -195,7 +215,7 @@ Assign each reviewable source file to exactly one module. Exclude dependencies,
 generated files, build output, vendored code, and operational directories
 (${OPERATIONAL_PATH_SEGMENTS.join(', ')}) including workflow records. Modules may read each other's files
 as context, but each file has only one owner for findings. Keep modules small enough
-for an independent review. Do not review the modules yet.${context}
+for an independent review. Do not review the modules yet.${context}${sourceState}
 
 ${readOnlyInstructions}`
   const directory = resolve(options.workflowDirectory ?? resolve(cwd, DEFAULT_WORKFLOW_DIRECTORY))
@@ -203,27 +223,20 @@ ${readOnlyInstructions}`
   // run directories are not resumed. sourceVersion/backendConfiguration are
   // reserved for future fingerprinting and intentionally null (see reuse note).
   const completed = await workflow({
-    name: 'code-review', revision: '4', directory,
+    name: 'code-review', revision: '5', directory,
     input: {
       cwd, model: options.model ?? null, focus: options.focus ?? null, concurrency,
       moduleIds: moduleIds ?? null, maxModules: maxModules ?? null,
       fix: fixRequested,
       angles, instructions: readOnlyInstructions, analysisPrompt,
-      sourceVersion: null, backendConfiguration: null,
+      sourceVersion: version, backendConfiguration: null,
     },
   }, async (run): Promise<ReviewReport> => {
     options.onProgress?.({ stage: 'workflow', status: 'started', runId: run.runId, directory })
     options.onProgress?.({ stage: 'analysis', status: 'started' })
-    const plan = await run.step({
-      key: 'analysis', input: { prompt: analysisPrompt }, schema: modulePlanSchema,
-      // Source and effective backend configuration are not fully fingerprinted yet.
-      // Keep checkpoints for inspection; do not reuse model claims across runs.
-      reuse: () => false,
-    }, async () => {
-      const analysis = await agent(analysisPrompt, { ...agentOptions, schema: modulePlanSchema })
-      if (analysis === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Module analysis failed: agent returned no result')
-      return validateOutput(() => validatePlan(cwd, analysis, directory))
-    })
+    const analysis = await agent(analysisPrompt, { ...agentOptions, schema: modulePlanSchema })
+    if (analysis === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Module analysis failed: agent returned no result')
+    const plan = await validateOutput(() => validatePlan(cwd, analysis, directory))
     options.onProgress?.({ stage: 'analysis', status: 'completed' })
     const selectedModules = selectModules(plan, moduleIds, maxModules)
     const runReviews = async (phase: 'review' | 'verification', previous?: readonly ModuleReview[]): Promise<ModuleReview[]> => {
@@ -261,20 +274,14 @@ reporting. Consolidate instances of the same root cause and remedy into one find
 do not repeat it merely because several checklist items apply.
 Severity: ${findingSeverities.join(', ')}. Prioritize demonstrated impact
 and scope rather than code size, pattern names, or the number of affected lines.
-Return an empty findings array if no supported issues are found.${context}${recheck}
+Return an empty findings array if no supported issues are found.${context}${recheck}${sourceState}
 
 ${readOnlyInstructions}`
           try {
-            const output = await run.step({
-              key: `${phase}:${JSON.stringify([module.id, angle.id])}`,
-              input: { prompt, module, angle }, schema: reviewOutputSchema,
-              reuse: () => false,
-            }, async () => {
-              const output = await agent(prompt, { ...agentOptions, schema: reviewOutputSchema })
-              if (output === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Review agent returned no result')
-              return { findings: await validateOutput(() => validateFindings(cwd, module, output.findings, directory)) }
-            })
-            result = { angle, status: 'completed', findings: output.findings }
+            const output = await agent(prompt, { ...agentOptions, schema: reviewOutputSchema })
+            if (output === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Review agent returned no result')
+            const findings = await validateOutput(() => validateFindings(cwd, module, output.findings, directory))
+            result = { angle, status: 'completed', findings }
           } catch (cause) {
             result = { angle, status: 'failed', error: failure(cause) }
           }
@@ -296,7 +303,8 @@ ${readOnlyInstructions}`
     }
     const reviews = await runReviews('review')
     const fix = fixRequested ? await fixFindings({
-      run, client: options.client, cwd, directory, modules: reviews, model: options.model,
+      sourceVersion: version,
+      client: options.client, cwd, directory, modules: reviews, model: options.model,
       ...(options.fixPermissionMode !== undefined ? { permissionMode: options.fixPermissionMode } : {}),
       onProgress: status => options.onProgress?.({ stage: 'fix', status }),
     }) : null

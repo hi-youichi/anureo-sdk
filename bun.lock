@@ -107,6 +107,9 @@
       "devDependencies": {
         "@logtape/logtape": "2.4.2",
       },
+      "peerDependencies": {
+        "@logtape/logtape": ">=2.0.0 <3",
+      },
     },
     "packages/hermes": {
       "name": "@anureo/adapter-hermes",
@@ -144,7 +147,7 @@
     },
     "packages/workflow": {
       "name": "@anureo/workflow",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "dependencies": {
         "@anureo/protocol": "workspace:*",
         "@anureo/sdk": "workspace:*",

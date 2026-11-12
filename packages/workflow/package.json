@@ -1,19 +1,39 @@
 {
   "name": "@anureo/workflow",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Agent execution, composition, and durable workflow steps over the Anureo SDK",
   "license": "Apache-2.0",
-  "repository": { "type": "git", "url": "git+https://github.com/hi-youichi/anureo-sdk.git", "directory": "packages/workflow" },
-  "publishConfig": { "access": "public" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
+    "directory": "packages/workflow"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
-  "scripts": { "build": "tsc --noEmit", "typecheck": "tsc --noEmit --pretty false", "test": "bun test src" },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --pretty false",
+    "test": "bun test src"
+  },
   "dependencies": {
     "@anureo/sdk": "workspace:*",
     "@anureo/protocol": "workspace:*",
     "ajv": "8.20.0",
     "zod": "4.6.7"
   },
-  "devDependencies": { "@anureo/conformance": "workspace:*", "@anureo/adapter-claude": "workspace:*", "@anureo/adapter-codex": "workspace:*", "@anureo/adapter-acp": "workspace:*", "@anureo/adapter-pi": "workspace:*" },
-  "engines": { "node": ">=22" }
+  "devDependencies": {
+    "@anureo/conformance": "workspace:*",
+    "@anureo/adapter-claude": "workspace:*",
+    "@anureo/adapter-codex": "workspace:*",
+    "@anureo/adapter-acp": "workspace:*",
+    "@anureo/adapter-pi": "workspace:*"
+  },
+  "engines": {
+    "node": ">=22"
+  }
 }

@@ -473,6 +473,10 @@ export class Client {
     for (const value of Object.values(options.limits ?? {})) positive(value, 1);
     for (const [kind, handler] of Object.entries(options.interactions ?? {})) if (!['approval', 'userInput', 'elicitation', 'dynamicTool'].includes(kind) || handler !== undefined && typeof handler !== 'function') throw new HarnessSdkError('INVALID_PARAMS');
   }
+  /** Stable identity participating in workflow journal cache keys. */
+  get identity(): ClientOptions['identity'] {
+    return { adapterId: this.options.identity.adapterId, runtimeConfigId: this.options.identity.runtimeConfigId }
+  }
   async initialize(wait?: RequestOptions): Promise<void> {
     if (invalidWait(wait)) throw new HarnessSdkError('INVALID_PARAMS');
     const result = await waitForRequest(() => this.options.adapter.initialize({ protocolVersions: [1], protocolContract: AHP_PROTOCOL_CONTRACT, clientInfo: { name: 'anureo-native-lifecycle', version: '0.2.0' }, clientCapabilities: { interactions: Object.keys(this.options.interactions ?? {}) as InteractionRequested['kind'][] } }), wait, this.options.runtime?.requestTimeoutMs);

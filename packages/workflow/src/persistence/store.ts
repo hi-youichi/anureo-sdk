@@ -1,15 +1,14 @@
 import type { WorkflowOptions } from '../workflow-types'
-import type { JsonValue } from './json'
 import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
 import { lstat, mkdir, open, readdir, realpath, unlink, type FileHandle } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 import { atomicPublish, syncDirectory } from './atomic'
-import { commitStep } from './commit'
-import { canonicalJson, digest, jsonCopy } from './json'
+import { canonicalJson, digest, jsonCopy, type JsonValue } from './json'
+import { AgentJournal, type JournalEvent } from './journal'
 import { invalidCheckpoint, record, runIdSchema, type Manifest } from './records'
-import { loadSource, type IndexedStep } from './replay'
+import { loadSourceJournal } from './replay'
 
 export interface RunIdentity {
   runId: string
@@ -19,31 +18,6 @@ export interface RunIdentity {
   input: JsonValue
 }
 
-export interface StepSpec {
-  key: string
-  input: JsonValue
-  schema: JsonValue
-  inputDigest: string
-  schemaDigest: string
-}
-
-export interface AttemptRef {
-  runId: string
-  attemptId: string
-  step: StepSpec
-}
-
-export interface Origin {
-  runId: string
-  attemptId: string
-}
-
-export type PriorStep =
-  | { kind: 'missing' }
-  | { kind: 'uncommitted'; outcome: 'started' | 'failed' | 'outcome_unknown' }
-  | { kind: 'committed'; inputDigest: string; schemaDigest: string;
-      value: JsonValue; origin: Origin }
-
 export interface StoredFailure {
   code: string
   retryable: boolean
@@ -51,12 +25,9 @@ export interface StoredFailure {
   cleanupFailed: boolean
 }
 
-export interface RunStore {
+export interface RunHandle {
   readonly identity: RunIdentity
-  prior(key: string): Promise<PriorStep>
-  begin(step: StepSpec, mode: 'execute' | 'reuse'): Promise<AttemptRef>
-  commit(attempt: AttemptRef, value: JsonValue, origin: Origin | null): Promise<void>
-  fail(attempt: AttemptRef, failure: StoredFailure): Promise<void>
+  readonly journal: AgentJournal
   finish(status: 'completed' | 'incomplete', result: JsonValue): Promise<void>
   abort(failure: StoredFailure): Promise<void>
   close(): Promise<void>
@@ -88,64 +59,17 @@ async function releaseLock(path: string, handle: FileHandle) {
   } finally { await handle.close() }
 }
 
-class FileRunStore implements RunStore {
+class FileRunHandle implements RunHandle {
   private closed = false
-  private begun = new Map<string, AttemptRef>()
-  private modes = new Map<string, 'execute' | 'reuse'>()
-  private terminal = new Set<string>()
-  private priorSteps: Map<string, PriorStep>
   private manifestQueue: Promise<void> = Promise.resolve()
 
   constructor(readonly identity: RunIdentity, private readonly path: string,
-    private readonly lock: FileHandle, private manifest: Manifest, inherited: IndexedStep[]) {
-    this.priorSteps = new Map(inherited.map(entry => [entry.key, entry.state]))
-  }
+    private readonly lock: FileHandle, private manifest: Manifest,
+    readonly journal: AgentJournal) {}
 
   private async io<T>(operation: () => Promise<T>): Promise<T> {
     if (this.closed) throw new HarnessSdkError('WORKFLOW_CLOSED')
     try { return await operation() } catch (cause) { throw storageError(cause) }
-  }
-
-  async prior(key: string): Promise<PriorStep> {
-    return jsonCopy(this.priorSteps.get(key) ?? { kind: 'missing' })
-  }
-
-  async begin(step: StepSpec, mode: 'execute' | 'reuse'): Promise<AttemptRef> {
-    return this.io(async () => {
-      if (this.begun.has(step.key)) throw new HarnessSdkError('WORKFLOW_DUPLICATE_STEP_KEY')
-      const attempt: AttemptRef = { runId: this.identity.runId, attemptId: randomUUID(), step: jsonCopy(step) }
-      this.begun.set(step.key, attempt)
-      this.modes.set(attempt.attemptId, mode)
-      await atomicPublish(join(this.path, 'attempts', `${attempt.attemptId}.json`), record({
-        checkpointFormatVersion: 1, ...attempt, mode, status: 'started', failure: null,
-      }))
-      return jsonCopy(attempt)
-    })
-  }
-
-  async commit(attempt: AttemptRef, value: JsonValue, origin: Origin | null): Promise<void> {
-    await this.io(async () => {
-      this.assertAttempt(attempt)
-      await commitStep(this.path, attempt, value, origin)
-      this.terminal.add(attempt.attemptId)
-    })
-  }
-
-  async fail(attempt: AttemptRef, failure: StoredFailure): Promise<void> {
-    await this.io(async () => {
-      this.assertAttempt(attempt)
-      await atomicPublish(join(this.path, 'attempts', `${attempt.attemptId}.json`), record({
-        checkpointFormatVersion: 1, ...attempt, mode: this.modes.get(attempt.attemptId)!,
-        status: failure.outcomeUnknown || failure.cleanupFailed ? 'outcome_unknown' : 'failed', failure,
-      }))
-      this.terminal.add(attempt.attemptId)
-    })
-  }
-
-  private assertAttempt(attempt: AttemptRef) {
-    const owned = this.begun.get(attempt.step.key)
-    if (!owned || owned.attemptId !== attempt.attemptId || digest(owned) !== digest(attempt)
-      || this.terminal.has(attempt.attemptId)) throw new HarnessSdkError('WORKFLOW_INVALID_ATTEMPT')
   }
 
   private updateManifest(update: () => Promise<void>): Promise<void> {
@@ -181,7 +105,7 @@ class FileRunStore implements RunStore {
 
 export async function openFileRun(
   options: WorkflowOptions<JsonValue> & { runId: string },
-): Promise<RunStore> {
+): Promise<RunHandle> {
   if (!runIdSchema.safeParse(options.runId).success || typeof options.name !== 'string' || !options.name
     || typeof options.revision !== 'string' || !options.revision || typeof options.directory !== 'string' || !options.directory) {
     throw new HarnessSdkError('INVALID_PARAMS')
@@ -212,20 +136,23 @@ export async function openFileRun(
       if ((cause as NodeJS.ErrnoException).code === 'EEXIST') throw new HarnessSdkError('WORKFLOW_RUN_EXISTS')
       throw cause
     }
-    await lock.writeFile(`${canonicalJson(record({ checkpointFormatVersion: 1, token: randomUUID(),
+    await lock.writeFile(`${canonicalJson(record({ checkpointFormatVersion: 2, token: randomUUID(),
       hostname: hostname(), pid: process.pid, createdAt: new Date().toISOString() }))}\n`)
     await lock.sync()
     if ((await readdir(path)).some(name => name !== 'writer.lock')) throw new HarnessSdkError('WORKFLOW_RUN_EXISTS')
-    for (const child of ['inherited', 'attempts', 'checkpoints', 'results']) await mkdir(join(path, child), { mode: 0o700 })
-    await syncDirectory(path)
-    const inherited = source ? await loadSource(join(source.directory, source.runId), options.name, source.runId) : []
-    await atomicPublish(join(path, 'inherited', 'index.json'), record({ checkpointFormatVersion: 1, steps: inherited }))
+    const inherited: JournalEvent[] = source
+      ? await loadSourceJournal(join(source.directory, source.runId), {
+        name: options.name, revision: options.revision, runId: source.runId,
+      })
+      : []
+    const journal = new AgentJournal(join(path, 'journal.json'), inherited)
+    await atomicPublish(join(path, 'journal.json'), [...inherited])
     const identity = { runId: options.runId, directory, name: options.name, revision: options.revision, input }
-    const manifest: Manifest = record({ checkpointFormatVersion: 1, fingerprintVersion: 1,
+    const manifest: Manifest = record({ checkpointFormatVersion: 2,
       identity, createdAt: new Date().toISOString(), resumedFrom: source,
       status: 'running', resultDigest: null, failure: null })
     await atomicPublish(join(path, 'run.json'), manifest)
-    return new FileRunStore(identity, path, lock, manifest, inherited)
+    return new FileRunHandle(identity, path, lock, manifest, journal)
   } catch (cause) {
     if (lock && lockPath) {
       try { await releaseLock(lockPath, lock) }

@@ -20,7 +20,6 @@ export function isFatal(error: HarnessSdkError): boolean {
 
 export class RunState {
   private accepting = true
-  private keys = new Set<string>()
   private pending = new Set<Promise<void>>()
   private stops = new Set<HarnessSdkError>()
   private rejected = 0
@@ -42,22 +41,22 @@ export class RunState {
     return this.rejected ? 'incomplete' : 'completed'
   }
 
+  /** Records a settled-but-unsuccessful outcome (for example a dropped agent)
+   * that does not reject the body but still marks the run incomplete. */
+  noteIncomplete(): void { this.rejected++ }
+
   assertDispatch(): void {
     const failure = this.failure
     if (failure) throw failure
   }
 
-  track<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  /** Registers in-flight work so body completion waits for it; late calls reject. */
+  track<T>(operation: () => Promise<T>): Promise<T> {
     if (!this.accepting) return Promise.reject(new HarnessSdkError('WORKFLOW_CLOSED'))
     let work: Promise<T>
     try {
       this.assertDispatch()
-      if (typeof key !== 'string' || !key || Buffer.byteLength(key) > 1024) {
-        throw new HarnessSdkError('WORKFLOW_INVALID_STEP_KEY')
-      }
-      if (this.keys.has(key)) throw new HarnessSdkError('WORKFLOW_DUPLICATE_STEP_KEY')
-      this.keys.add(key)
-      work = operation() // 同步准备参数，在此返回前固定输入。
+      work = operation()
     } catch (cause) {
       work = Promise.reject(cause)
     }

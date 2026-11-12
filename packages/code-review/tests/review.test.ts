@@ -139,7 +139,9 @@ test.each(['RATE_LIMITED', 'NATIVE_FAILED'])('failed angle %s preserves coverage
   expect(formatReport(report)).toContain('Review failed:')
   const manifest = JSON.parse(await readFile(join(report.workflowDirectory, report.runId, 'run.json'), 'utf8'))
   expect(manifest.status).toBe('incomplete')
-  expect(await readdir(join(report.workflowDirectory, report.runId, 'checkpoints'))).toHaveLength(4)
+  const journal = JSON.parse(await readFile(join(report.workflowDirectory, report.runId, 'journal.json'), 'utf8'))
+  expect(journal.filter((event: { type: string }) => event.type === 'result')).toHaveLength(4)
+  expect(journal.filter((event: { type: string }) => event.type === 'failed')).toHaveLength(1)
 })
 
 test('failure normalization retains only valid issue paths and codes', () => {
@@ -192,11 +194,12 @@ test('persists the run, validated analysis, every angle result, and the final re
   const report = await reviewCode({ client, cwd, workflowDirectory: directory })
   const path = join(report.workflowDirectory, report.runId)
   const manifest = JSON.parse(await readFile(join(path, 'run.json'), 'utf8'))
-  expect(manifest.identity).toMatchObject({ name: 'code-review', revision: '4', runId: report.runId })
+  expect(manifest.identity).toMatchObject({ name: 'code-review', revision: '5', runId: report.runId })
   expect(manifest.identity.input.analysisPrompt).toBe(prompts[0])
   expect(manifest.identity.input.concurrency).toBe(8)
   expect(manifest.status).toBe('completed')
-  expect(await readdir(join(path, 'checkpoints'))).toHaveLength(1 + plan.modules.length * defaultAngles.length)
+  const journal = JSON.parse(await readFile(join(path, 'journal.json'), 'utf8'))
+  expect(journal.filter((event: { type: string }) => event.type === 'result')).toHaveLength(prompts.length)
   expect(JSON.parse(await readFile(join(path, 'result.json'), 'utf8'))).toEqual(report)
   expect(await readdir(path)).not.toContain('writer.lock')
 
@@ -240,7 +243,8 @@ test('limits review to one module and one angle without dropping the full analys
   expect(report.scope).toEqual({ moduleIds: ['a'], angleIds: ['correctness'] })
   expect(formatReport(report)).toContain('Scope: 1 of 2 planned modules; angles: correctness')
   const path = join(report.workflowDirectory, report.runId)
-  expect(await readdir(join(path, 'checkpoints'))).toHaveLength(2)
+  const journal = JSON.parse(await readFile(join(path, 'journal.json'), 'utf8'))
+  expect(journal.filter((event: { type: string }) => event.type === 'result')).toHaveLength(2)
   expect(JSON.parse(await readFile(join(path, 'run.json'), 'utf8')).identity.input.maxModules).toBe(1)
 })
 
