@@ -21,6 +21,26 @@
         "zod": "4.6.7",
       },
     },
+    "apps/code-review": {
+      "name": "@anureo/code-review",
+      "version": "0.2.0",
+      "bin": {
+        "anureo-review": "./bin/anureo-review.ts",
+      },
+      "dependencies": {
+        "@anureo/adapter-claude": "workspace:*",
+        "@anureo/adapter-codex": "workspace:*",
+        "@anureo/adapter-hermes": "workspace:*",
+        "@anureo/adapter-pi": "workspace:*",
+        "@anureo/sdk": "workspace:*",
+        "@anureo/workflow": "workspace:*",
+        "zod": "4.6.7",
+      },
+      "devDependencies": {
+        "@anureo/conformance": "workspace:*",
+        "@anureo/protocol": "workspace:*",
+      },
+    },
     "packages/adapter/acp": {
       "name": "@anureo/adapter-acp",
       "version": "0.2.0",
@@ -93,26 +113,6 @@
       },
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": ">=1.5.2 <2",
-      },
-    },
-    "packages/code-review": {
-      "name": "@anureo/code-review",
-      "version": "0.2.0",
-      "bin": {
-        "anureo-review": "./bin/anureo-review.ts",
-      },
-      "dependencies": {
-        "@anureo/adapter-claude": "workspace:*",
-        "@anureo/adapter-codex": "workspace:*",
-        "@anureo/adapter-hermes": "workspace:*",
-        "@anureo/adapter-pi": "workspace:*",
-        "@anureo/sdk": "workspace:*",
-        "@anureo/workflow": "workspace:*",
-        "zod": "4.6.7",
-      },
-      "devDependencies": {
-        "@anureo/conformance": "workspace:*",
-        "@anureo/protocol": "workspace:*",
       },
     },
     "packages/conformance": {
@@ -198,7 +198,7 @@
 
     "@anureo/adapter-pi": ["@anureo/adapter-pi@workspace:packages/adapter/pi"],
 
-    "@anureo/code-review": ["@anureo/code-review@workspace:packages/code-review"],
+    "@anureo/code-review": ["@anureo/code-review@workspace:apps/code-review"],
 
     "@anureo/conformance": ["@anureo/conformance@workspace:packages/conformance"],
 

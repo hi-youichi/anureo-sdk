@@ -29,4 +29,4 @@ jobs:
       - run: bun run protocol:check
       - run: bun run typecheck
       - run: bun run typecheck:tooling
-      - run: bun test --timeout 15000 packages
+      - run: bun run test
