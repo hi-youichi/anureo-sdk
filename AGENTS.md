@@ -1,6 +1,7 @@
 # Documentation
 
 Write only official documentation in `docs/`. Write all other documentation in `draft/docs/`.
+Do not create, modify, move, or delete files under `docs/` unless explicitly requested by a human.
 
 # Workflow
 
