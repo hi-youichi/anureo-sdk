@@ -1,0 +1,31 @@
+{
+  "name": "@anureo/refactor",
+  "version": "0.2.0",
+  "description": "Graph-assisted parallel readability review and serial code refactoring",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
+    "directory": "apps/refactor"
+  },
+  "publishConfig": { "access": "public" },
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "bin": { "anureo-refactor": "./bin/anureo-refactor.ts" },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --pretty false",
+    "test": "bun test tests"
+  },
+  "dependencies": {
+    "@anureo/adapter-codex": "workspace:*",
+    "@anureo/sdk": "workspace:*",
+    "@anureo/workflow": "workspace:*",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@anureo/conformance": "workspace:*",
+    "@anureo/protocol": "workspace:*"
+  },
+  "engines": { "node": ">=22", "bun": ">=1.4.2" }
+}
