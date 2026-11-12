@@ -30,3 +30,13 @@ export async function createReviewClient(cwd: string, harness: ReviewHarness = '
     },
   })
 }
+
+/** Session permission mode for the fix agent, which edits sources and runs project
+ * checks directly. Hermes rejects the field outright; Pi already defaults to full access. */
+export function fixPermissionMode(harness: ReviewHarness): string | undefined {
+  switch (harness) {
+    case 'codex': return 'agent'
+    case 'claude': return 'bypassPermissions'
+    default: return undefined
+  }
+}

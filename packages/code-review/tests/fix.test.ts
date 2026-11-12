@@ -1,21 +1,42 @@
 import { expect, test } from 'bun:test'
-import { chmod, mkdir, readFile, readdir, stat, symlink, unlink, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { mkdir, readFile, readdir, symlink, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 import { correctnessAngle, formatReport, reviewCode, type ReviewProgress } from '../src'
 import { runCli } from '../src/cli'
 import { finding, fixture, plan } from './helpers'
 
-const proposal = { summary: 'Preserve zero instead of replacing it with the fallback.', edits: [{ file: 'a.ts', before: 'n || 1', after: 'n' }] }
+const exec = promisify(execFile)
+
+const fixResult = { summary: 'Preserve zero instead of replacing it with the fallback.', changedFiles: ['a.ts'] }
+const fixed = 'export const fallback = (n: number) => n\n'
+
+async function git(cwd: string, ...args: string[]): Promise<void> {
+  await exec('git', ['-C', cwd, ...args], { maxBuffer: 1 << 24 })
+}
+
+/** Commit the fixture sources so the review directory is a clean git repository. */
+async function commitFixture(cwd: string): Promise<void> {
+  const identity = ['-c', 'user.name=test', '-c', 'user.email=test@example.com']
+  await git(cwd, 'init', '-q')
+  await git(cwd, ...identity, 'add', '-A')
+  await git(cwd, ...identity, 'commit', '-q', '-m', 'init')
+}
 
 async function fixFixture(options: {
-  propose?: (cwd: string) => unknown | Promise<unknown>
+  fix?: (cwd: string) => unknown | Promise<unknown>
   verify?: unknown
   review?: unknown
 } = {}) {
   const context = await fixture(async prompt => {
     if (prompt.startsWith('Analyze')) return plan
-    if (prompt.startsWith('Propose fixes')) return options.propose ? options.propose(context.cwd) : proposal
+    if (prompt.startsWith('Fix these review findings')) {
+      if (options.fix) return options.fix(context.cwd)
+      await writeFile(join(context.cwd, 'a.ts'), fixed)
+      return fixResult
+    }
     if (prompt.startsWith('Verify')) return options.verify ?? { findings: [] }
     return options.review ?? { findings: [finding] }
   })
@@ -24,7 +45,7 @@ async function fixFixture(options: {
 
 const single = { maxModules: 1, angles: [correctnessAngle] }
 
-test('default review never proposes edits or writes source files', async () => {
+test('default review never dispatches a fix agent or writes source files', async () => {
   const { client, cwd, prompts } = await fixFixture()
   const before = await readFile(join(cwd, 'a.ts'))
   const report = await reviewCode({ client, cwd, ...single })
@@ -33,97 +54,164 @@ test('default review never proposes edits or writes source files', async () => {
   expect(prompts).toHaveLength(2)
 })
 
-test('fix applies exact edits, preserves CRLF and permissions, records backups, then reviews the same scope', async () => {
+test('fix edits sources directly, reconciles changes from git, then reviews the same scope', async () => {
   const { client, cwd, prompts, adapter } = await fixFixture()
-  const original = 'export const fallback = (n: number) => n || 1\r\n'
-  await writeFile(join(cwd, 'a.ts'), original)
-  await chmod(join(cwd, 'a.ts'), 0o755)
+  await commitFixture(cwd)
   const events: ReviewProgress[] = []
-  const report = await reviewCode({ client, cwd, ...single, fix: true, onProgress: event => events.push(event) })
+  const report = await reviewCode({
+    client, cwd, ...single, fix: true, fixPermissionMode: 'agent',
+    onProgress: event => events.push(event),
+  })
   expect(report.status).toBe('completed')
   expect(report.fix).toMatchObject({ status: 'applied', changedFiles: ['a.ts'], error: null })
   expect(report.modules[0]?.angles[0]).toMatchObject({ findings: [finding] })
   expect(report.fix?.verification?.[0]).toMatchObject({ module: { id: 'a' }, angles: [{ angle: { id: 'correctness' }, status: 'completed', findings: [] }] })
-  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe('export const fallback = (n: number) => n\r\n')
-  expect((await stat(join(cwd, 'a.ts'))).mode & 0o777).toBe(0o755)
+  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe(fixed)
   expect(await readFile(join(cwd, 'b.ts'), 'utf8')).toContain('n || 1')
   expect(prompts).toHaveLength(4)
-  expect(adapter.opened.every(session => session.instructions === undefined)).toBe(true)
-  expect(prompts[2]).toContain('Analyze the findings and propose minimal source edits. Do not modify files')
+  expect(prompts[2]).toContain('Fix the findings by editing the listed source files directly in the working tree.')
   expect(prompts.filter((_, index) => index !== 2).every(prompt => prompt.includes('Read and analyze source code only. Do not modify files,'))).toBe(true)
+  // The fix session is the third opened session and is the only one with a permission mode.
+  expect(adapter.opened[2]?.permissionMode).toBe('agent')
+  expect(adapter.opened.filter(session => session.permissionMode !== undefined)).toHaveLength(1)
+  expect(adapter.opened.every(session => session.instructions === undefined)).toBe(true)
   expect(events.filter(event => event.stage === 'fix').map(event => event.status)).toEqual(['started', 'completed'])
   expect(events.filter(event => event.stage === 'verification').map(event => event.status)).toEqual(['started', 'completed'])
   const path = join(report.workflowDirectory, report.runId)
-  expect(await readdir(join(path, 'checkpoints'))).toHaveLength(5)
-  expect(await readFile(join(path, 'fix-backups', '0.original'), 'utf8')).toBe(original)
-  expect(JSON.parse(await readFile(join(path, 'fix-backups', 'index.json'), 'utf8'))[0].file).toBe('a.ts')
-  expect((await readdir(cwd)).some(file => file.startsWith('.anureo-fix-'))).toBe(false)
+  expect(await readdir(join(path, 'checkpoints'))).toHaveLength(4)
+  expect((await readdir(path)).includes('fix-backups')).toBe(false)
   expect(JSON.parse(await readFile(join(path, 'result.json'), 'utf8'))).toEqual(report)
   expect(formatReport(report)).toContain('Review after fixes')
 })
 
-test.each([
-  { file: 'b.ts', before: 'n || 1', after: 'n' },
-  { file: '../outside.ts', before: 'n || 1', after: 'n' },
-  { file: 'a.ts', before: 'missing', after: 'n' },
-  { file: 'a.ts', before: 'n', after: 'value' },
-  { file: 'a.ts', before: 'n || 1', after: 'n || 1' },
-])('invalid or out-of-scope patches fail without modifying files: %j', async edit => {
-  const { client, cwd, prompts } = await fixFixture({ propose: () => ({ ...proposal, edits: [edit] }) })
-  const beforeA = await readFile(join(cwd, 'a.ts'))
-  const beforeB = await readFile(join(cwd, 'b.ts'))
+test('fix outside a git repository fails before dispatching a fix agent', async () => {
+  const { client, cwd, prompts } = await fixFixture()
+  const before = await readFile(join(cwd, 'a.ts'))
   const report = await reviewCode({ client, cwd, ...single, fix: true })
   expect(report.status).toBe('incomplete')
-  expect(report.fix).toMatchObject({ status: 'failed', changedFiles: [], error: { code: 'REVIEW_FIX_INVALID', outcomeUnknown: false } })
-  expect(await readFile(join(cwd, 'a.ts'))).toEqual(beforeA)
-  expect(await readFile(join(cwd, 'b.ts'))).toEqual(beforeB)
-  expect(prompts).toHaveLength(3)
+  expect(report.fix).toMatchObject({ status: 'failed', changedFiles: [], verification: null, error: { code: 'REVIEW_FIX_INVALID', outcomeUnknown: false } })
+  expect(report.fix?.error?.message).toContain('git repository')
+  expect(await readFile(join(cwd, 'a.ts'))).toEqual(before)
+  expect(prompts).toHaveLength(2)
 })
 
-test('an index collision after staging preserves source and removes the staged file', async () => {
-  let backupDirectory = ''
-  const { client, cwd, prompts } = await fixFixture({ propose: async () => {
-    await mkdir(backupDirectory, { recursive: true })
-    await writeFile(join(backupDirectory, 'index.json'), 'existing index')
-    return proposal
+test.each(['unstaged', 'staged', 'untracked'])('existing %s changes do not block fixing or count as scope violations', async state => {
+  const { client, cwd, prompts } = await fixFixture({ fix: async directory => {
+    const path = join(directory, 'a.ts')
+    await writeFile(path, (await readFile(path, 'utf8')).replace('n || 1', 'n'))
+    return fixResult
   } })
-  const before = await readFile(join(cwd, 'a.ts'))
-  const report = await reviewCode({ client, cwd, ...single, fix: true, onProgress: event => {
-    if (event.stage === 'workflow') backupDirectory = join(event.directory, event.runId, 'fix-backups')
+  await commitFixture(cwd)
+  const existing = 'existing unrelated changes\n'
+  await writeFile(join(cwd, 'notes.md'), existing)
+  if (state !== 'untracked') {
+    await writeFile(join(cwd, 'a.ts'), 'export const fallback = (n: number) => n || 1 // existing edit\n')
+    await writeFile(join(cwd, 'b.ts'), existing)
+    if (state === 'staged') await git(cwd, 'add', 'a.ts', 'b.ts', 'notes.md')
+  }
+  const report = await reviewCode({ client, cwd, ...single, fix: true })
+  expect(report.status).toBe('completed')
+  expect(report.fix).toMatchObject({ status: 'applied', changedFiles: ['a.ts'], error: null })
+  expect(await readFile(join(cwd, 'notes.md'), 'utf8')).toBe(existing)
+  if (state !== 'untracked') {
+    expect(await readFile(join(cwd, 'b.ts'), 'utf8')).toBe(existing)
+    expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toContain('=> n // existing edit')
+  }
+  expect(prompts).toHaveLength(4)
+  expect(prompts[2]).toContain('Preserve existing uncommitted changes')
+})
+
+test('fixing an existing untracked source file is allowed', async () => {
+  const { client, cwd } = await fixFixture()
+  await commitFixture(cwd)
+  await git(cwd, 'rm', '--cached', 'a.ts')
+  const report = await reviewCode({ client, cwd, ...single, fix: true })
+  expect(report.fix).toMatchObject({ status: 'applied', changedFiles: ['a.ts'], error: null })
+})
+
+test('existing changes are not reported as applied when the fix agent changes nothing', async () => {
+  const { client, cwd } = await fixFixture({ fix: () => fixResult })
+  await commitFixture(cwd)
+  const existing = 'export const fallback = (n: number) => n || 1 // existing edit\n'
+  await writeFile(join(cwd, 'a.ts'), existing)
+  await writeFile(join(cwd, 'b.ts'), 'existing unrelated changes\n')
+  const report = await reviewCode({ client, cwd, ...single, fix: true })
+  expect(report.fix).toMatchObject({ status: 'skipped', changedFiles: [], verification: null, error: null })
+  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe(existing)
+})
+
+test('fix changes are detected even when they restore a dirty source to its committed content', async () => {
+  let original = ''
+  const { client, cwd } = await fixFixture({ fix: async directory => {
+    await writeFile(join(directory, 'a.ts'), original)
+    return fixResult
   } })
+  await commitFixture(cwd)
+  original = await readFile(join(cwd, 'a.ts'), 'utf8')
+  await writeFile(join(cwd, 'a.ts'), `${original}// existing edit\n`)
+  const report = await reviewCode({ client, cwd, ...single, fix: true })
+  expect(report.fix).toMatchObject({ status: 'applied', changedFiles: ['a.ts'], error: null })
+})
+
+test('further edits to an already dirty out-of-scope file still fail scope validation', async () => {
+  const { client, cwd } = await fixFixture({ fix: async directory => {
+    await writeFile(join(directory, 'a.ts'), fixed)
+    await writeFile(join(directory, 'b.ts'), 'unexpected repair edit\n')
+    return fixResult
+  } })
+  await commitFixture(cwd)
+  await writeFile(join(cwd, 'b.ts'), 'existing unrelated changes\n')
+  const report = await reviewCode({ client, cwd, ...single, fix: true })
+  expect(report.fix).toMatchObject({ status: 'failed', error: { code: 'REVIEW_FIX_SCOPE' } })
+  expect(report.fix?.error?.message).toContain('b.ts')
+})
+
+test.each([
+  { name: 'edits an unselected module file', edit: async (cwd: string) => {
+    await writeFile(join(cwd, 'a.ts'), fixed)
+    await writeFile(join(cwd, 'b.ts'), fixed)
+  } },
+  { name: 'creates a new file', edit: async (cwd: string) => {
+    await writeFile(join(cwd, 'a.ts'), fixed)
+    await writeFile(join(cwd, 'new.ts'), 'new\n')
+  } },
+  { name: 'deletes a selected source file', edit: async (cwd: string) => {
+    await writeFile(join(cwd, 'a.ts'), fixed)
+    await unlink(join(cwd, 'a.ts'))
+  } },
+])('out-of-scope fix changes fail-stop with the paths listed: $name', async ({ edit }) => {
+  const { client, cwd, prompts } = await fixFixture({ fix: async directory => { await edit(directory); return fixResult } })
+  await commitFixture(cwd)
+  const report = await reviewCode({ client, cwd, ...single, fix: true })
   expect(report.status).toBe('incomplete')
   expect(report.fix).toMatchObject({ status: 'failed', changedFiles: [], verification: null,
-    error: { code: 'REVIEW_FIX_IO_FAILED', outcomeUnknown: false } })
-  expect(report.fix?.error?.message).toContain('code="EEXIST"')
-  expect(report.fix?.error?.message).toContain('syscall="open"')
-  expect(report.fix?.error?.message).toContain(`path=${JSON.stringify(join(backupDirectory, 'index.json'))}`)
-  expect(await readFile(join(cwd, 'a.ts'))).toEqual(before)
-  expect(await readFile(join(backupDirectory, '0.original'))).toEqual(before)
-  expect(await readFile(join(backupDirectory, 'index.json'), 'utf8')).toBe('existing index')
-  expect((await readdir(cwd)).filter(file => file.startsWith('.anureo-fix-'))).toEqual([])
+    error: { code: 'REVIEW_FIX_SCOPE', outcomeUnknown: false } })
+  expect(report.fix?.error?.message).toContain('revert with git')
   expect(prompts).toHaveLength(3)
 })
 
-test('schema-invalid fix proposals retain diagnostics in text and persisted JSON reports', async () => {
-  const { client, cwd } = await fixFixture({ propose: () => ({
-    ...proposal, edits: [{ ...proposal.edits[0]!, before: '' }],
-  }) })
+test('a fix agent that changes nothing on disk stays skipped without verification', async () => {
+  const { client, cwd, prompts } = await fixFixture({ fix: () => fixResult })
+  await commitFixture(cwd)
+  const events: ReviewProgress[] = []
+  const report = await reviewCode({ client, cwd, ...single, fix: true, onProgress: event => events.push(event) })
+  expect(report.fix).toMatchObject({ status: 'skipped', changedFiles: [], verification: null })
+  expect(report.modules[0]?.angles[0]).toMatchObject({ findings: [finding] })
+  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toContain('n || 1')
+  expect(prompts).toHaveLength(3)
+  expect(events.filter(event => event.stage === 'fix').map(event => event.status)).toEqual(['started', 'skipped'])
+})
+
+test('schema-invalid fix results retain diagnostics and leave sources unchanged', async () => {
+  const { client, cwd } = await fixFixture({ fix: () => ({ ...fixResult, summary: '' }) })
+  await commitFixture(cwd)
   const before = await readFile(join(cwd, 'a.ts'))
   const report = await reviewCode({ client, cwd, ...single, fix: true })
   expect(report.fix).toMatchObject({ status: 'failed', error: {
     code: 'STRUCTURED_OUTPUT_INVALID', outcomeUnknown: false,
-    issues: [{ path: '/edits/0/before', code: 'minLength' }],
+    issues: [{ path: '/summary', code: 'minLength' }],
   } })
-  expect(formatReport(report)).toContain('Validation issue: "/edits/0/before" [minLength]')
-  expect(await readFile(join(cwd, 'a.ts'))).toEqual(before)
-  expect(JSON.parse(await readFile(join(report.workflowDirectory, report.runId, 'result.json'), 'utf8'))).toEqual(report)
-})
-
-test('validates the complete patch before applying any edit', async () => {
-  const { client, cwd } = await fixFixture({ propose: () => ({ ...proposal, edits: [...proposal.edits, { ...proposal.edits[0]!, file: 'b.ts' }] }) })
-  const before = await readFile(join(cwd, 'a.ts'))
-  const report = await reviewCode({ client, cwd, ...single, fix: true })
-  expect(report.fix?.status).toBe('failed')
+  expect(formatReport(report)).toContain('Validation issue: "/summary" [minLength]')
   expect(await readFile(join(cwd, 'a.ts'))).toEqual(before)
 })
 
@@ -141,23 +229,12 @@ test.each([false, true])('custom workflow storage cannot enter the fix scope (sy
   expect(prompts).toHaveLength(1)
 })
 
-test('preserves external edits made while the fix agent is running', async () => {
-  const external = 'export const fallback = (n: number) => n + 10\n'
-  const { client, cwd } = await fixFixture({ propose: async cwd => { await writeFile(join(cwd, 'a.ts'), external); return proposal } })
-  const report = await reviewCode({ client, cwd, ...single, fix: true })
-  expect(report.fix).toMatchObject({ status: 'failed', error: { code: 'REVIEW_FIX_STALE' } })
-  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe(external)
-})
-
-test('rejects a target replaced by a symlink while planning', async () => {
-  const { client, cwd } = await fixFixture({ propose: async cwd => {
-    await unlink(join(cwd, 'a.ts'))
-    await symlink(join(cwd, 'b.ts'), join(cwd, 'a.ts'))
-    return proposal
-  } })
-  const report = await reviewCode({ client, cwd, ...single, fix: true })
-  expect(report.fix).toMatchObject({ status: 'failed', error: { code: 'REVIEW_FIX_INVALID' } })
-  expect(await readFile(join(cwd, 'b.ts'), 'utf8')).toContain('n || 1')
+test('untracked workflow storage inside the repository is excluded from fix changes', async () => {
+  const { client, cwd } = await fixFixture()
+  await commitFixture(cwd)
+  const report = await reviewCode({ client, cwd, ...single, fix: true, workflowDirectory: join(cwd, 'runs') })
+  expect(report.fix?.status).toBe('applied')
+  expect(report.fix?.changedFiles).toEqual(['a.ts'])
 })
 
 test.each([
@@ -171,16 +248,9 @@ test.each([
   expect(prompts).toHaveLength(2)
 })
 
-test('an empty fix proposal keeps the original findings without claiming applied changes', async () => {
-  const { client, cwd, prompts } = await fixFixture({ propose: () => ({ summary: 'Requires an out-of-scope change.', edits: [] }) })
-  const report = await reviewCode({ client, cwd, ...single, fix: true })
-  expect(report.fix).toMatchObject({ status: 'skipped', changedFiles: [], verification: null })
-  expect(report.modules[0]?.angles[0]).toMatchObject({ findings: [finding] })
-  expect(prompts).toHaveLength(3)
-})
-
 test.each(['RATE_LIMITED', 'NATIVE_FAILED'])('fix agent failure %s produces an incomplete report and leaves sources unchanged', async code => {
-  const { client, cwd } = await fixFixture({ propose: () => new HarnessSdkError(code) })
+  const { client, cwd } = await fixFixture({ fix: () => new HarnessSdkError(code) })
+  await commitFixture(cwd)
   const before = await readFile(join(cwd, 'a.ts'))
   const report = await reviewCode({ client, cwd, ...single, fix: true })
   expect(report.status).toBe('incomplete')
@@ -188,12 +258,11 @@ test.each(['RATE_LIMITED', 'NATIVE_FAILED'])('fix agent failure %s produces an i
   expect(await readFile(join(cwd, 'a.ts'))).toEqual(before)
 })
 
-test('unknown fix-agent outcomes reject the workflow without applying a patch', async () => {
-  const { client, cwd, prompts } = await fixFixture({ propose: () => new HarnessSdkError('RECEIPT_LOST', 'Unknown execution', false, true) })
-  const before = await readFile(join(cwd, 'a.ts'))
+test('unknown fix-agent outcomes reject the workflow without a scope check', async () => {
+  const { client, cwd, prompts } = await fixFixture({ fix: () => new HarnessSdkError('RECEIPT_LOST', 'Unknown execution', false, true) })
+  await commitFixture(cwd)
   await expect(reviewCode({ client, cwd, ...single, fix: true })).rejects.toMatchObject({ code: 'RECEIPT_LOST', outcomeUnknown: true })
   expect(prompts).toHaveLength(3)
-  expect(await readFile(join(cwd, 'a.ts'))).toEqual(before)
 })
 
 test.each([
@@ -202,6 +271,7 @@ test.each([
   { verify: new HarnessSdkError('RATE_LIMITED'), code: 2 },
 ])('CLI --fix uses post-fix review outcomes for exit status: %j', async ({ verify, code }) => {
   const { client, cwd, adapter } = await fixFixture({ verify })
+  await commitFixture(cwd)
   let stdout = '', stderr = ''
   expect(await runCli([cwd, '--max-modules', '1', '--angle', 'correctness', '--fix', '--json'], {
     createClient: async () => client, stdout: text => { stdout += text }, stderr: text => { stderr += text },

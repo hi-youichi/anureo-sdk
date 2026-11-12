@@ -8,13 +8,20 @@ and **design**, all enabled by default. Correctness looks for reachable behavior
 failures; code quality and design can also report concrete maintenance costs
 supported by source evidence.
 
+Every finding carries a `body` (the evidence and reasoning) and a `suggestion`
+(the concrete improvement: a minimal before/after code snippet, or comment /
+documentation text to add when no code change applies). Both appear in the text
+report; `--fix` proposals are seeded from the suggestions.
+
 The entire review runs inside `workflow()`. Module analysis is one `run.step()`;
 each module/angle pair is another step. Validated plans and findings are saved
 before the corresponding step completes, followed by the final report.
 
 ## CLI
 
-Requires Bun 1.4.2+ and an installed, authenticated Codex CLI. From this workspace:
+Requires Bun 1.4.2+ and configured authentication for the selected harness. Pi runs
+in-process; CLI-based harnesses require their corresponding executable.
+From this workspace:
 
 ```sh
 bun run review --help
@@ -23,13 +30,21 @@ bun run review . --concurrency 8 --focus 'Check session resource cleanup'
 bun run review . --model my-model --json > review.json
 bun run review . --max-modules 1 --angle correctness
 bun run review . --module code-review-workflow --angle design
+bun run review . --max-modules 1 --angle correctness --fix
+bun run review . --harness claude
+bun run review . --harness hermes
+bun run review . --harness pi
 ```
 
 The package also exposes the `anureo-review` executable. The optional directory
-defaults to the current directory. `CODEX_BIN` overrides the Codex executable;
-`--model` overrides `CODEX_MODEL`, otherwise the backend chooses its default.
-Progress goes to stderr and the final text or JSON report goes to stdout.
-The CLI sets Codex's read-only permission mode and denies approval requests.
+defaults to the current directory. `--harness` selects the review backend:
+`codex` (default), `claude`, `hermes`, or `pi`. `CODEX_BIN`, `CLAUDE_BIN`, and
+`HERMES_BIN` override the corresponding executable; Pi runs in-process and has
+no executable. `--model` overrides `CODEX_MODEL`, otherwise the backend chooses
+its default. Progress goes to stderr and the final text or JSON report goes to
+stdout. Sessions run with the harness's default permission mode; the CLI does
+not restrict them to read-only. Approval requests are denied uniformly for
+every harness so runs stay non-interactive.
 Run IDs and the workflow storage directory are printed to stderr and included in
 the report. Storage defaults to `<review-directory>/.anureo/workflows`; override it
 with `--workflow-dir <path>`. Each run has a `run.json` manifest, step attempts and
@@ -43,6 +58,8 @@ failures leave the workflow incomplete while siblings continue. Unknown executio
 outcomes, session cleanup failures, and workflow storage failures stop new step
 dispatch and reject the workflow after active steps settle. The CLI exits with
 code `2` in those cases. Agent calls are not retried automatically.
+Fatal diagnostics retain the error code and unknown-outcome indicator. If client
+cleanup also fails, its error is reported alongside the original execution cause.
 
 Use `--max-modules 1 --angle correctness` for a small run: one module analysis
 agent followed by one correctness review agent. The module limit takes the first
@@ -63,6 +80,47 @@ The text report shows how many planned modules were selected. A `completed`
 status describes completion of that selected scope; excluded modules have no
 review result and are not reported as having no findings.
 
+## Apply fixes
+
+`--fix` runs one bounded repair pass after every selected review has completed.
+If reviews are incomplete or have no findings, no fix agent is started. Otherwise,
+an agent with write access edits the source files owned by the selected modules
+directly in the working tree, and is asked to run the project's typecheck and test
+commands to verify its changes. Findings across angles are supplied together so
+the agent can consolidate overlapping fixes.
+
+The review directory must be inside a git repository. Existing staged, unstaged,
+and untracked changes do not block the repair; no commit or stash is required.
+The agent is instructed to preserve those changes. Before repair, the host records
+the contents and modes of selected sources and existing changed paths, excluding
+workflow storage. Afterwards, it uses `git status` and compares file states with
+that baseline so unchanged pre-existing edits are not reported as repair changes.
+Only modifications of existing selected source files are accepted. New files,
+deletions, renames, and changes outside that scope fail the fix with the violating
+paths listed; inspect and undo unwanted repair edits while preserving pre-existing
+work. The agent's reported file list is advisory.
+
+All edits occur after the initial review batch settles. Once the edits are
+verified in scope, fresh read-only agents review the same modules and angles,
+including the original findings. Review and verification use the configured
+concurrency limit. No repeated fix loop or automatic retry is performed; fix
+application and post-fix reviews have separate workflow steps, and application
+uses manual recovery.
+
+The fix session's permission mode is harness-specific: Codex uses `agent`
+(workspace-write sandbox), Claude uses `bypassPermissions`, and Hermes and Pi use
+their defaults. Approval requests are still denied uniformly, so harnesses that
+would need approval for a command cannot run it.
+
+The report keeps initial findings in `modules` and adds a `fix` object with status,
+summary, changed paths, errors, and `verification` results. `applied` means git
+observed source edits; the verification results determine remaining findings, and
+`skipped` means the agent made no observable change, so initial findings still
+count. With `--fix`, exit `0` means the final selected review completed with no
+findings, `1` means findings remain, and `2` means review, repair, verification,
+or cleanup was incomplete or failed. Without `--fix`, source files are not
+written and `fix` is `null`.
+
 ## Programmatic use
 
 ```ts
@@ -74,6 +132,8 @@ const report = await reviewCode({
   cwd: process.cwd(),
   concurrency: 8,
   angles: defaultAngles,
+  fix: false, // Set true to let an agent edit sources directly and review again.
+  fixPermissionMode: 'agent', // Optional openSession permission mode for the fix agent.
   workflowDirectory: '.anureo/workflows',
   onProgress: event => console.error(event),
 })
@@ -82,8 +142,9 @@ const report = await reviewCode({
 The workflow borrows the Client and releases each agent session through
 `agent()`. Callers own Client disposal and backend permissions. Review
 prompts request read-only analysis; enforcement belongs to the supplied backend.
-The Client must support structured output. The CLI uses Codex, while library
-callers can supply another compatible Client.
+The Client must support structured output. The CLI selects its harness with
+`--harness` (default `codex`), while library callers can supply another
+compatible Client.
 
 `reviewCode()` returns the report with its `runId` and `workflowDirectory`. Each
 invocation creates a new run. Checkpoints currently serve as durable execution
@@ -107,7 +168,10 @@ Reports preserve analysis order for modules and input order for angles. Findings
 include priority `P0`–`P3`, title, explanation, source path, and a 1-based inclusive
 line range. Module files must exist within the selected directory and have a
 single owner. Finding locations are checked against those files and their line
-counts. Invalid analysis aborts before review; invalid findings fail that angle.
+counts, including LF, CRLF, CR, and Unicode source line separators. Operational
+metadata and the configured workflow storage directory are excluded from source
+ownership, including paths reached through symlink aliases. Invalid analysis
+aborts before review; invalid findings fail that angle.
 The module plan is agent-generated; these checks validate ownership and locations,
 not exhaustive source coverage or the truth of a finding. This version reviews
 the current files in a directory, rather than selecting a Git diff.

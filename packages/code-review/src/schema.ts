@@ -24,18 +24,14 @@ export const findingSchema = z.strictObject({
 
 export const reviewOutputSchema = z.strictObject({ findings: z.array(findingSchema) })
 
-export const fixProposalSchema = z.strictObject({
+/** Reported by the fix agent after editing sources directly; the host reconciles
+ * changedFiles against git, so the agent's list is advisory only. */
+export const fixResultSchema = z.strictObject({
   summary: z.string().min(1),
-  edits: z.array(z.strictObject({
-    file: z.string().min(1),
-    before: z.string().min(1),
-    after: z.string(),
-  })),
+  changedFiles: z.array(z.string().min(1)),
 })
-
-export const appliedFixSchema = z.strictObject({ changedFiles: z.array(z.string().min(1)) })
 
 export type ReviewModule = z.infer<typeof moduleSchema>
 export type ModulePlan = z.infer<typeof modulePlanSchema>
 export type Finding = z.infer<typeof findingSchema>
-export type FixProposal = z.infer<typeof fixProposalSchema>
+export type FixResult = z.infer<typeof fixResultSchema>

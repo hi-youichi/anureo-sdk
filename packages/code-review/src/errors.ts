@@ -5,8 +5,10 @@ export interface ReviewFailure {
   issues?: Array<{ path: string | Array<string | number>; code: string }>
 }
 
-/** Normalize any thrown value into a ReviewFailure, extracting structured-output
- * validation issues (Zod-style details.issues with path/code) when present. */
+/** Normalize thrown values; retain only valid path/code pairs from details.issues.
+ * Accept string paths (Ajv JSON pointers) and segment arrays (Zod).
+ * Omit malformed issues, issue messages, and extra details to avoid exposing
+ * private validation diagnostics. */
 export function reviewFailure(cause: unknown): ReviewFailure {
   const details = cause && typeof cause === 'object' && 'details' in cause ? cause.details : undefined
   const candidates = details && typeof details === 'object' && 'issues' in details && Array.isArray(details.issues) ? details.issues : []

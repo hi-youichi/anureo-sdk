@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import type { Client } from '@anureo/sdk'
 import { defaultAngles } from './angles'
-import { createReviewClient, reviewHarnesses } from './client'
+import { createReviewClient, fixPermissionMode, reviewHarnesses } from './client'
 import { formatFailure } from './errors'
 import { formatReport } from './report'
 import { DEFAULT_REVIEW_CONCURRENCY, reviewCode } from './review'
@@ -23,7 +23,8 @@ Options:
   --module <id>          Select an analyzed module ID (repeatable)
   --angle <id>           Select a built-in angle (repeatable): ${defaultAngles.map(angle => angle.id).join(', ')}
   --focus <text>          Additional focus for module analysis and review
-  --fix                  Apply fixes in selected source files, then review again
+  --fix                  Let an agent edit selected sources directly to fix findings,
+                         then review again; existing uncommitted changes are allowed
   --workflow-dir <path>   Durable run storage (default: <directory>/.anureo/workflows)
   --json                 Print the structured report as JSON
   --help, -h             Show this help
@@ -74,6 +75,7 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
       const report = await reviewCode({
         client, cwd, concurrency, focus: values.focus, model: values.model ?? process.env.CODEX_MODEL,
         angles, moduleIds: values.module, maxModules, fix: values.fix,
+        ...(values.fix ? { fixPermissionMode: fixPermissionMode(harness) } : {}),
         workflowDirectory: values['workflow-dir'],
         onProgress: event => {
           if (event.stage === 'workflow') stderr(`[workflow] ${event.runId} (${event.directory})\n`)

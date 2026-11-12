@@ -49,8 +49,10 @@ export interface ReviewOptions {
   moduleIds?: readonly string[]
   /** Review at most this many selected modules, in plan order. */
   maxModules?: number
-  /** Apply proposed fixes, then review the selected scope again. Defaults to false. */
+  /** Let an agent fix findings by editing sources directly, then review the selected scope again. Defaults to false. */
   fix?: boolean
+  /** Session permission mode for the fix agent (edits and checks). Harness-specific; see fixPermissionMode(). */
+  fixPermissionMode?: string
   /** Shared limit across all modules and angles; defaults to DEFAULT_REVIEW_CONCURRENCY. */
   concurrency?: number
   /** Durable run storage. Defaults to <cwd>/.anureo/workflows. */
@@ -123,7 +125,7 @@ async function validateFindings(cwd: string, module: ReviewModule, findings: Fin
       lines = text.length === 0 ? 0 : segments.length - (segments.at(-1) === '' ? 1 : 0)
       lineCounts.set(file, lines)
     }
-    if (finding.lineEnd < finding.lineStart || finding.lineEnd > lines) throw new Error(`Invalid finding location: ${file}:${finding.lineStart}-${finding.lineEnd}`)
+    if (finding.lineEnd < finding.lineStart || finding.lineEnd > lines) throw new Error(`Invalid finding location: ${file}:${finding.lineStart}-${finding.lineEnd}; expected 1 <= lineStart <= lineEnd <= ${lines}`)
     validated.push({ ...finding, file })
   }
   return validated
@@ -269,6 +271,7 @@ ${readOnlyInstructions}`
     const reviews = await runReviews('review')
     const fix = fixRequested ? await fixFindings({
       run, client: options.client, cwd, directory, modules: reviews, model: options.model,
+      ...(options.fixPermissionMode !== undefined ? { permissionMode: options.fixPermissionMode } : {}),
       onProgress: status => options.onProgress?.({ stage: 'fix', status }),
     }) : null
     if (fix?.status === 'applied') fix.verification = await runReviews('verification', reviews)

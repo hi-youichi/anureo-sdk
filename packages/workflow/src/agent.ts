@@ -11,6 +11,8 @@ export interface AgentOptions<S extends z.ZodObject = z.ZodObject> {
   cwd: string
   model?: string
   instructions?: string
+  /** Optional openSession permission mode; unsupported values fail session open. */
+  permissionMode?: string
   schema?: S
 }
 
@@ -24,9 +26,9 @@ export function agent<S extends z.ZodObject>(prompt: string, options: AgentOptio
 export function agent<S extends z.ZodObject>(prompt: string, options: AgentOptions<S>): Promise<string | z.output<S> | null>
 /** Execute one fresh session, validate its terminal output, and release its observation resources. */
 export async function agent(prompt: string, options: AgentOptions): Promise<string | Record<string, unknown> | null> {
-  const { client, cwd, model, instructions, schema } = options
+  const { client, cwd, model, instructions, permissionMode, schema } = options
   const output = schema === undefined ? undefined : prepareOutputSchema(schema)
-  const session = await client.sessions.create({ cwd, ...(model !== undefined ? { model } : {}), ...(instructions !== undefined ? { instructions } : {}) })
+  const session = await client.sessions.create({ cwd, ...(model !== undefined ? { model } : {}), ...(instructions !== undefined ? { instructions } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}) })
     .catch(cause => { if (isStartupBlockException(cause)) return null; throw cause })
   if (!session) return null // A failed open never hands session ownership to this call.
   let outcome: AgentOutcome
