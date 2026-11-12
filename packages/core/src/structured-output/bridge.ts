@@ -110,6 +110,6 @@ export class OutputBridgeManager {
   }
 }
 
-export function toolError(code: string, issues?: unknown): CallToolResult {
-  return { isError: true, content: [{ type: 'text', text: JSON.stringify({ code, ...(issues ? { issues } : {}) }) }] }
+export function toolError(code: string, issues?: unknown, message?: string): CallToolResult {
+  return { isError: true, content: [{ type: 'text', text: JSON.stringify({ code, ...(message ? { message } : {}), ...(issues ? { issues } : {}) }) }] }
 }

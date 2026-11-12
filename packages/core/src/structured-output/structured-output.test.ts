@@ -100,13 +100,78 @@ test('validation corrections and structurally equal duplicate results are local 
   expect(f.calls).toBe(1)
 })
 
+for (const transport of ['http', 'stdio'] as const) test(`${transport} corrects a mistyped output ID without expiring the task or consuming schema retries`, async () => {
+  const f = await fixture(async (input, sink, config) => {
+    const mcp = await connect(config!)
+    try {
+      const outputId = contract(input)
+      const mistyped = outputId.slice(0, -1) + (outputId.endsWith('0') ? '1' : '0')
+      for (let n = 0; n < 3; n++) {
+        const response = await mcp.callTool({ name: 'submit_result', arguments: { outputId: mistyped, value: { sum: 42 } } })
+        expect(response.isError).toBe(true)
+        const content = response.content as Array<{ type: string; text: string }>
+        const error = JSON.parse(content[0]!.text)
+        expect(error.code).toBe('STRUCTURED_OUTPUT_ID_MISMATCH')
+        expect(error.message).toMatch(/copy outputId exactly/i)
+        expect(JSON.stringify(response)).not.toContain(outputId)
+      }
+      // Only business-schema failures count toward the three-invalid-value limit.
+      for (let n = 0; n < 2; n++) {
+        const response = await mcp.callTool({ name: 'submit_result', arguments: { outputId, value: {} } })
+        expect(response).toHaveProperty('isError', true)
+        expect(JSON.stringify(response)).toContain('STRUCTURED_OUTPUT_INVALID')
+        expect(JSON.stringify(response)).not.toContain('STRUCTURED_OUTPUT_RETRIES_EXCEEDED')
+      }
+      expect(await mcp.callTool({ name: 'submit_result', arguments: { outputId, value: { sum: 42 } } })).not.toHaveProperty('isError', true)
+      await sink.bindSubmission(input.submissionId, 'turn-1')
+      await final(sink, 'turn-1')
+      const expired = await mcp.callTool({ name: 'submit_result', arguments: { outputId, value: { sum: 42 } } })
+      expect(expired).toHaveProperty('isError', true)
+      expect(JSON.stringify(expired)).toContain('STRUCTURED_OUTPUT_EXPIRED')
+    } finally { await mcp.close() }
+  }, transport)
+  expect(await (await f.session.submit({ input: 'work', outputSchema: SCHEMA })).result()).toMatchObject({ status: 'completed', text: '{"sum":42}' })
+  expect(f.calls).toBe(1)
+})
+
+test('malformed MCP envelopes receive argument guidance and remain correctable', async () => {
+  const f = await fixture(async (input, sink, config) => {
+    const mcp = await connect(config!)
+    try {
+      const outputId = contract(input)
+      for (const args of [
+        { value: { outputId, value: { sum: 42 } } },
+        { outputId: 42, value: { sum: 42 } },
+        { outputId: '', value: { sum: 42 } },
+        { outputId },
+        { outputId, value: { sum: 42 }, extra: true },
+      ]) {
+        const response = await mcp.callTool({ name: 'submit_result', arguments: args })
+        expect(response).toHaveProperty('isError', true)
+        const content = response.content as Array<{ type: string; text: string }>
+        const error = JSON.parse(content[0]!.text)
+        expect(error.code).toBe('STRUCTURED_OUTPUT_INVALID_ARGUMENTS')
+        expect(error.message).toMatch(/top-level arguments/)
+      }
+      expect(await mcp.callTool({ name: 'submit_result', arguments: { outputId, value: { sum: 42 } } })).not.toHaveProperty('isError', true)
+      await final(sink, 'turn-1')
+    } finally { await mcp.close() }
+  })
+  expect(await (await f.session.submit({ input: 'work', outputSchema: SCHEMA })).result()).toMatchObject({ status: 'completed', text: '{"sum":42}' })
+  expect(f.calls).toBe(1)
+})
+
 test('raw input requests dedupe and sequential schemas use isolated output identities', async () => {
   const ids: string[] = []
   const f = await fixture(async (input, sink, config) => {
     const mcp = await connect(config!)
     try {
       const id = contract(input); ids.push(id)
-      if (ids.length > 1) expect(await mcp.callTool({ name: 'submit_result', arguments: { outputId: ids[0], value: { sum: 999 } } })).toHaveProperty('isError', true)
+      if (ids.length > 1) {
+        const stale = await mcp.callTool({ name: 'submit_result', arguments: { outputId: ids[0], value: { sum: 999 } } })
+        expect(stale).toHaveProperty('isError', true)
+        expect(JSON.stringify(stale)).toContain('STRUCTURED_OUTPUT_ID_MISMATCH')
+      }
       await mcp.callTool({ name: 'submit_result', arguments: { outputId: id, value: ids.length === 1 ? { sum: 42 } : false } })
       await final(sink, `turn-${ids.length}`)
     } finally { await mcp.close() }

@@ -283,10 +283,15 @@ class OutputSession implements BackendSession {
     await this.sink.emit(this.redact(event), scope)
   }
   private submitValue(args: unknown) {
-    if (!args || typeof args !== 'object' || Array.isArray(args)) return toolError('STRUCTURED_OUTPUT_EXPIRED')
-    const value = args as Record<string, unknown>
     const output = this.locked
-    if (!output || output.mode !== 'mcp' || output.outputId !== value.outputId || !Object.hasOwn(value, 'value') || Object.keys(value).some(key => key !== 'outputId' && key !== 'value')) return toolError('STRUCTURED_OUTPUT_EXPIRED')
+    if (this.disposed || !output || output.mode !== 'mcp' || output.finished) return toolError('STRUCTURED_OUTPUT_EXPIRED')
+    const invalidArguments = () => toolError('STRUCTURED_OUTPUT_INVALID_ARGUMENTS', undefined,
+      'Pass exactly two top-level arguments: outputId (a nonempty string copied exactly from the current task output contract) and value (the final JSON result). Do not nest the argument envelope inside value. Correct the arguments and call this tool again within this execution.')
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return invalidArguments()
+    const value = args as Record<string, unknown>
+    if (typeof value.outputId !== 'string' || !value.outputId || !Object.hasOwn(value, 'value') || Object.keys(value).some(key => key !== 'outputId' && key !== 'value')) return invalidArguments()
+    if (output.outputId !== value.outputId) return toolError('STRUCTURED_OUTPUT_ID_MISMATCH', undefined,
+      'The supplied outputId does not match the current task. This does not mean the task has expired. Copy outputId exactly from the current task output contract, preserving every character, and call this tool again within this execution. Do not reuse an ID from another task.')
     const result = this.submitCandidate(output, value.value)
     return result.accepted ? { content: [{ type: 'text' as const, text: '{"accepted":true}' }] } : toolError(result.error.code, result.error.details?.issues)
   }
@@ -344,6 +349,7 @@ class OutputSession implements BackendSession {
               'Required Anureo final-output protocol:',
               `After completing the task, you MUST invoke the ${OUTPUT_SERVER_NAME} MCP submit_result tool. Its exposed name may have an editor/server prefix and ends with submit_result.`,
               'Pass the outputId below and your final JSON value as the value argument. A plain text or JSON answer does not complete this task.',
+              'Copy outputId exactly, preserving every character. Pass outputId and value as separate top-level arguments; do not put outputId inside value.',
               'If the tool reports validation errors, correct the value and call it again within this execution. Once it acknowledges accepted:true, end the task.',
               'Do not substitute files or shell commands for submitting through this tool.',
               `outputId: ${output.outputId}`,
