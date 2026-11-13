@@ -1,3 +1,4 @@
+// Checks schema contracts; must not implement production policy.
 import { expect, test } from 'bun:test'
 import { compileOutputSchema } from './schema'
 import type { JsonSchema } from '@anureo/protocol'

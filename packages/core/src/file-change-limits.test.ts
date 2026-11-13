@@ -1,8 +1,10 @@
+// Checks file change limits contracts; must not implement production policy.
 import { expect, test } from 'bun:test'
 import { validateDefinition, type Item, type InteractionRequested } from '@anureo/protocol'
 import { SecretRedactor } from './secrets'
 import { boundFileChangeItem, FILE_CHANGE_TEXT_LIMIT } from './file-change-limits'
 
+/** Return one item with secret-bearing material and mirrors for shared privacy/budget assertions; no files are read or modified. */
 const makeFileChangeItem = (): Extract<Item, { type: 'toolCall' }> => ({
   id: 'edit',
   type: 'toolCall',

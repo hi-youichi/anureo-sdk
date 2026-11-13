@@ -1,3 +1,4 @@
+// Checks diagnostics contracts; must not implement production policy.
 import { expect, test } from 'bun:test'
 import { configure, dispose, type LogRecord } from '@logtape/logtape'
 import { catalogPhase, type CatalogProbeEvent } from './diagnostics'

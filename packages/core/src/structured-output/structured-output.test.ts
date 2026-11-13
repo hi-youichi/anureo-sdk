@@ -1,3 +1,4 @@
+// Checks native, tool and MCP structured-output integration; must not implement production output policy.
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js'
@@ -5,12 +6,14 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { AHP_PROTOCOL_CONTRACT, type AhpEvent, type AhpRequestMap, type Capabilities, type McpServer, type SessionOpenParams } from '@anureo/protocol'
 import { createClient, HarnessSdkError, type Client, type HarnessAdapter, type SessionEventSink } from '../index'
-import { OutputBridgeManager, OUTPUT_TOOL } from './bridge'
+import { OutputBridgeManager } from './bridge'
+import { OUTPUT_TOOL } from './tool'
 
 const disposals: Array<() => Promise<unknown>> = []
 afterEach(async () => { await Promise.all(disposals.splice(0).map(dispose => dispose())) })
 const SCHEMA = { type: 'object', properties: { sum: { type: 'integer' } }, required: ['sum'], additionalProperties: false }
 const rawCaps: Capabilities = { turn: { outputSchema: false, inputModalities: ['text'] }, input: { delivery: ['native', 'afterTurn'], steer: { target: 'turn', atomicMatch: true }, interrupt: { targets: ['turn'], reportsPendingInputs: false } }, mcp: { http: true, stdio: true }, compact: true, interactions: ['userInput'] }
+/** Connect a real MCP client using the lease’s HTTP or stdio config; caller must close it to release transports/processes. */
 async function connect(config: McpServer) {
   const client = new McpClient({ name: 'harness-fixture', version: '1' })
   const transport = config.type === 'http'
@@ -19,22 +22,27 @@ async function connect(config: McpServer) {
   await client.connect(transport)
   return client
 }
+/** Extract the current output identity from the injected protocol instructions or throw if the fixture never received its contract. */
 function contract(params: AhpRequestMap['input/submit']) {
   const last = params.input.at(-1)
   const outputId = last?.type === 'text' ? last.text.match(/outputId: (anureo_output_[a-f0-9]{48})/)?.[1] : undefined
   if (!outputId) throw new Error('Missing output contract')
   return outputId
 }
+/** Open an owned test client/session with selectable native/HTTP/stdio output and a controlled submission callback; afterEach disposes the client. */
 async function fixture(run: (params: AhpRequestMap['input/submit'], sink: SessionEventSink, config?: McpServer) => Promise<void>, mode: 'http' | 'stdio' | 'native' = 'http', limits?: Parameters<typeof createClient>[0]['limits']) {
   let opened!: SessionOpenParams, sink!: SessionEventSink
   let n = 0, calls = 0
   const adapter: HarnessAdapter = {
     outputBridgeTransport: () => mode === 'native' ? undefined : mode,
+    /** Advertise native support only in native mode so fallback tests exercise the real adapter route. */
     async initialize() { return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: 'fixture', version: '1', adapter: 'fixture' }, capabilities: { ...rawCaps, turn: { ...rawCaps.turn, outputSchema: mode === 'native' } } } },
+    /** Retain injected MCP configuration and let the wrapper receive native events before its acceptance receipt. */
     async openSession(params, target) {
       opened = params; sink = target
       return {
         binding: params.binding, capabilities: { ...rawCaps, turn: { ...rawCaps.turn, outputSchema: mode === 'native' } },
+        /** Start execution before the test callback and acknowledge afterward to exercise late association. */
         async execute(method, params) {
           if (method === 'session/close') return { closed: true, observationClosed: true, executionStopped: 'unconfirmed' } as never
           if (method !== 'input/submit') return { maintenanceId: 'maintenance', status: 'completed' } as never
@@ -45,16 +53,26 @@ async function fixture(run: (params: AhpRequestMap['input/submit'], sink: Sessio
           await run(input, target, opened.mcpServers?.find(server => server.name === 'anureo_output'))
           return { accepted: true, submissionId: input.submissionId, disposition: 'started', turnId } as never
         },
+        /** Native fixture owns no resources; wrapper/client cleanup must release real bridge transports. */
         async dispose() {},
       }
     },
+    /** Client-wide native fixture has no additional resources beyond wrapper-owned bridges. */
     async dispose() {},
   }
   const client: Client = await createClient({ adapter, identity: { adapterId: 'fixture', runtimeConfigId: 'test' }, limits, interactions: { userInput: undefined } })
   disposals.push(() => client.dispose())
   const session = await client.sessions.create({ cwd: process.cwd() })
-  return { client, session, get opened() { return opened }, get sink() { return sink }, get calls() { return calls } }
+  return { client, session,
+    /** Inspect the actual native configuration after fallback injection. */
+    get opened() { return opened },
+    /** Access the wrapper sink for independently timed native events. */
+    get sink() { return sink },
+    /** Read accepted native dispatch attempts without caching the count. */
+    get calls() { return calls }
+  }
 }
+/** Publish a final native item and terminal status in order; status/error variants exercise projection and validation before public completion. */
 async function final(sink: SessionEventSink, turnId: string, text = 'Task done', status: 'completed' | 'failed' | 'interrupted' = 'completed') {
   await sink.emit({ type: 'item/completed', payload: { item: { id: `message:${turnId}`, type: 'agentMessage', phase: 'final', text } } }, { turnId })
   await sink.emit({ type: 'turn/completed', payload: { turnId, status, ...(status === 'failed' ? { error: { code: 'NATIVE_FAILED', message: 'failed', retryable: false, outcomeUnknown: false } } : {}) } })

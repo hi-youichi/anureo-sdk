@@ -1,3 +1,4 @@
+// Checks subprocess I/O and process-tree cleanup; must not implement production process control.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, link, copyFile, rm, realpath } from 'node:fs/promises';
@@ -5,12 +6,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnHarnessProcess, ProcessPortError } from './process.ts';
 
+/** Drain and decode a process stream through EOF for output assertions; propagate stream failure without disposing the child. */
 async function textOf(stream: AsyncIterable<Uint8Array>): Promise<string> {
   const decoder = new TextDecoder(); let text = '';
   for await (const chunk of stream) text += decoder.decode(chunk, { stream: true });
   return text + decoder.decode();
 }
 
+/** Read until the readiness line or reject early EOF; keep the child running so process-tree cleanup tests can inspect descendants. */
 async function firstLine(stream: AsyncIterable<Uint8Array>): Promise<string> {
   const iterator = stream[Symbol.asyncIterator]();
   const decoder = new TextDecoder(); let text = '';

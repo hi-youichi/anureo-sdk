@@ -13,11 +13,33 @@ const commentGuide = `Comments are part of readability; treat missing or mislead
 - Every exported function, type and constant, and every non-trivial internal function, has a doc
   comment stating its contract: what it takes and returns, what it throws or rejects, side effects
   (files, processes, locks), ordering or lifecycle requirements, and who is expected to call it.
+- Explain how each function participates in the surrounding call flow: name concrete production
+  callers that explain its role, state when or why they call it, and describe how they consume its
+  result or failure (return, throw, await, publish, store, or advance a lifecycle phase). Avoid vague
+  descriptions such as "used by lifecycle owners" when concrete callers can be verified.
+- Where relevant, connect that flow to what the caller's consumer observes: a returned value,
+  rejected promise, event, changed shared state or released resource. State which responsibilities
+  remain with the caller, especially cleanup, ordering, retries, cancellation and resource ownership.
+- Distinguish direct callers from indirect entry points. For callbacks and interface implementations,
+  explain who registers or supplies them and what invokes them. For public APIs with unavailable
+  external callers, describe the supported consumer and entry scenario without inventing caller names.
+- Scale detail to the function: use a short paragraph for a simple relationship and a "Called by"
+  list when callers use it in meaningfully different situations. Do not enumerate every transitive
+  caller or duplicate the entire call graph.
+- Verify these claims by reading the implementation and production call sites within the permitted
+  scope. Use graph edges to locate evidence; missing edges do not prove absence of calls. Names,
+  signatures, existing comments and tests alone are insufficient evidence for interaction claims.
+  Never invent callers, side effects, guarantees or error propagation.
 - Comment WHY, not WHAT: the reason for a non-obvious choice, an invariant the code depends on,
   why steps run in this order, what cleanup protects, why an obvious alternative is wrong.
 - Each exported interface field whose meaning is not clear from its name has a one-line comment.
 - Update or delete comments that no longer match the code. Do not add comments that only restate
-  the next line, and do not add decoration, banners or change-log notes.`
+  the next line, and do not add decoration, banners or change-log notes.
+Before returning, review comments against the final code, including renamed, extracted or moved
+functions. Verify named callers, direct versus indirect relationships, triggers, result/failure
+consumption, effects and caller-owned responsibilities. Correct unsupported claims. If a relationship
+cannot be verified within the permitted scope, document the verified contract and report the concrete
+limitation in "deferred". In read-only mode, apply this review to proposed comments without editing.`
 
 /** Explains graph limitations to design and module agents so edge absence is not treated as proof. */
 const graphGuide = `The graph artifact is a repograph export: {nodes[{id,name,filePath,labels,startLine,endLine,properties}],
@@ -152,7 +174,10 @@ ${graphGuide}
 ${modeInstructions(input.mode)}
 Review this module's files and then fix what you find, in one pass. Start from the graph:
 list each function of the module with its lines, cognitive, param_count, callers and callees,
-then read the largest or most connected ones and the callers that matter. Look for:
+then read the largest or most connected ones and the callers that matter. Before writing a function's
+doc comment, read its implementation and the production call sites needed to explain its role.
+Follow results and failures far enough to establish the caller-visible outcome; for callbacks,
+inspect registration and invocation. Keep this investigation within the permitted scope. Look for:
 1. A long function that sequences several phases (setup, lock, analysis, loop, verification,
    cleanup) and shares mutable variables across them. Extract each phase into a named function
    that owns its own state; the entry function keeps only the order of phases.

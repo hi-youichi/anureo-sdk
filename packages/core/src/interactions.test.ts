@@ -1,7 +1,9 @@
+// Verifies native interaction settlement contracts; must not implement production policy or session integration.
 import { expect, test } from "bun:test";
 import { InteractionRegistry } from "./interactions";
 import type { InteractionRequested, InteractionResponse } from "@anureo/protocol";
 
+/** Create an isolated registry/publication recorder with overridable limits for settlement tests; the test owns cancellation/expiry cleanup. */
 function harness(overrides: Partial<{ maxPending: number; timeoutMs: number; responseTimeoutMs: number }> = {}) {
   const published: Array<{ interactionId: string; outcome: string; reason?: string }> = [];
   const registry = new InteractionRegistry(
@@ -10,6 +12,7 @@ function harness(overrides: Partial<{ maxPending: number; timeoutMs: number; res
   );
   return { published, registry };
 }
+/** Return a minimal valid approval request with caller-selected identity for replay and expiry assertions. */
 function approval(interactionId: string): InteractionRequested {
   return { kind: "approval", interactionId, turnId: "turn", title: "Approve?", options: [
     { id: "allow", label: "Allow", semantic: "allowOnce" }, { id: "deny", label: "Deny", semantic: "deny" },

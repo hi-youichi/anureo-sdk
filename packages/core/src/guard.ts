@@ -1,14 +1,24 @@
+// Enforces request shape, binding and capability policy; must not dispatch native operations.
 import { assertRequest, supportsCapability, validateJsonSchema, type AhpRequestMap, type Capabilities } from "@anureo/protocol";
-import { HarnessSdkError } from "./errors";
+import { HarnessSdkError } from "./sdk-error";
 import type { SessionMethod } from "./ports";
 
-/** Validates a request against the session binding and advertised capabilities before dispatch. */
+/** Validate request shape, session binding and capabilities before dispatch; reject with INVALID_PARAMS, SESSION_BINDING_MISMATCH or CAPABILITY_UNSUPPORTED and never dispatch native work. Session/runtime admission paths call this before side effects. */
 export function guardRequest<M extends SessionMethod>(method: M, params: AhpRequestMap[M], sessionId: string, capabilities: Capabilities): void {
   assertRequest(method, params);
   if (params.sessionId !== sessionId) throw new HarnessSdkError("SESSION_BINDING_MISMATCH");
-  function throwCapabilityUnsupported(): never {
-    throw new HarnessSdkError("CAPABILITY_UNSUPPORTED");
-  }
+  guardOperationCapability(method, params, capabilities);
+  guardSubmissionCapability(method, params, capabilities);
+  guardSessionConfigCapability(method, params, capabilities);
+}
+
+/** Reject any capability mismatch with the shared safe error so callers cannot expose capability details. */
+function throwCapabilityUnsupported(): never {
+  throw new HarnessSdkError("CAPABILITY_UNSUPPORTED");
+}
+
+/** Enforce method-level capability switches after shape and binding validation; has no side effects. */
+function guardOperationCapability<M extends SessionMethod>(method: M, params: AhpRequestMap[M], capabilities: Capabilities): void {
   if (method === "turn/steer" && !capabilities.input?.steer?.atomicMatch) throwCapabilityUnsupported();
   if (method === "turn/interrupt" && !capabilities.input?.interrupt?.targets.includes("turn")) throwCapabilityUnsupported();
   if (method === "session/revert" && !supportsCapability(capabilities, "session.revert", (params as AhpRequestMap["session/revert"]).scope)) throwCapabilityUnsupported();
@@ -20,6 +30,10 @@ export function guardRequest<M extends SessionMethod>(method: M, params: AhpRequ
     if (!capabilities.input?.interrupt?.targets.includes('session')) throwCapabilityUnsupported();
     if ((params as AhpRequestMap['session/interrupt']).cancelQueued && !capabilities.input?.interrupt?.cancelQueued) throwCapabilityUnsupported();
   }
+}
+
+/** Enforce input submission delivery, schema, modality and override policy; has no side effects. */
+function guardSubmissionCapability<M extends SessionMethod>(method: M, params: AhpRequestMap[M], capabilities: Capabilities): void {
   if (method === "input/submit") {
     const submission = params as AhpRequestMap["input/submit"];
     if (!capabilities.input?.delivery.includes(submission.delivery)) throwCapabilityUnsupported();
@@ -28,6 +42,10 @@ export function guardRequest<M extends SessionMethod>(method: M, params: AhpRequ
     if (submission.input.some((block) => !modalities.includes(block.type))) throwCapabilityUnsupported();
     if (submission.overrides && Object.keys(submission.overrides).some((key) => !capabilities.turn?.overrides?.includes(key))) throwCapabilityUnsupported();
   }
+}
+
+/** Enforce advertised session config options and validate values against their schema; rejects malformed values as INVALID_PARAMS. */
+function guardSessionConfigCapability<M extends SessionMethod>(method: M, params: AhpRequestMap[M], capabilities: Capabilities): void {
   if (method === "session/config/set") {
     const patch = (params as AhpRequestMap["session/config/set"]).patch;
     for (const [key, value] of Object.entries(patch)) {

@@ -1,7 +1,9 @@
+// Checks bounded result accumulation and snapshot isolation; must not implement production accumulation.
 import { expect, test } from 'bun:test';
 import type { AhpEvent, AhpEventPayload, Item } from '@anureo/protocol';
 import { ResultAccumulator } from './result';
 
+/** Wrap a test payload in a valid session event envelope for direct accumulator tests; does not run session validation. */
 function event(payload: AhpEventPayload): AhpEvent {
   return { sessionId: 'session', streamId: 'stream', turnId: 'turn', seq: 1, timestamp: '2026-11-10T00:00:00.000Z', ...payload } as AhpEvent;
 }
