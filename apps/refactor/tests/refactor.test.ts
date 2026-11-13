@@ -67,9 +67,13 @@ test('prompts name the problem catalog, the graph guide and the mode', async () 
   expect(module).toContain('five or more positional parameters')
   for (const prompt of [design, module]) {
     expect(prompt).toContain('Comment WHY, not WHAT')
-    expect(prompt).toContain('comment stating its contract')
+    expect(prompt).toContain('doc comment stating')
+    expect(prompt).toContain('Documentation syntax:')
+    expect(prompt).toContain('re-export chains')
   }
-  expect(module).toContain('Write the comments yourself')
+  expect(design).toContain('Design documentation scope:')
+  expect(module).toContain('Module documentation scope:')
+  expect(module).toContain('including declarations\nwhose implementation stays unchanged')
   expect(formatReport(report)).toContain('read-only prompt')
 })
 
