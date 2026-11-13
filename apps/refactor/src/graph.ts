@@ -1,8 +1,8 @@
 // Adapts and validates repograph CLI exports; it must not schedule agent work or persist run reports.
 import { mkdtemp, readFile, rm, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { exec } from './process'
@@ -32,9 +32,10 @@ export type RepositoryGraph = z.infer<typeof graphSchema>
  * Orchestration awaits it under the run lock; implementations may launch processes or maintain an
  * index and must finish temporary-resource cleanup before settling the promise. */
 export type GraphLoader = (cwd: string) => Promise<RepositoryGraph>
-/** Default CLI entry in the adjacent repograph checkout, resolved from this module rather than process cwd.
- * Embedders and the CLI may override it; computing this path does not launch a process. */
-export const defaultRepographEntry = fileURLToPath(new URL('../../../../repograph/src/cli.ts', import.meta.url))
+/** Installed @youichi/repograph CLI used by loadGraph and CLI help, resolved relative to this package
+ * so target/caller cwd and PATH cannot select another installation. The pinned release places its
+ * CLI beside its exported library entry. Consumers may override it; resolution starts no process. */
+export const defaultRepographEntry = join(dirname(createRequire(import.meta.url).resolve('@youichi/repograph')), 'cli.js')
 
 /** Export and parse the CLI payload for loadGraph using its caller-owned temporary directory.
  * Launches repograph, writes graph.json and retains the external index; process, filesystem,
@@ -60,7 +61,7 @@ async function validateRepositoryGraph(graph: RepositoryGraph, cwd: string): Pro
   }
 }
 
-/** Export cwd through the supplied CLI entry (or the adjacent checkout) and return a validated graph
+/** Export cwd through the supplied CLI entry (or the installed npm package) and return a validated graph
  * to orchestration or embedders. Callers must serialize exports sharing the same path/index;
  * orchestration does so with its repository-wide run lock, which this adapter does not acquire.
  * Creates and removes temporary export files outside cwd so later indexing cannot treat them as

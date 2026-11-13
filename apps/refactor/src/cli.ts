@@ -15,12 +15,12 @@ const help = `Usage: anureo-refactor [repository] [options]
 Export a repograph graph; one agent fixes design between modules, then one agent per
 module reviews and refactors it, serially. Defaults to the current directory, which may
 be any directory inside a Git work tree. Preserves public APIs and behavior.
-Requires Bun, a configured Codex CLI, Git, and the adjacent repograph checkout.
+Requires Bun, a configured Codex CLI and Git. Uses the installed @youichi/repograph package.
 
 Options:
   --review-only          Ask agents to propose changes without editing (stated in the prompt, not enforced)
   --model <name>         Codex model override (or CODEX_MODEL)
-  --repograph <entry>    repograph TypeScript CLI path
+  --repograph <entry>    Override the installed repograph CLI with a JS/TS entry path
                         Default: ${defaultRepographEntry}
   --check <command>      Validation command after each edit (repeatable)
                         Default: root package.json typecheck/test scripts

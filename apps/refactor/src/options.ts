@@ -13,7 +13,7 @@ export interface RefactorOptions {
   model?: string
   /** Ask agents to avoid edits and suppress host checks; editing-session permissions remain unrestricted. */
   reviewOnly?: boolean
-  /** Override the repograph TypeScript CLI path when using the default graph loader. */
+  /** Override the installed @youichi/repograph CLI with a JS/TS entry path for the default graph loader. */
   repographEntry?: string
   /** Export a validated graph under the run lock, bypassing the default subprocess and repographEntry. */
   graphLoader?: GraphLoader

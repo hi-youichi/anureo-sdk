@@ -6,7 +6,7 @@ import { defaultRepographEntry, loadGraph } from '../src/graph'
 import { exec } from '../src/process'
 import { temporary } from './helpers'
 
-/** Opt-in live-backend check for adapter maintainers using REPOGRAPH_CLI or the default checkout.
+/** Opt-in live-backend check for adapter maintainers using the installed package or REPOGRAPH_CLI.
  * Creates a fixture repository and index, then checks caller edges and index counts. Assertions,
  * process and backend failures reject; shared temporary() cleanup removes the repository, while
  * the finally block deletes the external index only after loadGraph has returned its identity. */
@@ -16,7 +16,7 @@ test.skipIf(process.env.REPOGRAPH_INTEGRATION !== '1')('real repograph exports c
   await writeFile(join(cwd, 'main.ts'), 'import { save } from "./store";\nexport function main() { return save() }\n')
   await writeFile(join(cwd, 'store.ts'), 'export function save() { return 1 }\nexport function isolated() { return 2 }\n')
   const entry = process.env.REPOGRAPH_CLI ?? defaultRepographEntry
-  const graph = await loadGraph(cwd, entry)
+  const graph = await loadGraph(cwd, process.env.REPOGRAPH_CLI)
   try {
     const byId = new Map(graph.nodes.map(node => [node.id, node.name]))
     expect(graph.edges.some(edge => edge.type === 'CALLS' && byId.get(edge.source) === 'main' && byId.get(edge.target) === 'save')).toBe(true)
@@ -24,9 +24,9 @@ test.skipIf(process.env.REPOGRAPH_INTEGRATION !== '1')('real repograph exports c
     expect(graph.indexReport.nodes).toBe(graph.nodes.length)
     expect(graph.indexReport.edges).toBe(graph.edges.length)
   } finally {
-    // Optional integration-only cleanup through the adjacent checkout's backend;
-    // production uses only its public CLI and reuses one index per target repo.
-    const { runTool } = await import(join(dirname(entry), 'cbm.ts'))
+    // Test-only cleanup through the package's backend (or a TS source override);
+    // production uses only the public CLI and reuses one index per target repo.
+    const { runTool } = await import(join(dirname(entry), entry.endsWith('.ts') ? 'cbm.ts' : 'cbm.js'))
     await runTool('delete_project', { project: graph.indexReport.project })
   }
 }, 120_000)
