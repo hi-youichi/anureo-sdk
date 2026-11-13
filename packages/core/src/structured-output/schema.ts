@@ -2,7 +2,7 @@
 import Ajv from 'ajv'
 import Ajv2020 from 'ajv/dist/2020.js'
 import type { JsonSchema } from '@anureo/protocol'
-import { HarnessSdkError } from '../sdk-error'
+import { HarnessSdkError } from '../errors'
 
 /** Reject unsupported references, async schemas, excessive nesting and unknown dialects before Ajv compilation; ignore schema-like instance annotations. */
 function validateSchemaDefinition(schema: JsonSchema): void {

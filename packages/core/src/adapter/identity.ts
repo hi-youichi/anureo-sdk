@@ -1,5 +1,5 @@
 // Maps session-local native identities to SDK identities; must not own sessions, events, or execution lifetimes.
-import { HarnessSdkError } from "./sdk-error";
+import { HarnessSdkError } from "../errors";
 
 /**
  * Maintains bidirectional turn bindings and turn-scoped item IDs for adapter callers.

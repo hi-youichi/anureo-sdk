@@ -2,7 +2,7 @@
 import { boundFileChangeItem } from "./file-change-limits";
 import type { Capabilities, AhpEventPayload, AhpMethod, AhpResultMap, FileChange, GoalState, HistoryPage, InputBlock, InteractionRequested, InteractionResponse, Item, JsonObject, JsonSchema, JsonValue, SessionState, ToolCallItem } from "@anureo/protocol";
 import { assertDefinition } from "@anureo/protocol";
-import { HarnessSdkError } from "./sdk-error";
+import { HarnessSdkError } from "../errors";
 
 /** Narrow protocol JSON to a map for schema traversal; arrays and null cannot supply named schema children. */
 function isJsonObject(value: JsonValue | undefined): value is JsonObject {

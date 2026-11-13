@@ -1,5 +1,5 @@
 // Bounds one producer stream with exclusive reader ownership; must not route session events.
-import { HarnessSdkError } from "./sdk-error";
+import { HarnessSdkError } from "./errors";
 
 /** Positive integer queue budgets; omitted values receive defaults in BoundedEventQueue without changing producer ordering. */
 export interface QueueLimits {

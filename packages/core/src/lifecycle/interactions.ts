@@ -1,9 +1,9 @@
 // Owns bounded native interaction settlement and replay; must not run host handlers or project private content.
 import { createHash } from "node:crypto";
 import { assertInteractionResponse, type InteractionRequested, type InteractionResponse, type InteractionResult } from "@anureo/protocol";
-import { HarnessSdkError, sdkError } from "./sdk-error";
-import { waitForRequest } from "./request";
-import type { NativeInteractionResponder } from "./ports";
+import { HarnessSdkError, sdkError } from "../errors";
+import { waitForRequest } from "../request";
+import type { NativeInteractionResponder } from "../ports";
 
 /** Per-request lifecycle state retained for settlement and a bounded replay guard. */
 interface RecordState {

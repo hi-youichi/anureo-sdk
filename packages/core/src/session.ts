@@ -2,21 +2,21 @@
 import { assertResult, assertEvent, publicInteraction, publicValue, supportsExtension,
   type AhpEvent, type AhpEventPayload, type AhpRequestMap, type AhpResultMap, type Capabilities,
   type InteractionRequested, type InteractionResponse, type SessionBinding, type SessionOpenParams, type SessionState } from '@anureo/protocol';
-import { HarnessSdkError, sdkError } from './sdk-error';
-import { invalidWait, waitForRequest, type RequestOptions } from './request';
+import { HarnessSdkError, sdkError } from './errors';
+import { invalidWait, waitForRequest } from './request';
 import type { ClientOptions, SubmitOptions } from './client-options';
-import { InteractionRegistry } from './interactions';
-import { SecretRedactor } from './secrets';
+import { InteractionRegistry } from './lifecycle/interactions';
+import { SecretRedactor } from './privacy/secrets';
 import type { BackendSession, EventScope, NativeInteractionResponder, SessionEventSink, SessionMethod } from './ports';
-import { EventHub, type EventSubscriptionOptions } from './lifecycle/events';
-import { guardRequest } from './guard';
+import { EventHub } from './lifecycle/events';
+import { guardRequest } from './requests/guard';
 import { ResultAccumulator } from './lifecycle/result';
-import { Turn, type ExecutionObservation } from './lifecycle/resources';
-import type { TurnResult } from './lifecycle/types';
+import { Turn, type ExecutionObservation } from './turn';
+import type { EventSubscriptionOptions, RequestOptions, TurnResult } from './types';
 import { deferred } from './lifecycle/deferred';
 import { immutable } from './lifecycle/immutable';
 import { inputBlocks } from './lifecycle/input';
-import { positive } from './limits';
+import { positive } from './lifecycle/limits';
 import { combined, observationClosed } from './lifecycle/errors';
 
 /** Methods that associate a new input with an execution; all share identity and acknowledgement rules. */

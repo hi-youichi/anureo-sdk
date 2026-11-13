@@ -2,12 +2,13 @@
 import { randomUUID } from 'node:crypto';
 import { AHP_PROTOCOL_CONTRACT, assertRequest, assertResult, supportsCapability,
   type AhpRequestMap, type Capabilities, type InteractionRequested, type SessionBinding, type SessionOpenParams } from '@anureo/protocol';
-import { HarnessSdkError } from './sdk-error';
-import { invalidWait, waitForRequest, type RequestOptions } from './request';
+import { HarnessSdkError } from './errors';
+import { invalidWait, waitForRequest } from './request';
+import type { RequestOptions } from './types';
 import type { ClientOptions } from './client-options';
 import { Session } from './session';
 import { immutable } from './lifecycle/immutable';
-import { positive } from './limits';
+import { positive } from './lifecycle/limits';
 import { combined } from './lifecycle/errors';
 import { withStructuredOutput } from './structured-output/adapter';
 

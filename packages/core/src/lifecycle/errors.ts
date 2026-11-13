@@ -1,5 +1,5 @@
 // Builds observation and owned-resource failure reports; must not close resources or control cleanup order.
-import { HarnessSdkError, sdkError } from '../sdk-error';
+import { HarnessSdkError, sdkError } from '../errors';
 
 /** Build an outcome-unknown observation failure for session teardown; stopped records native confirmation without inventing a terminal execution result. No cleanup is performed. */
 export function observationClosed(stopped = false): HarnessSdkError { return new HarnessSdkError('OBSERVATION_CLOSED', stopped ? 'Observation closed before a native terminal result' : 'Observation closed; execution stop is unconfirmed', false, true, { source: 'sdk', executionStopped: stopped ? 'confirmed' : 'unconfirmed' }); }

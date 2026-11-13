@@ -1,9 +1,9 @@
 // Provides independent turn observation handles; must not own or implicitly stop native execution.
 import type { AhpEvent } from '@anureo/protocol';
-import { HarnessSdkError } from '../sdk-error';
-import { waitForRequest, type RequestOptions } from '../request';
-import { EventHub, type EventSubscriptionOptions } from './events';
-import type { Input, TurnResult } from './types';
+import { HarnessSdkError } from './errors';
+import { waitForRequest } from './request';
+import type { EventHub } from './lifecycle/events';
+import type { EventSubscriptionOptions, Input, RequestOptions, TurnResult } from './types';
 
 /** Runtime-owned execution port shared by independent Turn handles; result/terminal represent native execution while handles own only observation. */
 export interface ExecutionObservation {

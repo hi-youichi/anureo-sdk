@@ -7,7 +7,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import type { McpServer } from '@anureo/protocol'
 import { OUTPUT_SERVER_NAME, OUTPUT_TOOL, toolError } from './tool'
-import { HarnessSdkError } from '../sdk-error'
+import { HarnessSdkError } from '../errors'
 
 // Preserve existing bridge imports while production callers depend on the tool contract directly.
 export { OUTPUT_SERVER_NAME, OUTPUT_TOOL, toolError } from './tool'

@@ -1,7 +1,7 @@
 // Defines host client configuration and submission policy; must not dispatch requests or own session state.
 import type { AhpRequestMap, InteractionRequested, InteractionResponse, SessionBinding } from '@anureo/protocol';
 import type { HarnessAdapter, RuntimeOptions } from './ports';
-import type { Input } from './lifecycle/types';
+import type { Input } from './types';
 
 /** Host callbacks invoked for advertised native requests; resolve a matching response or reject to request cancellation. Observe the signal to release host work on expiry/teardown; native settlement remains runtime-owned. */
 export type InteractionHandlers = { [K in InteractionRequested['kind']]?: (request: Extract<InteractionRequested, { kind: K }>, context: { signal: AbortSignal }) => Promise<Extract<InteractionResponse, { kind: K }>> };

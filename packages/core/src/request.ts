@@ -1,16 +1,9 @@
 // Owns caller wait deadlines and cancellation; must not cancel or retry native execution.
-import { HarnessSdkError } from './sdk-error';
+import { HarnessSdkError } from './errors';
+import type { RequestOptions } from './types';
 
 /** Return whether an explicit caller timeout exceeds the supported timer range; entry points check before dispatch. Does not start work or throw. */
 export function invalidWait(wait?: RequestOptions): boolean { return wait?.timeoutMs !== undefined && (!Number.isFinite(wait.timeoutMs) || wait.timeoutMs <= 0 || wait.timeoutMs > 0x7fffffff); }
-
-/** Controls only a caller’s observation wait; abort/deadline never interrupt an accepted native operation. */
-export interface RequestOptions {
-  /** Stops this caller waiting; does not interrupt accepted native execution. */
-  signal?: AbortSignal;
-  /** Positive observation deadline in milliseconds; omission uses the operation default. */
-  timeoutMs?: number;
-}
 
 /** Run operation once unless already aborted; resolve its result or reject on failure, abort or deadline. Owns and releases its timer/listener; late outcomes remain observed and native work is never cancelled. */
 export function waitForRequest<T>(operation: () => Promise<T>, options: RequestOptions = {}, defaultTimeoutMs = 30_000): Promise<T> {

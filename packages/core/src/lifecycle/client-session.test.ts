@@ -1,8 +1,8 @@
 // Checks public client/session lifecycle behavior; must not implement production dispatch policy.
 import { expect, test } from 'bun:test';
-import { createClient, HarnessSdkError, type ClientOptions, type HarnessAdapter, type SessionEventSink, type SessionMethod } from './index';
+import { createClient, HarnessSdkError, type ClientOptions, type HarnessAdapter, type SessionEventSink, type SessionMethod } from '../index';
 import { AHP_PROTOCOL_CONTRACT, type AhpEvent, type AhpRequestMap, type AhpResultMap, type Capabilities } from '@anureo/protocol';
-import { deferred } from './lifecycle/deferred';
+import { deferred } from './deferred';
 
 /** Shared native close receipt deliberately leaves execution stop unconfirmed for observation-only cleanup assertions. */
 const closeResult = { closed: true, observationClosed: true, executionStopped: 'unconfirmed' } as const;
@@ -411,7 +411,7 @@ test('malformed JavaScript input fails with typed validation before native dispa
   const f = await fixture(async () => closeResult);
   try {
     for (const value of [undefined, null, 42, { text: 'missing discriminant' }, [() => 'uncloneable']]) {
-      await expect(f.session.submit({ input: value as unknown as import('./index').Input })).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+      await expect(f.session.submit({ input: value as unknown as import('../index').Input })).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
     }
     expect(f.calls).toHaveLength(0);
   } finally { await f.client.dispose(); }

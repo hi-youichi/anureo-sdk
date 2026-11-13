@@ -1,13 +1,6 @@
 // Fans out isolated bounded event subscriptions; must not backpressure the native reader or validate lifecycle order.
 import { BoundedEventQueue } from '../queue';
-
-/** Per-observer cancellation and buffering; signal ends only this subscription and queue overflow never pauses the shared native producer. */
-export interface EventSubscriptionOptions {
-  /** Aborts only this observer, releasing its pending read and membership. */
-  signal?: AbortSignal;
-  /** Per-subscription regular-event capacity in count and serialized bytes. */
-  queue?: { maxEvents?: number; maxBytes?: number };
-}
+import type { EventSubscriptionOptions } from '../types';
 
 type Subscription<T> = {
   /** This subscriber’s private bounded storage and reader. */

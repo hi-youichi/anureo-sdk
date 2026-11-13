@@ -1,7 +1,7 @@
 // Enforces request shape, binding and capability policy; must not dispatch native operations.
 import { assertRequest, supportsCapability, validateJsonSchema, type AhpRequestMap, type Capabilities } from "@anureo/protocol";
-import { HarnessSdkError } from "./sdk-error";
-import type { SessionMethod } from "./ports";
+import { HarnessSdkError } from "../errors";
+import type { SessionMethod } from "../ports";
 
 /** Validate request shape, session binding and capabilities before dispatch; reject with INVALID_PARAMS, SESSION_BINDING_MISMATCH or CAPABILITY_UNSUPPORTED and never dispatch native work. Session/runtime admission paths call this before side effects. */
 export function guardRequest<M extends SessionMethod>(method: M, params: AhpRequestMap[M], sessionId: string, capabilities: Capabilities): void {

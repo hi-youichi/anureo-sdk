@@ -1,7 +1,7 @@
 // Accumulates bounded execution result snapshots; must not validate wire events or manage session lifetimes.
 import type { AhpEvent, Item, Usage } from '@anureo/protocol';
-import { HarnessSdkError } from '../sdk-error';
-import type { TurnResult } from './types';
+import { HarnessSdkError } from '../errors';
+import type { TurnResult } from '../types';
 import { immutable } from './immutable';
 
 /** Mutable text fields that can be provisionally reconstructed from item deltas. */
