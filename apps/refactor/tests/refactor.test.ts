@@ -68,8 +68,9 @@ test('prompts name the problem catalog, the graph guide and the mode', async () 
   for (const prompt of [design, module]) {
     expect(prompt).toContain('Comment WHY, not WHAT')
     expect(prompt).toContain('doc comment stating')
-    expect(prompt).toContain('Documentation syntax:')
+    expect(prompt).toContain('Documentation conventions and tags:')
     expect(prompt).toContain('re-export chains')
+    expect(prompt).toContain('Declaration order:')
   }
   expect(design).toContain('Design documentation scope:')
   expect(module).toContain('Module documentation scope:')
