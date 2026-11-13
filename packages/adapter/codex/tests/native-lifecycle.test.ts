@@ -1,9 +1,11 @@
+/** Guards SDK lifecycle behavior against the deterministic native process; real Codex execution and isolated projection rules belong elsewhere. */
 import { expect, test } from 'bun:test';
 import { fileURLToPath } from 'node:url';
 import { createClient } from '@anureo/sdk';
 import { createCodexAdapter } from '../src';
 import { runNativeConformance } from '@anureo/conformance';
 const executable = fileURLToPath(new URL('./native-lifecycle-fixture.mjs', import.meta.url));
+/** Launch the scripted stdio process for a profile and return its SDK client/session. Startup failures reject; successful callers must dispose the client in finally. */
 async function fixture(version = '0.164.0') {
   const client = await createClient({
     adapter: createCodexAdapter({
@@ -20,17 +22,22 @@ async function fixture(version = '0.164.0') {
   const session = await client.sessions.create({ cwd: process.cwd() });
   return { client, session };
 }
-for (const version of ['0.148.0', '0.164.0']) test(`${version}: real JSONL process correlates joined submissions by clientId rather than response turn id`, async () => {
-  const f = await fixture(version);
-  try {
-    const first = await f.session.submit({ input: 'first' });
-    await expect(f.session.submit({ input: 'reject' })).rejects.toMatchObject({ rpcCode: -32602 });
-    const second = await f.session.submit({ input: 'join' });
-    expect(first.id).toBe('actual'); expect(second.id).toBe(first.id);
-    expect((await first.result()).text).toBe('native result');
-    expect((await second.result()).text).toBe('native result');
-  } finally { await f.client.dispose(); }
-});
+for (const version of ['0.148.0', '0.164.0']) {
+  /** Keep the first execution active across a definite rejection and a join; both handles must resolve from client-ID evidence. The fixture client is always disposed. */
+  test(`${version}: real JSONL process correlates joined submissions by clientId rather than response turn id`, async () => {
+    const f = await fixture(version);
+    try {
+      const first = await f.session.submit({ input: 'first' });
+      await expect(f.session.submit({ input: 'reject' })).rejects.toMatchObject({ rpcCode: -32602 });
+      const second = await f.session.submit({ input: 'join' });
+      expect(first.id).toBe('actual');
+      expect(second.id).toBe(first.id);
+      expect((await first.result()).text).toBe('native result');
+      expect((await second.result()).text).toBe('native result');
+    } finally { await f.client.dispose(); }
+  });
+}
+/** Close observation while native execution remains active; assert its result rejects instead of reporting interruption, and release the process in finally. */
 test('native unsubscribe while active closes observation without inventing an interrupted result', async () => {
   const f = await fixture();
   try {
@@ -39,10 +46,17 @@ test('native unsubscribe while active closes observation without inventing an in
     await expect(turn.result()).rejects.toMatchObject({ code: 'OBSERVATION_CLOSED' });
   } finally { await f.client.dispose(); }
 });
-for (const version of ['0.148.0', '0.164.0']) test(`${version}: Codex revised v1 passes shared native lifecycle conformance over actual stdio`, async () => {
-  const report = await runNativeConformance(async () => ({ ...await fixture(version), first: 'first', second: 'join', relation: 'same' }));
-  expect(report).toMatchObject({ passed: true });
-});
+for (const version of ['0.148.0', '0.164.0']) {
+  /** Delegate lifecycle assertions and fixture disposal to shared conformance; a failed report must fail this test for each supported profile. */
+  test(`${version}: Codex revised v1 passes shared native lifecycle conformance over actual stdio`, async () => {
+    const report = await runNativeConformance(
+      /** Supply a fresh owned process per conformance scenario; the runner disposes successful fixtures and startup failures reject. */
+      async () => ({ ...await fixture(version), first: 'first', second: 'join', relation: 'same' }),
+    );
+    expect(report).toMatchObject({ passed: true });
+  });
+}
+/** Hold review evidence behind an explicit history request so acknowledgement cannot resolve the execution handle; assert the later native outcome and always dispose the client. */
 test('review acknowledgement alone never fabricates a started execution', async () => {
   const f = await fixture();
   try {
