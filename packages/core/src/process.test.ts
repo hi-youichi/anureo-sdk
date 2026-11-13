@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, link, copyFile, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnHarnessProcess, ProcessPortError } from './process.ts';
+import { spawnHarnessProcess, ProcessPortError, type HarnessProcess } from './process.ts';
 
 /** Drain and decode a process stream through EOF for output assertions; propagate stream failure without disposing the child. */
 async function textOf(stream: AsyncIterable<Uint8Array>): Promise<string> {
@@ -23,6 +23,29 @@ async function firstLine(stream: AsyncIterable<Uint8Array>): Promise<string> {
     text += decoder.decode(next.value, { stream: true });
   }
   return text.split('\n')[0]!;
+}
+
+/**
+ * Run disposal assertions with POSIX group signalling mocked, even on Windows. Restore process
+ * globals before killing the real child so a failing assertion cannot leave either mock installed.
+ */
+async function withPosixKillMock({ child, mockKill, check }: {
+  child: HarnessProcess;
+  mockKill: typeof process.kill;
+  check: () => Promise<void>;
+}): Promise<void> {
+  const killDescriptor = Object.getOwnPropertyDescriptor(process, 'kill');
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  const realKill = process.kill;
+  Object.defineProperty(process, 'kill', { value: mockKill, configurable: true, writable: true });
+  Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+  try {
+    await check();
+  } finally {
+    if (platformDescriptor) Object.defineProperty(process, 'platform', platformDescriptor);
+    if (killDescriptor) Object.defineProperty(process, 'kill', killDescriptor);
+    try { (realKill as (pid: number) => void)(child.pid); } catch { /* already gone */ }
+  }
 }
 
 test('spawn reports an unavailable executable without unhandled errors', async () => {
@@ -66,7 +89,9 @@ test('stdio writes drain, input closes, and nonzero exits are observable', async
 test('owned dispose is idempotent and escalates after grace timeout', async () => {
   const child = await spawnHarnessProcess({ command: process.execPath, args: ['-e', 'process.on("SIGTERM",()=>{});console.log("ready");setInterval(()=>{},1000)'], shutdownTimeoutMs: 50 });
   assert.equal(await firstLine(child.stdout), 'ready');
-  await Promise.all([child.dispose(), child.dispose()]);
+  const disposal = child.dispose();
+  assert.equal(child.dispose(), disposal);
+  await disposal;
   const exit = await child.exited;
   if (process.platform !== 'win32') assert.equal(exit.signal, 'SIGKILL');
   assert.throws(() => process.kill(child.pid, 0));
@@ -114,8 +139,6 @@ test('abruptly exited children retain their original PID for safe cleanup', asyn
 
 test('posix dispose rejects after retrying EPERM while the child remains alive', async () => {
   const child = await spawnHarnessProcess({ command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], shutdownTimeoutMs: 200 });
-  const killDescriptor = Object.getOwnPropertyDescriptor(process, 'kill');
-  const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
   const realKill = process.kill;
   const seen: Array<{ pid: number; signal: unknown }> = [];
   let termAttempts = 0;
@@ -130,38 +153,24 @@ test('posix dispose rejects after retrying EPERM while the child remains alive',
     }
     return (realKill as (pid: number, signal?: NodeJS.Signals | number) => void)(pid, signal);
   }) as typeof process.kill;
-  Object.defineProperty(process, 'kill', { value: mockKill, configurable: true, writable: true });
-  Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
-  try {
+  await withPosixKillMock({ child, mockKill, check: async () => {
     await assert.rejects(child.dispose(), (error: unknown) => error instanceof ProcessPortError && error.code === 'PROCESS_DISPOSE_FAILED');
     assert.equal(seen.filter((entry) => entry.pid < 0 && entry.signal === 'SIGTERM').length, 2);
     assert.ok(seen.some((entry) => entry.pid < 0 && entry.signal === 0));
-  } finally {
-    if (platformDescriptor) Object.defineProperty(process, 'platform', platformDescriptor);
-    if (killDescriptor) Object.defineProperty(process, 'kill', killDescriptor);
-    try { (realKill as (pid: number) => void)(child.pid); } catch { /* already gone */ }
-  }
+  } });
 });
 
 test('posix dispose rejects when group signaling reports ESRCH while the child remains alive', async () => {
   const child = await spawnHarnessProcess({ command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], shutdownTimeoutMs: 200 });
-  const killDescriptor = Object.getOwnPropertyDescriptor(process, 'kill');
-  const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
   const realKill = process.kill;
   const mockKill = ((pid: number, signal?: NodeJS.Signals | number) => {
     // Reporting a missing group does not terminate the child; dispose still waits for its exit.
     if (pid < 0) { const error = new Error('group gone') as NodeJS.ErrnoException; error.code = 'ESRCH'; throw error; }
     return (realKill as (pid: number, signal?: NodeJS.Signals | number) => void)(pid, signal);
   }) as typeof process.kill;
-  Object.defineProperty(process, 'kill', { value: mockKill, configurable: true, writable: true });
-  Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
-  try {
+  await withPosixKillMock({ child, mockKill, check: async () => {
     await assert.rejects(child.dispose(), (error: unknown) => error instanceof ProcessPortError && error.code === 'PROCESS_DISPOSE_FAILED');
-  } finally {
-    if (platformDescriptor) Object.defineProperty(process, 'platform', platformDescriptor);
-    if (killDescriptor) Object.defineProperty(process, 'kill', killDescriptor);
-    try { (realKill as (pid: number) => void)(child.pid); } catch { /* already gone */ }
-  }
+  } });
 });
 
 test('missing executables, NUL arguments, and excessive timeouts report HARNESS_UNAVAILABLE', async () => {

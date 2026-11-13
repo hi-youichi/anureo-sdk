@@ -1,15 +1,18 @@
-// Checks bounded result accumulation and snapshot isolation; must not implement production accumulation.
+// Verifies retained-result accounting, ordering and isolation; must not implement Session admission or native execution.
 import { expect, test } from 'bun:test';
-import type { AhpEvent, AhpEventPayload, Item } from '@anureo/protocol';
+import type { AhpEvent, AhpEventPayload, Item, Usage } from '@anureo/protocol';
 import { ResultAccumulator } from './result';
 
-/** Wrap a test payload in a valid session event envelope for direct accumulator tests; does not run session validation. */
+/** Direct tests supply payloads here; return a fixed envelope without running Session's validation or ordering. */
 function event(payload: AhpEventPayload): AhpEvent {
   return { sessionId: 'session', streamId: 'stream', turnId: 'turn', seq: 1, timestamp: '2026-11-10T00:00:00.000Z', ...payload } as AhpEvent;
 }
+/** Budget assertions use full serialization as an independent oracle for incremental accounting. */
 const bytes = (item: Item) => Buffer.byteLength(JSON.stringify(item));
+/** Direct finish calls use this native interruption payload without an error or terminal usage override. */
 const terminal = { turnId: 'turn', status: 'interrupted' as const };
 
+/** Mutate native error details after finish; the interrupted snapshot must retain detached metadata and status. */
 test('interrupted results preserve immutable native reason metadata without becoming failed', () => {
   const accumulator = new ResultAccumulator(1024, 10);
   const error = { code: 'USER_SKIPPED', message: 'skipped', retryable: false, outcomeUnknown: false, details: { workflowDisposition: 'skipped' } };
@@ -20,6 +23,7 @@ test('interrupted results preserve immutable native reason metadata without beco
   expect(accumulator.finish(terminal)).not.toHaveProperty('error');
 });
 
+/** Feed escaped and split-surrogate chunks; compare every retained size with the fully serialized item. */
 test('streamed text keeps exact serialized byte budgets across escapes and split surrogate pairs', () => {
   const accumulator = new ResultAccumulator(1024 * 1024, 10);
   const item: Item = { id: 'answer', type: 'agentMessage', phase: 'final', text: '' };
@@ -44,6 +48,7 @@ test('streamed text keeps exact serialized byte budgets across escapes and split
   expect(result.items).toEqual([item]);
 });
 
+/** Materialize optional and non-string fields, including empty chunks, and verify exact final content/budgets. */
 test('reasoning and tool output deltas account for absent and replaced fields', () => {
   const cases: Array<{ item: Item; expected: Item; kind: 'reasoningSummary' | 'output' }> = [
     { item: { id: 'r', type: 'reasoning' }, expected: { id: 'r', type: 'reasoning', summary: '日本語\ntext' }, kind: 'reasoningSummary' },
@@ -60,6 +65,7 @@ test('reasoning and tool output deltas account for absent and replaced fields', 
   }
 });
 
+/** Fill the exact byte limit, then reject another chunk; neither retained text nor accounting may change. */
 test('a rejected text delta leaves the retained result and its budget unchanged', () => {
   const item: Item = { id: 'answer', type: 'agentMessage', phase: 'final', text: 'start' };
   const expected = { ...item, text: 'start\n"end' };
@@ -72,6 +78,7 @@ test('a rejected text delta leaves the retained result and its budget unchanged'
   expect(accumulator.finish(terminal).text).toBe(expected.text);
 });
 
+/** Replace provisional content twice and then reset; earlier snapshots must remain frozen and independent. */
 test('authoritative patches and completion replace accumulated chunks and reset their budgets', () => {
   const accumulator = new ResultAccumulator(1024, 10);
   const item: Item = { id: 'answer', type: 'agentMessage', phase: 'final', text: 'initial' };
@@ -95,4 +102,59 @@ test('authoritative patches and completion replace accumulated chunks and reset 
   accumulator.clear();
   expect(accumulator.size).toBe(0);
   expect(accumulator.finish(terminal).items).toEqual([]);
+});
+
+/** Complete messages out of order; replacing an earlier item must preserve its original final-text position. */
+test('terminal text follows first-seen final-message order and preserves empty separators', () => {
+  const accumulator = new ResultAccumulator(1024, 10);
+  const first: Item = { id: 'first', type: 'agentMessage', phase: 'final', text: 'preview' };
+  const interim: Item = { id: 'interim', type: 'agentMessage', text: 'not final' };
+  const empty: Item = { id: 'empty', type: 'agentMessage', phase: 'final', text: '' };
+  const last: Item = { id: 'last', type: 'agentMessage', phase: 'final', text: 'last' };
+  for (const item of [first, interim, empty, last]) {
+    accumulator.accept(event({ type: 'item/started', payload: { item } }));
+  }
+  accumulator.accept(event({ type: 'item/completed', payload: { item: last } }));
+  accumulator.accept(event({ type: 'item/completed', payload: { item: { ...first, text: 'first' } } }));
+  const result = accumulator.finish({ ...terminal, status: 'completed' });
+  expect(result.text).toBe('first\n\nlast');
+  expect(result.items.map(item => item.id)).toEqual(['first', 'interim', 'empty', 'last']);
+  expect(Object.isFrozen(result)).toBe(true);
+  expect(Object.isFrozen(result.items)).toBe(true);
+});
+
+/** Exceed replacement bytes and new-item capacity separately; failed retention must preserve the existing snapshot. */
+test('rejected authoritative snapshots leave retention and byte accounting unchanged', () => {
+  const item: Item = { id: 'answer', type: 'agentMessage', phase: 'final', text: 'fits' };
+  const accumulator = new ResultAccumulator(bytes(item), 1);
+  accumulator.accept(event({ type: 'item/started', payload: { item } }));
+  expect(() => accumulator.accept(event({ type: 'item/completed', payload: { item: { ...item, text: 'too large' } } }))).toThrow('RESULT_BUDGET_EXCEEDED');
+  expect(() => accumulator.accept(event({ type: 'item/started', payload: { item: { id: 'r', type: 'reasoning' } } }))).toThrow('RESULT_BUDGET_EXCEEDED');
+  expect(accumulator.size).toBe(bytes(item));
+  expect(accumulator.finish(terminal).items).toEqual([item]);
+});
+
+/** Exercise usage precedence, detached native/default error metadata and reset; failures remain result values. */
+test('terminal snapshots select turn usage and preserve native or default failure metadata', () => {
+  const accumulator = new ResultAccumulator(1024, 10);
+  const observed: Usage = { provider: 'test', source: 'native', scope: 'turn', input: 1 };
+  const latest: Usage = { ...observed, input: 2 };
+  const native: Usage = { ...observed, input: 3 };
+  for (const usage of [observed, latest]) {
+    accumulator.accept(event({ type: 'usage/updated', payload: usage }));
+  }
+  latest.input = 99;
+  accumulator.accept(event({ type: 'usage/updated', payload: { ...observed, scope: 'session', input: 100 } }));
+  const fallback = accumulator.finish({ ...terminal, status: 'failed' });
+  expect(fallback).toMatchObject({ status: 'failed', usage: { input: 2 }, error: { code: 'TURN_FAILED', message: 'Turn failed', retryable: false, outcomeUnknown: false } });
+  expect(accumulator.finish({ ...terminal, usage: { ...native, scope: 'session' } }).usage?.input).toBe(2);
+  const error = { code: 'NATIVE_FAILURE', message: 'native reason', retryable: true, outcomeUnknown: true, details: { reason: 'original' } };
+  const result = accumulator.finish({ ...terminal, status: 'failed', usage: native, error });
+  native.input = 99;
+  error.details.reason = 'changed';
+  expect(result).toMatchObject({ status: 'failed', usage: { input: 3 }, error: { code: 'NATIVE_FAILURE', retryable: true, outcomeUnknown: true, details: { reason: 'original' } } });
+  expect(Object.isFrozen(result.usage)).toBe(true);
+  accumulator.clear();
+  expect(accumulator.finish(terminal)).not.toHaveProperty('usage');
+  expect(fallback.usage?.input).toBe(2);
 });

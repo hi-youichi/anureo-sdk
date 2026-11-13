@@ -1,12 +1,12 @@
-// Checks public client/session lifecycle behavior; must not implement production dispatch policy.
+// Exercises cooperating client/session lifecycle contracts; must not replace production admission or cleanup policy.
 import { expect, test } from 'bun:test';
 import { createClient, HarnessSdkError, type ClientOptions, type HarnessAdapter, type SessionEventSink, type SessionMethod } from '../index';
 import { AHP_PROTOCOL_CONTRACT, type AhpEvent, type AhpRequestMap, type AhpResultMap, type Capabilities } from '@anureo/protocol';
 import { deferred } from './deferred';
 
-/** Shared native close receipt deliberately leaves execution stop unconfirmed for observation-only cleanup assertions. */
+/** Fixture close receipt keeps native stop unconfirmed so tests cannot mistake observation teardown for execution completion. */
 const closeResult = { closed: true, observationClosed: true, executionStopped: 'unconfirmed' } as const;
-/** Deterministic fixture capabilities let lifecycle tests reach native dispatch without unrelated capability failures. */
+/** Fixture negotiation advertises the controls used below; tests override behavior through Run rather than capability bypasses. */
 const capabilities: Capabilities = {
   input: { delivery: ['native', 'afterTurn'], steer: { target: 'turn', atomicMatch: true }, interrupt: { targets: ['turn','session'], reportsPendingInputs: true } },
   turn: { inputModalities: ['text'], overrides: ['model'] },
@@ -14,48 +14,48 @@ const capabilities: Capabilities = {
   config: { options: [{ id: 'model', scope: 'session', schema: { type: 'string' } }] },
   review: true, compact: true, goal: { actions: ['set','clear'] }, interactions: ['userInput'],
 };
-/** Test-owned native operation: controls receipt/event ordering and may reject; fixture records dispatch before invoking it. */
+/** fixture supplies this callback to its backend execute port, recording dispatch before the test controls events, receipt or rejection. */
 type Run = (method: SessionMethod, params: AhpRequestMap[SessionMethod], sink: SessionEventSink) => Promise<unknown>;
-/** Open a real public client/session around a test-owned native operation; return dispatch/sink/release probes or reject setup failure. Each test disposes the client in finally; no native processes are created. */
+/** Build a public client/session around Run and return native dispatch, event and release probes. Client invokes the fixture adapter ports; setup failures reject. Tests own gates/readers and must await client.dispose in finally; the fixture starts no processes. */
 async function fixture(run: Run, options: Partial<ClientOptions> = {}) {
   // Native open assigns the sink before session creation resolves or any test can dispatch.
   let sink!: SessionEventSink, disposals = 0;
   const calls: Array<{ method: SessionMethod; params: AhpRequestMap[SessionMethod] }> = [];
   const adapter: HarnessAdapter = {
-    /** Assert contract negotiation while returning deterministic capabilities without native processes. */
+    /** withStructuredOutput forwards Client.initialize here; assert negotiation and return capabilities without acquiring native resources. */
     async initialize(p) { expect(p.protocolContract).toBe(AHP_PROTOCOL_CONTRACT); return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: 'fixture', version: '1', adapter: 'fixture' }, capabilities }; },
-    /** Capture the actual runtime sink so tests control event/receipt timing independently. */
+    /** OutputSession.open invokes this port; capture its forwarding sink and return an owned in-memory backend. */
     async openSession(p, events) {
       sink = events;
       return { binding: p.binding, capabilities,
-        /** Record every native dispatch and delegate its exact receipt/event ordering to the test. */
+        /** OutputSession.execute invokes this backend port; record the attempt and propagate Run's receipt or rejection without retries. */
         async execute<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> { calls.push({ method, params }); return await run(method, params, sink) as AhpResultMap[M]; },
-        /** Count release attempts so idempotent session cleanup is observable. */
+        /** OutputSession.dispose releases this backend; count attempts so tests can detect repeated cleanup. */
         async dispose() { disposals++; },
       };
     },
-    /** Adapter cleanup intentionally has no native resources in this fixture. */
+    /** Client.dispose reaches this through the output wrapper after session cleanup; the fixture owns no adapter resources. */
     async dispose() {},
   };
   const client = await createClient({ adapter, identity: { adapterId: 'fixture', runtimeConfigId: 'local' }, ...options });
   return { client, adapter, session: await client.sessions.create({ cwd: process.cwd() }), calls,
-    /** Expose the captured runtime sink for late native events. */
+    /** Tests read the captured forwarding sink after open resolves, including for events after a caller wait ends. */
     get sink() { return sink; },
-    /** Read the current release count after asynchronous cleanup. */
+    /** Tests read completed native release attempts after awaiting lifecycle cleanup. */
     get disposals() { return disposals; }
   };
 }
-/** Await a valid native start for the supplied execution through the ordered sink; publication errors reject so tests cannot proceed with unstarted work. */
+/** Test Run callbacks await ordered turn/started publication before binding or item events; sink rejection stops the simulated native sequence. */
 async function started(sink: SessionEventSink, turnId: string) { await sink.emit({ type: 'turn/started', payload: { turnId } }); }
-/** Await final item then terminal publication for one execution, rejecting sink failures; reusing the item ID deliberately verifies isolation between turns. */
+/** Tests and Run callbacks await final-item then terminal publication, propagating sink failure. Reuse the item ID across turns to expose missing execution isolation; callers still own fixture cleanup. */
 async function completed(sink: SessionEventSink, turnId: string, text = 'answer') {
   await sink.emit({ type: 'item/completed', payload: { item: { id: 'reused', type: 'agentMessage', text, phase: 'final' } } }, { turnId });
   await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'completed' } });
 }
-/** Narrow a fixture request only where the test already knows it carries submission identity; performs no validation or mutation. */
+/** Submission-specific Run callbacks recover their known request type here; this test assertion neither validates params nor changes native admission. */
 const asSubmitParams = (p: AhpRequestMap[SessionMethod]) => p as AhpRequestMap['input/submit'];
 
-/** Hold the native receipt until association returns a Turn, proving submission observation cannot depend on receipt acknowledgement; finally releases the gate and client. */
+/** Gate the native receipt after binding and require submit to return a Turn first; the public observer must reach completion without an acknowledgement dependency. Finally release both gate and client. */
 test('submit returns a Turn from binding before a delayed receipt; no public Submission stage', async () => {
   const ack = deferred<void>();
   const f = await fixture(async (_m, p, sink) => {
@@ -69,7 +69,7 @@ test('submit returns a Turn from binding before a delayed receipt; no public Sub
   } finally { ack.resolve(); await f.client.dispose(); }
 });
 
-/** Complete native work before binding so the public result must come from retained execution state; dispose the fixture after asserting the early text. */
+/** Publish native completion before association, then bind without an acceptance receipt. The public Turn must expose retained early text; finally dispose the client. */
 test('a backend without acceptance receipts binds a previously completed native result', async () => {
   const f = await fixture(async (_m, p, sink) => {
     await started(sink, 'actual'); await completed(sink, 'actual', 'early');
@@ -80,7 +80,7 @@ test('a backend without acceptance receipts binds a previously completed native 
   finally { await f.client.dispose(); }
 });
 
-/** Join one execution through two submissions, abort/dispose one observer, and require the sibling to retain the native result without extra dispatch. */
+/** Associate two inputs with one native execution and cancel/dispose only one Turn observer. Its sibling must retain the shared result with no extra dispatch; finally dispose the client. */
 test('two submissions share one actual result and independent observers', async () => {
   const f = await fixture(async (_m, p, sink) => {
     await started(sink, 'shared'); await sink.bindSubmission(asSubmitParams(p).submissionId, 'shared');
@@ -96,7 +96,7 @@ test('two submissions share one actual result and independent observers', async 
   } finally { await f.client.dispose(); }
 });
 
-/** Abort only the submission wait while dispatch remains gated; capture later binding/completion events and drain the reader during cleanup. */
+/** Abort only the association observer of gated native dispatch. Later binding/completion must still publish once; finally release the receipt gate, dispose the client and drain the event reader. */
 test('cancelled submit waiting retains dispatch and later association without resending', async () => {
   const sent = deferred<void>(), release = deferred<void>(); let submitted = '';
   const f = await fixture(async (_m, p) => { submitted = asSubmitParams(p).submissionId; sent.resolve(); await release.promise; return { submissionId: submitted, disposition: 'dispatched' }; });
@@ -112,7 +112,7 @@ test('cancelled submit waiting retains dispatch and later association without re
   } finally { release.resolve(); await f.client.dispose(); await reading; }
 });
 
-/** Repeat completed work at a one-execution limit so newly admitted submissions cannot pin snapshots that predate them; release the client in finally. */
+/** Force repeated native completions through one execution slot. New submissions must rotate older snapshots rather than pin results that predate them; finally release the fixture. */
 test('completed snapshots rotate while newly pending submissions do not pin older executions', async () => {
   let n = 0;
   const f = await fixture(async (_m, p, sink) => {
@@ -125,7 +125,7 @@ test('completed snapshots rotate while newly pending submissions do not pin olde
   } finally { await f.client.dispose(); }
 });
 
-/** Leave an older submission unbound after completion, then force capacity pressure; require failure instead of eviction of its possible late result. */
+/** Leave an older submission unbound after native completion, then exceed execution capacity. Observation must fail instead of losing its possible late result; finally dispose the client. */
 test('older unbound input pins its possible late result instead of silently evicting it', async () => {
   let n = 0;
   const f = await fixture(async (_m, p, sink) => {
@@ -140,7 +140,7 @@ test('older unbound input pins its possible late result instead of silently evic
   } finally { await f.client.dispose(); }
 });
 
-/** Reject a second native input definitively while retaining the first execution; completing the first proves rejection stays local to its submission. */
+/** Reject a second submission definitively while the first execution remains active. Only the rejected input wait must fail, and the retained Turn must still complete; finally dispose the client. */
 test('definite input rejection leaves another execution usable', async () => {
   let n = 0;
   const f = await fixture(async (_m, p, sink) => {
@@ -153,7 +153,7 @@ test('definite input rejection leaves another execution usable', async () => {
   } finally { await f.client.dispose(); }
 });
 
-/** Complete two active executions in reverse order using the same item ID; verify activity and final text stay scoped to each turn. */
+/** Complete two active executions in reverse order with the same native item ID. Public activity and retained text must remain execution-local; finally dispose the fixture. */
 test('interleaved executions and reused item IDs remain isolated', async () => {
   let n = 0;
   const f = await fixture(async (_m,p,sink) => { const turnId = `actual-${++n}`; await started(sink, turnId); return { submissionId: asSubmitParams(p).submissionId, accepted: true, disposition: 'started', turnId }; });
@@ -165,7 +165,7 @@ test('interleaved executions and reused item IDs remain isolated', async () => {
   } finally { await f.client.dispose(); }
 });
 
-/** Steer through the returned Turn and inspect the native atomic target; completion must still belong to the original execution. */
+/** Call the returned Turn control and inspect its native atomic target. A successful steer must retain the original execution and terminal result; finally dispose the client. */
 test('exact steer uses the actual target and keeps one execution', async () => {
   const f = await fixture(async (m,p,sink) => {
     if (m === 'turn/steer') { const v = p as AhpRequestMap['turn/steer']; return { accepted: true, submissionId: v.submissionId, turnId: v.expectedTurnId }; }
@@ -178,7 +178,7 @@ test('exact steer uses the actual target and keeps one execution', async () => {
   } finally { await f.client.dispose(); }
 });
 
-/** Return a schema-valid steer receipt for another turn and require a protocol failure, preventing a successful receipt from hiding identity drift. */
+/** Return a shape-valid steer receipt naming a different execution. The public control must reject PROTOCOL_ERROR, preserving identity validation before successful receipt handling; finally release the client. */
 test('mismatched native steer identity fails closed rather than reporting success', async () => {
   const f = await fixture(async (m,p,sink) => {
     if (m === 'turn/steer') { const v = p as AhpRequestMap['turn/steer']; return { accepted: true, submissionId: v.submissionId, turnId: 'wrong' }; }
@@ -188,7 +188,7 @@ test('mismatched native steer identity fails closed rather than reporting succes
   finally {await f.client.dispose();}
 });
 
-/** Apply omitted/null metadata fields and a native revert reference through public entry points; snapshots must preserve patch semantics and resume identity. */
+/** Apply native metadata omission/null patches and a request-owned revert reference. Public snapshots and resume references must preserve those distinct updates; finally dispose the fixture. */
 test('metadata patches and revert refs update snapshots and resume references', async () => {
   const f=await fixture(async (_m,p)=>({appliedScope:'conversation',boundary:(p as AhpRequestMap['session/revert']).boundary,nativeRef:{provider:'fixture',value:'new'}}));
   try {
@@ -200,7 +200,7 @@ test('metadata patches and revert refs update snapshots and resume references', 
   }finally{await f.client.dispose();}
 });
 
-/** Gate native close to inspect control admission and concurrent callers; after release require one cleanup, retained terminal results and unknown unfinished outcomes. */
+/** Gate shared native close while testing business rejection and explicit Turn control admission. After receipt, require one release, preserved completed results and unknown unfinished observation; finally release the gate and client. */
 test('active close is shared, preserves retained terminals and leaves unfinished results unknown', async () => {
   const closeRelease = deferred<void>();
   let n = 0;
@@ -237,14 +237,14 @@ test('active close is shared, preserves retained terminals and leaves unfinished
   }
 });
 
-/** Reject native close definitively, then complete active work to prove business admission/status can recover without discarding the execution. */
+/** Reject native close definitively and then complete the active execution. The failed close must restore running status without losing the Turn; finally dispose the client. */
 test('definite close rejection restores an active session',async()=>{
   const f=await fixture(async(m,p,sink)=>{if(m==='session/close')throw new HarnessSdkError('CLOSE_DENIED');await started(sink,'active');return {submissionId:asSubmitParams(p).submissionId,accepted:true,disposition:'started',turnId:'active'};});
   try{const turn=await f.session.submit({input:'x'});await expect(f.session.close()).rejects.toMatchObject({code:'CLOSE_DENIED'});expect(f.session.snapshot.status).toBe('running');await completed(f.sink,turn.id);expect((await turn.result()).status).toBe('completed');}
   finally{await f.client.dispose();}
 });
 
-/** Hold close past the default timeout but within the explicit observer deadline; release in finally so late native cleanup cannot be abandoned. */
+/** Hold native close beyond the default wait but inside an explicit caller deadline. The surviving observer must receive the late receipt and cleanup; finally release the gate and client. */
 test('close honors a longer caller deadline than the default request timeout', async () => {
   const release = deferred<void>();
   const f = await fixture(async () => { await release.promise; return closeResult; }, { runtime: { requestTimeoutMs: 5 } });
@@ -261,7 +261,7 @@ test('close honors a longer caller deadline than the default request timeout', a
   } finally { release.resolve(); await f.client.dispose(); }
 });
 
-/** Abort and time out separate observers of a gated shared close; a surviving observer must see its single native receipt and resource release. */
+/** Abort and time out separate observers of one gated native close. A remaining observer must still receive one receipt after resource release; finally release the gate and dispose the client. */
 test('timing out or aborting a close observer preserves the shared close and its late cleanup', async () => {
   const release = deferred<void>();
   const f = await fixture(async () => { await release.promise; return closeResult; });
@@ -281,7 +281,7 @@ test('timing out or aborting a close observer preserves the shared close and its
   } finally { release.resolve(); await f.client.dispose(); }
 });
 
-/** Repeatedly exceed frame capacity before dispatch, then submit valid work at a one-submission limit to verify admission failures release bookkeeping. */
+/** Reject oversized inputs before native dispatch at a one-submission limit. A later valid input must still complete with exactly one native attempt; finally dispose the client. */
 test('inputs rejected before native dispatch do not exhaust submission capacity', async () => {
   const f = await fixture(async (_method, params, sink) => {
     await started(sink, 'valid'); await sink.bindSubmission(asSubmitParams(params).submissionId, 'valid');
@@ -295,7 +295,7 @@ test('inputs rejected before native dispatch do not exhaust submission capacity'
   } finally { await f.client.dispose(); }
 });
 
-/** Occupy the request cache with gated maintenance, reject inputs, then release it; valid input must reuse submission capacity without hidden native attempts. */
+/** Fill the request cache with gated maintenance, reject inputs, then release maintenance. New input must regain submission capacity without hidden dispatches; finally release the gate and client. */
 test('request-cache backpressure before dispatch also releases submission capacity', async () => {
   const release = deferred<void>();
   const f = await fixture(async (method, params, sink) => {
@@ -313,7 +313,7 @@ test('request-cache backpressure before dispatch also releases submission capaci
   } finally { release.resolve(); await f.client.dispose(); }
 });
 
-/** Use malformed wait options and a foreign session identity; all public failures must precede native dispatch. */
+/** Supply malformed waits and foreign session identity through public methods. Typed admission errors must precede every native attempt; finally dispose the client. */
 test('invalid timeout parameters and mismatched session bindings never dispatch requests',async()=>{
   const f=await fixture(async()=>closeResult);
   try{
@@ -324,7 +324,7 @@ test('invalid timeout parameters and mismatched session bindings never dispatch 
   }finally{await f.client.dispose();}
 });
 
-/** Replay one raw request concurrently and then vary request/submission identity separately; require exactly one dispatch and distinct conflict errors. */
+/** Replay the same raw request concurrently, then vary payload and submission reservation independently. Require one native attempt plus distinct request/submission conflict errors; finally dispose the fixture. */
 test('raw requests dedupe and reject conflicting submission identity',async()=>{
   const f=await fixture(async(_m,p,sink)=>{await started(sink,'actual');return {submissionId:asSubmitParams(p).submissionId,accepted:true,disposition:'started',turnId:'actual'};});
   try{
@@ -335,7 +335,33 @@ test('raw requests dedupe and reject conflicting submission identity',async()=>{
   }finally{await f.client.dispose();}
 });
 
-/** Patch a retained tool snapshot before interrupted completion; the result must reflect new content while preserving item identity. */
+/** Abandon one wait while its native request fills the cache; identical replay must survive pressure, and only a settled outcome may make room for new work. */
+test('a full request cache replays abandoned work without evicting its unsettled outcome', async () => {
+  const entered = deferred<void>(), release = deferred<void>();
+  const result = { maintenanceId: 'compact', status: 'completed' } as const;
+  const f = await fixture(async () => { entered.resolve(); await release.promise; return result; }, {
+    runtime: { requestCacheSize: 1 },
+  });
+  try {
+    const params: AhpRequestMap['compact/start'] = { sessionId: f.session.id, requestId: 'original' };
+    const controller = new AbortController();
+    const abandoned = f.session.request('compact/start', params, { signal: controller.signal });
+    await entered.promise;
+    controller.abort();
+    await expect(abandoned).rejects.toMatchObject({ code: 'REQUEST_ABORTED' });
+
+    const replay = f.session.request('compact/start', params);
+    await expect(f.session.request('compact/start', { ...params, requestId: 'new' })).rejects.toMatchObject({ code: 'BACKPRESSURE_EXCEEDED' });
+    expect(f.calls).toHaveLength(1);
+    release.resolve();
+    expect(await replay).toEqual(result);
+
+    expect(await f.session.request('compact/start', { ...params, requestId: 'new' })).toEqual(result);
+    expect(f.calls.map(call => call.params.requestId)).toEqual(['original', 'new']);
+  } finally { release.resolve(); await f.client.dispose(); }
+});
+
+/** Patch a retained tool snapshot before interrupted completion. Turn.result must expose the replacement content under the original item identity; finally dispose the client. */
 test('item-shaped patch snapshots update retained results without changing item identity', async () => {
   const f = await fixture(async (_method, params, sink) => {
     await started(sink, 'actual'); await sink.bindSubmission(asSubmitParams(params).submissionId, 'actual');
@@ -350,7 +376,7 @@ test('item-shaped patch snapshots update retained results without changing item 
   } finally { await f.client.dispose(); }
 });
 
-/** Attempt identity and content-family changes through item patches; require both event rejection and typed observation failure for each isolated fixture. */
+/** Patch an item into a different identity or family in separate fixtures. Both sink publication and public observation must reject typed protocol errors; finally release each client. */
 test('a patch cannot move an item into another identity or content family', async () => {
   const patches: import('@anureo/protocol').JsonObject[] = [ { id: 'other', type: 'agentMessage', text: 'bad' }, { id: 'item', type: 'notice', severity: 'info', text: 'bad' } ];
   for (const value of patches) {
@@ -366,7 +392,7 @@ test('a patch cannot move an item into another identity or content family', asyn
   }
 });
 
-/** Overflow one reader while draining a sibling; completion and retained results must survive without native interrupt dispatch. */
+/** Overflow one Turn reader while draining a sibling. The sibling and retained result must complete without native interruption; return the slow reader and finally dispose the fixture. */
 test('one overflowing observer does not interrupt a sibling or discard the retained native result', async () => {
   const f = await fixture(async (_method, params, sink) => {
     await started(sink, 'actual'); return { submissionId: asSubmitParams(params).submissionId, accepted: true, disposition: 'started', turnId: 'actual' };
@@ -386,7 +412,7 @@ test('one overflowing observer does not interrupt a sibling or discard the retai
   } finally { await f.client.dispose(); }
 });
 
-/** Mark a secret through a manual interaction before native submission rejection; inspect public diagnostics for redaction while preserving the rejection code. */
+/** Register a marked answer through manual interaction, then reject native input with private diagnostics. Public status must redact content while the input wait retains its error code; release the reader and client. */
 test('submission rejection diagnostics redact marked answers and authentication fields', async () => {
   const sent = deferred<void>(); let submissionId = '';
   const f = await fixture(async (_method, params) => {
@@ -406,7 +432,7 @@ test('submission rejection diagnostics redact marked answers and authentication 
   } finally { await f.client.dispose(); }
 });
 
-/** Pass invalid JavaScript values through the typed facade deliberately; each must reject with validation before invoking the adapter. */
+/** Pass malformed JavaScript values through a deliberate type assertion. submit must reject INVALID_PARAMS before the adapter is called; finally dispose the fixture. */
 test('malformed JavaScript input fails with typed validation before native dispatch', async () => {
   const f = await fixture(async () => closeResult);
   try {
@@ -417,16 +443,16 @@ test('malformed JavaScript input fails with typed validation before native dispa
   } finally { await f.client.dispose(); }
 });
 
-/** Fail client initialization with both cleanup outcomes; require original error identity or ordered aggregation and exactly one adapter release. */
+/** Exercise setup failure with successful and failed cleanup. createClient must preserve original failure identity or ordered safe aggregation, releasing the failed adapter exactly once; finally dispose the independent fixture client. */
 for (const cleanupFails of [false, true]) test(`failed client initialization preserves setup and cleanup failures (cleanupFails=${cleanupFails})`, async () => {
   const f = await fixture(async () => closeResult);
   const setupFailure = new HarnessSdkError('SETUP_FAILED');
   let releases = 0;
   const adapter: HarnessAdapter = {
     ...f.adapter,
-    /** Fail before opens so the factory must release its adapter before rejecting. */
+    /** The output wrapper forwards initialization here; reject before opens so createClient must await adapter cleanup. */
     async initialize() { throw setupFailure; },
-    /** Count the release attempt and optionally fail to exercise safe aggregation. */
+    /** withStructuredOutput invokes this during failed initialization cleanup; count release and optionally reject so createClient must aggregate both causes. */
     async dispose() { releases++; if (cleanupFails) throw new HarnessSdkError('CLEANUP_FAILED'); },
   };
   try {
@@ -441,16 +467,26 @@ for (const cleanupFails of [false, true]) test(`failed client initialization pre
   } finally { await f.client.dispose(); }
 });
 
-/** Count native opens while varying foreign bindings and fork modes, then admit one valid fork to prove validation does not poison later admission. */
+/** Count opens while checking wait, shape, identity and capability precedence. Rejections must acquire no backend, and one valid fork must still open afterward; finally dispose the client. */
 test('open admission rejects invalid bindings and fork modes before native dispatch', async () => {
   const f = await fixture(async () => closeResult);
   let opens = 0;
   const nativeOpen = f.adapter.openSession;
-  /** Count opens while preserving the fixture's native backend behavior. */
+  /** OutputSession.open invokes this replacement port; count admission reaching native open and return the original fixture backend or failure. */
   f.adapter.openSession = async (params, sink) => { opens++; return nativeOpen(params, sink); };
   const reference = { ...f.session.reference, binding: { ...f.session.binding, nativeRef: { provider: 'fixture', value: 'native-session' } } };
   const foreign = { ...reference, binding: { ...reference.binding, runtimeConfigId: 'foreign' } };
   try {
+    const abort = new AbortController(); abort.abort();
+    const malformedForeignFork = { ...foreign, mode: 'fork' as const, requestId: 'malformed-foreign-fork' };
+    // Each request violates several rules: caller-wait checks must win before shape/binding/capability admission.
+    await expect(f.client.openSession(malformedForeignFork, { signal: abort.signal, timeoutMs: 0 })).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    await expect(f.client.openSession(malformedForeignFork, { signal: abort.signal })).rejects.toMatchObject({ code: 'REQUEST_ABORTED' });
+    await expect(f.client.openSession(malformedForeignFork)).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    await expect(f.client.openSession({
+      ...foreign, mode: 'fork', requestId: 'foreign-unsupported-fork',
+      fork: { sourceSessionId: reference.binding.sessionId, nativeRef: reference.binding.nativeRef, boundary: { turnId: 'turn', relation: 'through' } },
+    })).rejects.toMatchObject({ code: 'SESSION_BINDING_MISMATCH' });
     await expect(f.client.sessions.resume(foreign)).rejects.toMatchObject({ code: 'SESSION_BINDING_MISMATCH' });
     await expect(f.client.sessions.fork(foreign, { boundary: { turnId: 'turn', relation: 'before' } })).rejects.toMatchObject({ code: 'SESSION_BINDING_MISMATCH' });
     await expect(f.client.openSession({ ...reference, mode: 'fork', requestId: 'missing-fork' })).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
@@ -462,18 +498,18 @@ test('open admission rejects invalid bindings and fork modes before native dispa
   } finally { await f.client.dispose(); }
 });
 
-/** Abort a public open before a gated native backend arrives; wait for its release to prove late attachment cannot reopen or leak native ownership. */
+/** Abort an open observer while native attachment is gated. Its late backend must be released exactly once without reopening observation; finally release the gate and dispose the client. */
 test('aborting an open observer still releases a late native backend without reopening', async () => {
   const f = await fixture(async () => closeResult);
   const entered = deferred<void>(), release = deferred<void>(), disposed = deferred<void>();
   const nativeOpen = f.adapter.openSession;
   let opens = 0, releases = 0;
-  /** Hold native attachment beyond the caller's cancellation to exercise late cleanup. */
+  /** OutputSession.open invokes this replacement port; gate native attachment beyond caller cancellation, then return a backend whose late release is observable. */
   f.adapter.openSession = async (params, sink) => {
     opens++; entered.resolve(); await release.promise;
     const backend = await nativeOpen(params, sink);
     return { ...backend,
-      /** Observe late native resource release independently of the rejected open Promise. */
+      /** OutputSession.open releases this late backend after teardown; resolve disposed only after native cleanup so the test can await it independently of open rejection. */
       async dispose() { releases++; await backend.dispose(); disposed.resolve(); },
     };
   };
@@ -490,23 +526,23 @@ test('aborting an open observer still releases a late native backend without reo
   } finally { release.resolve(); await f.client.dispose(); }
 });
 
-/** Delay one owned session release and observe shared client disposal; admission must close immediately and adapter cleanup must follow every session. */
+/** Delay an owned session release and call client disposal twice. Admission must close immediately, both callers must share teardown, and adapter release must follow sessions; finally release the gate and client. */
 test('client disposal closes admission and waits for sessions before releasing the adapter', async () => {
   const f = await fixture(async () => closeResult);
   const disposingSession = deferred<void>(), release = deferred<void>();
   const order: string[] = [];
   const nativeOpen = f.adapter.openSession;
-  /** Give an additional owned session a controllably slow release. */
+  /** OutputSession.open invokes this replacement port for the extra session; return a delayed-release backend so client disposal ordering can be observed. */
   f.adapter.openSession = async (params, sink) => {
     const backend = await nativeOpen(params, sink);
     return { ...backend,
-      /** Delay session cleanup so adapter ordering and shared disposal are observable. */
+      /** OutputSession.dispose invokes this backend release; publish entry, await the test's gate, then record successful native cleanup before adapter release. */
       async dispose() {
         disposingSession.resolve(); await release.promise; await backend.dispose(); order.push('session');
       },
     };
   };
-  /** Record client-wide release after every owned session has settled. */
+  /** withStructuredOutput invokes this adapter release after its sessions; record the order Client.dispose must expose after awaiting owned session cleanup. */
   f.adapter.dispose = async () => { order.push('adapter'); };
   try {
     await f.client.sessions.create({ cwd: process.cwd() });
@@ -521,7 +557,7 @@ test('client disposal closes admission and waits for sessions before releasing t
   } finally { release.resolve(); await f.client.dispose(); }
 });
 
-/** Manually settle an interaction while its automatic handler is gated; the aborted handler must keep its capacity slot until host work settles, then permit a new interaction without sending a late answer. */
+/** Settle a native interaction manually while its automatic host handler is gated. Aborted host work must retain capacity until it settles, suppress its late answer, then admit another handler; finally release the gate and client. */
 test('aborted automatic handlers retain capacity until host work settles and suppress late answers', async () => {
   const entered = deferred<void>(), release = deferred<void>();
   let signal: AbortSignal | undefined;
@@ -531,7 +567,7 @@ test('aborted automatic handlers retain capacity until host work settles and sup
   const f = await fixture(async () => closeResult, {
     runtime: { maxPendingInteractions: 1 },
     interactions: {
-      /** Hold only the first handler beyond native settlement so capacity tracks live host work rather than registry membership. */
+      /** Session.startInteractionHandler invokes this host callback after publication; gate its first answer so settlement aborts its signal before the owned work finishes. */
       userInput: async (_request, context) => {
         if (++handlers === 1) {
           signal = context.signal;
@@ -542,9 +578,9 @@ test('aborted automatic handlers retain capacity until host work settles and sup
       },
     },
   });
-  /** Record native replies/cancellations; late automatic answers would add an unwanted extra reply. */
+  /** requestInteraction supplies this responder to the registry; record native answers/cancellations so an aborted handler cannot deliver a second reply. */
   const responder = async (value: unknown, reason?: string) => { responses.push({ value, reason }); };
-  /** Allocate independent registry identities while keeping the response contract identical. */
+  /** This test allocates distinct interaction identities for each capacity probe while retaining the same answer contract; no registration occurs here. */
   const request = (interactionId: string) => ({ kind: 'userInput' as const, interactionId, questions: [{ id: 'q', prompt: 'Question' }] });
   try {
     const pending = f.sink.requestInteraction(request('first'), responder);

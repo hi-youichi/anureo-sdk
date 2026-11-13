@@ -1,11 +1,11 @@
-// Checks native, tool and MCP structured-output integration; must not implement production output policy.
+// Exercises native, direct-tool and MCP output integration. Admission and commitment policy remain in production modules.
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { AHP_PROTOCOL_CONTRACT, type AhpEvent, type AhpRequestMap, type Capabilities, type McpServer, type SessionOpenParams } from '@anureo/protocol'
-import { createClient, HarnessSdkError, type Client, type HarnessAdapter, type SessionEventSink } from '../index'
+import { createClient, HarnessSdkError, type Client, type HarnessAdapter, type SessionEventSink, type StructuredOutputToolDefinition } from '../index'
 import { OutputBridgeManager } from './bridge'
 import { OUTPUT_TOOL } from './tool'
 
@@ -13,7 +13,11 @@ const disposals: Array<() => Promise<unknown>> = []
 afterEach(async () => { await Promise.all(disposals.splice(0).map(dispose => dispose())) })
 const SCHEMA = { type: 'object', properties: { sum: { type: 'integer' } }, required: ['sum'], additionalProperties: false }
 const rawCaps: Capabilities = { turn: { outputSchema: false, inputModalities: ['text'] }, input: { delivery: ['native', 'afterTurn'], steer: { target: 'turn', atomicMatch: true }, interrupt: { targets: ['turn'], reportsPendingInputs: false } }, mcp: { http: true, stdio: true }, compact: true, interactions: ['userInput'] }
-/** Connect a real MCP client using the lease’s HTTP or stdio config; caller must close it to release transports/processes. */
+/**
+ * MCP integration cases await a real client connected with the fixture/manager lease's configuration.
+ * Connection failures reject. Successful callers must close the client in finally to release its
+ * HTTP transport or stdio process, separately from the fixture's bridge-lease cleanup.
+ */
 async function connect(config: McpServer) {
   const client = new McpClient({ name: 'harness-fixture', version: '1' })
   const transport = config.type === 'http'
@@ -22,27 +26,37 @@ async function connect(config: McpServer) {
   await client.connect(transport)
   return client
 }
-/** Extract the current output identity from the injected protocol instructions or throw if the fixture never received its contract. */
+/** MCP cases and their call helper read the injected fallback instructions here to construct tool envelopes. Return the exact opaque ID or throw when the expected contract is absent. */
 function contract(params: AhpRequestMap['input/submit']) {
   const last = params.input.at(-1)
   const outputId = last?.type === 'text' ? last.text.match(/outputId: (anureo_output_[a-f0-9]{48})/)?.[1] : undefined
   if (!outputId) throw new Error('Missing output contract')
   return outputId
 }
-/** Open an owned test client/session with selectable native/HTTP/stdio output and a controlled submission callback; afterEach disposes the client. */
-async function fixture(run: (params: AhpRequestMap['input/submit'], sink: SessionEventSink, config?: McpServer) => Promise<void>, mode: 'http' | 'stdio' | 'native' = 'http', limits?: Parameters<typeof createClient>[0]['limits']) {
+/**
+ * Integration cases await this client/session with a scripted backend and real optional MCP bridge.
+ * The backend invokes run before returning its receipt, exercising event-before-binding behavior.
+ * Native tool tests inspect the configured definition through tool. afterEach disposes the client,
+ * while each test still owns MCP clients and deferred execution gates it creates. Setup failures reject.
+ */
+async function fixture(run: (params: AhpRequestMap['input/submit'], sink: SessionEventSink, config?: McpServer) => Promise<void>, mode: 'http' | 'stdio' | 'native' | 'tool' = 'http', limits?: Parameters<typeof createClient>[0]['limits']) {
   let opened!: SessionOpenParams, sink!: SessionEventSink
+  let tool: StructuredOutputToolDefinition | undefined
   let n = 0, calls = 0
   const adapter: HarnessAdapter = {
-    outputBridgeTransport: () => mode === 'native' ? undefined : mode,
-    /** Advertise native support only in native mode so fallback tests exercise the real adapter route. */
+    outputBridgeTransport: () => mode === 'http' || mode === 'stdio' ? mode : undefined,
+    /** withStructuredOutput.initialize awaits this scripted negotiation. Advertise native schemas only for native-mode cases so the other cases exercise fallback preparation. */
     async initialize() { return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: 'fixture', version: '1', adapter: 'fixture' }, capabilities: { ...rawCaps, turn: { ...rawCaps.turn, outputSchema: mode === 'native' } } } },
-    /** Retain injected MCP configuration and let the wrapper receive native events before its acceptance receipt. */
+    /** OutputSession.open awaits this fake backend. Retain injected config and the supplied sink so run and tests can publish native events before the receipt. */
     async openSession(params, target) {
       opened = params; sink = target
       return {
+        structuredOutputTool: mode === 'tool' ? {
+          /** OutputSession awaits this fake native registration before dispatch or cleanup. Retain the exact callback so tests can also invoke stale definitions. */
+          async configure(definition) { tool = definition },
+        } : undefined,
         binding: params.binding, capabilities: { ...rawCaps, turn: { ...rawCaps.turn, outputSchema: mode === 'native' } },
-        /** Start execution before the test callback and acknowledge afterward to exercise late association. */
+        /** OutputSession dispatches here after policy setup. Publish a start, await the test's run callback, then return its receipt to exercise late association. run/publication failures reject dispatch. */
         async execute(method, params) {
           if (method === 'session/close') return { closed: true, observationClosed: true, executionStopped: 'unconfirmed' } as never
           if (method !== 'input/submit') return { maintenanceId: 'maintenance', status: 'completed' } as never
@@ -53,26 +67,28 @@ async function fixture(run: (params: AhpRequestMap['input/submit'], sink: Sessio
           await run(input, target, opened.mcpServers?.find(server => server.name === 'anureo_output'))
           return { accepted: true, submissionId: input.submissionId, disposition: 'started', turnId } as never
         },
-        /** Native fixture owns no resources; wrapper/client cleanup must release real bridge transports. */
+        /** OutputSession.dispose awaits this fulfilled fake native release. The client/output wrapper owns the real bridge resources used by these cases. */
         async dispose() {},
       }
     },
-    /** Client-wide native fixture has no additional resources beyond wrapper-owned bridges. */
+    /** withStructuredOutput.dispose awaits this fulfilled fake adapter release after session attempts. Real bridge transport cleanup stays with the wrapper. */
     async dispose() {},
   }
   const client: Client = await createClient({ adapter, identity: { adapterId: 'fixture', runtimeConfigId: 'test' }, limits, interactions: { userInput: undefined } })
   disposals.push(() => client.dispose())
   const session = await client.sessions.create({ cwd: process.cwd() })
   return { client, session,
-    /** Inspect the actual native configuration after fallback injection. */
+    /** Integration cases read the native-open params here to connect independent clients to the injected bridge. */
     get opened() { return opened },
-    /** Access the wrapper sink for independently timed native events. */
+    /** Integration cases publish independently timed native events/interactions through the sink retained by openSession. */
     get sink() { return sink },
-    /** Read accepted native dispatch attempts without caching the count. */
-    get calls() { return calls }
+    /** Integration assertions read the number of input dispatch attempts made by the fake backend's execute. */
+    get calls() { return calls },
+    /** Expose current native tool registration to tool-mode cases, including cleanup removal. */
+    get tool() { return tool },
   }
 }
-/** Publish a final native item and terminal status in order; status/error variants exercise projection and validation before public completion. */
+/** Integration run callbacks await item then terminal admission through the native sink. The wrapper may hold both until binding. Sink failures reject run, while status selects the simulated native completion outcome. */
 async function final(sink: SessionEventSink, turnId: string, text = 'Task done', status: 'completed' | 'failed' | 'interrupted' = 'completed') {
   await sink.emit({ type: 'item/completed', payload: { item: { id: `message:${turnId}`, type: 'agentMessage', phase: 'final', text } } }, { turnId })
   await sink.emit({ type: 'turn/completed', payload: { turnId, status, ...(status === 'failed' ? { error: { code: 'NATIVE_FAILED', message: 'failed', retryable: false, outcomeUnknown: false } } : {}) } })
@@ -104,6 +120,7 @@ test('validation corrections and structurally equal duplicate results are local 
   const f = await fixture(async (input, sink, config) => {
     const mcp = await connect(config!)
     try {
+      /** This correction case awaits each MCP decision for the current input, retaining one identity across candidate retries. Transport failures reject the test callback. */
       const call = (value: unknown) => mcp.callTool({ name: 'submit_result', arguments: { outputId: contract(input), value } })
       expect(await call({ sum: 'bad' })).toHaveProperty('isError', true)
       expect(await call({ sum: 42 })).not.toHaveProperty('isError', true)
@@ -116,6 +133,46 @@ test('validation corrections and structurally equal duplicate results are local 
   })
   expect((await (await f.session.submit({ input: 'work', outputSchema: SCHEMA })).result()).text).toBe('{"sum":42}')
   expect(f.calls).toBe(1)
+})
+
+test('direct-tool registration precedes dispatch and stale callbacks cannot satisfy a later submission', async () => {
+  const firstSent = Promise.withResolvers<void>()
+  const firstTerminal = Promise.withResolvers<void>()
+  let firstTool: StructuredOutputToolDefinition | undefined
+  let dispatches = 0
+  const f = await fixture(async (input, sink, config) => {
+    expect(config).toBeUndefined()
+    expect(input.outputSchema).toBeUndefined()
+    const tool = f.tool
+    if (!tool) throw new Error('Missing native output tool')
+    expect(tool.schema).toEqual(SCHEMA)
+    if (++dispatches === 1) {
+      firstTool = tool
+      expect(await tool.execute({ sum: 'invalid' })).toMatchObject({ accepted: false, error: { code: 'STRUCTURED_OUTPUT_INVALID' } })
+      expect(await tool.execute({ sum: 42 })).toEqual({ accepted: true })
+      expect(await tool.execute({ sum: 42 })).toEqual({ accepted: true })
+      expect(await tool.execute({ sum: 43 })).toMatchObject({ accepted: false, error: { code: 'STRUCTURED_OUTPUT_ALREADY_SUBMITTED' } })
+      firstSent.resolve()
+      await firstTerminal.promise
+    } else {
+      if (!firstTool) throw new Error('Missing earlier native output tool')
+      expect(await firstTool.execute({ sum: 99 })).toMatchObject({ accepted: false, error: { code: 'STRUCTURED_OUTPUT_EXPIRED' } })
+      expect(await tool.execute({ sum: 43 })).toEqual({ accepted: true })
+    }
+    await final(sink, `turn-${dispatches}`)
+    // Bind explicitly to replay the held terminal and disable the tool before the native receipt.
+    await sink.bindSubmission(input.submissionId, `turn-${dispatches}`)
+    expect(f.tool).toBeUndefined()
+    expect(await tool.execute({ sum: 42 })).toMatchObject({ accepted: false, error: { code: 'STRUCTURED_OUTPUT_EXPIRED' } })
+  }, 'tool')
+  const first = f.session.submit({ input: 'first', outputSchema: SCHEMA })
+  try {
+    await Promise.race([firstSent.promise, first])
+    await expect(f.session.submit({ input: 'concurrent' })).rejects.toMatchObject({ code: 'STRUCTURED_OUTPUT_BUSY' })
+    firstTerminal.resolve()
+    expect(await (await first).result()).toMatchObject({ status: 'completed', text: '{"sum":42}' })
+    expect(await (await f.session.submit({ input: 'second', outputSchema: SCHEMA })).result()).toMatchObject({ status: 'completed', text: '{"sum":43}' })
+  } finally { firstTerminal.resolve() }
 })
 
 for (const transport of ['http', 'stdio'] as const) test(`${transport} corrects a mistyped output ID without expiring the task or consuming schema retries`, async () => {

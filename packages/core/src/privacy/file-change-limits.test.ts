@@ -1,10 +1,10 @@
-// Checks file change limits contracts; must not implement production policy.
+// Checks privacy projection and shared file-change retention contracts; must not implement production policy.
 import { expect, test } from 'bun:test'
-import { validateDefinition, type Item, type InteractionRequested } from '@anureo/protocol'
+import { validateDefinition, type Item, type InteractionRequested, type JsonSchema } from '@anureo/protocol'
 import { SecretRedactor } from './secrets'
 import { boundFileChangeItem, FILE_CHANGE_TEXT_LIMIT } from './file-change-limits'
 
-/** Return one item with secret-bearing material and mirrors for shared privacy/budget assertions; no files are read or modified. */
+/** Privacy and retention tests call this for independent mutable fixtures with canonical material and mirrors; no files are read or modified. */
 const makeFileChangeItem = (): Extract<Item, { type: 'toolCall' }> => ({
   id: 'edit',
   type: 'toolCall',
@@ -31,6 +31,7 @@ const makeFileChangeItem = (): Extract<Item, { type: 'toolCall' }> => ({
   }],
 })
 
+/** Exercise item, patch and history entry points after explicit registration; every returned observation must hide the marked value. */
 test('new material and every snapshot/history path use marked-secret filtering', () => {
   const filter = new SecretRedactor()
   filter.rememberResponse({ kind: 'userInput', interactionId: 'request', questions: [{ id: 'key', prompt: 'Key', secret: true }] } as InteractionRequested, { kind: 'userInput', answers: { key: 'secret' } })
@@ -40,6 +41,7 @@ test('new material and every snapshot/history path use marked-secret filtering',
   expect(JSON.stringify(filter.history({ items: [{ turnId: 'turn', item: makeFileChangeItem() }], snapshotToken: 'token' }))).not.toContain('secret')
 })
 
+/** Oversized multibyte text must stay within one item budget and expose partial metadata without invalidating the protocol item. */
 test('a shared UTF-8 budget includes canonical source and raw/input/output mirrors', () => {
   const source = makeFileChangeItem(); const text = '🙂'.repeat(80000)
   source.fileChanges![0]!.materials = [{ format: 'unified', patch: text }]
@@ -53,6 +55,7 @@ test('a shared UTF-8 budget includes canonical source and raw/input/output mirro
   expect(validateDefinition('Item', result)).toBe(true)
 })
 
+/** Exhaust material capacity across files, checking retained count and the later file's downgraded stat accuracy. */
 test('the fifty-material limit spans all files and never leaves exact stats after truncation', () => {
   const source = makeFileChangeItem()
   source.fileChanges = [0, 1].map(index => ({ path: `${index}.ts`, operation: 'modify', completeness: 'complete', stats: { added: 60, removed: 0, accuracy: 'exact' }, materials: Array.from({ length: 30 }, () => ({ format: 'text', scope: 'fragment', oldText: '', newText: 'new\n' })) }))
@@ -64,6 +67,7 @@ test('the fifty-material limit spans all files and never leaves exact stats afte
 })
 
 
+/** A malformed snapshot must throw before returning a bounded event; arbitrary extension JSON must still project successfully. */
 test('malformed Item-shaped patch snapshots fail before returning a retained event', () => {
   const filter = new SecretRedactor()
   const source = makeFileChangeItem()
@@ -76,6 +80,7 @@ test('malformed Item-shaped patch snapshots fail before returning a retained eve
   expect(filter.event({ type: 'item/delta', payload: { itemId: 'extension', kind: 'patch', value: { custom: 'compatible JSON' } } })).toMatchObject({ payload: { value: { custom: 'compatible JSON' } } })
 })
 
+/** Truncating either replacement side must make the whole replacement unavailable and the containing change partial. */
 test('independently truncated replacement sides degrade to metadata-only material', () => {
   const source = makeFileChangeItem()
   source.fileChanges![0]!.materials = [{ format: 'text', scope: 'fragment', oldText: 'old\nline\n', newText: 'y'.repeat(300000) }]
@@ -87,6 +92,7 @@ test('independently truncated replacement sides degrade to metadata-only materia
   expect(validateDefinition('Item', result)).toBe(true)
 })
 
+/** Compare all snapshot paths so one cannot retain oversized material that another path would discard. */
 test('started, completed, full delta and history all apply the same source budget', () => {
   const filter = new SecretRedactor()
   const source = makeFileChangeItem()
@@ -118,4 +124,95 @@ test('started, completed, full delta and history all apply the same source budge
     expect(new TextEncoder().encode(JSON.stringify(value)).byteLength, name).toBeLessThan(FILE_CHANGE_TEXT_LIMIT + 3000)
     expect(JSON.stringify(value), name).toContain('tooLarge')
   }
+})
+
+/** Verify local-reference cycles stop and siblings still register in host-hook order across object, array and composed rules. */
+test('schema registration preserves reference, property, additional and composition order', () => {
+  const remembered: string[] = []
+  const filter = new SecretRedactor(value => remembered.push(value))
+  const schema: JsonSchema = {
+    $defs: {
+      marked: { $ref: '#/$defs/marked', properties: { ref: { writeOnly: true } } },
+    },
+    $ref: '#/$defs/marked',
+    properties: {
+      ref: {},
+      known: { secret: true },
+      ignored: false,
+      list: { items: { writeOnly: true } },
+      composed: {},
+      last: {},
+    },
+    additionalProperties: { secret: true },
+    allOf: [{ properties: { composed: { secret: true } } }],
+    anyOf: [{ properties: { known: { writeOnly: true } } }],
+    oneOf: [{ properties: { last: { secret: true } } }],
+  }
+  filter.rememberResponse({ kind: 'elicitation', interactionId: 'schema', mode: 'form', schema }, {
+    kind: 'elicitation', action: 'accept',
+    content: { ref: 'reference', known: 'declared', ignored: 'public', list: ['array'], extra: 'additional', composed: 'composition', last: 'last' },
+  })
+  expect(remembered).toEqual(['reference', 'declared', 'array', 'additional', 'composition', 'last'])
+  expect(filter.text(remembered.join(' '))).toBe(Array(6).fill('[redacted]').join(' '))
+  expect(filter.text('public')).toBe('public')
+})
+
+/** A failing synchronous metadata hook must leave earlier registrations effective and allow the failed value to be retried. */
+test('metadata hook failure preserves earlier registrations without accepting the failed value', () => {
+  const failure = new Error('metadata unavailable')
+  let fail = true
+  const remembered: string[] = []
+  /** SecretRedactor.remember invokes this before storing each value; fail the second value once to exercise retry semantics. */
+  const filter = new SecretRedactor(value => {
+    remembered.push(value)
+    if (fail && value === 'second') throw failure
+  })
+  const request: InteractionRequested = {
+    kind: 'userInput', interactionId: 'registration',
+    questions: [{ id: 'one', prompt: 'One', secret: true }, { id: 'two', prompt: 'Two', secret: true }],
+  }
+  const response = { kind: 'userInput' as const, answers: { one: 'first', two: 'second' } }
+  expect(() => filter.rememberResponse(request, response)).toThrow(failure)
+  expect(filter.text('first second')).toBe('[redacted] second')
+  fail = false
+  filter.rememberResponse(request, response)
+  expect(remembered).toEqual(['first', 'second', 'second'])
+  expect(filter.text('first second')).toBe('[redacted] [redacted]')
+})
+
+/** Interleaved turns sharing an item ID must buffer separately; completion discards only its own prefix and keeps identities intact. */
+test('stream prefixes are isolated by turn and cleared by authoritative completion', () => {
+  const filter = new SecretRedactor()
+  filter.rememberResponse({ kind: 'userInput', interactionId: 'secret', questions: [{ id: 'key', prompt: 'Key', secret: true }] }, { kind: 'userInput', answers: { key: 'secret' } })
+  const delta = { type: 'item/delta' as const, payload: { itemId: 'same', kind: 'text' as const, text: 'sec' } }
+  expect(filter.event(delta, 'one')).toEqual({ ...delta, payload: { ...delta.payload, text: '' } })
+  expect(filter.event({ ...delta, payload: { ...delta.payload, text: 'ret' } }, 'two')).toMatchObject({ payload: { text: 'ret' } })
+  expect(filter.event({ ...delta, payload: { ...delta.payload, text: 'ret' } }, 'one')).toMatchObject({ payload: { text: '[redacted]' } })
+  filter.event(delta, 'one')
+  filter.event(delta, 'two')
+  expect(filter.event({ type: 'item/completed', payload: { item: { id: 'same', type: 'agentMessage', text: 'secret' } } }, 'one')).toMatchObject({ payload: { item: { id: 'same', text: '[redacted]' } } })
+  expect(filter.event({ ...delta, payload: { ...delta.payload, text: 'ret' } }, 'one')).toMatchObject({ payload: { text: 'ret' } })
+  expect(filter.event({ ...delta, payload: { ...delta.payload, text: 'ret' } }, 'two')).toMatchObject({ payload: { text: '[redacted]' } })
+})
+
+/** Force a UTF-8 character across the cap after a complete line; only that line may survive and mirrors share the remainder. */
+test('UTF-8 truncation retains complete lines and reserves canonical bytes before mirrors', () => {
+  const source = makeFileChangeItem()
+  const retained = `${'a'.repeat(FILE_CHANGE_TEXT_LIMIT - 4)}\n`
+  source.fileChanges![0]!.materials = [{ format: 'unified', patch: `${retained}🙂\n` }]
+  source.input = 'é\n'
+  source.output = 'later\n'
+  source.raw = 'raw\n'
+  source.extensions = { mirror: 'extension\n' }
+  const original = structuredClone(source)
+  const result = boundFileChangeItem(source)
+  if (result.type !== 'toolCall') throw Error('unexpected item')
+  expect(result.fileChanges![0]!.materials).toEqual([{ format: 'unified', patch: retained }])
+  expect(result.fileChanges![0]!.completeness).toBe('partial')
+  expect(result.input).toBe('é\n')
+  expect(result.output).toBe('')
+  expect(result.raw).toBe('')
+  expect(result.extensions).toEqual({ mirror: '', 'x-anureo/fileChangesTruncated': true })
+  expect(source).toEqual(original)
+  expect(validateDefinition('Item', result)).toBe(true)
 })

@@ -1,4 +1,4 @@
-// Checks schema contracts; must not implement production policy.
+// Exercises schema dialect, definition and value contracts. Production admission and publication stay in the output session.
 import { expect, test } from 'bun:test'
 import { compileOutputSchema } from './schema'
 import type { JsonSchema } from '@anureo/protocol'

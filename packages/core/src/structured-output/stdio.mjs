@@ -1,4 +1,9 @@
-// Proxies MCP stdio to a session bridge and watches its owner; must not validate or retain task results.
+/**
+ * Internal executable resolved by OutputBridgeManager.create for native clients to launch over stdio.
+ * ANUREO_OUTPUT_BRIDGE_URL and ANUREO_OUTPUT_BRIDGE_AUTH identify its private session lease. Forward
+ * tools to that bridge and exit when stdin ends, a termination signal arrives, the owner disappears
+ * or the bridge fails a ping. Startup failures report only a safe code on stderr and exit with 1.
+ */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -10,7 +15,11 @@ const upstream = new Client({ name: 'anureo-output-proxy', version: '1.0.0' })
 const downstream = new Server({ name: 'anureo_output', version: '1.0.0' }, { capabilities: { tools: {} } })
 let closing = false
 let ready = false
-/** Idempotently stop heartbeat, settle both MCP peers and exit with the supplied code; lifecycle signals and upstream failure share this cleanup path. */
+/**
+ * Stop heartbeat, settle both MCP peer closes (ignoring their rejections), then exit with code.
+ * Stdin-end and SIGTERM/SIGINT listeners start cleanup; checkLiveness and startup failure await it.
+ * Only the first call performs cleanup; later calls return without waiting for that exit.
+ */
 async function close(code = 0) {
   if (closing) return
   closing = true
@@ -19,7 +28,11 @@ async function close(code = 0) {
   process.exit(code)
 }
 let checking = false
-/** Check owner identity and upstream reachability once; the flag prevents slow pings from overlapping and confusing cleanup. */
+/**
+ * The 2-second heartbeat invokes this without awaiting. Check owner identity even during startup,
+ * then ping only after upstream connects, allowing 3 seconds for a reply. Owner loss exits with 0;
+ * ping failure exits with 1. The checking flag prevents overlapping pings during slow replies.
+ */
 async function checkLiveness() {
   if (closing || checking) return
   if (process.ppid !== parent || process.ppid === 1) { await close(); return }
@@ -34,7 +47,13 @@ heartbeat.unref()
 process.stdin.once('end', () => { void close() })
 process.once('SIGTERM', () => { void close() })
 process.once('SIGINT', () => { void close() })
-/** Connect upstream with the lease credential, then expose its tool contract over stdio; caller owns startup failure reporting and process exit. */
+/**
+ * Connect upstream with the required lease URL/credential before attaching downstream stdio.
+ * Upstream initialization uses a 10-second request timeout; connection enables heartbeat pings. The SDK
+ * invokes the registered downstream handlers, which return upstream tool lists/results or propagate rejection
+ * to protocol handling. Configuration/connection failures reject to the module entry for safe stderr
+ * reporting and close(1); this function does not own process exit.
+ */
 async function connectProxy() {
   const url = process.env.ANUREO_OUTPUT_BRIDGE_URL
   const credential = process.env.ANUREO_OUTPUT_BRIDGE_AUTH

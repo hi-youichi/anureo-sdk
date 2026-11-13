@@ -1,12 +1,69 @@
-// Compiles local synchronous output schemas; must not fetch references or publish execution results.
+// Owns synchronous local schema compilation and value checks. Reference fetching and result publication belong to other layers.
 import Ajv from 'ajv'
 import Ajv2020 from 'ajv/dist/2020.js'
 import type { JsonSchema } from '@anureo/protocol'
 import { HarnessSdkError } from '../errors'
 
-/** Reject unsupported references, async schemas, excessive nesting and unknown dialects before Ajv compilation; ignore schema-like instance annotations. */
+/**
+ * OutputSession.prepareOutput calls this before retaining submission state or dispatching input.
+ * Return a detached schema plus synchronous check/parse operations for candidate admission and final
+ * commitment. Compilation defaults to draft-07 and supports explicit 2020-12. Unsupported or invalid
+ * definitions throw INVALID_PARAMS, while source-cloning failures propagate directly. The caller owns
+ * the returned validator's lifetime and converts candidate/publication failures into its tool or
+ * terminal outcomes. Compilation performs no network I/O and leaves source untouched.
+ */
+export function compileOutputSchema(source: JsonSchema) {
+  const schema = structuredClone(source)
+  try {
+    validateSchemaDefinition(schema)
+    const dialect = typeof schema === 'object' ? schema.$schema : undefined
+    const engine = dialect === 'https://json-schema.org/draft/2020-12/schema' ? Ajv2020 : Ajv
+    const ajv = new engine({ allErrors: true, strict: false, validateFormats: false, multipleOfPrecision: 6, logger: false })
+    const validate = ajv.compile(schema)
+    /**
+     * OutputSession.submitCandidate uses this for provisional admission and publishOutput uses
+     * it before serialization. parse also invokes it after JSON decoding. Return void on a match or
+     * throw STRUCTURED_OUTPUT_INVALID with at most sixteen path/keyword issues. Values are neither
+     * coerced nor filled with defaults, so accepted output preserves the producer's JSON.
+     */
+    const check = (value: unknown): void => {
+      if (!validate(value)) throw new HarnessSdkError('STRUCTURED_OUTPUT_INVALID', 'Output does not match its schema', false, false,
+        { issues: validate.errors?.slice(0, 16).map(error => ({ path: error.instancePath, code: error.keyword })) ?? [] })
+    }
+    return {
+      schema,
+      check,
+      /**
+       * OutputSession.outputValue parses native finals and publishOutput rechecks projected JSON
+       * so privacy redaction cannot bypass schema constraints. Return the decoded value after check,
+       * or throw STRUCTURED_OUTPUT_MISSING, STRUCTURED_OUTPUT_NOT_JSON or check's invalid-value error.
+       * The caller retains responsibility for converting these failures into a failed terminal.
+       */
+      parse(text: string): unknown {
+        if (!text.trim()) throw new HarnessSdkError('STRUCTURED_OUTPUT_MISSING')
+        let value: unknown
+        try { value = JSON.parse(text) } catch { throw new HarnessSdkError('STRUCTURED_OUTPUT_NOT_JSON') }
+        check(value)
+        return value
+      },
+    }
+  } catch (cause) {
+    if (cause instanceof HarnessSdkError) throw cause
+    throw new HarnessSdkError('INVALID_PARAMS', 'Unsupported or invalid output schema')
+  }
+}
+
+/**
+ * compileOutputSchema invokes this before choosing Ajv and converts its failures to INVALID_PARAMS.
+ * Reject external references, async schemas, excessive nesting and unsupported root dialects without
+ * changing the schema. Instance annotations are skipped because their contents need not be schemas.
+ */
 function validateSchemaDefinition(schema: JsonSchema): void {
-  /** Walk only schema-bearing keywords; examples and defaults are instance data and may legitimately resemble schemas. */
+  /**
+   * validateSchemaDefinition walks the root with this callback. Recurse only through schema-bearing
+   * keywords and throw on unsupported nodes or excessive depth. Object/array iteration supplies child
+   * nodes with incremented depth, leaving example/default instance data untouched.
+   */
   const visit = (node: unknown, depth = 0): void => {
     if (depth > 128) throw new Error('depth')
     if (!node || typeof node !== 'object') return
@@ -27,36 +84,4 @@ function validateSchemaDefinition(schema: JsonSchema): void {
   visit(schema)
   const dialect = typeof schema === 'object' ? schema.$schema : undefined
   if (dialect !== undefined && dialect !== 'http://json-schema.org/draft-07/schema#' && dialect !== 'https://json-schema.org/draft/2020-12/schema') throw new Error('dialect')
-}
-
-/** Clone and compile a local synchronous draft-07/2020-12 schema for the output adapter; reject unsupported schemas with INVALID_PARAMS. No references are fetched and caller schemas are not mutated. */
-export function compileOutputSchema(source: JsonSchema) {
-  const schema = structuredClone(source)
-  try {
-    validateSchemaDefinition(schema)
-    const dialect = typeof schema === 'object' ? schema.$schema : undefined
-    const engine = dialect === 'https://json-schema.org/draft/2020-12/schema' ? Ajv2020 : Ajv
-    const ajv = new engine({ allErrors: true, strict: false, validateFormats: false, multipleOfPrecision: 6, logger: false })
-    const validate = ajv.compile(schema)
-    /** Validate an uncoerced candidate or throw STRUCTURED_OUTPUT_INVALID with bounded path/keyword issues; retain no raw candidate values in diagnostics. */
-    const check = (value: unknown): void => {
-      if (!validate(value)) throw new HarnessSdkError('STRUCTURED_OUTPUT_INVALID', 'Output does not match its schema', false, false,
-        { issues: validate.errors?.slice(0, 16).map(error => ({ path: error.instancePath, code: error.keyword })) ?? [] })
-    }
-    return {
-      schema,
-      check,
-      /** Parse nonempty JSON and check the compiled schema; throw structured-output missing, not-JSON or invalid errors without changing the input/schema. */
-      parse(text: string): unknown {
-        if (!text.trim()) throw new HarnessSdkError('STRUCTURED_OUTPUT_MISSING')
-        let value: unknown
-        try { value = JSON.parse(text) } catch { throw new HarnessSdkError('STRUCTURED_OUTPUT_NOT_JSON') }
-        check(value)
-        return value
-      },
-    }
-  } catch (cause) {
-    if (cause instanceof HarnessSdkError) throw cause
-    throw new HarnessSdkError('INVALID_PARAMS', 'Unsupported or invalid output schema')
-  }
 }

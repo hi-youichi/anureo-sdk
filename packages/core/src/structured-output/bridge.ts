@@ -1,4 +1,4 @@
-// Owns authenticated loopback bridge listeners and leases; must not validate task results or own output-tool policy.
+// Owns the shared loopback listener, authenticated session leases and request-scoped MCP transports.
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
@@ -12,26 +12,87 @@ import { HarnessSdkError } from '../errors'
 // Preserve existing bridge imports while production callers depend on the tool contract directly.
 export { OUTPUT_SERVER_NAME, OUTPUT_TOOL, toolError } from './tool'
 
-/** Session-scoped authenticated endpoint configuration and its cleanup handle; the manager owns the shared listener. */
+/** Internal session endpoint and cleanup handle returned to OutputSession.open; the manager owns the shared listener. */
 export interface OutputBridgeLease {
   /** Native-reachable config contains lease credentials; callers must keep it out of public state/history. */
   readonly config: McpServer
-  /** Invalidate this endpoint and close its active protocol instances; reject release failure without stopping other leases. */
+  /**
+   * Revoke admission immediately, then await active protocol closes. Reject RESOURCE_RELEASE_FAILED
+   * if any close rejects; other leases remain usable. Repeated calls return without retrying cleanup.
+   */
   dispose(): Promise<void>
 }
-type Handler = (args: unknown) => Promise<CallToolResult>
-/** One lease's secret, submission handler and live protocol instances; requests counts admitted HTTP bodies until their response settles. */
-interface Lease { credential: string; handler: Handler; active: Set<Server>; disposed: boolean; requests: number }
 
-/** One listener per Client; independent leases and protocol instances prevent cross-session state. */
+/**
+ * Internal bridge owner constructed by withStructuredOutput for one Client. OutputSession.open
+ * requests independent session leases; the adapter wrapper must dispose this manager after session
+ * cleanup to release the shared listener, even when individual lease cleanup fails.
+ */
 export class OutputBridgeManager {
+  /** Set the HTTP body limit in bytes (default 8 MiB); the listener starts only on the first create call. */
+  constructor(private readonly maxFrameBytes = 8 * 1024 * 1024) {}
+
+  /**
+   * Allocate an authenticated endpoint and native MCP configuration, awaiting shared listener startup.
+   * OutputSession.open supplies a queued submitValue handler, injects config into native open
+   * params and handles setup rejection by releasing any lease and publishing an unavailable warning.
+   * Stdio entry resolution happens before listener startup and can reject, as can startup or disposal
+   * races. The caller must keep credentials private and dispose the returned lease after use.
+   */
+  async create(transport: 'http' | 'stdio', handler: Handler): Promise<OutputBridgeLease> {
+    if (this.closed) throw new HarnessSdkError('CLIENT_DISPOSED')
+    const resolvedTransport: ResolvedTransport = transport === 'stdio'
+      ? { type: 'stdio', proxy: createRequire(import.meta.url).resolve('@anureo/sdk/structured-output-stdio') }
+      : { type: transport }
+    const port = await this.listen()
+    if (this.closed) throw new HarnessSdkError('CLIENT_DISPOSED')
+    const path = `/mcp/${randomBytes(24).toString('hex')}`
+    const credential = randomBytes(32).toString('hex')
+    const lease: Lease = { credential, handler, active: new Set(), disposed: false, requests: 0 }
+    this.leases.set(path, lease)
+    const url = `http://127.0.0.1:${port}${path}`
+    return {
+      config: bridgeConfig({ transport: resolvedTransport, url, credential }),
+      dispose: () => this.releaseLease(path, lease),
+    }
+  }
+
+  /**
+   * Close admission, settle active protocol closes, then stop the listener and its connections.
+   * withStructuredOutput's dispose port awaits this after attempting session disposal and classifies
+   * shutdown rejection with other resource failures. Individual protocol close rejections are ignored
+   * here; listener shutdown errors reject. Repeated calls return without awaiting an earlier disposal.
+   */
+  async dispose(): Promise<void> {
+    if (this.closed) return
+    this.closed = true
+    for (const lease of this.leases.values()) {
+      lease.disposed = true
+      await closeLeaseServers(lease)
+    }
+    this.leases.clear()
+    if (this.starting) await this.starting.catch(() => {})
+    const listener = this.listener
+    if (listener?.listening) {
+      const stopped = new Promise<void>((resolve, reject) => {
+        listener.close(error => {
+          if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') reject(error)
+          else resolve()
+        })
+      })
+      listener.closeAllConnections()
+      await stopped
+    }
+  }
+
   private listener?: HttpServer
   private starting?: Promise<number>
   private closed = false
   private readonly leases = new Map<string, Lease>()
-  /** Configure the maximum HTTP request frame for a client-wide manager; no listener starts before the first lease is requested. */
-  constructor(private readonly maxFrameBytes = 8 * 1024 * 1024) {}
-  /** Lazily start one authenticated loopback HTTP listener and cache its port promise; reject startup/disposal races. */
+  /**
+   * OutputBridgeManager.create awaits this port before allocating a lease. Lazily start one
+   * authenticated loopback HTTP listener and cache its port promise; reject startup/disposal races.
+   */
   private listen(): Promise<number> {
     return this.starting ??= new Promise((resolve, reject) => {
       const listener = this.listener = createServer((req, res) => {
@@ -48,21 +109,35 @@ export class OutputBridgeManager {
       })
     })
   }
-  /** Admit one authenticated request, account for it while its body/response is active, and dispatch it to a lease-local MCP server. */
+  /**
+   * listen registers this fire-and-forget HTTP callback. Admit, parse and dispatch one request;
+   * contain failures with a 500 status when headers permit, then release its concurrency permit.
+   * Accounting ends when dispatch/error handling settles, independently of response-close cleanup.
+   */
   private handleRequest(req: IncomingMessage, res: ServerResponse, listener: HttpServer): Promise<void> {
-    let counted: Lease | undefined
+    let countedLease: Lease | undefined
     // Keep accounting outside dispatch so an error response precedes permit release.
     return (async () => {
       const lease = this.admitRequest(req, res, listener)
       if (!lease) return
-      lease.requests++; counted = lease
+      lease.requests++
+      countedLease = lease
       const body = await this.readRequestBody(req, res)
       if (body === undefined) return
       if (lease.disposed) { res.writeHead(404).end(); return }
       await this.dispatchRequest(req, res, body, lease)
-    })().catch(() => { if (!res.headersSent) res.writeHead(500); res.end() }).finally(() => { if (counted) counted.requests-- })
+    })().catch(() => {
+      if (!res.headersSent) res.writeHead(500)
+      res.end()
+    }).finally(() => {
+      if (countedLease) countedLease.requests--
+    })
   }
-  /** Apply endpoint, credential, origin, method and concurrency rules in order; write the established rejection status and return no lease on failure. */
+  /**
+   * Apply endpoint, credential, host/origin, POST and 32-request concurrency checks in that order.
+   * Write the rejection response and return no lease on failure; handleRequest reserves the permit
+   * synchronously after success. An absent or empty Origin is allowed for native clients.
+   */
   private admitRequest(req: IncomingMessage, res: ServerResponse, listener: HttpServer): Lease | undefined {
     const lease = this.leases.get(req.url ?? '')
     if (this.closed || !lease || lease.disposed) { res.writeHead(404).end(); return }
@@ -74,7 +149,11 @@ export class OutputBridgeManager {
     if (lease.requests >= 32) { res.writeHead(429).end(); return }
     return lease
   }
-  /** Read and parse one bounded JSON frame; return undefined after writing the original 413 or 400 response. */
+  /**
+   * Read one bounded JSON body for handleRequest. Return undefined after a 413 size rejection or a
+   * 400 parse rejection; stream failures reject into handleRequest's HTTP error path. Parsing waits
+   * for the body to end, while an oversized body is rejected immediately.
+   */
   private async readRequestBody(req: IncomingMessage, res: ServerResponse): Promise<unknown | undefined> {
     const chunks: Buffer[] = []
     let size = 0
@@ -86,7 +165,13 @@ export class OutputBridgeManager {
     try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) }
     catch { res.writeHead(400).end(); return }
   }
-  /** Create and connect an independent MCP server/transport for this HTTP response; response close removes and closes the server. */
+  /**
+   * Connect a fresh stateless MCP server/transport and await its HTTP dispatch for handleRequest.
+   * The SDK invokes the registered tool callbacks: list the shared contract, or await create's handler
+   * after lease/tool-name checks. Protocol errors use SDK handling; setup/dispatch rejections reach
+   * handleRequest's HTTP error path. Response close removes the server and attempts best-effort close;
+   * lease and manager disposal also own active servers until then.
+   */
   private async dispatchRequest(req: IncomingMessage, res: ServerResponse, body: unknown, lease: Lease): Promise<void> {
     const server = new Server({ name: OUTPUT_SERVER_NAME, version: '1.0.0' }, { capabilities: { tools: {} } })
     server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [OUTPUT_TOOL] }))
@@ -101,39 +186,41 @@ export class OutputBridgeManager {
     await server.connect(transport)
     await transport.handleRequest(req, res, body)
   }
-  /** Allocate an unguessable authenticated session endpoint and HTTP/stdio MCP config; reject disposed managers, proxy resolution or listener failure. Caller must dispose the returned lease. */
-  async create(transport: 'http' | 'stdio', handler: Handler): Promise<OutputBridgeLease> {
-    if (this.closed) throw new HarnessSdkError('CLIENT_DISPOSED')
-    const proxy = transport === 'stdio' ? createRequire(import.meta.url).resolve('@anureo/sdk/structured-output-stdio') : undefined
-    const port = await this.listen()
-    if (this.closed) throw new HarnessSdkError('CLIENT_DISPOSED')
-    const path = `/mcp/${randomBytes(24).toString('hex')}`
-    const credential = randomBytes(32).toString('hex')
-    const lease: Lease = { credential, handler, active: new Set(), disposed: false, requests: 0 }
-    this.leases.set(path, lease)
-    const url = `http://127.0.0.1:${port}${path}`
-    const config: McpServer = transport === 'http'
-      ? { type: 'http', name: OUTPUT_SERVER_NAME, url, headers: { Authorization: `Bearer ${credential}` } }
-      : { type: 'stdio', name: OUTPUT_SERVER_NAME, command: process.execPath, args: [proxy!], env: { ANUREO_OUTPUT_BRIDGE_URL: url, ANUREO_OUTPUT_BRIDGE_AUTH: credential } }
-    return { config, dispose: async () => {
-      if (lease.disposed) return
-      lease.disposed = true; this.leases.delete(path)
-      const results = await Promise.allSettled([...lease.active].map(server => server.close()))
-      lease.active.clear()
-      if (results.some(result => result.status === 'rejected')) throw new HarnessSdkError('RESOURCE_RELEASE_FAILED')
-    } }
+  /**
+   * The returned lease callback delegates here when OutputSession.release or open awaits
+   * disposal. Revoke this endpoint before awaiting closes, clear its server registry after settlement
+   * and reject RESOURCE_RELEASE_FAILED on any close rejection. Revocation is permanent even on failure.
+   */
+  private async releaseLease(path: string, lease: Lease): Promise<void> {
+    if (lease.disposed) return
+    lease.disposed = true
+    this.leases.delete(path)
+    const results = await closeLeaseServers(lease)
+    lease.active.clear()
+    if (results.some(result => result.status === 'rejected')) throw new HarnessSdkError('RESOURCE_RELEASE_FAILED')
   }
-  /** Close admission, settle active protocol instances, then stop listener/connections; reject listener shutdown errors after invalidating every lease. */
-  async dispose(): Promise<void> {
-    if (this.closed) return
-    this.closed = true
-    for (const lease of this.leases.values()) { lease.disposed = true; await Promise.allSettled([...lease.active].map(server => server.close())) }
-    this.leases.clear()
-    if (this.starting) await this.starting.catch(() => {})
-    if (this.listener?.listening) {
-      const stopped = new Promise<void>((resolve, reject) => this.listener!.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve()))
-      this.listener.closeAllConnections()
-      await stopped
-    }
-  }
+}
+
+/** OutputSession.open supplies a serialized submitValue callback; MCP consumes its result as the tool response. */
+type Handler = (args: unknown) => Promise<CallToolResult>
+
+/** Mutable session lease state; requests counts admitted handlers until dispatch/error handling settles. */
+interface Lease { credential: string; handler: Handler; active: Set<Server>; disposed: boolean; requests: number }
+
+/** Stdio entry resolution must succeed before create starts the shared listener. */
+type ResolvedTransport = { type: 'http' } | { type: 'stdio'; proxy: string }
+
+/** Build create's native config from an already resolved transport; URL/auth remain private lease credentials. */
+function bridgeConfig({ transport, url, credential }: { transport: ResolvedTransport; url: string; credential: string }): McpServer {
+  return transport.type === 'http'
+    ? { type: 'http', name: OUTPUT_SERVER_NAME, url, headers: { Authorization: `Bearer ${credential}` } }
+    : { type: 'stdio', name: OUTPUT_SERVER_NAME, command: process.execPath, args: [transport.proxy], env: { ANUREO_OUTPUT_BRIDGE_URL: url, ANUREO_OUTPUT_BRIDGE_AUTH: credential } }
+}
+
+/**
+ * Snapshot and close every currently active server for releaseLease or manager disposal, settling all
+ * rejections so each caller can apply its own failure/registry policy. Does not revoke admission.
+ */
+function closeLeaseServers(lease: Lease): Promise<PromiseSettledResult<void>[]> {
+  return Promise.allSettled([...lease.active].map(server => server.close()))
 }

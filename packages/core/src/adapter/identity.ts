@@ -2,70 +2,81 @@
 import { HarnessSdkError } from "../errors";
 
 /**
- * Maintains bidirectional turn bindings and turn-scoped item IDs for adapter callers.
- * All state is in memory and scoped to this instance; clear it only after no later
- * event needs the old identities. This class does not own provider or session work.
+ * Root-exported helper for adapters translating native turn/item IDs to SDK IDs.
+ * Identifiers are opaque strings; this map does not validate or normalize them.
+ * All state is in memory and scoped to this instance. Adapters own event ordering,
+ * failure handling and clearing the map after no later event needs its identities.
  */
 export class NativeIdentityMap {
-  private readonly turns = new Map<string, string>();
-  private readonly reverseTurns = new Map<string, string>();
+  private readonly turnIdsByNativeTurnId = new Map<string, string>();
+  private readonly nativeTurnIdsByTurnId = new Map<string, string>();
   private readonly items = new Map<string, string>();
 
   /**
-   * Create an empty session-local map using the adapter's SDK ID allocator.
-   * No IDs are allocated until an item lookup misses; allocator failures propagate.
+   * Adapters supply a synchronous SDK item ID allocator when creating a session-local
+   * map. Construction does not invoke it; item() invokes it on a cache miss and
+   * propagates its failures. Supply nonempty IDs to make subsequent lookups reuse them.
    */
   constructor(private readonly createId: () => string) {}
 
   /**
-   * Bind a native/SDK turn pair, checking existing nonempty bindings before
-   * changing either direction. Adapter callers bind protocol-valid IDs before
-   * publishing events that rely on this pair; conflicts throw PROTOCOL_ERROR.
+   * Adapters record an SDK/native turn pair before translating it through turn()
+   * or nativeTurn(). Rebinding the same pair is harmless. A conflicting nonempty
+   * stored ID throws HarnessSdkError with code PROTOCOL_ERROR before either map
+   * changes; existing empty values do not reject rebinding. Returns no value and
+   * publishes no events; the adapter decides how to handle a conflict.
    */
   bindTurn(turnId: string, nativeTurnId: string): void {
-    const existingTurnId = this.turns.get(nativeTurnId);
-    const existingNativeTurnId = this.reverseTurns.get(turnId);
+    const existingTurnId = this.turnIdsByNativeTurnId.get(nativeTurnId);
+    const existingNativeTurnId = this.nativeTurnIdsByTurnId.get(turnId);
     if (
       (existingTurnId && existingTurnId !== turnId) ||
       (existingNativeTurnId && existingNativeTurnId !== nativeTurnId)
     ) {
       throw new HarnessSdkError("PROTOCOL_ERROR", "Conflicting native turn identity");
     }
-    this.turns.set(nativeTurnId, turnId);
-    this.reverseTurns.set(turnId, nativeTurnId);
+    this.turnIdsByNativeTurnId.set(nativeTurnId, turnId);
+    this.nativeTurnIdsByTurnId.set(turnId, nativeTurnId);
   }
 
-  /** Look up an SDK turn ID without allocation or mutation; return undefined when unbound. */
+  /** Adapters translate a native turn ID to its stored SDK ID, or undefined, without mutation or allocation. */
   turn(nativeTurnId: string): string | undefined {
-    return this.turns.get(nativeTurnId);
+    return this.turnIdsByNativeTurnId.get(nativeTurnId);
   }
 
-  /** Look up the native peer ID without allocation or mutation; return undefined when unbound. */
+  /** Adapters translate an SDK turn ID to its stored native ID, or undefined, without mutation or allocation. */
   nativeTurn(turnId: string): string | undefined {
-    return this.reverseTurns.get(turnId);
+    return this.nativeTurnIdsByTurnId.get(turnId);
   }
 
   /**
-   * Resolve the SDK item ID for this turn/item pair, using the adapter allocator
-   * when the cache has no nonempty ID. Allocator failures propagate.
+   * Adapters obtain a stable SDK item ID for repeated native item events within an
+   * SDK turn. No turn binding is required. Return the cached nonempty ID, or invoke
+   * the supplied allocator synchronously and cache its result for this pair.
+   * Allocator failures propagate unchanged without caching a result, so a later
+   * call tries again; the adapter owns retry policy. Empty results are returned
+   * but cause another allocation on the next lookup. clear() forgets these IDs.
    */
   item(turnId: string, nativeItemId: string): string {
+    // Encode the pair so delimiter characters inside opaque IDs cannot alias another pair.
     const key = JSON.stringify([turnId, nativeItemId]);
-    let value = this.items.get(key);
-    if (!value) {
-      value = this.createId();
-      this.items.set(key, value);
+    let itemId = this.items.get(key);
+    if (!itemId) {
+      itemId = this.createId();
+      this.items.set(key, itemId);
     }
-    return value;
+    return itemId;
   }
 
   /**
-   * Drop all session-local mappings. Adapter callers must ensure no remaining
-   * events need these identities; this does not cancel or clean up provider work.
+   * Adapters call this after no remaining events need the old identities. Forget
+   * both turn directions and all cached item IDs; later calls can bind and allocate
+   * again using the same allocator. Repeated clears are harmless and return no value.
+   * Native work is not cancelled or released: the adapter retains cleanup ownership.
    */
   clear(): void {
-    this.turns.clear();
-    this.reverseTurns.clear();
+    this.turnIdsByNativeTurnId.clear();
+    this.nativeTurnIdsByTurnId.clear();
     this.items.clear();
   }
 }
