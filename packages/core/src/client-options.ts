@@ -7,6 +7,7 @@ import type { Input } from './types';
  * Hosts register these callbacks in ClientOptions.interactions; Client.initialize advertises own
  * keys, including undefined values for manual responses. Session.requestInteraction schedules a
  * supplied handler through startInteractionHandler after publishing interaction/requested.
+ * Handlers receive a detached native request, including private fields needed to answer it.
  * Resolve a matching answer for native delivery; rejection triggers cancellation while actionable.
  * Observe the signal to stop host-owned work after settlement/teardown: late answers are ignored,
  * but handler capacity stays occupied until the host promise settles. The SDK owns native settlement.
@@ -34,13 +35,16 @@ export interface ClientOptions {
   interactions?: InteractionHandlers;
   /** Positive safe-integer retention budgets; capacity checks reject rather than evict unresolved work. */
   limits?: {
-    /** Maximum retained execution snapshots, including pinned terminal executions. */
+    /** Maximum retained execution snapshots per session, including pinned terminals; defaults to 128. */
     maxExecutions?: number;
-    /** Maximum retained submission/association records. */
+    /** Maximum retained submission/association records per session; defaults to 1024. */
     maxSubmissions?: number;
-    /** Shared retained execution-result budget in serialized UTF-8 bytes. */
+    /**
+     * Shared execution-result budget per session in serialized UTF-8 bytes; defaults to 16 MiB.
+     * Output wrapping applies this budget independently to its own retention.
+     */
     maxResultBytes?: number;
-    /** Maximum distinct retained items per execution. */
+    /** Maximum distinct retained items per execution; defaults to 2048. */
     maxItems?: number;
   };
 }
@@ -52,6 +56,7 @@ export interface ClientOptions {
  * validation; callers use Turn.result to observe that outcome.
  */
 export interface SubmitOptions {
+  /** Text or protocol blocks to detach and validate before native dispatch. */
   input: Input;
   /** Native delivery policy; omitted uses native delivery rather than SDK queueing. */
   delivery?: AhpRequestMap['input/submit']['delivery'];

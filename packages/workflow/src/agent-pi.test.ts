@@ -9,7 +9,11 @@ test('workflow schema uses direct Pi tools and retains Zod refinement validation
   const fake = fakeFactory(host => {
     let output: StructuredOutputToolDefinition | undefined
     Object.assign(host, { async setOutputTool(tool?: StructuredOutputToolDefinition) { output = tool } })
-    host.script = async host => { await output!.execute({ sum: 42 }); await host.assistant('submitted') }
+    host.script = async host => {
+      if (!output) throw new Error('Output tool must be registered before scripted execution')
+      await output.execute({ sum: 42 })
+      await host.assistant('submitted')
+    }
   })
   const client = await createClient({ adapter: createPiAdapter({ version: '1.5.2', createHost: fake.factory }), identity: { adapterId: 'pi', runtimeConfigId: 'workflow-direct-tool' } })
   try {

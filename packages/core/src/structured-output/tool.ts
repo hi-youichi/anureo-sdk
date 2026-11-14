@@ -3,7 +3,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 
 /**
  * Internal reserved MCP identity for bridge configuration and fallback instructions.
- * OutputSession.open rejects configurations that already claim this name when preparing a fallback bridge;
+ * OutputSession.prepareBridge rejects configurations that already claim this name before lease allocation;
  * OutputBridgeManager.create assigns it to the injected server configuration.
  */
 export const OUTPUT_SERVER_NAME = 'anureo_output'
@@ -11,6 +11,7 @@ export const OUTPUT_SERVER_NAME = 'anureo_output'
  * Wire contract exposed to MCP clients by OutputBridgeManager.dispatchRequest's ListTools handler.
  * This internal export defines the routing envelope: outputId must identify the current submission,
  * while value is unconstrained here and is checked against the prepared schema by OutputSession.
+ * Acceptance is provisional: terminal publication still rechecks the value and its privacy projection.
  * dispatchRequest's CallTool handler checks the name before invoking the session candidate handler.
  */
 export const OUTPUT_TOOL = {

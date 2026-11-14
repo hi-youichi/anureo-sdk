@@ -1,9 +1,15 @@
+/** Supply a review perspective through ReviewOptions.angles; reviewCode copies and validates
+ * the selection before analysis and retains its order in each module's angle results. */
 export interface ReviewAngle {
+  /** Stable identity, unique within the selection, nonblank and at most 256 UTF-8 bytes. */
   id: string
+  /** Nonblank display label included in prompts and reports. */
   title: string
+  /** Nonblank guidance included verbatim in both review and verification tasks. */
   instructions: string
 }
 
+/** Review concrete behavior, contract violations and lifecycle failures. */
 export const correctnessAngle: ReviewAngle = {
   id: 'correctness',
   title: 'Correctness',
@@ -59,6 +65,7 @@ Do not report style preferences, unsupported risks, or feature requests. Return
 no findings when the inspected paths support no correctness defect.`,
 }
 
+/** Review obstacles to understanding and safely changing the implementation. */
 export const codeQualityAngle: ReviewAngle = {
   id: 'code-quality',
   title: 'Code Quality',
@@ -129,6 +136,7 @@ changes belong to design, and concrete behavior failures belong to correctness.
 Return no findings when the actual maintenance tasks are already clear.`,
 }
 
+/** Review responsibility, contract, state and dependency ownership. */
 export const designAngle: ReviewAngle = {
   id: 'design',
   title: 'Design',
@@ -218,4 +226,6 @@ a related structural cause here only when it warrants a distinct design change.
 Return no findings when there is no supported structural improvement.`,
 }
 
+/** Default perspectives when ReviewOptions.angles is omitted, in report order.
+ * Execution may overlap; reviewCode copies the angle records during preflight. */
 export const defaultAngles: readonly ReviewAngle[] = [correctnessAngle, codeQualityAngle, designAngle]

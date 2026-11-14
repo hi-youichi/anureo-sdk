@@ -64,12 +64,23 @@ test('safe codes prefer an existing code property and only fall back to Error me
   expect(safeCatalogErrorCode(new Error('private cause'))).toBe('CATALOG_QUERY_FAILED')
 })
 
-test('diagnostic property failures replace the work rejection before terminal reporting', async () => {
+test.each(['code', 'rpcCode'])('diagnostic %s property failures replace the work rejection before terminal reporting', async property => {
   const events: CatalogProbeEvent[] = []
   const propertyFailure = new Error('getter failure')
-  const cause = { get code() { throw propertyFailure } }
+  const cause = { get [property]() { throw propertyFailure } }
   await expect(catalogPhase({ onPhase: event => { events.push(event) } }, 'models', async () => { throw cause })).rejects.toBe(propertyFailure)
   expect(events).toEqual([{ phase: 'models', outcome: 'started' }])
+})
+
+test('native RPC accessors are read for classification and delivery without replacing the work failure', async () => {
+  const events: CatalogProbeEvent[] = []
+  let reads = 0
+  const cause = { code: 'NATIVE_RPC_ERROR', get rpcCode() { reads++; return -32603 } }
+  await expect(catalogPhase({ onPhase: event => { events.push(event) } }, 'models', async () => { throw cause })).rejects.toBe(cause)
+  expect(reads).toBe(2)
+  expect(events[1]).toEqual({
+    phase: 'models', outcome: 'error', errorCode: 'NATIVE_RPC_ERROR', nativeRpcCode: -32603, durationMs: expect.any(Number),
+  })
 })
 
 test('catalog phases are logged to LogTape without leaking private causes', async () => {

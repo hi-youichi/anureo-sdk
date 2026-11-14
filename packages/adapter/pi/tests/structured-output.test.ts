@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import type { AgentSession } from '@earendil-works/pi-coding-agent'
 import { createClient, type StructuredOutputToolDefinition } from '@anureo/sdk'
 import { createPiAdapter, createPiHost } from '../src'
 import { fakeFactory, type FakePiHost } from './fake-host'
@@ -7,6 +8,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const SCHEMA = { type: 'object', properties: { sum: { type: 'integer' } }, required: ['sum'], additionalProperties: false }
+/**
+ * Install a controllable setOutputTool port on each scripted host. OutputSession invokes that port
+ * during setup/cleanup; scripts receive the current definition and tests inspect its replacement
+ * history. Tests own the clients created with this factory and await their disposal.
+ */
 function directFactory(script: (host: FakePiHost, tool: StructuredOutputToolDefinition | undefined, text: string) => Promise<void>) {
   let current: StructuredOutputToolDefinition | undefined
   const definitions: Array<StructuredOutputToolDefinition | undefined> = []
@@ -16,8 +22,26 @@ function directFactory(script: (host: FakePiHost, tool: StructuredOutputToolDefi
   })
   return { ...fake, definitions, get current() { return current } }
 }
+/** Open a client with verified Pi capabilities and the injected direct-tool factory; tests await its disposal. */
 async function clientFor(createHost: ReturnType<typeof directFactory>['factory']) {
   return createClient({ adapter: createPiAdapter({ version: '1.5.2', createHost }), identity: { adapterId: 'pi', runtimeConfigId: 'direct-tool' } })
+}
+
+/**
+ * Replace only the native provider stream with one completed tool-call message. The installed Pi
+ * agent loop still validates arguments and invokes the registered output tool; no credentials or
+ * network call are involved. Both iteration and result expose the same message, as Pi expects.
+ */
+function toolStream({ model, id, args }: {
+  model: { api: 'openai-completions'; provider: string; id: string }
+  id: string
+  args: Record<string, unknown>
+}): ReturnType<AgentSession['agent']['streamFunction']> {
+  const message = { role: 'assistant', api: model.api, provider: model.provider, model: model.id, stopReason: 'toolUse', timestamp: Date.now(),
+    content: [{ type: 'toolCall', id, name: 'anureo_submit_result', arguments: args }],
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  } as const
+  return { async *[Symbol.asyncIterator]() { yield { type: 'done', reason: 'toolUse', message } }, async result() { return message } } as unknown as ReturnType<AgentSession['agent']['streamFunction']>
 }
 
 test('Pi carries the business schema on a direct tool and normalizes its validated result without MCP', async () => {
@@ -139,16 +163,19 @@ test('installed Pi SDK dynamically replaces and disables a direct output tool, p
   const host = await createPiHost({ cwd: dir, agentDir: join(dir, 'agent'), persist: false, mode: 'new', tools: ['read'], instructions: 'Test instructions.' })
   try {
     // Inspect the installed SDK, independently of fake host contracts and model credentials.
-    const native = Reflect.get(host, 'session') as import('@earendil-works/pi-coding-agent').AgentSession
-    const define = (schema: StructuredOutputToolDefinition['schema'], accepted: boolean): StructuredOutputToolDefinition => ({ name: 'anureo_submit_result', description: 'Submit result', schema, async execute() { return accepted ? { accepted: true } : { accepted: false, error: { code: 'INVALID', message: 'invalid', retryable: false, outcomeUnknown: false } } } })
+    const native = Reflect.get(host, 'session') as AgentSession
+    const define = ({ schema, result }: {
+      schema: StructuredOutputToolDefinition['schema']
+      result: Awaited<ReturnType<StructuredOutputToolDefinition['execute']>>
+    }): StructuredOutputToolDefinition => ({ name: 'anureo_submit_result', description: 'Submit result', schema, async execute() { return result } })
     expect(native.getActiveToolNames()).toEqual(['read'])
-    await host.setOutputTool!(define(SCHEMA, false))
+    await host.setOutputTool!(define({ schema: SCHEMA, result: { accepted: false, error: { code: 'INVALID', message: 'invalid', retryable: false, outcomeUnknown: false } } }))
     expect(native.getAllTools().find(tool => tool.name === 'anureo_submit_result')?.parameters).toEqual(SCHEMA)
     host.setActiveTools(['read', 'bash'])
     expect(native.getActiveToolNames()).toContain('anureo_submit_result')
     const tool = native.agent.state.tools.find(tool => tool.name === 'anureo_submit_result')!
     expect(await tool.execute('invalid', {})).toMatchObject({ isError: true })
-    await host.setOutputTool!(define({ type: 'array', items: { type: 'integer' } }, true))
+    await host.setOutputTool!(define({ schema: { type: 'array', items: { type: 'integer' } }, result: { accepted: true } }))
     const replacement = native.agent.state.tools.find(tool => tool.name === 'anureo_submit_result')!
     expect(replacement.parameters).toHaveProperty('properties.value.type', 'array')
     expect(await replacement.execute('valid', { value: [1, 2, 3] })).toMatchObject({ terminate: true, details: { accepted: true } })
@@ -164,7 +191,7 @@ test('the real Pi agent loop invokes the direct tool, preserves raw arguments an
   const dir = await mkdtemp(join(tmpdir(), 'anureo-pi-loop-'))
   const host = await createPiHost({ cwd: dir, agentDir: join(dir, 'agent'), persist: false, mode: 'new', tools: [] })
   try {
-    const native = Reflect.get(host, 'session') as import('@earendil-works/pi-coding-agent').AgentSession
+    const native = Reflect.get(host, 'session') as AgentSession
     const values: unknown[] = []
     let requests = 0
     await host.setOutputTool!({ name: 'anureo_submit_result', description: 'Submit result', schema: SCHEMA,
@@ -179,11 +206,7 @@ test('the real Pi agent loop invokes the direct tool, preserves raw arguments an
     native.agent.state.model = { ...model, input: ['text'] }
     native.agent.streamFunction = () => {
       if (++requests > 2) throw new Error('Accepted output must end the agent loop')
-      const message = { role: 'assistant', api: model.api, provider: model.provider, model: model.id, stopReason: 'toolUse', timestamp: Date.now(),
-        content: [{ type: 'toolCall', id: `call-${requests}`, name: 'anureo_submit_result', arguments: { sum: requests === 1 ? '42' : 42 } }],
-        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-      } as const
-      return { async *[Symbol.asyncIterator]() { yield { type: 'done', reason: 'toolUse', message } }, async result() { return message } } as unknown as ReturnType<typeof native.agent.streamFunction>
+      return toolStream({ model, id: `call-${requests}`, args: { sum: requests === 1 ? '42' : 42 } })
     }
     await native.agent.prompt('Calculate 17 + 25.')
     expect(requests).toBe(2)
@@ -201,11 +224,7 @@ test('the real Pi agent loop invokes the direct tool, preserves raw arguments an
       await host.setOutputTool!({ name: 'anureo_submit_result', description: 'Submit value', schema: root.schema, async execute(value) { submitted = value; return { accepted: true } } })
       native.agent.streamFunction = () => {
         if (++rootRequests > 1) throw new Error('Output must terminate without another provider call')
-        const message = { role: 'assistant', api: model.api, provider: model.provider, model: model.id, stopReason: 'toolUse', timestamp: Date.now(),
-          content: [{ type: 'toolCall', id: 'root-call', name: 'anureo_submit_result', arguments: { value: root.value } }],
-          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        } as const
-        return { async *[Symbol.asyncIterator]() { yield { type: 'done', reason: 'toolUse', message } }, async result() { return message } } as unknown as ReturnType<typeof native.agent.streamFunction>
+        return toolStream({ model, id: 'root-call', args: { value: root.value } })
       }
       await native.agent.prompt('Submit the value.')
       expect(submitted).toEqual(root.value)

@@ -1,17 +1,39 @@
+/** Failure data retained in angle, fix and progress outcomes; these records are returned in the
+ * report rather than thrown. Fatal workflow errors can still reject reviewCode instead. */
 export interface ReviewFailure {
   message: string
+  /** String code from the cause, or null when none was supplied. */
   code: string | null
+  /** True only when the cause explicitly reports an unknown execution outcome; false is not a rollback guarantee. */
   outcomeUnknown: boolean
+  /** Valid path/code pairs from validation details, without issue messages or other private details.
+   * String paths pass through unchanged; array paths are copied and allow strings/nonnegative safe integers. */
   issues?: Array<{ path: string | Array<string | number>; code: string }>
 }
 
-/** Normalize thrown values; retain only valid path/code pairs from details.issues.
- * String paths are assumed to be trusted Ajv JSON pointers from the SDK's own
- * validator and are passed through unchanged; only their shape-unknown array
- * variant is strictly filtered.
- * Omit malformed issues, issue messages, and extra details to avoid exposing
- * private validation diagnostics. */
+/** Internal normalization used by reviewAngle, reviewCode's progress observer and recoverFixFailure
+ * to retain failures in reports. CLI formatFailure also uses it for thrown errors. Keeps the cause's
+ * message/string representation and string code, while filtering validation details to path/code pairs. */
 export function reviewFailure(cause: unknown): ReviewFailure {
+  const issues = failureIssues(cause)
+  return {
+    message: cause instanceof Error ? cause.message : String(cause),
+    code: cause && typeof cause === 'object' && 'code' in cause && typeof cause.code === 'string' ? cause.code : null,
+    outcomeUnknown: !!cause && typeof cause === 'object' && 'outcomeUnknown' in cause && cause.outcomeUnknown === true,
+    ...(issues.length > 0 ? { issues } : {}),
+  }
+}
+
+/** Internal CLI diagnostic for runCli and executeReviewCommand: message, optional code and outcome
+ * uncertainty, without a trailing newline. Callers write it to stderr; validation issues stay in reports. */
+export function formatFailure(cause: unknown): string {
+  const error = reviewFailure(cause)
+  return `${error.message}${error.code ? ` [${error.code}]` : ''}${error.outcomeUnknown ? ' (execution outcome unknown)' : ''}`
+}
+
+/** Retain only validation paths/codes so reports omit private issue messages and extra details.
+ * String paths from SDK validators pass through unchanged; array paths require safe components. */
+function failureIssues(cause: unknown): NonNullable<ReviewFailure['issues']> {
   const details = cause && typeof cause === 'object' && 'details' in cause ? cause.details : undefined
   const candidates = details && typeof details === 'object' && 'issues' in details && Array.isArray(details.issues) ? details.issues : []
   const issues: NonNullable<ReviewFailure['issues']> = []
@@ -24,15 +46,5 @@ export function reviewFailure(cause: unknown): ReviewFailure {
       issues.push({ path: [...path], code: issue.code })
     }
   }
-  return {
-    message: cause instanceof Error ? cause.message : String(cause),
-    code: cause && typeof cause === 'object' && 'code' in cause && typeof cause.code === 'string' ? cause.code : null,
-    outcomeUnknown: !!cause && typeof cause === 'object' && 'outcomeUnknown' in cause && cause.outcomeUnknown === true,
-    ...(issues.length > 0 ? { issues } : {}),
-  }
-}
-
-export function formatFailure(cause: unknown): string {
-  const error = reviewFailure(cause)
-  return `${error.message}${error.code ? ` [${error.code}]` : ''}${error.outcomeUnknown ? ' (execution outcome unknown)' : ''}`
+  return issues
 }

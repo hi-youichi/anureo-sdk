@@ -63,12 +63,8 @@ export interface HarnessProcess {
   dispose(): Promise<void>;
 }
 
-/** Process failure category for adapters; native causes are reduced to an allowlisted code. */
+/** Process failure category for adapters; native causes are reduced to a format-checked code. */
 export class ProcessPortError extends Error {
-  /** Stable adapter-facing category; native error messages are not exposed. */
-  readonly code: 'HARNESS_UNAVAILABLE' | 'PROCESS_WRITE_FAILED' | 'PROCESS_DISPOSE_FAILED';
-  /** Safe OS error code extracted without retaining raw spawn arguments or causes. */
-  readonly nativeCode?: string;
   /**
    * Construct a failure using caller-supplied safe message text, which is retained verbatim.
    * Inspect the optional native cause for a code, but never retain its message, arguments, or cause.
@@ -78,9 +74,13 @@ export class ProcessPortError extends Error {
     super(message);
     this.name = 'ProcessPortError';
     this.code = code;
-    const cause = options?.cause;
-    if (cause && typeof cause === 'object' && 'code' in cause && typeof cause.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(cause.code)) this.nativeCode = cause.code;
+    const nativeCode = readNativeErrorCode(options?.cause);
+    if (nativeCode !== undefined) this.nativeCode = nativeCode;
   }
+  /** Stable adapter-facing category; native error messages are not exposed. */
+  readonly code: 'HARNESS_UNAVAILABLE' | 'PROCESS_WRITE_FAILED' | 'PROCESS_DISPOSE_FAILED';
+  /** Native code matching the bounded uppercase format; raw arguments and causes are not retained. */
+  readonly nativeCode?: string;
 }
 
 /**
@@ -95,15 +95,48 @@ export async function spawnHarnessProcess(options: HarnessProcessOptions): Promi
   const owned = options.owned ?? true;
   const child = launchProcess({ options, owned });
   const observation = observeProcess(child);
-  let disposePromise: Promise<void> | undefined;
   // Prevent an unhandled pipe error if a peer closes while the caller isn't writing.
   child.stdin.on('error', () => {});
   const pid = await waitForSpawn(child, observation);
+  return createProcessHandle({ child, pid, owned, timeoutMs, didExit: observation.didExit, exited: observation.exited });
+}
+
+/**
+ * Extract only a bounded uppercase code for ProcessPortError; a native cause may contain private
+ * spawn arguments and must never become part of the public error.
+ */
+function readNativeErrorCode(cause: unknown): string | undefined {
+  if (!cause || typeof cause !== 'object' || !('code' in cause)) return undefined;
+  if (typeof cause.code !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/.test(cause.code)) return undefined;
+  return cause.code;
+}
+
+/** Shared child resources; the exit observer must be installed before waiting for spawn. */
+interface ProcessResources {
+  readonly child: ChildProcessWithoutNullStreams;
+  /** Original positive spawn PID, independent of later changes to child.pid. */
+  readonly pid: number;
+  readonly owned: boolean;
+  /** Validated graceful termination timeout in milliseconds. */
+  readonly timeoutMs: number;
+  /** Read current exit state, including events delivered during asynchronous teardown. */
+  readonly didExit: () => boolean;
+  readonly exited: Promise<ProcessExit>;
+}
+
+/**
+ * spawnHarnessProcess transfers a successfully spawned child's pipes here. Keep write admission
+ * and the cached teardown promise under one owner so disposal immediately closes admission and
+ * repeated disposal shares its outcome. Consumers still own output draining and invoking disposal.
+ */
+function createProcessHandle(resources: ProcessResources): HarnessProcess {
+  const { child, pid, owned, didExit, exited } = resources;
+  let disposePromise: Promise<void> | undefined;
   return {
-    pid, owned, stdout: child.stdout, stderr: child.stderr, exited: observation.exited,
+    pid, owned, stdout: child.stdout, stderr: child.stderr, exited,
     /** Write to live stdin and resolve its native callback; reject closed/disposed/exited input or OS write failure without retrying. */
     write(chunk) {
-      if (disposePromise || child.stdin.destroyed || child.stdin.writableEnded || observation.didExit()) {
+      if (disposePromise || child.stdin.destroyed || child.stdin.writableEnded || didExit()) {
         return Promise.reject(new ProcessPortError('PROCESS_WRITE_FAILED', 'Harness process input is closed'));
       }
       return new Promise<void>((resolve, reject) => {
@@ -118,7 +151,7 @@ export async function spawnHarnessProcess(options: HarnessProcessOptions): Promi
      * children are unrefed without waiting. Reject sanitized cleanup failure.
      */
     dispose() {
-      return disposePromise ??= disposeProcess({ child, pid, owned, timeoutMs, didExit: observation.didExit, exited: observation.exited });
+      return disposePromise ??= disposeProcess(resources);
     },
   };
 }
@@ -263,11 +296,12 @@ function launchProcess({ options, owned }: { options: HarnessProcessOptions; own
   }
 }
 
-/** Lifecycle observations for one child; closures expose state without allowing callers to mutate it. */
+/** Lifecycle observations for one child; only recordSpawn updates the retained PID. */
 interface ProcessObservation {
   readonly exited: Promise<ProcessExit>;
   readonly didExit: () => boolean;
   readonly originalPid: () => number | undefined;
+  /** The spawn-event listener refreshes the retained PID before startup resolves. */
   readonly recordSpawn: () => void;
 }
 
@@ -339,22 +373,12 @@ function closeProcessInput(child: ChildProcessWithoutNullStreams): Promise<void>
   });
 }
 
-/** Inputs needed for ordered process teardown; ownership chooses termination versus unref. */
-interface ProcessDisposal {
-  readonly child: ChildProcessWithoutNullStreams;
-  readonly pid: number;
-  readonly owned: boolean;
-  readonly timeoutMs: number;
-  readonly didExit: () => boolean;
-  readonly exited: Promise<ProcessExit>;
-}
-
 /**
- * The returned HarnessProcess.dispose caches this promise so repeated callers observe the same
- * teardown. Dispose once: terminate owned trees or unref external processes, then destroy local pipes
- * even on failure.
+ * createProcessHandle caches this promise so repeated dispose calls share success or failure.
+ * Terminate owned trees or unref external processes, then destroy local pipes even on failure;
+ * convert native termination errors to ProcessPortError without retaining private causes.
  */
-async function disposeProcess({ child, pid, owned, timeoutMs, didExit, exited }: ProcessDisposal): Promise<void> {
+async function disposeProcess({ child, pid, owned, timeoutMs, didExit, exited }: ProcessResources): Promise<void> {
   try {
     if (owned) {
       await terminateTree(pid, timeoutMs, didExit);

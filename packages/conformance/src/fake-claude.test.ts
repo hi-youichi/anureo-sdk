@@ -39,3 +39,44 @@ test('rewind without checkpoint capability reports an explicit native denial', a
   const reader = query[Symbol.asyncIterator]()
   expect((await reader.next()).done).toBe(true)
 })
+
+test('initial messages are cloned and drain after idempotent close', async () => {
+  const message = { type: 'system', nested: { value: 'initial' } }
+  const query = createFakeClaudeQuery({ messages: [message] })
+  message.nested.value = 'changed'
+  query.finish()
+  query.close()
+  query.close()
+  const reader = query[Symbol.asyncIterator]()
+  expect((await reader.next()).value).toEqual({ type: 'system', nested: { value: 'initial' } })
+  expect((await reader.next()).done).toBe(true)
+  expect(query.calls).toEqual([{ method: 'close' }])
+})
+
+test('input callback failure stops input consumption without closing output', async () => {
+  const failure = new Error('script failed')
+  const query = createFakeClaudeQuery({
+    messages: [],
+    onInput: async (_, emit) => {
+      await emit({ type: 'result' })
+      throw failure
+    },
+  })
+  try {
+    await expect(query.streamInput((async function* () {
+      yield { type: 'user', content: 'first' }
+      yield { type: 'user', content: 'second' }
+    })())).rejects.toBe(failure)
+    expect(query.calls).toEqual([{ method: 'input', value: { type: 'user', content: 'first' } }])
+    const reader = query[Symbol.asyncIterator]()
+    try {
+      expect((await reader.next()).value).toEqual({ type: 'result' })
+      await expect(query.streamInput((async function* () { yield null })())).rejects.toBe(failure)
+      expect((await reader.next()).value).toEqual({ type: 'result' })
+    } finally {
+      await reader.return?.()
+    }
+  } finally {
+    query.close()
+  }
+})

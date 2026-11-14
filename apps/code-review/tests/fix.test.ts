@@ -1,11 +1,12 @@
 import { expect, test } from 'bun:test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { mkdir, readFile, readdir, symlink, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, realpath, symlink, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 import { correctnessAngle, formatReport, reviewCode, type ReviewProgress } from '../src'
 import { runCli } from '../src/cli'
+import { fixFindings } from '../src/fix'
 import { finding, fixture, output, plan, stages } from './helpers'
 
 const exec = promisify(execFile)
@@ -13,6 +14,7 @@ const exec = promisify(execFile)
 const fixResult = { summary: 'Preserve zero instead of replacing it with the fallback.', changedFiles: ['a.ts'] }
 const fixed = 'export const fallback = (n: number) => n\n'
 
+/** Run a fixture Git command, rejecting the test on process failure. */
 async function git(cwd: string, ...args: string[]): Promise<void> {
   await exec('git', ['-C', cwd, ...args], { maxBuffer: 1 << 24 })
 }
@@ -25,6 +27,9 @@ async function commitFixture(cwd: string): Promise<void> {
   await git(cwd, ...identity, 'commit', '-q', '-m', 'init')
 }
 
+/** Supply fixture's submit-time responder with analysis, review, fix and verification outcomes.
+ * Defaults to editing a.ts only during a fix and clearing findings at verification; a custom fix
+ * owns its edits and response. fixture's afterEach owns client disposal and directory removal. */
 async function fixFixture(options: {
   fix?: (cwd: string) => unknown | Promise<unknown>
   verify?: unknown
@@ -46,6 +51,9 @@ async function fixFixture(options: {
 }
 
 const single = { maxModules: 1, angles: [correctnessAngle] }
+const reviewedModules = plan.modules.slice(0, 1).map(module => ({
+  module, angles: [{ angle: correctnessAngle, status: 'completed' as const, findings: [finding] }],
+}))
 
 test('module fixes start before later modules finish reviewing and are serialized', async () => {
   // Safe: fixture() only invokes respond after it returns.
@@ -174,6 +182,44 @@ test.each(['started', 'completed', 'failed', 'skipped'] as const)('fix progress 
   expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe(status === 'skipped'
     ? 'export const fallback = (n: number) => n || 1\n' : fixed)
   expect(JSON.parse(await readFile(join(report.workflowDirectory, report.runId, 'result.json'), 'utf8'))).toEqual(report)
+})
+
+test.each(['completed', 'skipped'] as const)('direct fix observer failure at %s retains the reconciled outcome', async status => {
+  const { client, cwd: directory } = await fixFixture({ fix: async cwd => {
+    if (status === 'completed') await writeFile(join(cwd, 'a.ts'), fixed)
+    return fixResult
+  } })
+  const cwd = await realpath(directory)
+  await commitFixture(cwd)
+  const events: string[] = []
+  const report = await fixFindings({
+    client, cwd, directory: join(cwd, '.anureo/workflows'), sourceVersion: null, modules: reviewedModules,
+    onProgress: event => {
+      events.push(event)
+      if (event === status) throw new Error('Terminal observer failed')
+    },
+  })
+  expect(report).toMatchObject({ status: 'failed', summary: fixResult.summary,
+    changedFiles: status === 'completed' ? ['a.ts'] : [],
+    error: { message: 'Terminal observer failed', code: null, outcomeUnknown: false } })
+  expect(events).toEqual(['started', status, 'failed'])
+  if (status === 'completed') expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe(fixed)
+})
+
+test('direct fix baseline failure publishes failed and lets observer exceptions reject', async () => {
+  const { client, cwd: directory, prompts } = await fixFixture()
+  const cwd = await realpath(directory)
+  const events: string[] = []
+  const failure = new Error('Failure observer failed')
+  await expect(fixFindings({
+    client, cwd, directory: join(cwd, '.anureo/workflows'), sourceVersion: null, modules: reviewedModules,
+    onProgress: event => {
+      events.push(event)
+      if (event === 'failed') throw failure
+    },
+  })).rejects.toBe(failure)
+  expect(events).toEqual(['started', 'failed'])
+  expect(prompts).toEqual([])
 })
 
 test('default review never dispatches a fix agent or writes source files', async () => {
@@ -411,7 +457,7 @@ test('failed fix execution retains partial edits and scope violations with the o
   expect(prompts).toHaveLength(3)
 })
 
-test('unknown fix-agent outcomes reject the workflow without a scope check', async () => {
+test('unknown fix-agent outcomes reject the workflow', async () => {
   const { client, cwd, prompts } = await fixFixture({ fix: () => new HarnessSdkError('RECEIPT_LOST', 'Unknown execution', false, true) })
   await commitFixture(cwd)
   await expect(reviewCode({ client, cwd, ...single, fix: true })).rejects.toMatchObject({ code: 'RECEIPT_LOST', outcomeUnknown: true })

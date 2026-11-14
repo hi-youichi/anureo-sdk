@@ -2,7 +2,7 @@
 import type { HarnessProcess, HarnessProcessOptions } from '@anureo/sdk/process'
 import type { JsonlOptions } from './jsonl'
 
-/** Host construction contract retained by adapter/catalog owners, without validation or I/O here. Each launched process belongs to its calling owner; changing these settings does not reset an adapter's cached initialization. */
+/** Host launch and resource settings for adapter and catalog construction. Each launched process belongs to its calling owner; changing these settings does not reset an adapter's cached initialization. In addition to limiting transport requests, maxPending bounds submissions still awaiting execution evidence (default 128). */
 export interface CodexAdapterOptions extends JsonlOptions {
   /** Executable selected by the host; never inferred from account state. */
   command: string;
@@ -12,12 +12,12 @@ export interface CodexAdapterOptions extends JsonlOptions {
   cwd?: string;
   /** Environment passed to the process factory, including any explicitly selected Codex home. */
   env?: Record<string, string | undefined>;
-  /** Trusted version override that skips --version; semantic-version suffixes normalize, otherwise text is preserved for profile selection. */
+  /** Nonempty trusted version override that skips --version; semantic-version suffixes normalize, otherwise text is preserved for profile selection. Empty text still probes. */
   version?: string;
   /** Optional injected launcher; each returned process becomes the calling owner’s cleanup responsibility. */
   processFactory?: (options: HarnessProcessOptions) => Promise<HarnessProcess>;
   /** Receives safe diagnostic codes only; raw native stderr and request data are excluded. */
   diagnostic?: (code: string) => void;
-  /** Maximum retained items or paged turns per history read; defaults to 10,000. */
+  /** Limit for mapped items from paged item history or turns from paged turn lists; defaults to 10,000. Legacy thread/read snapshots are not capped here. */
   maxHistoryItems?: number;
 }

@@ -31,8 +31,8 @@ try {
     const child = await spawnHarnessProcess({ command: 'node', args: [output], cwd: directory,
       env: { ...process.env, ...native.adapter().options.env, FIXTURE_BUN: process.execPath, FIXTURE_ENTRY: nativeFixture } })
     try {
-      const stdout = (async () => { let value = ''; for await (const chunk of child.stdout) value += new TextDecoder().decode(chunk); return value })()
-      const stderr = (async () => { let value = ''; for await (const chunk of child.stderr) value += new TextDecoder().decode(chunk); return value })()
+      const stdout = readProcessOutput(child.stdout)
+      const stderr = readProcessOutput(child.stderr)
       const [exit, result, errors] = await Promise.all([child.exited, stdout, stderr])
       expect(errors).toBe('')
       expect(exit.code).toBe(0)
@@ -41,3 +41,10 @@ try {
     expect((await native.state()).inputs).toHaveLength(1)
   } finally { await native.dispose(); await rm(directory, { recursive: true, force: true }) }
 }, 15_000)
+
+/** Drain each consumer pipe concurrently with process exit so a full stdout/stderr pipe cannot stall the Node test. */
+async function readProcessOutput(stream: AsyncIterable<Uint8Array>): Promise<string> {
+  let value = ''
+  for await (const chunk of stream) value += new TextDecoder().decode(chunk)
+  return value
+}

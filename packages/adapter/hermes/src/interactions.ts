@@ -4,24 +4,32 @@ import { array, identity, integer, object, protocolError, stableId, text, type N
 import type { HermesAdapterOptions } from './options'
 import type { HermesRpc, ServerRequest } from './rpc'
 
-interface Pending {
-  id: string
-  nativeId: string
-  generation?: number
-  wire: 'prompt' | 'request'
-  done: boolean
-  responding: boolean
-  cancelled?: string
-  completion?: Promise<void>
-}
-
-/** The two native interaction mechanisms deliberately share only their AHP registry. */
+/**
+ * Internal interaction registry owned by HermesSession. Map replayed prompts and gateway requests
+ * to stable SDK interaction ids without blocking the serial reader on user answers. The two native
+ * mechanisms share this registry but retain their different acknowledgement semantics. Session's
+ * sink owns handler cancellation/privacy; HermesSession owns channel cleanup and recovery.
+ */
 export class HermesInteractions {
-  private readonly pending = new Map<string, Pending>()
-  constructor(private readonly sessionId: () => string, private readonly rpc: () => HermesRpc,
-    private readonly sink: SessionEventSink, private readonly turnId: (generation: number) => string | undefined,
-    private readonly epoch: () => number, private readonly options: HermesAdapterOptions) {}
+  /** Capture callbacks supplied by HermesSession; resolve identity/channel lazily so pending answers use the recovered connection. */
+  constructor({ sessionId, rpc, sink, turnId, epoch, options }: {
+    sessionId: () => string
+    rpc: () => HermesRpc
+    sink: SessionEventSink
+    /** Resolve a generation only in the session's current authority epoch. */
+    turnId: (generation: number) => string | undefined
+    epoch: () => number
+    options: HermesAdapterOptions
+  }) {
+    this.sessionId = sessionId; this.rpc = rpc; this.sink = sink
+    this.turnId = turnId; this.epoch = epoch; this.options = options
+  }
 
+  /**
+   * Register an approval/clarification from HermesSession.apply or snapshot, ignoring replayed ids.
+   * Validate choices before admission; the sink later invokes the responder with an answer or null.
+   * Prompt responses require a native ACK and matching authority, and are never automatically retried.
+   */
   async prompt(value: NativeObject): Promise<void> {
     const nativeId = identity(value.prompt_id), generation = integer(value.execution_generation), epoch = this.epoch()
     const id = `hermes-prompt-${stableId(this.sessionId(), epoch, generation, nativeId)}`
@@ -53,6 +61,11 @@ export class HermesInteractions {
       if (result.status === 'already_resolved') throw new HarnessSdkError('INTERACTION_ALREADY_RESOLVED', 'Hermes prompt already settled', false, true)
     })
   }
+  /**
+   * Register supported session-scoped srq requests from RPC delivery or snapshot; reject others on
+   * the wire. The sink invokes the responder later; its reply resolves after local send, so reconnect
+   * reconciliation must detect answers whose remote delivery remains unconfirmed.
+   */
   async serverRequest(request: ServerRequest): Promise<void> {
     if (request.params.session_id !== this.sessionId()) { await this.rpc().reject(request.id); return }
     if (typeof request.id !== 'string' || !request.id.startsWith('srq-')) { await this.rpc().reject(request.id); return }
@@ -77,33 +90,16 @@ export class HermesInteractions {
       await this.rpc().reply(request.id, result)
     })
   }
-  private question(id: string, prompt: string, choices: unknown): UserQuestion {
-    return { id, prompt, ...(choices != null && array(choices).length ? { options: array(choices).map(value => ({ id: text(value), label: text(value) })) } : {}) }
-  }
-  private answer(value: unknown): string {
-    if (Array.isArray(value) && value.every(entry => typeof entry === 'string')) return value.join(', ')
-    if (value === undefined || value === null) return ''
-    return text(value)
-  }
-  private register(pending: Pending, request: InteractionRequested, respond: (response: InteractionResponse | null) => Promise<void>): void {
-    if ([...this.pending.values()].filter(value => !value.done).length >= (this.options.maxInteractions ?? 32)) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED')
-    if (this.pending.size >= (this.options.maxInteractions ?? 32) + 1024) {
-      const retired = [...this.pending].find(([, value]) => value.done)
-      if (retired) this.pending.delete(retired[0])
-    }
-    this.pending.set(pending.id, pending)
-    // Do not await the user from the receive loop. Core owns cancellation and response privacy.
-    pending.completion = this.sink.requestInteraction(request, async response => {
-      if (pending.done) throw new HarnessSdkError('INTERACTION_EXPIRED')
-      pending.responding = true
-      await respond(response)
-      if (pending.cancelled && pending.cancelled !== 'resolved') throw new HarnessSdkError('RESULT_UNKNOWN', 'Hermes interaction ended while responding', false, true)
-    }).then(() => { pending.done = true }, () => { pending.done = true })
-  }
+  /** HermesSession.applyTurnEvent awaits only deliveries already in flight before projecting a terminal frame. */
   async waitResponders(): Promise<void> {
     // A terminal frame may beat the native response ACK. The reader still routes ACKs directly.
     await Promise.all([...this.pending.values()].filter(value => value.responding && !value.done).map(value => value.completion))
   }
+  /**
+   * Resolve matching peer-settled interactions without sending another answer. Generation, when
+   * supplied, fences prompt reuse; in-flight local delivery arbitrates its own ACK. A bare native
+   * resolved signal has unknown SDK outcome because it carries no user answer. Sink failures reject.
+   */
   async settled(nativeId: string, wire: Pending['wire'], reason = 'resolved', generation?: number): Promise<void> {
     for (const pending of this.pending.values()) {
       if (pending.done || pending.nativeId !== nativeId || pending.wire !== wire || generation !== undefined && pending.generation !== generation) continue
@@ -113,6 +109,11 @@ export class HermesInteractions {
       await this.sink.resolveInteraction({ interactionId: pending.id, outcome: reason === 'timeout' ? 'expired' : reason === 'resolved' ? 'unknown' : 'cancelled', reason: reason === 'resolved' ? 'native_settled' : reason })
     }
   }
+  /**
+   * HermesSession.snapshot reconciles open native questions before releasing held traffic. Withdraw
+   * missing questions and register new ones; reject RESULT_UNKNOWN if a locally finished delivery is
+   * still open remotely, preventing silent suppression or replay of a possibly delivered secret.
+   */
   async snapshot(prompts: unknown[], requests: unknown[]): Promise<void> {
     const promptIds = new Set(prompts.map(value => identity(object(value).prompt_id)))
     const requestIds = new Set(requests.map(value => identity(object(value).id)))
@@ -130,4 +131,57 @@ export class HermesInteractions {
       await this.serverRequest({ id: identity(entry.id), method: identity(entry.method), params: object(entry.params) })
     }
   }
+
+  private readonly pending = new Map<string, Pending>()
+  /** Normalize optional native choices; null, omission and an empty array all leave the question open-ended. */
+  private question(id: string, prompt: string, choices: unknown): UserQuestion {
+    const values = choices == null ? [] : array(choices)
+    return { id, prompt, ...(values.length ? { options: values.map(value => ({ id: text(value), label: text(value) })) } : {}) }
+  }
+  /** Encode SDK answers for Hermes text fields; unanswered/null values become empty text and string selections are comma-separated. */
+  private answer(value: unknown): string {
+    if (Array.isArray(value) && value.every(entry => typeof entry === 'string')) return value.join(', ')
+    if (value === undefined || value === null) return ''
+    return text(value)
+  }
+  /**
+   * Admit within registry budgets and let the sink own the user wait. The sink invokes this wrapper
+   * for response/cancellation; it rejects expired or concurrently cancelled delivery. Observe both
+   * settlement outcomes locally without rethrowing into the native reader; the sink publishes them.
+   */
+  private register(pending: Pending, request: InteractionRequested, respond: (response: InteractionResponse | null) => Promise<void>): void {
+    if ([...this.pending.values()].filter(value => !value.done).length >= (this.options.maxInteractions ?? 32)) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED')
+    if (this.pending.size >= (this.options.maxInteractions ?? 32) + 1024) {
+      const retired = [...this.pending].find(([, value]) => value.done)
+      if (retired) this.pending.delete(retired[0])
+    }
+    this.pending.set(pending.id, pending)
+    // Do not await the user from the receive loop. Core owns cancellation and response privacy.
+    pending.completion = this.sink.requestInteraction(request, async response => {
+      if (pending.done) throw new HarnessSdkError('INTERACTION_EXPIRED')
+      pending.responding = true
+      await respond(response)
+      if (pending.cancelled && pending.cancelled !== 'resolved') throw new HarnessSdkError('RESULT_UNKNOWN', 'Hermes interaction ended while responding', false, true)
+    }).then(() => { pending.done = true }, () => { pending.done = true })
+  }
+
+  private readonly sessionId: () => string
+  private readonly rpc: () => HermesRpc
+  private readonly sink: SessionEventSink
+  private readonly turnId: (generation: number) => string | undefined
+  private readonly epoch: () => number
+  private readonly options: HermesAdapterOptions
+}
+
+interface Pending {
+  id: string
+  nativeId: string
+  generation?: number
+  wire: 'prompt' | 'request'
+  done: boolean
+  /** Delivery has begun; native settlement must let that delivery's ACK arbitrate the outcome. */
+  responding: boolean
+  cancelled?: string
+  /** Observes the sink's user wait and settlement, resolving on success or failure. */
+  completion?: Promise<void>
 }

@@ -153,6 +153,29 @@ describe('interactions and private payload projection', () => {
     expect(validateInteractionResponse(form, { kind: 'elicitation', action: 'decline' })).toBe(true)
     expect(validateInteractionResponse({ interactionId: 'd', kind: 'dynamicTool', toolName: 'example', arguments: {} }, { kind: 'dynamicTool', content: [{ type: 'text', text: 'result' }] })).toBe(true)
   })
+  test('question presence is independent of truthiness and empty option lists allow free answers', () => {
+    const request: InteractionRequested = {
+      interactionId: 'questions', kind: 'userInput', questions: [
+        { id: 'required', prompt: 'Answer', options: [] },
+        { id: 'optional', prompt: 'Optional', required: false, options: [{ id: 'a', label: 'A' }] },
+      ],
+    }
+    expect(validateInteractionResponse(request, { kind: 'userInput', answers: {} })).toBe(false)
+    for (const answer of [null, false, 0, '', [], {}]) {
+      expect(validateInteractionResponse(request, { kind: 'userInput', answers: { required: answer } })).toBe(true)
+    }
+    expect(validateInteractionResponse(request, { kind: 'userInput', answers: { required: 'free', optional: 'other' } })).toBe(false)
+  })
+  test('offered question IDs constrain every selection while permitting empty selections', () => {
+    const request: InteractionRequested = {
+      interactionId: 'choices', kind: 'userInput',
+      questions: [{ id: 'choice', prompt: 'Choose', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] }],
+    }
+    expect(validateInteractionResponse(request, { kind: 'userInput', answers: { choice: ['a', 'b'] } })).toBe(true)
+    expect(validateInteractionResponse(request, { kind: 'userInput', answers: { choice: [] } })).toBe(true)
+    expect(validateInteractionResponse(request, { kind: 'userInput', answers: { choice: ['a', 'other'] } })).toBe(false)
+    expect(validateInteractionResponse(request, { kind: 'userInput', answers: { choice: ['a', 1] } })).toBe(false)
+  })
   test('resolved unknown is explicit and schema-valid', () => {
     expect(validateEvent({ ...envelope, type: 'interaction/resolved', payload: { interactionId: 'i', outcome: 'unknown' } })).toBe(true)
     expect(validateEvent({ ...envelope, type: 'interaction/resolved', payload: { interactionId: 'i', outcome: 'approvedProbably' } })).toBe(false)

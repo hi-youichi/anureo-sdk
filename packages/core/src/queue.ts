@@ -1,46 +1,36 @@
-// Bounds one producer stream with exclusive reader ownership; must not route session events.
+// Owns bounded admission, buffered drain and exclusive iterator ownership for one producer stream.
 import { HarnessSdkError } from "./errors";
 
-/** Budgets supplied by public queue producers or EventHub.subscribe; construction rejects values other than positive safe integers and defaults omissions. */
+/** Queue budgets for producers and event subscriptions; each resolved budget must be a positive safe integer. */
 export interface QueueLimits {
-  /** Buffered regular events; direct delivery to a waiting reader consumes no slot. */
+  /** Maximum buffered regular events; defaults to 2048. Direct delivery to a waiting reader consumes no slot. */
   maxEvents?: number;
-  /** Serialized bytes buffered by regular events; controls have a separate count budget. */
+  /** Maximum bytes buffered by regular events; defaults to 16 MiB. Controls have a separate count budget. */
   maxBytes?: number;
-  /** Serialized bytes allowed for a single regular or control event. */
+  /** Maximum bytes per regular or control event; defaults to 8 MiB. Each event must also fit maxBytes. */
   maxFrameBytes?: number;
-  /** Number of producers allowed to suspend while awaiting capacity. */
+  /** Maximum producers suspended awaiting capacity; defaults to 32. */
   maxWaitingWriters?: number;
-  /** Buffered control events delivered after regular events, even when regular capacity is full. */
+  /** Maximum buffered controls; defaults to 33. They drain after regular events and use separate capacity. */
   maxControlEvents?: number;
 }
-/** A buffered regular event and the byte count reserved until its reader consumes it. */
-type Entry<T> = { value: T; bytes: number };
-/** One pending read tied to its owner so detachment cannot settle a replacement reader. */
-type Waiter<T> = { readerToken: symbol; resolve: (value: IteratorResult<T>) => void; reject: (cause: unknown) => void };
-
 /**
- * EventHub.subscribe creates one queue per observer; EventHub.publish uses synchronous admission to
- * isolate overflow. Public producers may instead await write. One iterator owns reads at a time;
- * returning it releases ownership without ending the producer. Producers own closure and consumers
- * own iterator release. Buffered regular events drain before controls, then completion or failure.
+ * Buffer a producer stream within event and byte budgets, or await capacity with write.
+ * One iterator owns reads at a time; returning it releases ownership without ending the producer.
+ * Producers own closure and consumers own iterator release. Regular events drain before controls,
+ * then completion or failure. Values are retained by reference; producers must not mutate buffered
+ * values in ways that change their measured size. EventHub uses a private queue per observer to
+ * isolate overflow, while adapter transports use queues for incoming frames or native input.
  */
 export class BoundedEventQueue<T> implements AsyncIterable<T> {
-  private readonly entries: Entry<T>[] = [];
-  private bytes = 0;
-  private activeReaderToken?: symbol;
-  private waiting?: Waiter<T>;
-  private controls: T[] = [];
-  private ended = false;
-  private failure?: unknown;
-  private waitingWriterResumes = new Set<() => void>();
   /** Resolved construction-time budgets exposed for producers; callers must treat this object as read-only. */
   readonly limits: Required<QueueLimits>;
 
   /**
-   * EventHub.subscribe and public producers allocate storage here; invalid budgets throw INVALID_PARAMS.
-   * sizeOf defaults to UTF-8 JSON byte length and may throw during admission. Callers must supply a
-   * consistent measurement because a value can be measured more than once; no reader is claimed here.
+   * Configure storage without claiming a reader; invalid resolved budgets throw INVALID_PARAMS.
+   * Omitted or nullish budgets select the QueueLimits defaults. sizeOf defaults to UTF-8 JSON byte
+   * length and may throw during admission. A custom measurement must return a consistent,
+   * nonnegative byte count because a value can be measured more than once.
    */
   constructor(limits: QueueLimits = {}, private readonly sizeOf: (value: T) => number = (value) => new TextEncoder().encode(JSON.stringify(value)).byteLength) {
     this.limits = {
@@ -57,6 +47,158 @@ export class BoundedEventQueue<T> implements AsyncIterable<T> {
   get bufferedEvents(): number { return this.entries.length + this.controls.length; }
   /** Public producers can inspect regular-buffer byte occupancy; controls consume only their separate count budget. */
   get bufferedBytes(): number { return this.bytes; }
+  /**
+   * Check regular-event admission without reserving capacity; a later push can still fail.
+   * Throw the stored closure cause (or STREAM_CLOSED), FRAME_TOO_LARGE, measurement failures or
+   * BACKPRESSURE_EXCEEDED for a full regular buffer. Buffered events remain available to drain.
+   */
+  assertWritable(value: T): void {
+    this.assertOpen();
+    const bytes = this.checkedSize(value);
+    if (this.isRegularBufferFull(bytes)) throw new HarnessSdkError("BACKPRESSURE_EXCEEDED");
+  }
+  /**
+   * Deliver to a waiting read or buffer synchronously, throwing on closure, capacity or
+   * size/measurement failure without evicting data. Producers handle failures and own closure.
+   * EventHub.publish catches admission failure to end only the affected observer; transport
+   * producers decide whether an admission failure should also close their native connection.
+   */
+  push(value: T): void {
+    this.assertWritable(value);
+    const bytes = this.checkedSize(value);
+    const waiter = this.takeWaitingReader();
+    if (waiter) {
+      waiter.resolve({ done: false, value });
+      return;
+    }
+    this.entries.push({ value, bytes });
+    this.bytes += bytes;
+  }
+
+  /**
+   * Await capacity and resolve once delivered or buffered, without waiting for consumption.
+   * Reject on closure, size/measurement failure or exhausted writer capacity.
+   * Waking writers recheck capacity without reserving slots or promising
+   * writer fairness. accepted runs synchronously after admission; if it throws, the promise rejects
+   * but the value remains admitted. There is no per-write cancellation; producers can end the queue
+   * to wake blocked writers and reject admission. EventHub.publish uses push to avoid waiting.
+   */
+  async write(value: T, accepted?: () => void): Promise<void> {
+    const bytes = this.checkedSize(value);
+    // Resuming notifies all waiting writers to recheck capacity; it reserves no slot.
+    while (this.isRegularBufferFull(bytes)) {
+      this.assertOpen();
+      if (this.waitingWriterResumes.size >= this.limits.maxWaitingWriters) throw new HarnessSdkError("BACKPRESSURE_EXCEEDED");
+      await new Promise<void>((resolve) => this.waitingWriterResumes.add(resolve));
+    }
+    this.push(value);
+    accepted?.();
+  }
+
+  /**
+   * Admit a control event even when the regular buffer is full. Each event still obeys
+   * maxFrameBytes and maxBytes; buffered controls have a separate maxControlEvents limit
+   * and do not contribute to bufferedBytes.
+   * Buffered regular events are delivered before buffered control events. Throws on closure,
+   * measurement/size failure or exhausted control capacity; callers still own producer closure.
+   */
+  pushControl(value: T): void {
+    this.assertOpen();
+    this.checkedSize(value);
+    const waiter = this.takeWaitingReader();
+    if (waiter) {
+      waiter.resolve({ done: false, value });
+      return;
+    }
+    if (this.controls.length >= this.limits.maxControlEvents) throw new HarnessSdkError("BACKPRESSURE_EXCEEDED", "Control event limit exceeded");
+    this.controls.push(value);
+  }
+  /**
+   * Admit a final control before closing so a waiting read receives it before completion;
+   * already-ended queues ignore it. Admission failures propagate without closing, leaving
+   * recovery or explicit closure to the producer.
+   */
+  endWithControl(value: T): void {
+    if (this.ended) return;
+    this.pushControl(value);
+    this.end();
+  }
+  /**
+   * Idempotently close admission, wake blocked writers to reject, and settle any pending read.
+   * Buffered values drain before a truthy cause rejects reads; falsy causes complete reads normally.
+   * Closure checks throw a non-nullish stored cause, otherwise STREAM_CLOSED.
+   * Reader ownership remains until next observes drained closure or the iterator is returned/thrown.
+   * EventHub ends queues for cancellation, publication failure and hub termination; ending a queue
+   * alone never stops its native producer.
+   */
+  end(cause?: unknown): void {
+    if (this.ended) return;
+    this.ended = true;
+    this.failure = cause;
+    this.resumeWaitingWriters();
+    const waiter = this.takeWaitingReader();
+    if (waiter) {
+      if (cause) waiter.reject(cause);
+      else waiter.resolve({ done: true, value: undefined });
+    }
+  }
+
+  /**
+   * Claim exclusive reader ownership, throwing EVENT_STREAM_ALREADY_OWNED until the prior reader
+   * releases it. next drains regular values then controls before terminal completion or rejection;
+   * overlapping blocked reads reject CONCURRENT_EVENT_READ. return/throw release ownership and
+   * complete a blocked read without closing the producer. A pending read settled by end still needs
+   * a subsequent next/return/throw to release ownership. EventHub claims one reader per subscription.
+   */
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    if (this.activeReaderToken) throw new HarnessSdkError("EVENT_STREAM_ALREADY_OWNED");
+    const readerToken = Symbol("reader");
+    this.activeReaderToken = readerToken;
+    let detached = false;
+    /** next at terminal drain and return/throw call this; complete only this reader's pending read so a replacement reader keeps its ownership. Buffers and producer stay intact. */
+    const detach = (): IteratorResult<T> => {
+      detached = true;
+      if (this.activeReaderToken === readerToken) this.activeReaderToken = undefined;
+      const waiter = this.waiting;
+      if (waiter?.readerToken === readerToken) {
+        this.takeWaitingReader();
+        waiter.resolve({ done: true, value: undefined });
+      }
+      return { done: true, value: undefined };
+    };
+    return {
+      /** Consumers, including the subscription iterator, drain or wait here; regular consumption/direct-read availability wakes writers. */
+      next: () => {
+        if (detached) return Promise.resolve({ done: true, value: undefined });
+        const buffered = this.readBuffered();
+        if (buffered) return Promise.resolve(buffered);
+        // After end, next releases ownership only once both buffers are drained.
+        if (this.ended) {
+          detach();
+          return this.failure ? Promise.reject(this.failure) : Promise.resolve({ done: true, value: undefined });
+        }
+        if (this.waiting) return Promise.reject(new HarnessSdkError("CONCURRENT_EVENT_READ"));
+        return new Promise<IteratorResult<T>>((resolve, reject) => {
+          this.waiting = { readerToken, resolve, reject };
+          this.resumeWaitingWriters();
+        });
+      },
+      /** Consumer early exit releases this reader; createSubscription also invokes it when an observer cancels. */
+      return: async () => detach(),
+      /** Consumer failure releases ownership before rejecting with the supplied cause; the producer remains open. */
+      throw: async (cause) => { detach(); throw cause; },
+    };
+  }
+
+  private readonly entries: Entry<T>[] = [];
+  private bytes = 0;
+  private activeReaderToken?: symbol;
+  private waiting?: Waiter<T>;
+  private controls: T[] = [];
+  private ended = false;
+  private failure?: unknown;
+  private waitingWriterResumes = new Set<() => void>();
+
   /**
    * end, readBuffered and the iterator next callback invoke this when closure or capacity may unblock a write.
    * Wake all blocked producers to recheck capacity; notifications reserve no slots and are cleared
@@ -99,102 +241,6 @@ export class BoundedEventQueue<T> implements AsyncIterable<T> {
   }
 
   /**
-   * push preflights synchronous admission here; public producers can also check without reserving
-   * capacity and must still handle later admission failure. Throw on closure, frame-size/measurement
-   * failure or a full regular buffer. Existing events remain intact for the reader to drain.
-   */
-  assertWritable(value: T): void {
-    this.assertOpen();
-    const bytes = this.checkedSize(value);
-    if (this.isRegularBufferFull(bytes)) throw new HarnessSdkError("BACKPRESSURE_EXCEEDED");
-  }
-  /**
-   * EventHub.publish admits each subscriber's clone here and isolates admission failure to that
-   * observer; write also calls after capacity becomes available. Deliver to a waiting read or buffer
-   * synchronously, throwing on closure, capacity or size/measurement failure without evicting data.
-   * Direct public producers must handle these failures and retain responsibility for closure.
-   */
-  push(value: T): void {
-    this.assertWritable(value);
-    const bytes = this.checkedSize(value);
-    const waiter = this.takeWaitingReader();
-    if (waiter) {
-      waiter.resolve({ done: false, value });
-      return;
-    }
-    this.entries.push({ value, bytes });
-    this.bytes += bytes;
-  }
-
-  /**
-   * Public producers await admission here when they can pause; EventHub.publish uses push instead.
-   * Resolve after delivery/buffering, not consumption. Reject on closure, size/measurement failure or
-   * exhausted writer capacity. Waking writers recheck capacity without reserving slots or promising
-   * writer fairness. accepted runs synchronously after admission; if it throws, the promise rejects
-   * but the value remains admitted. Producers retain closure and cancellation responsibility.
-   */
-  async write(value: T, accepted?: () => void): Promise<void> {
-    const bytes = this.checkedSize(value);
-    // Resuming notifies all waiting writers to recheck capacity; it reserves no slot.
-    while (this.isRegularBufferFull(bytes)) {
-      this.assertOpen();
-      if (this.waitingWriterResumes.size >= this.limits.maxWaitingWriters) throw new HarnessSdkError("BACKPRESSURE_EXCEEDED");
-      await new Promise<void>((resolve) => this.waitingWriterResumes.add(resolve));
-    }
-    this.push(value);
-    accepted?.();
-  }
-
-  /**
-   * endWithControl and public control-event producers use this lane even when the regular buffer is
-   * full. Each event still obeys maxFrameBytes and maxBytes; buffered controls have a separate
-   * maxControlEvents limit and do not contribute to bufferedBytes.
-   * Buffered regular events are delivered before buffered control events. Throws on closure,
-   * measurement/size failure or exhausted control capacity; callers still own producer closure.
-   */
-  pushControl(value: T): void {
-    this.assertOpen();
-    this.checkedSize(value);
-    const waiter = this.takeWaitingReader();
-    if (waiter) {
-      waiter.resolve({ done: false, value });
-      return;
-    }
-    if (this.controls.length >= this.limits.maxControlEvents) throw new HarnessSdkError("BACKPRESSURE_EXCEEDED", "Control event limit exceeded");
-    this.controls.push(value);
-  }
-  /**
-   * Public producers may synchronously append their final control via this convenience call;
-   * EventHub instead closes queues through end. Admit the final control before closing so a waiting
-   * read receives it before completion; already-ended queues ignore it. Admission failures propagate
-   * without closing, leaving recovery or explicit closure to the producer.
-   */
-  endWithControl(value: T): void {
-    if (this.ended) return;
-    this.pushControl(value);
-    this.end();
-  }
-  /**
-   * EventHub.subscribe closes already-ended subscriptions here and supplies endSubscription for
-   * cancellation, publication failure and hub termination. Public producers and endWithControl
-   * also close here. Idempotently wake writers to reject admission and settle any
-   * pending read, retaining reader ownership. Buffered values drain before a truthy cause rejects
-   * reads (otherwise they complete); the reader must still exhaust or return its iterator. Ending
-   * this queue never stops a shared native producer.
-   */
-  end(cause?: unknown): void {
-    if (this.ended) return;
-    this.ended = true;
-    this.failure = cause;
-    this.resumeWaitingWriters();
-    const waiter = this.takeWaitingReader();
-    if (waiter) {
-      if (cause) waiter.reject(cause);
-      else waiter.resolve({ done: true, value: undefined });
-    }
-  }
-
-  /**
    * The iterator's next callback drains regular values before controls, even if a control arrived
    * earlier. Release regular byte capacity before waking writers; controls do not consume it.
    * Return undefined only when neither buffer has data, leaving terminal settlement to next.
@@ -209,51 +255,9 @@ export class BoundedEventQueue<T> implements AsyncIterable<T> {
     if (this.controls.length) return { done: false, value: this.controls.shift()! };
     return undefined;
   }
-
-  /**
-   * EventHub.subscribe claims this reader once per private queue; other queue consumers must return or
-   * exhaust their iterator before claiming another or receive EVENT_STREAM_ALREADY_OWNED. next
-   * drains regular values then controls before terminal settlement; overlapping blocked reads reject
-   * CONCURRENT_EVENT_READ. return/throw release ownership and settle a blocked read without closing
-   * the producer. A pending read settled by end still needs a subsequent next/return to release ownership.
-   */
-  [Symbol.asyncIterator](): AsyncIterator<T> {
-    if (this.activeReaderToken) throw new HarnessSdkError("EVENT_STREAM_ALREADY_OWNED");
-    const readerToken = Symbol("reader");
-    this.activeReaderToken = readerToken;
-    let detached = false;
-    /** next at terminal drain and return/throw call this; complete only this reader's pending read so a replacement reader keeps its ownership. Buffers and producer stay intact. */
-    const detach = (): IteratorResult<T> => {
-      detached = true;
-      if (this.activeReaderToken === readerToken) this.activeReaderToken = undefined;
-      const waiter = this.waiting;
-      if (waiter?.readerToken === readerToken) {
-        this.takeWaitingReader();
-        waiter.resolve({ done: true, value: undefined });
-      }
-      return { done: true, value: undefined };
-    };
-    return {
-      /** Consumers (including EventHub.subscribe's wrapper) invoke this to drain, observe closure or wait; only regular consumption/direct-read availability wakes writers. */
-      next: () => {
-        if (detached) return Promise.resolve({ done: true, value: undefined });
-        const buffered = this.readBuffered();
-        if (buffered) return Promise.resolve(buffered);
-        // After end, next releases ownership only once both buffers are drained.
-        if (this.ended) {
-          detach();
-          return this.failure ? Promise.reject(this.failure) : Promise.resolve({ done: true, value: undefined });
-        }
-        if (this.waiting) return Promise.reject(new HarnessSdkError("CONCURRENT_EVENT_READ"));
-        return new Promise<IteratorResult<T>>((resolve, reject) => {
-          this.waiting = { readerToken, resolve, reject };
-          this.resumeWaitingWriters();
-        });
-      },
-      /** Consumer early exit releases this reader; EventHub.subscribe calls it on observer cancellation. */
-      return: async () => detach(),
-      /** Consumer failure releases ownership before rejecting with the supplied cause; the producer remains open. */
-      throw: async (cause) => { detach(); throw cause; },
-    };
-  }
 }
+
+/** A buffered regular event and the byte count reserved until its reader consumes it. */
+type Entry<T> = { value: T; bytes: number };
+/** One pending read tied to its owner so detachment cannot settle a replacement reader. */
+type Waiter<T> = { readerToken: symbol; resolve: (value: IteratorResult<T>) => void; reject: (cause: unknown) => void };

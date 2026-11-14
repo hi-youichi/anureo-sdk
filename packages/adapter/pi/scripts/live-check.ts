@@ -1,5 +1,5 @@
 /**
- * Live end-to-end check of persisted sessions: submit, history, fork (through/before), resume, interrupt.
+ * Live end-to-end check of persisted sessions: submit, history, fork through a turn, resume, interrupt.
  *   PI_SMOKE_MODEL=provider/id bun scripts/live-check.ts   (needs Pi credentials)
  */
 import { mkdtemp, rm } from 'node:fs/promises'

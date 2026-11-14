@@ -4,7 +4,8 @@
  *   PI_SMOKE_MODEL=provider/id bun scripts/spike.ts [prompt]
  *
  * Needs Pi credentials (Pi's agentDir/auth.json or provider env vars). Writes
- * `protocol/<pi version>/run.json` with the host events and a provenance record; never stores prompts' secrets.
+ * `protocol/<pi version>/run.json` with raw host events and provenance. Recorded message and tool
+ * content is not redacted; use inputs and a working directory suitable for a checked-in fixture.
  */
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'

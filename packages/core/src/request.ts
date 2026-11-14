@@ -16,6 +16,8 @@ export function invalidWait(wait?: RequestOptions): boolean {
 /**
  * Bound one observation for public SDK/adapter consumers. Reject a pre-aborted signal before checking
  * the effective timeout, then reject a non-finite/non-positive timeout before invoking operation.
+ * An omitted timeout uses defaultTimeoutMs (30 seconds unless supplied); timer range and fractional
+ * duration handling follow the host's setTimeout. Client/Session admission applies stricter bounds.
  * Otherwise invoke operation synchronously once and forward its value or original failure, including
  * synchronous throws. Abort/deadline after admission rejects with outcomeUnknown=true. Remove the
  * owned timer/listener before settlement while continuing to observe late operation rejection.
@@ -26,8 +28,8 @@ export function invalidWait(wait?: RequestOptions): boolean {
  * - Session.submitExecution to await binding, request to await receipts, and closeRequest to observe
  *   shared close/cleanup work. Those owners retain admitted work after the caller stops waiting.
  * - Turn.result to observe the shared terminal snapshot independently of sibling handles.
- * - InteractionRegistry.respond/cancel to bound the supplied native responder before publishing its
- *   settlement; those methods translate failures into interaction outcomes.
+ * - InteractionRegistry.deliverResponse/cancelPending to bound the supplied native responder before
+ *   publishing settlement; those methods translate failures into interaction outcomes.
  * The caller owns native cancellation, retries and resource release; this helper performs none.
  */
 export function waitForRequest<T>(operation: () => Promise<T>, options: RequestOptions = {}, defaultTimeoutMs = 30_000): Promise<T> {

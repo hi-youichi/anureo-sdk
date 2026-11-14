@@ -3,14 +3,15 @@ import { HarnessSdkError } from '@anureo/sdk'
 import { CodexRpcError, type CodexJsonlClient } from './jsonl'
 import { record } from './native-values'
 
-/** For adapter probes, catalog reads and session preflight on an initialized client, return readiness without refreshing credentials. Method-not-found means unknown; malformed replies and other failures reject, with SDK failures marked definite before dispatch. Caller retains client ownership. */
+/** Read readiness on an initialized client without refreshing credentials. CodexNativeAdapter.readAuthStatus and catalog readAuthStatus return it to hosts; CodexBackendSession.startInput rejects required auth before turn dispatch. Method-not-found means unknown; malformed replies and other failures reject, with SDK failures marked definite because this read cannot dispatch a turn. Caller retains client ownership. */
 export async function readAccountStatus(client: CodexJsonlClient): Promise<'unknown'|'required'|'ready'> {
   try {
     const response = record(await client.request('account/read', { refreshToken: false }))
     // A native installation may explicitly disable OpenAI auth; an account is not required then.
     if (response.requiresOpenaiAuth === false) return 'ready'
     // A known account takes precedence over the generic auth requirement, even for future account types.
-    if (typeof record(response.account).type === 'string' && String(record(response.account).type).trim()) return 'ready'
+    const accountType = record(response.account).type
+    if (typeof accountType === 'string' && accountType.trim()) return 'ready'
     if (response.account === null && response.requiresOpenaiAuth === true) return 'required'
     throw new HarnessSdkError('PROTOCOL_ERROR', 'Invalid native account status')
   } catch (cause) {

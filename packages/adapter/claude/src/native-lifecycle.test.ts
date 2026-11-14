@@ -8,6 +8,9 @@ import type { AhpEvent } from '@anureo/protocol';
 import type { SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { createClaudeAdapter, type ClaudeQuery } from './index';
 
+/** Open a manually driven native query and collect events continuously for correlation/race assertions.
+ * received waits for actual input consumption; tests drive native replies and await dispose to release
+ * the event subscription, collector and client in that order. */
 async function fixture() {
   const output = new BoundedEventQueue<SDKMessage>();
   const inputs: SDKUserMessage[] = [];

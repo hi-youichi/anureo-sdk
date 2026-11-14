@@ -1,4 +1,4 @@
-// Sequences design, planning and serial module work; it must not own locking, command policy or result types.
+// Sequences design, planning, serial module work and validation checkpoints under the run lock.
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { agent } from '@anureo/workflow'
@@ -19,6 +19,28 @@ import { isSource, validateSourcePath } from './source-policy'
 export type { RefactorOptions } from './options'
 /** Host-observed report types retained for direct consumers; importing them performs no work. */
 export type { RefactorReport, ModuleResult, StepResult, CheckResult, Failure } from './results'
+
+/** Run design, plan the resulting tree, then edit modules serially using a caller-owned client.
+ * Writes baselines, graphs and reports under cwd/.anureo/refactor while holding a writer lock;
+ * agent edits and check commands may modify the target. A failed phase stops later work
+ * and returns an incomplete report, including checkpoint write failures, so later work cannot
+ * build on an unvalidated tree. Invalid input, repository preflight, lock, final publication
+ * and cleanup failures reject; partial edits remain. Resolves only after final report publication
+ * and writer-lock release. Keep the client usable until settlement and dispose it separately;
+ * executeRefactor owns that cleanup for CLI runs. Review-only requests suppress host checks
+ * and instruct design/module agents to avoid edits, but their session permissions remain unrestricted. */
+export async function refactorCode(input: RefactorOptions): Promise<RefactorReport> {
+  validateChecks(input.checks)
+  const cwd = await repositoryDirectory(input.cwd)
+  const options = { ...input, cwd }
+  return withRun(options, async (report, progress) => {
+    const checks = input.reviewOnly ? [] : input.checks ?? await defaultChecks(cwd)
+    const context = { options, report, checks, progress }
+    const design = await runDesign(context)
+    const modules = await prepareModules(context, design)
+    await runModules(context, modules)
+  })
+}
 
 /** Capture a host baseline for design/planning and validate eligible paths before agent dispatch.
  * Reads Git and the filesystem; rejects empty inventories, unsafe source paths and snapshot errors. */
@@ -44,8 +66,10 @@ async function plan(options: RefactorOptions, files: string[], version: string):
 
 /** Run a design/module session with the caller-owned client and return its host-observed result.
  * The agent and shell checks may edit files; unchanged work never runs checks.
- * Agent/check failures become a failed step with partial edits retained; initial or recovery snapshot
- * errors still reject. Review-only is a prompt instruction and only suppresses host checks. */
+ * Successful changedFiles describe the post-agent snapshot before checks; failed work is resnapshotted
+ * so partial agent/check edits are retained. Agent/check failures become a failed step, while initial
+ * or recovery snapshot errors still reject. runDesign and runModules record the result before
+ * checkpointStep publishes it and gates the next phase. Review-only only suppresses host checks here. */
 async function runStep(options: RefactorOptions, prompt: string, checks: readonly string[]): Promise<StepResult> {
   const step: StepResult = { summary: '', changes: [], deferred: [], status: 'unchanged', changedFiles: [], checks: [], error: null, failure: null }
   const before = await captureTree(options.cwd)
@@ -143,8 +167,9 @@ async function prepareModules(context: RunContext, input: DesignResult): Promise
 }
 
 /** Execute prepared modules serially under the run lock, stopping after the first failed checkpoint.
- * Owns the previous-step edit flag: refresh immediately after edits, otherwise use the prepared
- * baseline graph. Records a module before export/dispatch so failures leave its pending slot.
+ * Owns the previous-step edit flag: refresh after the immediately preceding module changed files;
+ * otherwise reuse the prepared baseline graph. Records a module before export/dispatch so failures
+ * leave its pending slot.
  * Agent/check edits remain on disk; export, snapshot, publication and failed-step errors reject. */
 async function runModules(context: RunContext, input: ModuleExecution): Promise<void> {
   const { options, report, checks, progress } = context
@@ -162,23 +187,4 @@ async function runModules(context: RunContext, input: ModuleExecution): Promise<
     await checkpointStep(context, { step, label: `module/${module.id}`, failureMessage: `Module ${module.id} failed` })
     previousStepChangedFiles = step.changedFiles.length > 0
   }
-}
-
-/** Run design, plan the resulting tree, then edit modules serially using a caller-owned client.
- * Writes baselines, graphs and reports under cwd/.anureo/refactor while holding a writer lock;
- * agent edits and explicit check commands may modify the target. A failed phase stops later work
- * and returns an incomplete report, including checkpoint write failures, so later work cannot
- * build on an unvalidated tree. Invalid input, repository preflight, lock, final publication
- * and cleanup failures reject; partial edits remain. */
-export async function refactorCode(input: RefactorOptions): Promise<RefactorReport> {
-  validateChecks(input.checks)
-  const cwd = await repositoryDirectory(input.cwd)
-  const options = { ...input, cwd }
-  return withRun(options, async (report, progress) => {
-    const checks = input.reviewOnly ? [] : input.checks ?? await defaultChecks(cwd)
-    const context = { options, report, checks, progress }
-    const design = await runDesign(context)
-    const modules = await prepareModules(context, design)
-    await runModules(context, modules)
-  })
 }

@@ -6,9 +6,12 @@ import { getLogger } from '@logtape/logtape'
  * supplies safe classifications; hosts emitting their own reports must keep all fields safe.
  */
 export interface CatalogProbeEvent {
+  /** Operation being observed; diagnostics do not enforce an order between phases. */
   phase: 'spawn' | 'handshake' | 'models' | 'dispose'
+  /** catalogPhase reports cancelled when its signal is aborted at failure reporting, regardless of cause. */
   outcome: 'started' | 'success' | 'error' | 'cancelled'
-  /** Elapsed milliseconds including started notification time; absent on started, rounded only in logs. */
+  /** catalogPhase measures elapsed milliseconds until terminal reporting, including started delivery
+   * but excluding terminal delivery. Omitted on started reports; rounded only in logs. */
   durationMs?: number
   /** Safe allowlisted classification, never raw native error text. */
   errorCode?: string
@@ -24,7 +27,8 @@ export interface CatalogProbeOptions {
   signal?: AbortSignal
   /** Optional timeout budget in milliseconds for the probe owner; ignored by diagnostics helpers. */
   timeoutMs?: number
-  /** Called synchronously after logging each event; throws are ignored and promises are not awaited. */
+  /** Supplied by the host and invoked by emitCatalogPhase after logging each event. Synchronous throws
+   * are ignored; returned promises are not awaited, so the host must handle any async rejections. */
   onPhase?: (event: CatalogProbeEvent) => void
 }
 /**

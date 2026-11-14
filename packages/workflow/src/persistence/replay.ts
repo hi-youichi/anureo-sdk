@@ -6,27 +6,12 @@ import { journalEventSchema, lockSchema, manifestSchema, invalidCheckpoint, miss
   readJson, regularDirectory, verifyRecord, type Manifest } from './records'
 import type { JournalEvent } from './journal'
 
-async function requiredJson(path: string) {
-  try { return await readJson(path) }
-  catch (cause) {
-    if (missing(cause) || (cause as NodeJS.ErrnoException)?.code === 'ELOOP') invalidCheckpoint()
-    throw cause
-  }
-}
-
-async function assertInactive(directory: string): Promise<void> {
-  let lock
-  try { lock = verifyRecord(lockSchema, await readJson(join(directory, 'writer.lock'))) }
-  catch (cause) { if (missing(cause)) return; throw cause }
-  if (lock.hostname === hostname()) {
-    try { process.kill(lock.pid, 0) }
-    catch (cause) { if ((cause as NodeJS.ErrnoException).code === 'ESRCH') return }
-  }
-  // A reused PID is conservatively considered active. Never infer backend termination.
-  throw new HarnessSdkError('WORKFLOW_SOURCE_ACTIVE')
-}
-
-/** Loads a finished or crashed source run's journal for cache replay. */
+/** Load an inactive source run's validated events without modifying its files.
+ * publishInitialRun calls this while holding the target lock, then copies the events
+ * into the new journal. Mismatched name/revision rejects as WORKFLOW_INCOMPATIBLE_RUN;
+ * a mismatched run ID or corrupt/missing required records rejects as WORKFLOW_CHECKPOINT_INVALID.
+ * Unproven writer inactivity rejects as WORKFLOW_SOURCE_ACTIVE; other I/O failures propagate.
+ * Failed/running sources need no result file. No source lock is acquired or backend state inferred. */
 export async function loadSourceJournal(
   directory: string,
   identity: { name: string; revision: string; runId: string },
@@ -46,4 +31,27 @@ export async function loadSourceJournal(
     if (digest(await requiredJson(join(directory, 'result.json'))) !== manifest.resultDigest) invalidCheckpoint()
   }
   return parsed.data
+}
+
+/** Missing required recovery files and final symlinks are invalid checkpoints, never cache misses. */
+async function requiredJson(path: string) {
+  try { return await readJson(path) }
+  catch (cause) {
+    if (missing(cause) || (cause as NodeJS.ErrnoException)?.code === 'ELOOP') invalidCheckpoint()
+    throw cause
+  }
+}
+
+/** Permit an absent writer lock or a validated local claim whose PID no longer exists.
+ * Foreign hosts, permission failures and reused PIDs conservatively block replay; this
+ * check says nothing about whether a prior backend execution terminated. */
+async function assertInactive(directory: string): Promise<void> {
+  let lock
+  try { lock = verifyRecord(lockSchema, await readJson(join(directory, 'writer.lock'))) }
+  catch (cause) { if (missing(cause)) return; throw cause }
+  if (lock.hostname === hostname()) {
+    try { process.kill(lock.pid, 0) }
+    catch (cause) { if ((cause as NodeJS.ErrnoException).code === 'ESRCH') return }
+  }
+  throw new HarnessSdkError('WORKFLOW_SOURCE_ACTIVE')
 }

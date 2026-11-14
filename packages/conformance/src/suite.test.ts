@@ -80,3 +80,27 @@ test("a rejected input submission fails the case with the native cause", async (
   expect(report.passed).toBe(false);
   expect(report.cases[0]).toMatchObject({ scenario: "lifecycle", status: "failed", message: "Native start failed" });
 });
+
+for (const scenario of ['lifecycle', 'fork', 'history'] as const) {
+  test(`client release failure replaces the ${scenario} verdict and later cases still run`, async () => {
+    const base = createScriptedConformanceFactory(scenario === 'fork' ? { input: { delivery: ['native'] } } : undefined);
+    const adapters: ReturnType<typeof createScriptedAdapter>[] = [];
+    const report = await runConformance(async selected => {
+      const driver = await base(selected);
+      const adapter = driver.adapter as ReturnType<typeof createScriptedAdapter>;
+      adapters.push(adapter);
+      if (adapters.length === 1) {
+        adapter.dispose = async () => { adapter.disposeCount++; throw new Error('release failed'); };
+        if (scenario === 'history') driver.afterStart = async () => { throw new Error('fixture failed'); };
+      }
+      return driver;
+    }, { scenarios: [scenario, 'identity'] });
+    expect(report.cases).toEqual([
+      { scenario, status: 'failed', message: 'RESOURCE_RELEASE_FAILED' },
+      { scenario: 'identity', status: 'passed' },
+    ]);
+    expect(report.passed).toBe(false);
+    expect(adapters.map(adapter => adapter.disposeCount)).toEqual([1, 1]);
+    expect(adapters.map(adapter => adapter.backends.get('conformance-session')?.disposeCount)).toEqual([1, 1]);
+  });
+}

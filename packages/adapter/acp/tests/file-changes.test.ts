@@ -35,6 +35,22 @@ test('tool updates preserve omitted source, replace explicit empty content, and 
   await mapper.update({ sessionUpdate: 'tool_call', toolCallId: 'edit', kind: 'edit', content: [{ type: 'diff', path: 'a', oldText: 'old', newText: 'new' }] })
   await mapper.update({ sessionUpdate: 'tool_call_update', toolCallId: 'edit', title: 'Changed' })
   expect(events[1]).toMatchObject({ type: 'item/delta', payload: { kind: 'patch', value: { fileChanges: [{ path: 'a' }] } } })
+  await mapper.update({
+    sessionUpdate: 'tool_call_update', toolCallId: 'edit', rawOutput: null,
+    locations: [{ path: 'a', line: 0 }, { path: 'b', line: 'invalid' }, { line: 2 }, null],
+  })
+  expect(events[2]).toMatchObject({ type: 'item/delta', payload: { value: {
+    output: null,
+    fileChanges: [{ path: 'a' }],
+    locations: [{ path: 'a', line: 0 }, { path: 'b' }],
+  } } })
   await mapper.update({ sessionUpdate: 'tool_call_update', toolCallId: 'edit', content: [], status: 'completed' })
-  expect(events[2]).toMatchObject({ type: 'item/completed', payload: { item: { fileChanges: [], status: 'completed' } } })
+  expect(events[3]).toMatchObject({ type: 'item/completed', payload: { item: {
+    fileChanges: [], output: [], status: 'completed',
+    locations: [{ path: 'a', line: 0 }, { path: 'b' }],
+  } } })
+  // Late native patches and the final flush must not emit a second completion.
+  await mapper.update({ sessionUpdate: 'tool_call_update', toolCallId: 'edit', title: 'Late patch' })
+  await mapper.complete()
+  expect(events).toHaveLength(4)
 })

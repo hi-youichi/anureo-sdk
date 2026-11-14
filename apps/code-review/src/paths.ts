@@ -3,7 +3,7 @@ import { isAbsolute, relative, sep } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 
 /** Operational directory names never reviewable as source. This list is the
- * single source of truth: the analysis prompt in src/review.ts derives its
+ * single source of truth: the analysis prompt in src/prompts.ts derives its
  * exclusion wording from it, and the default storage directory below lives
  * under '.anureo' — update consumers together. */
 export const OPERATIONAL_PATH_SEGMENTS = ['.git', '.anureo', 'node_modules'] as const
@@ -13,19 +13,23 @@ export const OPERATIONAL_PATH_SEGMENTS = ['.git', '.anureo', 'node_modules'] as 
  * always excluded regardless of --workflow-dir overrides. */
 export const DEFAULT_WORKFLOW_DIRECTORY = '.anureo/workflows'
 
-/** True when `path` is lexically inside `base` (both normalized absolute paths;
- * an empty relative result means they are equal). Shared by the review-scope
- * and fix-scope containment checks so the predicate has one owner. */
+/** Test lexical containment of normalized absolute paths, including equality by default.
+ * Pass allowSelf=false to require a descendant, as fix-tree's storagePrefixes does when
+ * collecting storage exclusions. Does not access the filesystem or resolve symlinks;
+ * resolveReviewableSourcePath supplies canonical paths for source containment checks. */
 export function isInsideDirectory(base: string, path: string, allowSelf = true): boolean {
   const local = relative(base, path)
   if (local === '') return allowSelf
   return !isAbsolute(local) && local !== '..' && !local.startsWith(`..${sep}`)
 }
 
-/** Exclude both conventional metadata paths and the actual configured run storage. */
+/** Reject canonical source paths inside configured workflow storage or with an operational
+ * segment relative to canonical cwd, using REVIEW_INVALID_SOURCE. All inputs must be absolute;
+ * the caller resolves source symlinks and separately checks containment and file type.
+ * resolveReviewableSourcePath awaits this before accepting plan or finding paths. */
 export async function assertReviewablePath(cwd: string, path: string, workflowDirectory: string): Promise<void> {
-  // Storage may not exist yet before the workflow store creates it (see src/fix.ts);
-  // fall back to the unresolved path so the guard stays usable for pre-validation.
+  // Storage may be unavailable; retain the configured path as a lexical exclusion
+  // even when its canonical path cannot be read.
   const storage = await realpath(workflowDirectory).catch(() => workflowDirectory)
   if (isInsideDirectory(storage, path)) {
     throw new HarnessSdkError('REVIEW_INVALID_SOURCE', `Path is inside workflow run storage (${workflowDirectory}) and cannot be reviewed or fixed as source: ${path}`)

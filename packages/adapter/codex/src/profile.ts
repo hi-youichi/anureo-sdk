@@ -21,28 +21,11 @@ export type CodexProfile = {
   /** Live session settings: thread/settings/update, or per-turn overrides applied to the next turn. */
   settings: 'thread/settings/update' | 'per-turn'
 }
-/** Ascending native compatibility profiles shared by capability selection and session fallback; callers must not mutate these templates. */
+/** Package-internal ascending compatibility profiles shared by capability selection and session fallback; callers must not mutate these templates. */
 export const CODEX_PROFILES: CodexProfile[] = [
   { since: '0.148.0', fork: ['through'], turns: 'thread/read', revert: 'thread/rollback', history: 'turns', settings: 'per-turn' },
   { since: '0.164.0', fork: ['before', 'through'], turns: 'thread/turns/list', revert: 'thread/revert', history: 'thread/items/list', settings: 'thread/settings/update' },
 ]
-/** Exact versions checked against the pinned native schema; other versions stay unverified even when a compatibility profile matches. */
-const VERIFIED_VERSIONS: readonly string[] = ['0.148.0', '0.164.0']
-/**
- * For profile selection, compare dotted numeric components with absent components treated as zero;
- * return a signed ordering or NaN without I/O or validation. Unmatched probe text deliberately follows
- * JavaScript's numeric/NaN comparison behavior to retain the existing profile fallback.
- */
-const compareVersions = (a: string, b: string) => {
-  const left = a.split('.').map(Number)
-  const right = b.split('.').map(Number)
-  for (let i = 0; i < Math.max(left.length, right.length); i++) {
-    const leftPart = left[i] ?? 0
-    const rightPart = right[i] ?? 0
-    if (leftPart !== rightPart) return leftPart - rightPart
-  }
-  return 0
-}
 /**
  * For adapter/session initialization and capability advertisement, return the newest compatible profile
  * and exact-schema verification flag. Versions below the baseline have no profile; unmatched probe text
@@ -82,4 +65,22 @@ export function codexCapabilities(version: string): Capabilities {
       { id: 'fastMode', title: 'Fast mode', scope: 'session' as const, schema: { type: 'boolean', default: false } },
     ] },
   }
+}
+
+/** Exact versions checked against the pinned native schema; other versions stay unverified even when a compatibility profile matches. */
+const VERIFIED_VERSIONS: readonly string[] = ['0.148.0', '0.164.0']
+/**
+ * For profile selection, compare dotted numeric components with absent components treated as zero;
+ * return a signed ordering or NaN without I/O or validation. Unmatched probe text deliberately follows
+ * JavaScript's numeric/NaN comparison behavior to retain the existing profile fallback.
+ */
+const compareVersions = (a: string, b: string) => {
+  const left = a.split('.').map(Number)
+  const right = b.split('.').map(Number)
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    const leftPart = left[i] ?? 0
+    const rightPart = right[i] ?? 0
+    if (leftPart !== rightPart) return leftPart - rightPart
+  }
+  return 0
 }

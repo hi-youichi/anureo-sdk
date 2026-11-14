@@ -81,11 +81,60 @@ test('turn starts: first message and user messages after a finished assistant me
   expect(items.at(-1)).toMatchObject({ turnId: 'native:5', nativeTurnId: '5' })
 })
 
+test('history preserves block ids and phases, redacts content and pairs failed tools without mutating entries', () => {
+  const entries: PiHostEntry[] = [
+    { id: 'compact', parentId: null, kind: 'compaction', summary: 'secret summary' },
+    { id: 'metadata', parentId: 'compact', kind: 'other' },
+    entry('user', 'metadata', { role: 'user', content: [{ type: 'image', data: 'secret' }, { type: 'text', text: 'secret input' }] }),
+    entry('assistant', 'user', { role: 'assistant', stopReason: 'stop', content: [
+      { type: 'text', text: 'secret commentary' },
+      { type: 'thinking', thinking: 'secret reasoning' },
+      { type: 'image', data: 'secret' },
+      { type: 'toolCall', id: 'edit-call', name: 'edit', arguments: { path: 'secret.txt', edits: [{ oldText: 'secret', newText: 'safe' }] } },
+      { type: 'toolCall', id: 'pending-call', name: 'read', arguments: {} },
+    ] }),
+    entry('result', 'assistant', { role: 'toolResult', toolCallId: 'edit-call', isError: true, content: [{ type: 'text', text: 'secret failure' }] }),
+    entry('unmatched', 'result', { role: 'toolResult', toolCallId: 'absent', content: 'ignored' }),
+    entry('final', 'unmatched', { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'secret final' }] }),
+    entry('plain', 'final', { role: 'assistant', content: 'omitted' }),
+  ]
+  const before = structuredClone(entries)
+  const items = historyItems(createRedactor(['secret']), entries, new Map([['user', 'live-turn']]))
+  expect(items.map(value => value.item.id)).toEqual(['compact', 'user', 'assistant:0', 'assistant:1', 'edit-call', 'pending-call', 'final:0'])
+  expect(items[0]).toEqual({ turnId: 'native:session', nativeItemId: 'compact', item: { id: 'compact', type: 'compaction', status: 'completed', summary: '[REDACTED] summary' } })
+  expect(items.slice(1).every(value => value.turnId === 'live-turn' && value.nativeTurnId === 'user')).toBe(true)
+  expect(items[1]!.item).toMatchObject({ type: 'userMessage', content: [{ type: 'text', text: '[REDACTED] input' }] })
+  expect(items[2]!.item).toMatchObject({ type: 'agentMessage', phase: 'commentary', text: '[REDACTED] commentary' })
+  expect(items[3]!.item).toMatchObject({ type: 'reasoning', text: '[REDACTED] reasoning' })
+  expect(items[4]).toMatchObject({ nativeItemId: 'assistant', item: { status: 'failed', output: '[REDACTED] failure', input: { path: '[REDACTED].txt' }, fileChanges: [{ path: '[REDACTED].txt' }] } })
+  expect(items[5]!.item).not.toHaveProperty('status')
+  expect(items[6]!.item).toMatchObject({ type: 'agentMessage', phase: 'final', text: '[REDACTED] final' })
+  expect(JSON.stringify(items)).not.toContain('secret')
+  expect(entries).toEqual(before)
+})
+
+test('history pairs reused tool ids with the latest call across known turn boundaries', () => {
+  const entries = [
+    entry('user1', null, { role: 'user', content: 'one' }),
+    entry('call1', 'user1', { role: 'assistant', content: [{ type: 'toolCall', id: 'shared', name: 'read', arguments: {} }] }),
+    entry('call2', 'call1', { role: 'assistant', content: [{ type: 'toolCall', id: 'shared', name: 'read', arguments: {} }] }),
+    entry('user2', 'call2', { role: 'user', content: 'two' }),
+    entry('result', 'user2', { role: 'toolResult', toolCallId: 'shared', content: 'done' }),
+  ]
+  const items = historyItems(createRedactor(), entries, new Map([['user2', 'second-turn']]))
+  expect(items[1]!.item).not.toHaveProperty('status')
+  expect(items[2]).toMatchObject({ turnId: 'native:user1', nativeItemId: 'call2', item: { status: 'completed', output: 'done' } })
+  expect(items[3]).toMatchObject({ turnId: 'second-turn', nativeTurnId: 'user2' })
+})
+
 test('Pi messages and events normalize into the host shape', () => {
   const message = toHostMessage({ role: 'assistant', content: [{ type: 'text', text: 'hi' }, { type: 'thinking', thinking: 't' }, { type: 'toolCall', id: 'c', name: 'bash', arguments: { command: 'ls' } }, { type: 'weird' }], stopReason: 'toolUse', usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 3 }, timestamp: 5, api: 'ignored' })
   expect(message).toMatchObject({ role: 'assistant', stopReason: 'toolUse', usage: { totalTokens: 3 }, timestamp: 5 })
   expect(message.content).toEqual([{ type: 'text', text: 'hi' }, { type: 'thinking', thinking: 't' }, { type: 'toolCall', id: 'c', name: 'bash', arguments: { command: 'ls' } }, { type: 'text', text: '' }])
   expect(toHostMessage({ role: 'user', content: 'plain' }).content).toBe('plain')
+  const argumentsObject = { nested: { value: 1 } }
+  const normalized = toHostMessage({ role: 'assistant', content: [{ type: 'toolCall', id: 'identity', name: 'read', arguments: argumentsObject }] })
+  expect(Array.isArray(normalized.content) && normalized.content[0]?.type === 'toolCall' && normalized.content[0].arguments).toBe(argumentsObject)
   const e = (value: unknown) => toHostEvent(value as AgentSessionEvent)
   expect(e({ type: 'agent_settled', aborted: true })).toEqual({ type: 'settled', aborted: true })
   expect(e({ type: 'agent_end', messages: [], willRetry: true })).toEqual({ type: 'agent_end', willRetry: true })

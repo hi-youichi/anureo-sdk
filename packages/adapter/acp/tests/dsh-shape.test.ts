@@ -10,6 +10,7 @@ const executable = resolve(import.meta.dirname, './fixtures/dsh-acp.mjs');
 // `turnId` lives on the source envelope; turn events also repeat it inside the payload.
 const turnIdOf = (event: AhpEvent): string | undefined => event.turnId ?? (('turnId' in event.payload) ? (event.payload as { turnId?: string }).turnId : undefined);
 
+/** Collect DSH-shaped peer events and poll for terminal publication; callers must close the fixture to join its pump. */
 async function fixture(args: string[] = [], options: Partial<AcpAdapterOptions> = {}) {
   const adapter = createAcpAdapter({ command: process.execPath, args: [executable, ...args], ...options });
   // Declaring the approval channel opts into explicit `interaction/respond`; the adapter
@@ -27,12 +28,14 @@ async function fixture(args: string[] = [], options: Partial<AcpAdapterOptions> 
       // unconditionally ignores all event-stream errors.
     }
   })();
+  /** Poll an observed event condition for up to roughly one second; timeout rejects the test. */
   const until = async (predicate: () => boolean) => {
     for (let index = 0; index < 500; index++) { if (predicate()) return; await new Promise((done) => setTimeout(done, 2)); }
     throw new Error('Timed out awaiting the DSH fixture');
   };
   return {
     adapter, runtime, session, events, until,
+    /** Observe terminal events even for failed TurnResults, whose rejection is explicitly consumed. */
     async turn(text: string) {
       const value = await session.submit({ input: text });
       // A failed turn rejects its TurnResult; observe it so the test never leaks a rejection.

@@ -1,4 +1,4 @@
-// Builds scripted repositories and clients for tests; it must not reproduce production phase logic.
+// Builds scripted repositories and clients with shared cleanup for refactor tests.
 import { afterEach } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -9,15 +9,6 @@ import { createScriptedAdapter } from '@anureo/conformance'
 import type { JsonObject } from '@anureo/protocol'
 import type { RepositoryGraph } from '../src/graph'
 import { exec } from '../src/process'
-
-const clients: Client[] = []
-const directories: string[] = []
-/** Release test-owned clients before deleting repositories; afterEach awaits both cleanup stages.
- * Disposal or removal failures reject the hook, while finally still attempts directory cleanup. */
-afterEach(async () => {
-  try { await Promise.all(clients.splice(0).map(client => client.dispose())) }
-  finally { await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true }))) }
-})
 
 /** Create a test-owned temporary directory, registering removal after the test; filesystem errors reject. */
 export async function temporary(): Promise<string> {
@@ -49,9 +40,39 @@ export function graph(cwd: string): RepositoryGraph {
   ], edges: [{ id: 'call', source: 'a', target: 'b', type: 'CALLS' }] }
 }
 
+/** Create a staged two-file Git repository and scripted SDK client for refactor, CLI and lifecycle tests.
+ * Defaults to the shared plan for planning prompts and unchanged work otherwise. A supplied responder
+ * is awaited on each submission; return HarnessSdkError to fail the turn or a JSON-serializable value
+ * as agent output. Tests make edits themselves so host snapshots can verify them independently.
+ * Returns the cwd, client, adapter, prompt log and an in-memory graph loader; setup failures reject.
+ * Shared afterEach disposes registered clients and removes registered directories, even if setup fails. */
+export async function fixture(respond: (prompt: string) => unknown | Promise<unknown> = prompt => prompt.startsWith('PLAN') ? plan : unchanged) {
+  const cwd = await temporary()
+  await Promise.all(['a.ts', 'b.ts'].map(file => writeFile(join(cwd, file), 'export const value = 1\n')))
+  await writeFile(join(cwd, '.gitignore'), '.anureo/\n')
+  await exec('git', ['init', '-q', cwd])
+  await exec('git', ['-C', cwd, 'add', '.'])
+  const prompts: string[] = []
+  const adapter = respondingAdapter(respond, prompts)
+  const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: randomUUID() } })
+  clients.push(client)
+  return { cwd, client, adapter, prompts, graphLoader: async () => graph(cwd) }
+}
+
+const clients: Client[] = []
+const directories: string[] = []
+/** Attempt client disposal before removing test repositories. Disposal or removal failures reject
+ * the hook; finally starts directory cleanup even when Promise.all rejects during disposal. */
+afterEach(async () => {
+  try { await Promise.all(clients.splice(0).map(client => client.dispose())) }
+  finally { await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true }))) }
+})
+
 /** Build the fixture adapter with a caller-supplied responder and prompt log; no resources start yet.
- * Submissions later emit start before awaiting respond, then emit either failure or final JSON
- * before completion. Responder/serialization/event errors reject execution; other calls fall through. */
+ * createScriptedAdapter invokes execute for session calls: submissions append their text to prompts
+ * and emit start before awaiting respond. A returned HarnessSdkError becomes a failed terminal event;
+ * other values become final JSON followed by completion. Thrown responder/serialization/event errors
+ * reject submission; non-submission calls fall through to the adapter defaults. */
 function respondingAdapter(respond: (prompt: string) => unknown | Promise<unknown>, prompts: string[]) {
   return createScriptedAdapter({
     /** Handle submissions in SDK event order, awaiting the test responder before completing each turn. */
@@ -77,20 +98,4 @@ function respondingAdapter(respond: (prompt: string) => unknown | Promise<unknow
       return { submissionId, accepted: true, disposition: 'started', turnId }
     },
   })
-}
-
-/** Create a staged two-file Git repository and scripted SDK client for orchestration/CLI tests.
- * Returns the cwd, client, adapter, prompt log and an in-memory graph loader; setup failures reject.
- * Shared afterEach owns client disposal and directory removal so tests share one cleanup path. */
-export async function fixture(respond: (prompt: string) => unknown | Promise<unknown> = prompt => prompt.startsWith('PLAN') ? plan : unchanged) {
-  const cwd = await temporary()
-  await Promise.all(['a.ts', 'b.ts'].map(file => writeFile(join(cwd, file), 'export const value = 1\n')))
-  await writeFile(join(cwd, '.gitignore'), '.anureo/\n')
-  await exec('git', ['init', '-q', cwd])
-  await exec('git', ['-C', cwd, 'add', '.'])
-  const prompts: string[] = []
-  const adapter = respondingAdapter(respond, prompts)
-  const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: randomUUID() } })
-  clients.push(client)
-  return { cwd, client, adapter, prompts, graphLoader: async () => graph(cwd) }
 }

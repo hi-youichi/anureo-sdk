@@ -11,6 +11,8 @@ import { runConformance, type ConformanceScenario } from "@anureo/conformance";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
+/** Script native input handling while exposing controls and output for adapter assertions.
+ * close ends observation; onInput rejection ends the output stream and is consumed by the adapter pump. */
 class FakeQuery implements ClaudeQuery {
   readonly output = new BoundedEventQueue<SDKMessage>();
   readonly calls: Array<{ method: string; value?: unknown }> = [];
@@ -47,6 +49,7 @@ class FakeQuery implements ClaudeQuery {
   async text(value: string, messageId = "assistant") { await this.emit({ type: "assistant", uuid: `${messageId}-uuid`, session_id: this.current?.session_id ?? this.options.sessionId ?? this.options.resume, user_message_uuid: this.current?.uuid, parent_tool_use_id: null, message: { id: messageId, role: "assistant", content: [{ type: "text", text: value }] } }); }
   async result(value = "conformance", reason = "end_turn") { await this.emit({ type: "result", subtype: "success", is_error: false, result: value, stop_reason: reason, user_message_uuid: this.current?.uuid, uuid: "result", session_id: this.current?.session_id, usage: { input_tokens: 7, output_tokens: 9, cache_read_input_tokens: 2, cache_creation_input_tokens: 1 } }); }
 }
+/** Retain every scripted query, including discovery/replacement queries, for lifecycle assertions. */
 function factory(onInput: (input: SDKUserMessage, query: FakeQuery) => Promise<void> = async (_, stream) => { await stream.text("conformance"); await stream.result(); }) {
   const queries: FakeQuery[] = [];
   const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => { const stream = new FakeQuery(options ?? {}, prompt, onInput); queries.push(stream); return stream; };
@@ -89,6 +92,7 @@ test('native close retains both close and iterator release failures without repe
 });
 const OPEN: SessionOpenParams = { requestId: "open", mode: "new", binding: { sessionId: "s", adapterId: "claude", runtimeConfigId: "r" }, cwd: "/tmp", model: "fake-model" };
 const readers = new WeakMap<Session, AsyncIterator<AhpEvent>>();
+/** Subscribe before dispatch and reuse the subscription until collect closes and replaces it. */
 function readerFor(session: Session) {
   let reader = readers.get(session);
   if (!reader) {
@@ -98,16 +102,21 @@ function readerFor(session: Session) {
   return reader;
 }
 const turnIdsByAlias = new WeakMap<Session, Map<string, string>>();
+/** Resolve test aliases only after observed native binding; fail rather than substitute input identity. */
 function requireBoundTurnId(session: Session, alias: string): string {
   const turnId = turnIdsByAlias.get(session)?.get(alias);
   if (!turnId) throw new Error(`Execution ${alias} is not bound`);
   return turnId;
 }
+/** Open a scripted session with manual interactions and an event subscription installed before input.
+ * Tests own runtime disposal; collect services interaction requests while waiting for terminal events. */
 async function setup(options: ClaudeAdapterOptions = {}, onInput?: (input: SDKUserMessage, query: FakeQuery) => Promise<void>) {
   const fake = factory(onInput); const adapter = createClaudeAdapter({ ...options, queryFactory: fake.queryFactory });
   const runtime = await createClient({adapter, identity: OPEN.binding, interactions: {approval:undefined,userInput:undefined,elicitation:undefined,dynamicTool:undefined}});
   const session = await runtime.openSession(OPEN); readerFor(session); return { ...fake, adapter, runtime, session };
 }
+/** Read through one terminal, optionally answering manual interactions; always renew the subscription
+ * before returning so the next submission cannot publish into a gap between collectors. */
 async function collect(session: Session, answer?: (request: InteractionRequested) => InteractionResponse): Promise<AhpEvent[]> {
   const reader = readerFor(session), events: AhpEvent[] = [];
   try {
@@ -126,6 +135,8 @@ async function collect(session: Session, answer?: (request: InteractionRequested
     readerFor(session);
   }
 }
+/** Dispatch without waiting for binding so collect can answer interactions needed by native progress.
+ * Retain the eventual bound turn under alias and observe rejection until the test inspects events. */
 async function submitAndYield(session: Session, alias: string) {
   readerFor(session);
   const pending = session.submit({ input: 'conformance' });
@@ -266,6 +277,46 @@ test("configuration uses actual query controls and advertises output schemas", a
   expect(await adapter.listModels()).toMatchObject([{ value: "fake-model" }]); await runtime.dispose();
 });
 
+test("configuration failure preserves earlier native effects without committing the patch or applying later controls", async () => {
+  const { runtime, session, queries } = await setup();
+  try {
+    const query = queries[0]!;
+    query.setPermissionMode = async (value) => {
+      query.calls.push({ method: "permission", value });
+      throw new HarnessSdkError("NATIVE_PERMISSION_REJECTED");
+    };
+    await expect(session.request("session/config/set", {
+      requestId: "partial-config", sessionId: session.id,
+      patch: { model: "changed-model", permissionMode: "plan", fastMode: true, maxThinkingTokens: 100 },
+    })).rejects.toMatchObject({ code: "NATIVE_PERMISSION_REJECTED", outcomeUnknown: false });
+    expect(query.calls).toEqual([{ method: "model", value: "changed-model" }, { method: "permission", value: "plan" }]);
+
+    // A later successful patch publishes the retained native model but cannot commit the failed patch.
+    const state = await session.request("session/config/set", {
+      requestId: "next-config", sessionId: session.id, patch: { fastMode: false },
+    });
+    expect(state.model).toBe("changed-model");
+    expect(state.config).toEqual({ fastMode: false });
+    expect(state.capabilityRevision).toBe(2);
+    expect(query.calls.at(-1)).toEqual({ method: "flags", value: { fastMode: false } });
+  } finally { await runtime.dispose(); }
+});
+
+test("unclassified native configuration failure requires SDK recovery before further changes", async () => {
+  const { runtime, session, queries } = await setup();
+  try {
+    const query = queries[0]!;
+    query.setPermissionMode = async () => { throw new Error("Private native failure"); };
+    await expect(session.request("session/config/set", {
+      requestId: "unknown-config", sessionId: session.id, patch: { model: "changed-model", permissionMode: "plan", fastMode: true },
+    })).rejects.toMatchObject({ code: "CLAUDE_CONFIG_FAILED", outcomeUnknown: true });
+    await expect(session.request("session/config/set", {
+      requestId: "blocked-config", sessionId: session.id, patch: { fastMode: false },
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(query.calls).toEqual([{ method: "model", value: "changed-model" }]);
+  } finally { await runtime.dispose(); }
+});
+
 test("FileSessionStore atomically preserves opaque entries, dedupes UUIDs, and isolates project/subpaths", async () => {
   const directory = await mkdtemp(join(tmpdir(), "claude-store ")); const store = new FileSessionStore(directory); const key = { projectKey: "project", sessionId: "session" };
   try {
@@ -284,6 +335,7 @@ test("FileSessionStore atomically preserves opaque entries, dedupes UUIDs, and i
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+/** Keep an in-memory transcript and exact inclusive fork cutoffs for history/revert tests. */
 function historyApi() {
   const histories = new Map<string, SessionMessage[]>(); const forks: Array<{ source: string; point?: string }> = [];
   const sessionMessages: NonNullable<ClaudeAdapterOptions["getSessionMessages"]> = async (id) => structuredClone(histories.get(id) ?? []);

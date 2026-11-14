@@ -2,7 +2,13 @@
 import type { Usage } from '@anureo/protocol'
 import { record, type NativeRecord } from './native-values'
 
-/** For live events and public callers, copy finite nonnegative counters with the requested scope (turn by default). Missing/invalid fields remain absent; no aggregation, mutation or I/O. */
+/**
+ * Copy finite nonnegative native token counters into AHP usage with the requested scope (turn by
+ * default). Zero and fractional counters survive; missing/invalid counters remain absent and
+ * totals are never inferred. CodexBackendSession.notification retains the last-turn projection
+ * for turn/completed and publishes the session projection as usage/updated. Callers own retention
+ * and aggregation; this performs neither mutation of the input nor I/O.
+ */
 export function mapUsage(value: unknown, scope: 'turn' | 'session' = 'turn'): Usage {
   const raw = record(value)
   const usage: Usage = { provider: 'codex', scope, source: 'native' }

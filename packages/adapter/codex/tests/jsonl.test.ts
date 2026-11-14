@@ -1,7 +1,7 @@
 /** Verifies transport framing, ordering and cleanup with controlled streams; it must not interpret session policy or require a native process. */
 import { describe, expect, test } from 'bun:test'
 import { PassThrough } from 'node:stream'
-import { CodexJsonlClient } from '../src/jsonl'
+import { CodexJsonlClient, CodexRpcError } from '../src/jsonl'
 import type { JsonlHandlers, JsonlOptions } from '../src/jsonl'
 import type { HarnessProcess } from '@anureo/sdk/process'
 
@@ -83,6 +83,32 @@ describe('native JSONL transport', () => {
     const f = fixture({ options: { maxPending: 1 } }); const first = f.client.request('first'); const observed = first.catch(cause => cause)
     await expect(f.client.request('second')).rejects.toMatchObject({ code: 'BACKPRESSURE_EXCEEDED' }); await f.client.dispose()
     expect(await observed).toMatchObject({ code: 'RUNTIME_DISPOSED', outcomeUnknown: true })
+  })
+  /** A definite native rejection frees admission and its duplicate cannot settle a later request; error payloads must stay private even when result is also present. */
+  test('settles native rejection once and releases capacity for the next response', async () => {
+    const f = fixture({ options: { maxPending: 1 } })
+    try {
+      const first = f.client.request('optional').catch(cause => cause)
+      await f.waitForWrite()
+      const firstId = JSON.parse(f.writes[0]!).id
+      f.stdout.write(JSON.stringify({ id: firstId, error: { code: -32601, message: 'PRIVATE_NATIVE_ERROR' }, result: 'ignored' }) + '\n')
+      const cause = await first
+      expect(cause).toBeInstanceOf(CodexRpcError)
+      expect(cause).toMatchObject({ code: 'METHOD_NOT_FOUND', rpcCode: -32601, outcomeUnknown: false })
+      expect(JSON.stringify(cause)).not.toContain('PRIVATE_NATIVE_ERROR')
+
+      const second = f.client.request('next')
+      // Await a later write to inspect the second RPC without relying on microtask timing.
+      await f.client.notify('barrier')
+      const secondId = JSON.parse(f.writes[1]!).id
+      expect(secondId).not.toBe(firstId)
+      f.stdout.write([
+        { id: firstId, result: 'duplicate' },
+        { id: secondId, result: null },
+      ].map(frame => JSON.stringify(frame) + '\n').join(''))
+      expect(await second).toBeNull()
+      expect(f.failures).toEqual([])
+    } finally { await f.client.dispose() }
   })
   /** A broken write has an uncertain native outcome but does not itself claim stdout has closed. */
   test('a failed write fails the caller with an unknown outcome while the stream stays open', async () => {

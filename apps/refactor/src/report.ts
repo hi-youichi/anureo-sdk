@@ -1,23 +1,11 @@
 // Renders host-observed reports as text; it must not run refactors or persist their state.
 import type { RefactorReport, StepResult } from './results'
 
-/** Append one step's host facts to formatReport's buffer in presentation order, returning void.
- * Mutates only the buffer; valid step records have no expected errors. Unknown outcomes remain
- * explicit because a failure message alone cannot establish whether edits ran. */
-function appendStep(lines: string[], step: StepResult): void {
-  lines.push(`Result: ${step.status}. ${step.error ?? step.summary}`)
-  if (step.failure?.outcomeUnknown) lines.push('Agent execution outcome is unknown; inspect source and backend execution before starting another run.')
-  for (const change of step.changes) lines.push(`- ${change}`)
-  if (step.changedFiles.length) lines.push(`Changed files: ${step.changedFiles.join(', ')}`)
-  for (const item of step.deferred) lines.push(`Deferred ${item.title}: ${item.reason}`)
-  for (const check of step.checks) lines.push(`Check ${check.status}: ${check.command}`)
-  if (step.status === 'applied' && !step.checks.length) lines.push('No validation commands ran; runtime behavior was not tested.')
-}
-
 /** Render a structured run as newline-terminated text for CLI/library presentation.
- * Pure formatting preserves design-before-module order and includes check and observer failures;
- * it does not inspect files, retry work or change the supplied report. CLI/library callers must
- * supply a valid host record; formatting such records has no expected errors. */
+ * executeRefactor prints this result for text-mode CLI runs; library consumers may format a report
+ * returned by refactorCode. Preserves design-before-module order and includes check statuses and
+ * observer errors, but omits check output and raw failure codes. Supply a valid host record;
+ * formatting it has no expected errors, I/O or mutation. */
 export function formatReport(report: RefactorReport): string {
   const lines = [
     `Refactor: ${report.status}${report.reviewOnly ? ' (read-only prompt)' : ''}`,
@@ -36,4 +24,17 @@ export function formatReport(report: RefactorReport): string {
   for (const error of report.errors) lines.push('', `Error: ${error}`)
   for (const error of report.progressErrors) lines.push('', `Progress reporting error: ${error}`)
   return `${lines.join('\n')}\n`
+}
+
+/** Append one step's host facts to formatReport's buffer in presentation order, returning void.
+ * Mutates only the buffer; valid step records have no expected errors. Unknown outcomes remain
+ * explicit because a failure message alone cannot establish whether edits ran. */
+function appendStep(lines: string[], step: StepResult): void {
+  lines.push(`Result: ${step.status}. ${step.error ?? step.summary}`)
+  if (step.failure?.outcomeUnknown) lines.push('Agent execution outcome is unknown; inspect source and backend execution before starting another run.')
+  for (const change of step.changes) lines.push(`- ${change}`)
+  if (step.changedFiles.length) lines.push(`Changed files: ${step.changedFiles.join(', ')}`)
+  for (const item of step.deferred) lines.push(`Deferred ${item.title}: ${item.reason}`)
+  for (const check of step.checks) lines.push(`Check ${check.status}: ${check.command}`)
+  if (step.status === 'applied' && !step.checks.length) lines.push('No validation commands ran; runtime behavior was not tested.')
 }

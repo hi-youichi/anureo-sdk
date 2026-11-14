@@ -27,7 +27,7 @@ export function withStructuredOutput(adapter: HarnessAdapter, limits: OutputLimi
     async openSession(params, sink) {
       const session = new OutputSession({ params, sink, manager, limits, forget: () => sessions.delete(session) })
       sessions.add(session)
-      try { return await session.open(adapter, nativeOutput) }
+      try { return await session.open({ adapter, nativeOutput }) }
       catch (cause) {
         try { await session.dispose() }
         catch { throw new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'Structured output setup cleanup failed', false, sdkError(cause).outcomeUnknown) }

@@ -4,77 +4,12 @@ import { HarnessSdkError } from '../errors';
 import type { TurnResult } from '../types';
 import { immutable } from './immutable';
 
-/** Fields acceptDelta can reconstruct provisionally; authoritative snapshots replace their buffers. */
-type TextField = 'text' | 'summary' | 'output';
-/** Mutable retention owned by ResultAccumulator; finish materializes buffers without changing this state. */
-interface RetainedItem {
-  /** Detached authoritative value, kept separate from provisional text. */
-  snapshot: Item;
-  /** JSON bytes of the item after applying buffered text, excluding any surrounding array. */
-  serializedBytes: number;
-  /** One supported text field per item family; chunks avoid rebuilding the full string on every delta. */
-  bufferedText?: { field: TextField; chunks: string[]; lastCodeUnit?: number };
-}
-
-/**
- * ResultAccumulator.append uses this pure calculation before reserving bytes. Inputs describe the
- * authoritative field and any existing buffer; return the exact JSON byte change for the new chunk.
- * Accounting must join split UTF-16 pairs just as eventual string materialization does.
- */
-function serializedTextAppendByteDelta({ field, previous, chunk, lastCodeUnit, bufferedText }: {
-  field: TextField;
-  previous: unknown;
-  chunk: string;
-  lastCodeUnit: number | undefined;
-  bufferedText: RetainedItem['bufferedText'];
-}): number {
-  const chunkContentBytes = Buffer.byteLength(JSON.stringify(chunk)) - 2; // Exclude string quotes.
-  let surrogatePairByteDelta = 0;
-  if (lastCodeUnit !== undefined && lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff && chunk.charCodeAt(0) >= 0xdc00 && chunk.charCodeAt(0) <= 0xdfff) {
-    // Replace two isolated JSON surrogate escapes (6 bytes each) with one UTF-8 pair (4 bytes).
-    surrogatePairByteDelta = 4 - 2 * 6;
-  }
-  let fieldStructureByteDelta = 0;
-  if (!bufferedText && typeof previous !== 'string') {
-    fieldStructureByteDelta = previous === undefined
-      ? Buffer.byteLength(JSON.stringify(field)) + 4 // Comma, colon and empty string quotes.
-      : 2 - Buffer.byteLength(JSON.stringify(previous)); // Replace the previous value with empty string quotes.
-  }
-  return chunkContentBytes + surrogatePairByteDelta + fieldStructureByteDelta;
-}
-
-/**
- * ResultAccumulator.finish maps retained entries through this callback in first-seen item order.
- * Overlay provisional text without consuming its buffer; finish still owns detaching/freezing the
- * result, since entries without buffers return their retained snapshot directly.
- */
-function materializeItem({ snapshot, bufferedText }: RetainedItem): Item {
-  return bufferedText
-    ? { ...snapshot, [bufferedText.field]: bufferedText.chunks.join('') } as Item
-    : snapshot;
-}
-
-/**
- * ResultAccumulator.finish derives host-visible text from materialized items. Keep final messages in
- * retained order, including empty messages and their separators; interim messages remain in items.
- */
-function finalMessageText(items: readonly Item[]): string {
-  return items
-    .filter((item): item is Extract<Item, { type: 'agentMessage' }> => item.type === 'agentMessage' && item.phase === 'final')
-    .map(item => item.text)
-    .join('\n');
-}
-
 /**
  * Session.context creates one accumulator per execution; Session.retainEvent feeds privacy-projected
  * events in publication order and resolves its terminal snapshot to Turn.result. Retention is detached
  * and bounded, but Session still owns wire validation, shared budgets, publication and reclamation.
  */
 export class ResultAccumulator {
-  private readonly items = new Map<string, RetainedItem>();
-  private readonly completed = new Set<string>();
-  private bytes = 0;
-  private usage?: Usage;
   /**
    * Session.context supplies validated positive byte/item limits for one execution. Construction
    * allocates no native resources; Session must feed validated events in publication order.
@@ -96,6 +31,41 @@ export class ResultAccumulator {
     if (event.type === 'usage/updated' && event.payload.scope === 'turn') this.usage = structuredClone(event.payload);
     this.acceptItemEvent(event);
   }
+  /**
+   * Session.retainEvent resolves the shared completion promise with this value before publishing the
+   * terminal execution event and ending its hub. Return a detached frozen snapshot without consuming
+   * retention: terminal turn usage takes precedence, final text follows first-seen item order, and
+   * native failed/interrupted statuses resolve values rather than reject Turn.result. Missing failure
+   * details get TURN_FAILED; cloning/freezing failures instead throw into Session.emit's failure chain.
+   */
+  finish(payload: Extract<AhpEvent, { type: 'turn/completed' }>['payload']): TurnResult {
+    const items = [...this.items.values()].map(materializeItem);
+    const usage = payload.usage?.scope === 'turn' ? payload.usage : this.usage;
+    const common = { text: finalMessageText(items), items, ...(usage ? { usage } : {}) };
+    if (payload.status === 'failed') {
+      return immutable({ ...common, status: 'failed', error: payload.error ?? { code: 'TURN_FAILED', message: 'Turn failed', retryable: false, outcomeUnknown: false } });
+    }
+    if (payload.status === 'interrupted') {
+      return immutable({ ...common, status: 'interrupted', ...(payload.error ? { error: payload.error } : {}) });
+    }
+    return immutable({ ...common, status: payload.status });
+  }
+  /**
+   * Direct tests call this reset; no production caller currently reuses accumulators. Clear retained
+   * items, completion markers, usage and byte accounting synchronously. Previously returned snapshots
+   * stay independent; Session.reclaimExecution instead releases its whole execution registry entry.
+   */
+  clear(): void {
+    this.items.clear();
+    this.completed.clear();
+    this.usage = undefined;
+    this.bytes = 0;
+  }
+
+  private readonly items = new Map<string, RetainedItem>();
+  private readonly completed = new Set<string>();
+  private bytes = 0;
+  private usage?: Usage;
   /**
    * accept routes item events here after usage handling. Replace authoritative snapshots before
    * marking completion so failed retention cannot suppress later deltas; put failures propagate.
@@ -163,34 +133,78 @@ export class ResultAccumulator {
     this.items.set(item.id, { snapshot: structuredClone(item), serializedBytes: size });
     this.bytes = bytes;
   }
-  /**
-   * Session.retainEvent resolves the shared completion promise with this value before publishing the
-   * terminal execution event and ending its hub. Return a detached frozen snapshot without consuming
-   * retention: terminal turn usage takes precedence, final text follows first-seen item order, and
-   * native failed/interrupted statuses resolve values rather than reject Turn.result. Missing failure
-   * details get TURN_FAILED; cloning/freezing failures instead throw into Session.emit's failure chain.
-   */
-  finish(payload: Extract<AhpEvent, { type: 'turn/completed' }>['payload']): TurnResult {
-    const items = [...this.items.values()].map(materializeItem);
-    const usage = payload.usage?.scope === 'turn' ? payload.usage : this.usage;
-    const common = { text: finalMessageText(items), items, ...(usage ? { usage } : {}) };
-    if (payload.status === 'failed') {
-      return immutable({ ...common, status: 'failed', error: payload.error ?? { code: 'TURN_FAILED', message: 'Turn failed', retryable: false, outcomeUnknown: false } });
-    }
-    if (payload.status === 'interrupted') {
-      return immutable({ ...common, status: 'interrupted', ...(payload.error ? { error: payload.error } : {}) });
-    }
-    return immutable({ ...common, status: payload.status });
+}
+
+/** Fields acceptDelta can reconstruct provisionally; authoritative snapshots replace their buffers. */
+type TextField = 'text' | 'summary' | 'output';
+/** Mutable retention owned by ResultAccumulator; finish materializes buffers without changing this state. */
+interface RetainedItem {
+  /** Detached authoritative value, kept separate from provisional text. */
+  snapshot: Item;
+  /** JSON bytes of the item after applying buffered text, excluding any surrounding array. */
+  serializedBytes: number;
+  /** One supported text field per item family; chunks avoid rebuilding the full string on every delta. */
+  bufferedText?: {
+    field: TextField;
+    chunks: string[];
+    /** Tail used to account for surrogate pairs spanning deltas; empty chunks must preserve it. */
+    lastCodeUnit?: number;
+  };
+}
+
+/**
+ * ResultAccumulator.append uses this pure calculation before reserving bytes. Inputs describe the
+ * authoritative field and any existing buffer; return the exact JSON byte change for the new chunk.
+ * Accounting must join split UTF-16 pairs just as eventual string materialization does.
+ */
+function serializedTextAppendByteDelta({ field, previous, chunk, lastCodeUnit, bufferedText }: {
+  field: TextField;
+  previous: unknown;
+  chunk: string;
+  lastCodeUnit: number | undefined;
+  bufferedText: RetainedItem['bufferedText'];
+}): number {
+  const chunkContentBytes = Buffer.byteLength(JSON.stringify(chunk)) - 2; // Exclude string quotes.
+  const surrogatePairByteDelta = splitSurrogateByteAdjustment(lastCodeUnit, chunk);
+  let fieldStructureByteDelta = 0;
+  if (!bufferedText && typeof previous !== 'string') {
+    fieldStructureByteDelta = previous === undefined
+      ? Buffer.byteLength(JSON.stringify(field)) + 4 // Comma, colon and empty string quotes.
+      : 2 - Buffer.byteLength(JSON.stringify(previous)); // Replace the previous value with empty string quotes.
   }
-  /**
-   * Direct tests call this reset; no production caller currently reuses accumulators. Clear retained
-   * items, completion markers, usage and byte accounting synchronously. Previously returned snapshots
-   * stay independent; Session.reclaimExecution instead releases its whole execution registry entry.
-   */
-  clear(): void {
-    this.items.clear();
-    this.completed.clear();
-    this.usage = undefined;
-    this.bytes = 0;
-  }
+  return chunkContentBytes + surrogatePairByteDelta + fieldStructureByteDelta;
+}
+
+/**
+ * ResultAccumulator.finish maps retained entries through this callback in first-seen item order.
+ * Overlay provisional text without consuming its buffer; finish still owns detaching/freezing the
+ * result, since entries without buffers return their retained snapshot directly.
+ */
+function materializeItem({ snapshot, bufferedText }: RetainedItem): Item {
+  return bufferedText
+    ? { ...snapshot, [bufferedText.field]: bufferedText.chunks.join('') } as Item
+    : snapshot;
+}
+
+/**
+ * ResultAccumulator.finish derives host-visible text from materialized items. Keep final messages in
+ * retained order, including empty messages and their separators; interim messages remain in items.
+ */
+function finalMessageText(items: readonly Item[]): string {
+  return items
+    .filter((item): item is Extract<Item, { type: 'agentMessage' }> => item.type === 'agentMessage' && item.phase === 'final')
+    .map(item => item.text)
+    .join('\n');
+}
+
+/**
+ * Correct append accounting when a chunk joins a trailing high surrogate to a leading low surrogate.
+ * JSON replaces two isolated escapes (6 bytes each) with one UTF-8 pair (4 bytes); empty chunks and
+ * non-pair boundaries need no adjustment.
+ */
+function splitSurrogateByteAdjustment(previousCodeUnit: number | undefined, chunk: string): number {
+  const endsWithHighSurrogate = previousCodeUnit !== undefined && previousCodeUnit >= 0xd800 && previousCodeUnit <= 0xdbff;
+  const firstCodeUnit = chunk.charCodeAt(0);
+  const startsWithLowSurrogate = firstCodeUnit >= 0xdc00 && firstCodeUnit <= 0xdfff;
+  return endsWithHighSurrogate && startsWithLowSurrogate ? 4 - 2 * 6 : 0;
 }

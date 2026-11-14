@@ -7,9 +7,8 @@ import type { HarnessError, InputBlock, Item, Usage } from '@anureo/protocol';
  */
 export type Input = string | readonly InputBlock[];
 /**
- * ResultAccumulator.finish builds this frozen terminal snapshot; Session.retainEvent resolves the
- * shared execution promise read by Turn.result. Native failed/interrupted terminals resolve values
- * with those statuses; observation closure or a caller timeout rejects Turn.result instead. This is
+ * Read the frozen terminal snapshot returned by Turn.result. Native failed/interrupted terminals
+ * resolve values with those statuses; observation closure or a caller timeout rejects Turn.result instead. This is
  * retained observation, so hosts needing authoritative history must request history/read separately.
  */
 export type TurnResult = {
@@ -17,7 +16,7 @@ export type TurnResult = {
   text: string;
   /** Privacy-projected snapshots retained for this execution, including non-message items. */
   items: readonly Item[];
-  /** Terminal turn usage, or the latest observed turn-scoped usage when the terminal omits it. */
+  /** Terminal turn-scoped usage, or the latest observed turn-scoped usage when the terminal has none. */
   usage?: Usage;
 } & (
   { status: 'completed' }
@@ -41,7 +40,10 @@ export type TurnResult = {
 export interface RequestOptions {
   /** Stops this caller waiting; does not interrupt accepted native execution. */
   signal?: AbortSignal;
-  /** Positive finite observation deadline in milliseconds; omission uses the operation default. */
+  /**
+   * Positive finite observation deadline in milliseconds; omission uses the operation default.
+   * Client/Session admission also rejects values above 2_147_483_647; standalone waits use host timers.
+   */
   timeoutMs?: number;
 }
 
@@ -55,9 +57,12 @@ export interface EventSubscriptionOptions {
   signal?: AbortSignal;
   /** Independent observer budgets, each a positive safe integer; omission selects hub defaults. */
   queue?: {
-    /** Maximum buffered regular events; direct delivery to a pending read needs no slot. */
+    /** Maximum buffered regular events; defaults to 2048. Direct delivery to a pending read needs no slot. */
     maxEvents?: number;
-    /** Maximum serialized bytes buffered for this observer. */
+    /**
+     * Maximum serialized bytes buffered for this observer; defaults to 16 MiB.
+     * Single events are also limited to the smaller of this budget and 8 MiB.
+     */
     maxBytes?: number;
   };
 }

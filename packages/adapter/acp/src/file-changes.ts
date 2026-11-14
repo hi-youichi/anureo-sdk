@@ -1,6 +1,12 @@
 import type { FileChange } from '@anureo/protocol'
 
-/** Only ACP's typed diff blocks are source material. Text output is execution output. */
+/**
+ * Convert valid ACP diff blocks to complete file-text materials without reading or writing files.
+ * AcpUpdateMapper uses these for live tool snapshots; AcpBackendSession.extension enriches history
+ * when fileChanges is absent. Non-array input and invalid/non-diff blocks contribute no changes:
+ * text output remains execution output even when it resembles a patch. Missing/null oldText means
+ * a new file, while an empty string is an existing file; newText must be a string, including empty.
+ */
 export function acpFileChanges(content: unknown): FileChange[] {
   if (!Array.isArray(content)) return []
   return content.flatMap(value => {

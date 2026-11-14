@@ -3,8 +3,9 @@ import { tmpdir } from 'node:os'
 import { createClient, type Client, type InteractionHandlers, type Session } from '@anureo/sdk'
 import type { AhpEvent } from '@anureo/protocol'
 import type { HermesAdapterOptions } from '../src'
-import { startFake } from './helpers'
+import { startFake, until } from './helpers'
 
+/** Run a scenario with an initialized client, disposing client observation before the shared fixture owner on every outcome. */
 async function withFixture(scenario: string, run: (fixture: Awaited<ReturnType<typeof startFake>>, client: Client) => Promise<void>, options: HermesAdapterOptions = {}, interactions?: InteractionHandlers) {
   const fixture = await startFake(scenario)
   let client: Client | undefined
@@ -13,10 +14,8 @@ async function withFixture(scenario: string, run: (fixture: Awaited<ReturnType<t
     await run(fixture, client)
   } finally { await client?.dispose(); await fixture.dispose() }
 }
-async function until(predicate: () => Promise<boolean>): Promise<void> {
-  for (let i = 0; i < 200; i++) { if (await predicate()) return; await new Promise(resolve => setTimeout(resolve, 5)) }
-  throw new Error('Native fixture condition was not observed')
-}
+
+/** Record live events while turn.result remains the source-error assertion; callers must stop the iterator before client disposal. */
 function collect(session: Session) {
   const events: AhpEvent[] = [], iterator = session.events()[Symbol.asyncIterator]()
   const task = (async () => { try { for (;;) { const next = await iterator.next(); if (next.done) return; events.push(next.value) } } catch { /* Tests assert source errors through the public turn. */ } })()
@@ -70,6 +69,33 @@ test('authoritative final snapshots replace streamed text and cumulative usage r
       expect(result.items.filter(value => value.type === 'agentMessage' && value.phase === 'final')).toHaveLength(1)
       expect(result.items.find(value => value.type === 'reasoning')).toMatchObject({ summary: 'brief reasoning' })
       expect(read.events.some(value => value.type === 'usage/updated' && value.payload.scope === 'session')).toBe(true)
+    } finally { await read.stop() }
+  })
+})
+
+test.each(['delta-replay', 'delta-gap'])('%s preserves text overlap and native terminal authority', async scenario => {
+  await withFixture(scenario, async (fixture, client) => {
+    const session = await client.sessions.create({ cwd: tmpdir() }), read = collect(session)
+    try {
+      const result = await (await session.submit({ input: 'stream once' })).result()
+      expect(result).toMatchObject({ status: 'completed', text: 'authoritative final' })
+      const streamed = read.events.flatMap(event => event.type === 'item/delta' && event.payload.kind === 'text' ? [event.payload.text] : []).join('')
+      expect(streamed).toBe(scenario === 'delta-replay' ? 'provisional continued' : 'provisional ')
+      const gaps = result.items.filter(item => item.type === 'notice' && item.code === 'HERMES_PROGRESS_GAP')
+      expect(gaps).toHaveLength(scenario === 'delta-gap' ? 1 : 0)
+      expect((await fixture.state()).inputs).toHaveLength(1)
+    } finally { await read.stop() }
+  })
+})
+
+test('conflicting streamed overlap fails observation without fabricating terminal evidence or resending input', async () => {
+  await withFixture('delta-conflict', async (fixture, client) => {
+    const session = await client.sessions.create({ cwd: tmpdir() }), read = collect(session)
+    try {
+      const turn = await session.submit({ input: 'stream once' })
+      await expect(turn.result()).rejects.toMatchObject({ code: 'PROTOCOL_ERROR', outcomeUnknown: true })
+      expect(read.events.some(event => event.type === 'turn/completed')).toBe(false)
+      expect((await fixture.state()).inputs).toHaveLength(1)
     } finally { await read.stop() }
   })
 })

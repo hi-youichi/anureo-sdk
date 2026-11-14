@@ -57,6 +57,22 @@ test('spawn reports an unavailable executable without unhandled errors', async (
   });
 });
 
+test('process errors retain only native codes matching the bounded uppercase format', () => {
+  for (const code of ['ENOENT', 'E'.repeat(64)]) {
+    const error = new ProcessPortError('HARNESS_UNAVAILABLE', 'Safe message', {
+      cause: { code, message: 'secret native message', spawnargs: ['secret argument'] },
+    });
+    assert.equal(error.nativeCode, code);
+    assert.equal(error.message, 'Safe message');
+    assert.equal('cause' in error, false);
+    assert.equal(JSON.stringify(error).includes('secret'), false);
+  }
+  for (const code of [undefined, 1, '', 'enoent', 'E-FAIL', 'E'.repeat(65)]) {
+    const error = new ProcessPortError('HARNESS_UNAVAILABLE', 'Safe message', { cause: { code } });
+    assert.equal(error.nativeCode, undefined);
+  }
+});
+
 test('argument arrays preserve executable/cwd spaces and literal shell metacharacters', async () => {
   const root = await mkdtemp(join(tmpdir(), 'harness process '));
   try {
@@ -91,6 +107,7 @@ test('owned dispose is idempotent and escalates after grace timeout', async () =
   assert.equal(await firstLine(child.stdout), 'ready');
   const disposal = child.dispose();
   assert.equal(child.dispose(), disposal);
+  await assert.rejects(child.write('during-disposal'), (error: unknown) => error instanceof ProcessPortError && error.code === 'PROCESS_WRITE_FAILED');
   await disposal;
   const exit = await child.exited;
   if (process.platform !== 'win32') assert.equal(exit.signal, 'SIGKILL');
@@ -154,7 +171,10 @@ test('posix dispose rejects after retrying EPERM while the child remains alive',
     return (realKill as (pid: number, signal?: NodeJS.Signals | number) => void)(pid, signal);
   }) as typeof process.kill;
   await withPosixKillMock({ child, mockKill, check: async () => {
-    await assert.rejects(child.dispose(), (error: unknown) => error instanceof ProcessPortError && error.code === 'PROCESS_DISPOSE_FAILED');
+    const disposal = child.dispose();
+    await assert.rejects(disposal, (error: unknown) => error instanceof ProcessPortError && error.code === 'PROCESS_DISPOSE_FAILED');
+    assert.equal(child.dispose(), disposal);
+    await assert.rejects(child.write('after-failed-disposal'), (error: unknown) => error instanceof ProcessPortError && error.code === 'PROCESS_WRITE_FAILED');
     assert.equal(seen.filter((entry) => entry.pid < 0 && entry.signal === 'SIGTERM').length, 2);
     assert.ok(seen.some((entry) => entry.pid < 0 && entry.signal === 0));
   } });

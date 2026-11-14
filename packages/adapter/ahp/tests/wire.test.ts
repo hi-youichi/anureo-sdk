@@ -54,3 +54,70 @@ test('a background protocol failure still cleans up and exposes release errors o
   await expect(wire.close()).rejects.toMatchObject({ code: 'RESOURCE_RELEASE_FAILED', details: { errors: [{ code: 'AHP_CLOSE_HANDLER_FAILED' }] } });
   expect(closed).toBe(1);
 });
+
+test('notification callbacks can await RPC replies without allowing later callbacks to overtake', async () => {
+  const incoming = new BoundedEventQueue<string>();
+  const outgoing = new BoundedEventQueue<string>();
+  const wire = new AhpWire({
+    messages: incoming,
+    send: async frame => { outgoing.push(frame); },
+    close: async () => { incoming.end(); outgoing.end(); },
+  }, { timeoutMs: 1000 });
+  const reader = outgoing[Symbol.asyncIterator]();
+  const observed: string[] = [];
+  let finish = () => {};
+  const delivered = new Promise<void>(resolve => { finish = resolve; });
+  wire.onNotification = async method => {
+    observed.push(method);
+    if (method === 'first') {
+      observed.push(String(await wire.request('replay', {})));
+    } else {
+      finish();
+    }
+  };
+  try {
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', method: 'first' }));
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', method: 'second' }));
+    const sent = await reader.next();
+    if (sent.done) throw new Error('Missing replay request');
+    const request = JSON.parse(sent.value) as { id: number; method: string };
+    expect(request.method).toBe('replay');
+    expect(observed).toEqual(['first']);
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: 'replayed' }));
+    await delivered;
+    expect(observed).toEqual(['first', 'replayed', 'second']);
+  } finally {
+    await reader.return?.();
+    await wire.close();
+  }
+});
+
+test('peer requests and late replies do not disturb correlated response failures', async () => {
+  const incoming = new BoundedEventQueue<string>();
+  const sent: Array<Record<string, unknown>> = [];
+  const wire = new AhpWire({
+    messages: incoming,
+    send: async frame => { sent.push(JSON.parse(frame) as Record<string, unknown>); },
+    close: async () => { incoming.end(); },
+  }, { timeoutMs: 1000 });
+  try {
+    const first = wire.request('first', {});
+    const malformed = wire.request('malformed', {}).catch(cause => cause as unknown);
+    const unsupported = wire.request('unsupported', {}).catch(cause => cause as unknown);
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: 'peer-request', method: 'peer/call' }));
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: 999, result: 'unmatched' }));
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: sent[2]!.id, error: { code: -32601, message: 'private peer error' } }));
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: sent[1]!.id }));
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: sent[0]!.id, result: null }));
+    expect(await first).toBeNull();
+    expect(await malformed).toMatchObject({ code: 'PROTOCOL_ERROR' });
+    expect(await unsupported).toMatchObject({ code: 'CAPABILITY_UNSUPPORTED', message: 'AHP_RPC_ERROR' });
+    expect(sent[3]).toEqual({ jsonrpc: '2.0', id: 'peer-request', error: { code: -32601, message: 'Method not found' } });
+    // A malformed correlated response fails its request rather than the whole connection.
+    const next = wire.request('next', {});
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: sent[4]!.id, result: 'still open' }));
+    expect(await next).toBe('still open');
+  } finally {
+    await wire.close();
+  }
+});

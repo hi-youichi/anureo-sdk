@@ -1,20 +1,16 @@
+import { createFixture } from './test-helpers'
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { createClient, HarnessSdkError, type Client, type SessionEventSink } from '@anureo/sdk'
-import { createScriptedAdapter, type FakeAdapterOptions } from '@anureo/conformance'
+import { HarnessSdkError, type Client, type SessionEventSink } from '@anureo/sdk'
 import { z } from 'zod'
 import { agent, parallel, pipeline, type AgentOptions } from './index'
 import type { HarnessError } from '@anureo/protocol'
 
 const clients: Client[] = []
+const fixture = createFixture(clients)
 afterEach(async () => { await Promise.all(clients.splice(0).map(client => client.dispose())) })
 
-async function fixture(options?: FakeAdapterOptions) {
-  const adapter = createScriptedAdapter(options)
-  const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: randomUUID() } })
-  clients.push(client)
-  return { client, adapter }
-}
+/** Publish final text before completion so the retained terminal includes it. */
 async function complete(sink: SessionEventSink, turnId: string, text: string) {
   await sink.emit({ type: 'item/completed', payload: { item: { id: randomUUID(), type: 'agentMessage', phase: 'final', text } } }, { turnId })
   await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'completed' } })
@@ -149,6 +145,7 @@ test('cleanup failure cannot hide the primary uncertain execution failure', asyn
   expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
 })
 
+/** Script a retained terminal before submit's reply, including partial text on failed/interrupted turns. */
 async function terminalFixture(
   status: 'failed' | 'interrupted' | 'completed',
   { error, text = 'partial' }: { error?: HarnessError; text?: string } = {},
@@ -185,6 +182,27 @@ test('schema preflight rejects before opening, while absent backend support rele
   await expect(agent('unsupported', { client: unsupported.client, cwd: '.', schema: z.object({ a: z.string() }) })).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' })
   expect(unsupported.adapter.calls.some(call => call.method === 'input/submit')).toBe(false)
   expect([...unsupported.adapter.backends.values()][0]?.disposeCount).toBe(1)
+})
+
+test('session cleanup waits for asynchronous local output validation', async () => {
+  const entered = Promise.withResolvers<void>()
+  const validation = Promise.withResolvers<boolean>()
+  const schema = z.object({ count: z.number() }).refine(async () => {
+    entered.resolve()
+    return validation.promise
+  })
+  const { client, adapter } = await terminalFixture('completed', { text: '{"count":3}' })
+  const result = agent('validate before cleanup', { client, cwd: '.', schema })
+  try {
+    await entered.promise
+    expect(adapter.calls.some(call => call.method === 'session/close')).toBe(false)
+    expect([...adapter.backends.values()][0]?.disposeCount).toBe(0)
+  } finally {
+    validation.resolve(true)
+  }
+  expect(await result).toEqual({ count: 3 })
+  expect(adapter.calls.some(call => call.method === 'session/close')).toBe(true)
+  expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
 })
 
 test.each(['AUTH_REQUIRED', 'AUTH_FORBIDDEN', 'USAGE_LIMIT_EXCEEDED', 'RATE_LIMITED', 'NATIVE_SERVICE_UNAVAILABLE'])('only terminal %s becomes null', async code => {

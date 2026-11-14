@@ -1,4 +1,4 @@
-// Verifies session-local identity contracts; must not implement production policy or manage adapter lifetimes.
+// Verifies opaque identity scoping, reset behavior and allocator failures.
 import { expect, test } from "bun:test";
 import { NativeIdentityMap } from "./identity";
 

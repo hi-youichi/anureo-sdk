@@ -1,24 +1,31 @@
 // Defines structured agent responses and inferred types; it must not validate inventory coverage or dispatch agents.
 import { z } from 'zod'
 
-/** Planning response shape supplied to the workflow agent; parsing rejects empty fields and unknown keys.
- * Parsing has no I/O effects; validatePlan must check ID safety and exact inventory coverage before dispatch. */
+/** Internal planning shape passed by plan in refactor.ts to the workflow agent for response validation.
+ * All strings, the module list and each file list must be nonempty; whitespace is not trimmed.
+ * Parsing rejects unknown keys at either object level without I/O. validatePlan must then check
+ * ID safety and exact inventory coverage before module dispatch. */
 export const modulePlanSchema = z.strictObject({
   summary: z.string().min(1),
   modules: z.array(z.strictObject({
+    /** Artifact filename component; syntax and uniqueness are checked separately by validatePlan. */
     id: z.string().min(1),
     name: z.string().min(1),
     description: z.string().min(1),
+    /** Exact host inventory paths; validatePlan checks membership and exclusive assignment. */
     files: z.array(z.string().min(1)).min(1),
   })).min(1),
 })
 
-/** Design/module response shape supplied to workflow agents; parsing rejects empty entries and unknown keys.
- * Parsing has no I/O effects. The host adds observed edits and check results separately so agent claims
- * cannot replace execution facts; empty change and deferral lists are valid. */
+/** Internal work shape passed by runStep to the workflow agent for design/module response validation.
+ * Strings must be nonempty without trimming; empty change and deferral lists are valid. Parsing rejects
+ * unknown keys at either object level without I/O. runStep records observed edits, status and checks
+ * separately so agent claims cannot replace execution facts. */
 export const workSchema = z.strictObject({
   summary: z.string().min(1),
+  /** Agent-reported edits or proposals, which need not correspond to observed file changes. */
   changes: z.array(z.string().min(1)),
+  /** Unresolved findings with reasons; these do not by themselves make the host step fail. */
   deferred: z.array(z.strictObject({ title: z.string().min(1), reason: z.string().min(1) })),
 })
 

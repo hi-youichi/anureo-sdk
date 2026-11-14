@@ -1,3 +1,8 @@
+/**
+ * Verify typed native output with authenticated CLIs and real model requests.
+ * Run: bun run example:workflow-schema [all|codex|claude]. The default checks Codex
+ * then Claude, stopping on failure and disposing each opened client.
+ */
 import assert from 'node:assert/strict'
 import { z } from 'zod'
 import { createClient } from '@anureo/sdk'
@@ -5,8 +10,6 @@ import { createCodexAdapter } from '@anureo/adapter-codex'
 import { createClaudeAdapter } from '@anureo/adapter-claude'
 import { agent } from '@anureo/workflow'
 
-// Uses installed, authenticated CLIs and makes real model requests.
-// Run: bun run example:workflow-schema [all|codex|claude]
 const selected = process.argv[2] ?? 'all'
 if (!['all', 'codex', 'claude'].includes(selected) || process.argv.length > 3) {
   throw new Error('Usage: bun run example:workflow-schema [all|codex|claude]')

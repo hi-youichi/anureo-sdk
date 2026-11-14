@@ -20,11 +20,12 @@ export function permissionSettings(value: unknown): { approvalPolicy: string; sa
   }
 }
 
-/** Anureo's fastMode boolean maps to Codex's priority service tier; standard speed is the thread default (null). */
-const FAST_TIER = 'priority'
 /**
  * For native request builders, return the priority tier only for true and null otherwise so disabling
- * fast mode restores the thread default. No I/O or errors; callers validate input and decide whether an
- * absent option should omit the native field.
+ * fast mode restores the thread default. No I/O or errors. CodexBackendSession.setConfig validates
+ * booleans before translating; threadOptions and startInput decide whether to omit an absent option.
  */
 export const serviceTierFor = (fast: unknown) => fast === true ? FAST_TIER : null
+
+/** Anureo's fastMode boolean maps to Codex's priority service tier; standard speed is the thread default (null). */
+const FAST_TIER = 'priority'

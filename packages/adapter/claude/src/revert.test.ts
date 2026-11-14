@@ -9,6 +9,8 @@ function deferred() {
   return { promise, resolve };
 }
 const history: SessionMessage[] = [{ type: 'user', uuid: 'historical', session_id: 'native', parent_tool_use_id: null, parent_agent_id: null, message: { role: 'user', content: 'old' } }];
+/** Expose each query generation so revert tests can pause history reads and drive old/new streams.
+ * The injected history reader owns its gates; tests release them and dispose the client in finally. */
 async function fixture(getSessionMessages: NonNullable<ClaudeAdapterOptions['getSessionMessages']> = async () => history) {
   const queries: Array<{ output: BoundedEventQueue<SDKMessage>; input: AsyncIterator<SDKUserMessage>; closed: number }> = [];
   const client = await createClient({

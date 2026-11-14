@@ -8,7 +8,7 @@ import { createReviewClient } from '../src/client'
 // Cross-package test dependency: hermes fake MCP server; coordinate changes
 // with packages/adapter/hermes/tests/helpers.ts.
 import { startFake } from '../../../packages/adapter/hermes/tests/helpers'
-import { finding, fixture, plan } from './helpers'
+import { finding, fixture, isAnalysis, isModule, plan } from './helpers'
 
 const angles = [correctnessAngle, { id: 'contracts', title: 'Contracts', instructions: 'Check caller contracts.' }]
 
@@ -95,6 +95,27 @@ test('one shared concurrency limit bounds agents across both levels', async () =
   expect((await pending).status).toBe('completed')
   expect(reviews).toBe(4)
   expect(peak).toBe(2)
+})
+
+test('module coverage stays in plan order when lifecycles finish in reverse order', async () => {
+  const laterModuleCompleted = Promise.withResolvers<void>()
+  const completed: string[] = []
+  const { client, cwd } = await fixture(async prompt => {
+    if (isAnalysis(prompt)) return plan
+    if (isModule('a')(prompt)) await laterModuleCompleted.promise
+    return { findings: [] }
+  })
+  const report = await reviewCode({
+    client, cwd, concurrency: 2, angles: [correctnessAngle],
+    onProgress: event => {
+      if (event.stage !== 'review' || event.status !== 'completed') return
+      completed.push(event.moduleId)
+      if (event.moduleId === 'b') laterModuleCompleted.resolve()
+    },
+  })
+  expect(completed).toEqual(['b', 'a'])
+  expect(report.modules.map(outcome => outcome.review.module.id)).toEqual(['a', 'b'])
+  expect(report.status).toBe('completed')
 })
 
 test('defaults to correctness, code quality, and design angles and passes their full instructions', async () => {

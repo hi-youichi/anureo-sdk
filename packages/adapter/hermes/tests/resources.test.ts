@@ -2,13 +2,12 @@ import { expect, test } from 'bun:test'
 import { spawnHarnessProcess, type HarnessProcess } from '@anureo/sdk/process'
 import { AHP_PROTOCOL_CONTRACT } from '@anureo/protocol'
 import { createClient } from '@anureo/sdk'
-import { startFake } from './helpers'
+import { startFake, until as waitUntil } from './helpers'
+
+const until = (predicate: () => Promise<boolean>) => waitUntil(predicate, 'Resource state not observed')
 
 const initialize = { protocolVersions: [1], protocolContract: AHP_PROTOCOL_CONTRACT, clientInfo: { name: 'resource-test', version: '1' } }
-async function until(predicate: () => Promise<boolean>) {
-  for (let i = 0; i < 200; i++) { if (await predicate()) return; await new Promise(resolve => setTimeout(resolve, 5)) }
-  throw new Error('Resource state not observed')
-}
+
 
 test('disposing during attach aborts and reaps its real child process', async () => {
   const fake = await startFake(), children: HarnessProcess[] = []

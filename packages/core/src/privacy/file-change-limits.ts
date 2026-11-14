@@ -1,4 +1,4 @@
-// Bounds canonical file-change material and its JSON mirrors; must not redact secrets or validate patches.
+// Owns package-internal retention of canonical file-change material and its JSON mirrors.
 import type { FileChange, Item, JsonObject, JsonValue } from '@anureo/protocol'
 
 /**
@@ -11,6 +11,31 @@ export const FILE_CHANGE_MATERIAL_LIMIT = 50
  * Canonical material reserves bytes before mirrors; JSON keys and item metadata are outside the cap.
  */
 export const FILE_CHANGE_TEXT_LIMIT = 256 * 1024
+
+/**
+ * SecretRedactor.toolCall calls this after projecting marked content, so live events and history share one
+ * retention rule. Return a bounded copy of a file-change tool item, or the original unrelated item;
+ * preserve metadata while marking incomplete material. Canonical material consumes the shared byte
+ * budget before input, output, raw and extensions, in that order. The caller owns protocol validation
+ * and publication; this synchronous pass performs no I/O and does not mutate the input. Exceeding a
+ * cap marks x-anureo/fileChangesTruncated; affected changes and their stats become partial. Mirror-only
+ * overflow sets the item marker without downgrading complete canonical changes.
+ */
+export function boundFileChangeItem(item: Item): Item {
+  if (item.type !== 'toolCall' || item.fileChanges === undefined) return item
+  const budget = createRetentionBudget()
+  const fileChanges = item.fileChanges.map(change => boundChange(change, budget))
+  const result = {
+    ...item,
+    fileChanges,
+    ...(item.input !== undefined ? { input: boundMirror(item.input, budget) } : {}),
+    ...(item.output !== undefined ? { output: boundMirror(item.output, budget) } : {}),
+    ...(item.raw !== undefined ? { raw: boundMirror(item.raw, budget) } : {}),
+    ...(item.extensions ? { extensions: boundMirror(item.extensions, budget) as JsonObject } : {}),
+  }
+  if (budget.truncated) result.extensions = { ...result.extensions, 'x-anureo/fileChangesTruncated': true }
+  return result
+}
 
 /** boundFileChangeItem owns these per-pass counters; boundMaterial and boundMirror consume them in order. */
 interface RetentionBudget {
@@ -26,6 +51,7 @@ interface RetentionBudget {
 /** takeText returns a retained prefix; boundMaterial uses completeness to avoid authoritative partial replacements. */
 interface TakenText {
   value: string
+  /** Whether all source text fit; an empty retained prefix can also represent overflow. */
   complete: boolean
 }
 
@@ -41,6 +67,7 @@ function createRetentionBudget(): RetentionBudget {
  * boundMaterial and boundMirror use this shared accounting rather than independent budgets. Return
  * text within the remaining UTF-8 allowance and debit it. Overflow sets the sticky truncation flag
  * and keeps only complete newline-terminated lines, dropping any split UTF-8 character with its line.
+ * Debit only the retained prefix, leaving unused bytes available to later material or mirrors.
  */
 function takeText(budget: RetentionBudget, value: string): TakenText {
   const encoded = budget.encoder.encode(value)
@@ -116,27 +143,4 @@ function boundMirror(value: JsonValue, budget: RetentionBudget): JsonValue {
   if (Array.isArray(value)) return value.map(entry => boundMirror(entry, budget))
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, boundMirror(child, budget)]))
   return value
-}
-
-/**
- * SecretRedactor.item calls this after projecting marked content, so live events and history share one
- * retention rule. Return a bounded copy of a file-change tool item, or the original unrelated item;
- * preserve metadata while marking incomplete material. Canonical material consumes the shared byte
- * budget before input, output, raw and extensions, in that order. The caller owns protocol validation
- * and publication; this synchronous pass performs no I/O and does not mutate the input.
- */
-export function boundFileChangeItem(item: Item): Item {
-  if (item.type !== 'toolCall' || item.fileChanges === undefined) return item
-  const budget = createRetentionBudget()
-  const fileChanges = item.fileChanges.map(change => boundChange(change, budget))
-  const result = {
-    ...item,
-    fileChanges,
-    ...(item.input !== undefined ? { input: boundMirror(item.input, budget) } : {}),
-    ...(item.output !== undefined ? { output: boundMirror(item.output, budget) } : {}),
-    ...(item.raw !== undefined ? { raw: boundMirror(item.raw, budget) } : {}),
-    ...(item.extensions ? { extensions: boundMirror(item.extensions, budget) as JsonObject } : {}),
-  }
-  if (budget.truncated) result.extensions = { ...result.extensions, 'x-anureo/fileChangesTruncated': true }
-  return result
 }

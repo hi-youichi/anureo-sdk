@@ -4,6 +4,7 @@ import { createClaudeAdapter } from '@anureo/adapter-claude'
 
 // Uses installed, authenticated CLIs and makes real model requests.
 // Run: bun run example:schema [all|codex|claude]
+// "all" runs Codex then Claude; a failure stops the sequence after client cleanup.
 const selected = process.argv[2] ?? 'all'
 if (!['all', 'codex', 'claude'].includes(selected) || process.argv.length > 3) {
   throw new Error('Usage: bun run example:schema [all|codex|claude]')
@@ -35,9 +36,11 @@ for (const backend of selected === 'all' ? ['codex', 'claude'] : [selected]) {
     if (result.status === 'failed') throw new Error(result.error.message)
     if (result.status !== 'completed') throw new Error(`Turn ${result.status}`)
 
-    // Structured output is returned as JSON text: {"sum":42}.
+    // submit returns a turn handle; result waits for completion and schema validation.
+    // A completed result carries JSON text such as {"sum":42}, ready for parsing.
     console.log(backend, JSON.parse(result.text))
   } finally {
+    // Each backend's client owns its session and adapter, including on turn/parse failure.
     await client.dispose()
   }
 }

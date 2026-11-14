@@ -8,22 +8,14 @@ import { createScriptedAdapter, type FakeAdapterOptions } from '@anureo/conforma
 import type { JsonObject } from '@anureo/protocol'
 import type { ModulePlan } from '../src/schema'
 
-const clients: Client[] = []
-const directories: string[] = []
-afterEach(async () => {
-  // Dispose failures must neither skip directory cleanup nor mask the test's result.
-  const disposed = await Promise.allSettled(clients.splice(0).map(client => client.dispose()))
-  await Promise.allSettled(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true })))
-  const failed = disposed.filter(result => result.status === 'rejected')
-  if (failed.length > 0) console.error('cleanup dispose failures:', failed.map(result => String(result.reason)))
-})
-
 /** Routing convention for scripted responses: `respond` receives the full prompt
  * text; route on the stage prefixes below (stages.analyze / stages.fix /
  * stages.verify) and on the module's compact JSON marker via isModule(id).
  * Prompt-building changes in src must update these keys. */
 export const stages = { analyze: 'Analyze', fix: 'Fix these review findings', verify: 'Verify' } as const
+/** Recognize analysis submissions when routing fixture responses. */
 export const isAnalysis = (prompt: string) => prompt.startsWith(stages.analyze)
+/** Build a predicate for the compact module JSON embedded in review/verification prompts. */
 export const isModule = (id: string) => (prompt: string) => prompt.includes(`"id":"${id}"`)
 
 /** Captured-IO recorder matching the CliDependencies stdout/stderr seam. */
@@ -34,6 +26,7 @@ export function output() {
     read: () => ({ stdout: stdout.join(''), stderr: stderr.join('') }) }
 }
 
+/** Default analysis response assigning the fixture's two source files to independent modules. */
 export const plan: ModulePlan = {
   summary: 'Two independent modules.',
   modules: [
@@ -42,15 +35,19 @@ export const plan: ModulePlan = {
   ],
 }
 
+/** Valid finding against the first line of fixture source a.ts, reusable in review and fix tests. */
 export const finding = {
   severity: 'P2' as const, title: 'Incorrect fallback', body: 'A zero input returns the fallback instead of zero.',
   suggestion: 'Treat zero as a valid value: `return n === 0 ? n : (n || 1)`',
   file: 'a.ts', lineStart: 1, lineEnd: 1,
 }
 
-// respond is invoked only after fixture() returns (prompts are captured and
-// answered as turns are submitted), so callers may reference their own result
-// variable inside the callback.
+/** Create two temporary source files and an initialized scripted client for review, fix and CLI tests.
+ * The adapter invokes respond with captured full prompts when turns are submitted after setup, so
+ * the callback may reference this fixture's returned context. Defaults to plan plus empty reviews;
+ * returning HarnessSdkError emits a failed turn, while other values become JSON agent messages.
+ * Setup failures reject. This module's afterEach disposes clients and removes directories; tests must
+ * settle their runs first. Hooks customize adapter capabilities/session opening, not turn execution. */
 export async function fixture(
   respond: (prompt: string) => unknown | Promise<unknown> = prompt => isAnalysis(prompt) ? plan : { findings: [] },
   hooks: Omit<FakeAdapterOptions, 'execute'> = {},
@@ -84,3 +81,14 @@ export async function fixture(
   clients.push(client)
   return { client, cwd, adapter, prompts }
 }
+
+const clients: Client[] = []
+const directories: string[] = []
+
+afterEach(async () => {
+  // Dispose failures must neither skip directory cleanup nor mask the test's result.
+  const disposed = await Promise.allSettled(clients.splice(0).map(client => client.dispose()))
+  await Promise.allSettled(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true })))
+  const failed = disposed.filter(result => result.status === 'rejected')
+  if (failed.length > 0) console.error('cleanup dispose failures:', failed.map(result => String(result.reason)))
+})

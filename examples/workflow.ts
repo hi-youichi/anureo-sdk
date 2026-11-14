@@ -3,13 +3,18 @@ import { createClient, type Client } from '@anureo/sdk'
 import { createCodexAdapter } from '@anureo/adapter-codex'
 import { agent, parallel, pipeline } from '@anureo/workflow'
 
-// A workflow is an ordinary TypeScript function. Its stages can change value types.
+/**
+ * Double then square each input independently, then request both summaries concurrently.
+ * Print each settled agent response; pipeline/parallel failures or dropped calls become null
+ * and are reported here as calculation errors. The caller keeps the client alive and disposes it.
+ */
 async function calculate(client: Client, inputs: readonly number[]) {
   const options = {
     client,
     cwd: process.cwd(),
     instructions: 'Perform only the requested arithmetic. Do not use tools. Return only the numeric result.',
   }
+  /** Composition callbacks use a fresh agent session per prompt and log its text or null after cleanup. */
   const ask = async (input: string) => {
     const output = await agent(input, options)
     console.log(JSON.stringify({ input, output }))

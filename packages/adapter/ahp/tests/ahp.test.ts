@@ -5,6 +5,7 @@ import type { AhpEvent } from "@anureo/protocol";
 import { createAhpAdapter,createWebSocketTransport,AhpWire,createStdioTransport,type AhpTransport } from "../src/index";
 import { createReferenceHarness } from "../examples/reference";
 
+/** Connect an owned client/session to a scripted peer, optionally perturbing notifications; dispose runtime. */
 async function fixture(options:{dropSeq?:number;replay?:boolean;duplicate?:boolean}={}){
   const queue=new BoundedEventQueue<string>();
   const forwardedFrames: Array<{method?:string;params?:AhpEvent}>=[];
@@ -34,7 +35,8 @@ async function fixture(options:{dropSeq?:number;replay?:boolean;duplicate?:boole
   const session=await runtime.openSession({requestId:"open",mode:"new",binding:{sessionId:"session",adapterId:"ahp",runtimeConfigId:"ref"},cwd:process.cwd()});
   return {runtime,session,queue,forwardedFrames};
 }
-async function collect(session:Session,respondToApproval=false):Promise<AhpEvent[]>{
+/** Read through the first terminal, optionally deny approvals, and always release the reader and timer. */
+async function collect(session:Session,{respondToApproval=false}:{respondToApproval?:boolean}={}):Promise<AhpEvent[]>{
   const events:AhpEvent[]=[],reader=session.events()[Symbol.asyncIterator]();
   const timer=setTimeout(()=>{void reader.return?.();},1500);
   try{for(;;){const next=await reader.next();if(next.done)throw new Error("Missing terminal");events.push(next.value);
@@ -52,7 +54,7 @@ test("external AHP preserves immediate lifecycle over stdio",async()=>{
 });
 test("remote interaction responds once, with no duplicate local resolution",async()=>{
   const f=await fixture();try{
-    const reading=collect(f.session,true);await f.session.submit({ input:[{type:"text",text:"/approval"}] });
+    const reading=collect(f.session,{respondToApproval:true});await f.session.submit({ input:[{type:"text",text:"/approval"}] });
     const events=await reading;expect(events.filter(e=>e.type==="interaction/resolved")).toHaveLength(1);expect(events.filter(e=>e.type==="interaction/requested")).toHaveLength(1);
   }finally{await f.runtime.dispose();}
 });
@@ -102,7 +104,7 @@ test("WebSocket factory uses identical lifecycle and closes only its connection"
   try{
     const session=await runtime.openSession({requestId:"open",mode:"new",binding:{sessionId:"ws",adapterId:"ahp",runtimeConfigId:"ref"},cwd:process.cwd()});
     const text=collect(session);await session.submit({ input:[{type:"text",text:"stdio"}] });expect((await text).some(e=>e.type==="item/completed"&&e.payload.item.type==="agentMessage"&&e.payload.item.text==="stdio")).toBe(true);
-    const approval=collect(session,true);await session.submit({ input:[{type:"text",text:"/approval"}] });expect((await approval).filter(e=>e.type==="interaction/resolved")).toHaveLength(1);
+    const approval=collect(session,{respondToApproval:true});await session.submit({ input:[{type:"text",text:"/approval"}] });expect((await approval).filter(e=>e.type==="interaction/resolved")).toHaveLength(1);
     const reading=collect(session);const active=await session.submit({ input:"/wait" });await active.interrupt();expect((await reading).at(-1)).toMatchObject({payload:{status:"interrupted"}});
     await runtime.dispose();expect(server.port).toBeGreaterThan(0);
   }finally{await runtime.dispose();await server.stop(true);}
@@ -165,6 +167,7 @@ test("stdio transport frames stdout and drains broken stderr silently", async ()
   await transport.close();
 });
 
+/** Model socket state and event listeners so tests can drive handshake/frame failures without a server. */
 function fakeWebSocket(initialReadyState = 0) {
   const listeners = new Map<string, Array<(event: unknown) => void>>();
   const sent: string[] = [];

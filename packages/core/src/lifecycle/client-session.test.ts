@@ -361,6 +361,73 @@ test('a full request cache replays abandoned work without evicting its unsettled
   } finally { release.resolve(); await f.client.dispose(); }
 });
 
+/** Abandon a history wait while its host projection is gated. Replay must await one projected, revalidated outcome, preserving privacy and frozen results; finally release the gate and client. */
+for (const validProjection of [true, false]) test(`history projection survives caller cancellation and revalidates hook output (valid=${validProjection})`, async () => {
+  const entered = deferred<void>(), release = deferred<void>();
+  const secret = 'PRIVATE_HISTORY_VALUE';
+  const nativePage: AhpResultMap['history/read'] = { items: [{ turnId: 'old', item: { id: 'message', type: 'agentMessage', text: secret } }] };
+  let projections = 0;
+  const f = await fixture(async () => nativePage, {
+    interactions: { userInput: undefined },
+    runtime: {
+      /** Session.executeRequest calls this after marked-secret projection; gate its result beyond caller abort and optionally return malformed JavaScript data. */
+      async redactHistory(binding, page) {
+        projections++;
+        expect(binding.adapterId).toBe('fixture');
+        expect(page.items[0]?.item).toMatchObject({ text: '[redacted]' });
+        entered.resolve();
+        await release.promise;
+        return validProjection ? { ...page, snapshotToken: 'projected' } : { items: null } as unknown as AhpResultMap['history/read'];
+      },
+    },
+  });
+  try {
+    const interaction = f.sink.requestInteraction({ kind: 'userInput', interactionId: 'secret', questions: [{ id: 'q', prompt: 'Secret', secret: true }] }, async () => {});
+    await f.session.request('interaction/respond', { sessionId: f.session.id, requestId: 'answer', interactionId: 'secret', response: { kind: 'userInput', answers: { q: secret } } });
+    await interaction;
+    const params: AhpRequestMap['history/read'] = { sessionId: f.session.id, requestId: 'history' };
+    const controller = new AbortController();
+    const abandoned = f.session.request('history/read', params, { signal: controller.signal });
+    await entered.promise;
+    controller.abort();
+    await expect(abandoned).rejects.toMatchObject({ code: 'REQUEST_ABORTED' });
+    const replay = f.session.request('history/read', params);
+    release.resolve();
+    if (validProjection) {
+      const result = await replay;
+      expect(result.snapshotToken).toBe('projected');
+      expect(JSON.stringify(result)).not.toContain(secret);
+      expect(Object.isFrozen(result)).toBe(true);
+      expect(Object.isFrozen(result.items[0]?.item)).toBe(true);
+    } else {
+      await expect(replay).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    }
+    expect(projections).toBe(1);
+    expect(f.calls.map(call => call.method)).toEqual(['history/read']);
+    expect(nativePage.items[0]?.item).toMatchObject({ text: secret });
+    expect(f.session.snapshot.status).toBe('ready');
+  } finally { release.resolve(); await f.client.dispose(); }
+});
+
+/** Confirm native stop without a terminal event. Close must release the backend while the unfinished Turn still rejects with unknown result diagnostics; finally dispose the client. */
+test('confirmed native close reports stop confirmation without inventing an unfinished Turn result', async () => {
+  const receipt = { ...closeResult, executionStopped: 'confirmed' } as const;
+  const f = await fixture(async (method, params, sink) => {
+    if (method === 'session/close') return receipt;
+    await started(sink, 'active');
+    return { submissionId: asSubmitParams(params).submissionId, accepted: true, disposition: 'started', turnId: 'active' };
+  });
+  try {
+    const turn = await f.session.submit({ input: 'work' });
+    expect(await f.session.close()).toEqual(receipt);
+    await expect(turn.result()).rejects.toMatchObject({
+      code: 'OBSERVATION_CLOSED', outcomeUnknown: true,
+      details: { source: 'sdk', executionStopped: 'confirmed' },
+    });
+    expect(f.disposals).toBe(1);
+  } finally { await f.client.dispose(); }
+});
+
 /** Patch a retained tool snapshot before interrupted completion. Turn.result must expose the replacement content under the original item identity; finally dispose the client. */
 test('item-shaped patch snapshots update retained results without changing item identity', async () => {
   const f = await fixture(async (_method, params, sink) => {

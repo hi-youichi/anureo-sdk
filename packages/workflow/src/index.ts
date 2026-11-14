@@ -1,3 +1,4 @@
+/** Independent agent/composition primitives and the durable workflow API for applications. */
 export { agent, type AgentOptions } from './agent'
 export { parallel } from './parallel'
 export { pipeline } from './pipeline'

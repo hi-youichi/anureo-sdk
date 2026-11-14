@@ -1,8 +1,8 @@
 // Creates externally settled promises for lifecycle gates; must not decide when work completes or cancel it.
 /**
  * Session constructs its closure gate here; context and record allocate execution-result and
- * submission-binding gates. Return a promise with resolve/reject callbacks, observing early rejection
- * until a consumer attaches without changing that consumer's outcome. Session owns settlement order;
+ * submission-binding gates. Return a promise with resolve/reject callbacks and rejection already
+ * observed, so consumers may attach later without changing their outcome. Session owns settlement order;
  * host wait cancellation never settles these shared gates or cancels underlying native work.
  */
 export function deferred<T>() {

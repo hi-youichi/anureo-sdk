@@ -6,16 +6,7 @@
  * attached to failures so a startup crash stays diagnosable.
  */
 
-const LINE_CODE_UNIT_LIMIT = 8 * 1024;
-const TOTAL_CODE_UNIT_LIMIT = 32 * 1024;
-
-const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
-  [/\b(sk-[A-Za-z0-9_-]{8,})/g, 'sk-[redacted]'],
-  [/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[redacted]'],
-  [/\b((?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*)\S+/gi, '$1[redacted]'],
-  [/\b(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[redacted]@'],
-];
-
+/** Internal diagnostics projection: truncate oversized lines, then redact recognized credential patterns. */
 export function redactLine(line: string): string {
   let value = line.length > LINE_CODE_UNIT_LIMIT ? `${line.slice(0, LINE_CODE_UNIT_LIMIT)}…` : line;
   for (const [pattern, replacement] of REDACTIONS) value = value.replace(pattern, replacement);
@@ -27,14 +18,13 @@ export function redactLine(line: string): string {
  * The total counts each line's length plus one code unit for a separator.
  */
 export class StderrTail {
-  private readonly lines: string[] = [];
-  private retainedCodeUnits = 0;
-  private partial = '';
+  /** maxLines <= 0 disables retention and callbacks; callback throws never interrupt stderr draining. */
   constructor(
     private readonly maxLines: number,
     private readonly onLine?: (line: string) => void,
   ) {}
 
+  /** Accept one line, notifying onLine after redaction and evicting oldest entries to enforce both bounds. */
   push(line: string): void {
     if (this.maxLines <= 0) return;
     const redacted = redactLine(line);
@@ -75,7 +65,21 @@ export class StderrTail {
     return this.lines.join('\n');
   }
 
+  /** Number of retained lines, excluding a buffered partial line. */
   get size(): number {
     return this.lines.length;
   }
+  private readonly lines: string[] = [];
+  private retainedCodeUnits = 0;
+  private partial = '';
 }
+
+const LINE_CODE_UNIT_LIMIT = 8 * 1024;
+const TOTAL_CODE_UNIT_LIMIT = 32 * 1024;
+
+const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\b(sk-[A-Za-z0-9_-]{8,})/g, 'sk-[redacted]'],
+  [/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[redacted]'],
+  [/\b((?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*)\S+/gi, '$1[redacted]'],
+  [/\b(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[redacted]@'],
+];

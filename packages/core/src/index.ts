@@ -32,3 +32,5 @@ export * from './privacy/secrets';
 export { configure, configureSync, dispose, disposeSync, drain, getLogger, reset, resetSync } from '@logtape/logtape';
 /** LogTape types for hosts configuring logging through the forwarded functions above. */
 export type { Config, LogLevel, LogRecord, Logger, Sink } from '@logtape/logtape';
+/** Explicit unattended approval policy for hosts; never enabled by Client automatically. */
+export { approveWithNarrowestScope } from './lifecycle/approval';

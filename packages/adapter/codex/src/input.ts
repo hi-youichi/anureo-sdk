@@ -1,10 +1,16 @@
-/** Translates ordered public input to native records; turn dispatch and file reads belong to callers. */
+/** Translates ordered AHP input blocks to native turn input records without opening files. */
 import { fileURLToPath } from 'node:url'
 import type { InputBlock } from '@anureo/protocol'
 import { HarnessSdkError } from '@anureo/sdk'
 import type { NativeRecord } from './native-values'
 
-/** For turn/steer builders, preserve block order without reading files. Throws CAPABILITY_UNSUPPORTED for non-file URIs and propagates fileURLToPath errors for invalid file URLs. */
+/**
+ * Convert input blocks in order without reading files or dispatching a request. Images prefer a
+ * supplied URL, including an empty one, over inline data; files require file: URIs. Throws
+ * CAPABILITY_UNSUPPORTED for other file URI schemes and propagates fileURLToPath errors.
+ * CodexBackendSession.startInput and execute's turn/steer branch build native requests from the
+ * result; conversion failures reject their operation before that request is dispatched.
+ */
 export function nativeInput(blocks: readonly InputBlock[]): NativeRecord[] {
   return blocks.map(nativeInputBlock)
 }

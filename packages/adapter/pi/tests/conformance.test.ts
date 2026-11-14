@@ -13,7 +13,7 @@ test('the Pi adapter passes shared conformance for every declared capability', a
       if (scenario === 'interrupt') host.script = async h => { await h.hold() }
       if (scenario === 'disconnect') host.script = async h => { await h.assistant('working'); h.emit({ type: 'failed', code: 'CONNECTION_CLOSED' }); await new Promise(() => {}) }
       if (scenario === 'backpressure') host.script = async h => { await h.assistant('working'); h.emit({ type: 'failed', code: 'BACKPRESSURE_EXCEEDED' }); await new Promise(() => {}) }
-      if (scenario === 'unknown-item') host.script = async h => { await h.toolRound('mystery', 'future_tool', { x: 1 }, 'out'); await h.assistant('conformance') }
+      if (scenario === 'unknown-item') host.script = async h => { await h.toolRound({ id: 'mystery', name: 'future_tool', args: { x: 1 }, output: 'out' }); await h.assistant('conformance') }
       if (scenario === 'lifecycle' || scenario === 'immediate' || scenario === 'identity') host.script = async h => { await h.assistant('conformance') }
     })
     return { adapter: createPiAdapter({ version: '1.5.2', createHost: fake.factory }), openParams: open(scenario) }

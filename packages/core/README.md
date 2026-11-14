@@ -145,6 +145,7 @@ for ordering, failure, and ownership contracts.
 | Purpose | Import path | Exports |
 | --- | --- | --- |
 | Errors and caller waits | `@anureo/sdk` | `HarnessSdkError` carries a safe code and outcome metadata. `sdkError()` normalizes a failure. `waitForRequest()` applies a caller-scoped wait using `RequestOptions`. |
+| Unattended approvals | `@anureo/sdk` | `approveWithNarrowestScope()` can be explicitly registered as `interactions.approval`. It chooses allow-once, then session, then rule grants, and rejects when none is offered. Clients never enable it automatically. |
 | Host logging | `@anureo/sdk` | LogTape's `configure`, `configureSync`, `getLogger`, `drain`, `dispose`, `disposeSync`, `reset`, and `resetSync`, plus `Config`, `LogLevel`, `LogRecord`, `Logger`, and `Sink`. The application configures logging sinks. |
 | Native subprocesses | `@anureo/sdk/process` or `@anureo/sdk` | `spawnHarnessProcess()` launches and owns stdio subprocess I/O and cleanup. The module also exports `ProcessPortError`, `ProcessExit`, `HarnessProcess`, and `HarnessProcessOptions`. |
 | Bounded buffering | `@anureo/sdk/queue` or `@anureo/sdk` | `BoundedEventQueue` provides a bounded, single-reader async queue. `QueueLimits` configures its budgets. |

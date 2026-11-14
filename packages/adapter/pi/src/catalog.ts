@@ -5,8 +5,10 @@ import { createPiHost } from './host'
 export type PiModel = PiHostModel
 
 /**
- * List the models Pi can use right now. Opens a throwaway in-memory session so no session file is written,
- * and always disposes it.
+ * List credential-available Pi models using a throwaway in-memory host; no session file is written.
+ * cwd defaults to process.cwd(), and createHost defaults to the embedded factory. After acquisition,
+ * disposal is awaited even if listing rejects. Acquisition/listing/disposal failures reject; a disposal
+ * failure takes precedence over a listing failure. The caller receives models with no host to release.
  */
 export async function createPiCatalogSession(options: { cwd?: string; agentDir?: string; createHost?: PiHostFactory } = {}): Promise<{ models: PiModel[] }> {
   const factory = options.createHost ?? createPiHost

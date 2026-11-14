@@ -39,7 +39,7 @@ function readSmokeConfiguration(): SmokeConfiguration | undefined {
   return { command, mode: 'authenticated', codexHome }
 }
 
-/** For runAuthenticatedTurn, drain the open session until native completion, cancelling every interaction without authorizing tools. Reject request/stream failures or premature EOF; the smoke owner disposes the session. */
+/** For runAuthenticatedTurn, drain the open session until it publishes turn/completed, cancelling every interaction without authorizing tools. Reject request/stream failures or premature EOF; the smoke owner disposes the session. */
 async function observeNativeTurnCompletion(session: Session) {
   for await (const event of session.events()) {
     if (event.type === 'interaction/requested') {
@@ -86,7 +86,7 @@ async function collectSmokeEvidence({ adapter, client, temporary, mode }: {
   return result
 }
 
-/** Run validated CLI configuration: create isolated state/client, print acceptance evidence, then dispose the client before deleting temporary files. Propagate setup, execution and sequential cleanup failures; preserve the provisioned live home. */
+/** Run validated CLI configuration: create isolated state/client, print acceptance evidence, then dispose the client before deleting temporary files. Cleanup begins only after client creation succeeds; disposal failure prevents file removal. Propagate setup, execution and sequential cleanup failures; preserve the provisioned live home. */
 async function runSmoke(configuration: SmokeConfiguration): Promise<void> {
   const temporary = await mkdtemp(path.join(tmpdir(), 'anureo codex smoke '))
   const codexHome = configuration.mode === 'offline' ? path.join(temporary, 'codex-home') : configuration.codexHome

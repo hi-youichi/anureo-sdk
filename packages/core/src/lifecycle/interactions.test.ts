@@ -1,14 +1,15 @@
 // Verifies native interaction settlement contracts; must not implement production policy or session integration.
 import { expect, test } from "bun:test";
 import { InteractionRegistry } from "./interactions";
+import { approveWithNarrowestScope } from "./approval";
 import { deferred } from "./deferred";
 import { HarnessSdkError } from "../errors";
 import type { InteractionRequested, InteractionResponse, InteractionResult } from "@anureo/protocol";
 
 /**
  * Settlement tests use this recorder with optional publication/privacy hooks to gate or fail a phase.
- * The registry invokes those hooks; failures propagate through settlement. Tests own gates and must
- * settle requests or cancelAll to release expiry timers.
+ * The registry invokes publication hooks during settlement and privacy hooks before response
+ * admission. Tests own gates and must settle requests or cancelAll to release expiry timers.
  */
 function harness(overrides: Partial<ConstructorParameters<typeof InteractionRegistry>[1]> = {}, hooks: {
   publish?: ConstructorParameters<typeof InteractionRegistry>[0];
@@ -174,6 +175,24 @@ for (const phase of ["delivery", "publication"] as const) test(`response ${phase
     : { interactionId: "i1", outcome: "responded" }]);
 });
 
+/** Preserve the response path's distinct failure boundary: failed unknown publication never reaches waiter rejection. */
+test("failed unknown publication is cached while the original waiter remains unresolved", async () => {
+  const failure = new Error("publication failed");
+  let deliveries = 0, settled = false;
+  const { registry, published } = harness({}, { publish: async () => { throw failure; } });
+  const observed = registry.begin(approval("i1"), async () => {
+    deliveries++;
+    throw new Error("native delivery failed");
+  });
+  void observed.then(() => { settled = true; }, () => { settled = true; });
+  await expect(registry.respond("i1", "r1", answer)).rejects.toBe(failure);
+  await expect(registry.respond("i1", "r1", answer)).rejects.toBe(failure);
+  expect(settled).toBe(false);
+  expect(deliveries).toBe(1);
+  expect(registry.pendingCount).toBe(0);
+  expect(published).toEqual([{ interactionId: "i1", outcome: "unknown", reason: "RESULT_UNKNOWN" }]);
+});
+
 /** A response deadline abandons observation, publishes unknown and preserves capacity until that deadline. */
 test("response timeout is unknown and late native rejection stays observed", async () => {
   const native = deferred<void>();
@@ -280,4 +299,23 @@ test("cancelAll filters by turn and awaits all cancellation attempts", async () 
     expect(registry.pendingCount).toBe(1);
   } finally { first.resolve(); second.resolve(); await operation; await registry.cancelAll("test_cleanup"); }
   await expect(otherWait).rejects.toMatchObject({ code: "INTERACTION_CANCELLED" });
+});
+
+/** Scope priority beats advertised order; equally scoped grants retain the peer's first choice. */
+test("unattended approval selects the narrowest scope and the first matching option", async () => {
+  const options: Extract<InteractionRequested, { kind: "approval" }>["options"] = [
+    { id: "deny", label: "Deny", semantic: "deny" },
+    { id: "rule", label: "Rule", semantic: "allowWithRule" },
+    { id: "session", label: "Session", semantic: "allowSession" },
+    { id: "once", label: "Once", semantic: "allowOnce" },
+    { id: "once-again", label: "Once again", semantic: "allowOnce" },
+  ];
+  const request = { ...approval("i1"), kind: "approval" as const, options };
+  expect(await approveWithNarrowestScope(request)).toEqual({ kind: "approval", optionId: "once" });
+  request.options = options.slice(0, 3);
+  expect(await approveWithNarrowestScope(request)).toEqual({ kind: "approval", optionId: "session" });
+  request.options = options.slice(0, 2);
+  expect(await approveWithNarrowestScope(request)).toEqual({ kind: "approval", optionId: "rule" });
+  request.options = options.slice(0, 1);
+  await expect(approveWithNarrowestScope(request)).rejects.toThrow("Approval request has no allow option");
 });

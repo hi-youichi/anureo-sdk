@@ -9,6 +9,24 @@ import { defaultRepographEntry, type GraphLoader } from './graph'
 import { refactorCode } from './refactor'
 import { formatReport } from './report'
 
+/** Internal executable entry point; bin/anureo-refactor.ts awaits its result as process.exitCode.
+ * Returns 0 for help/completion, 2 for incomplete runs or caught argument/run/cleanup failures.
+ * Help and argument errors acquire no client; disposal of an acquired client is awaited before this settles.
+ * Orchestration may edit files and start processes. Supplied output callbacks run synchronously,
+ * and an error diagnostic callback that throws still rejects. */
+export async function runCli(args: string[], dependencies: CliDependencies = {}): Promise<number> {
+  const stdout = dependencies.stdout ?? (text => { process.stdout.write(text) })
+  const stderr = dependencies.stderr ?? (text => { process.stderr.write(text) })
+  try {
+    const command = parseCliInput(args, dependencies)
+    if (command.kind === 'help') { stdout(help); return 0 }
+    return await executeRefactor(command, dependencies, { stdout, stderr })
+  } catch (cause) {
+    stderr(`anureo-refactor: ${message(cause)}\n`)
+    return 2
+  }
+}
+
 /** Usage printed by runCli; interpolate the graph default so help and execution paths stay aligned. */
 const help = `Usage: anureo-refactor [repository] [options]
 
@@ -34,17 +52,20 @@ Runs start fresh; partial edits are retained on failure for inspection.
 Exit codes: 0 complete, 2 incomplete/error.
 `
 
-/** Overrides for runCli callers; omitted fields use production factories, paths and streams. */
+/** Internal overrides for runCli tests; omitted fields use production factories, paths and streams. */
 interface CliDependencies {
   /** Factory for the CLI-owned client; runCli awaits disposal even after execution fails. */
   createClient?: (cwd: string) => Promise<Client>
-  /** Substitute graph export without starting the repograph subprocess. */
+  /** Supply a validated graph for the canonical target, finishing exporter cleanup before resolving. */
   graphLoader?: GraphLoader
-  /** Base directory for relative CLI paths; defaults to process.cwd(). */
+  /** Base directory for relative repository and repograph paths; defaults to process.cwd(). */
   cwd?: string
-  /** Model-default environment; adapter-specific environment remains owned by client setup. */
+  /** CODEX_MODEL lookup; defaults to process.env. A supplied object replaces this lookup entirely;
+   * it does not change the environment used to create the client or launch subprocesses. */
   env?: Record<string, string | undefined>
+  /** Synchronous help/report sink; a thrown error enters CLI error reporting. */
   stdout?: (text: string) => void
+  /** Synchronous progress/error sink; progress errors are recorded, error-reporting throws may reject runCli. */
   stderr?: (text: string) => void
 }
 
@@ -95,7 +116,10 @@ async function executeRefactor(command: RefactorCommand, dependencies: CliDepend
     })
     stdout(values.json ? `${JSON.stringify(report, null, 2)}\n` : formatReport(report))
     return report.status === 'incomplete' ? 2 : 0
-  } catch (cause) { failed = true; throw cause }
+  } catch (cause) {
+    failed = true
+    throw cause
+  }
   finally {
     try { await client.dispose() }
     catch (cause) {
@@ -103,22 +127,5 @@ async function executeRefactor(command: RefactorCommand, dependencies: CliDepend
       if (!failed) throw cause
       stderr(`anureo-refactor: cleanup failed: ${message(cause)}\n`)
     }
-  }
-}
-
-/** CLI/executable entry point: parse args, execute once, print output and return an exit code.
- * Returns 0 for help/completion, 2 for incomplete runs or caught argument/run/cleanup failures.
- * Owns the created client; orchestration may edit files and start processes. Supplied output
- * callbacks run synchronously, and an error diagnostic callback that throws still rejects. */
-export async function runCli(args: string[], dependencies: CliDependencies = {}): Promise<number> {
-  const stdout = dependencies.stdout ?? (text => { process.stdout.write(text) })
-  const stderr = dependencies.stderr ?? (text => { process.stderr.write(text) })
-  try {
-    const command = parseCliInput(args, dependencies)
-    if (command.kind === 'help') { stdout(help); return 0 }
-    return await executeRefactor(command, dependencies, { stdout, stderr })
-  } catch (cause) {
-    stderr(`anureo-refactor: ${message(cause)}\n`)
-    return 2
   }
 }

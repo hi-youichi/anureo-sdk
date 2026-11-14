@@ -56,9 +56,9 @@ test('tool calls become toolCall items with output and file changes', async () =
   const f = await fixture()
   try {
     f.host.script = async host => {
-      await host.toolRound('call-1', 'bash', { command: 'ls' }, 'a.txt')
-      await host.toolRound('call-2', 'edit', { path: 'a.txt', edits: [{ oldText: 'a', newText: 'b' }] }, 'ok')
-      await host.toolRound('call-3', 'read', { path: 'nope' }, 'ENOENT', true)
+      await host.toolRound({ id: 'call-1', name: 'bash', args: { command: 'ls' }, output: 'a.txt' })
+      await host.toolRound({ id: 'call-2', name: 'edit', args: { path: 'a.txt', edits: [{ oldText: 'a', newText: 'b' }] }, output: 'ok' })
+      await host.toolRound({ id: 'call-3', name: 'read', args: { path: 'nope' }, output: 'ENOENT', isError: true })
       await host.assistant('finished')
     }
     const turn = await observe(f.session.submit({ input: 'tools' }))
@@ -108,7 +108,7 @@ test('input consumed by an extension is accepted without being reported as queue
 test('interrupt aborts native work and the turn ends as interrupted', async () => {
   const f = await fixture()
   try {
-    f.host.script = async host => { await host.toolRound('c1', 'bash', { command: 'sleep' }, ''); await host.hold() }
+    f.host.script = async host => { await host.toolRound({ id: 'c1', name: 'bash', args: { command: 'sleep' }, output: '' }); await host.hold() }
     const turn = await observe(f.session.submit({ input: 'long' }))
     await until(() => f.events.some(e => e.type === 'item/started' && e.payload.item.type === 'toolCall'))
     const receipt = await f.session.interrupt()
@@ -194,7 +194,7 @@ test('config changes apply to Pi and invalid values leave the previous one', asy
 test('history is ordered, paged and pairs tool results with their calls', async () => {
   const f = await fixture()
   try {
-    f.host.script = async host => { await host.toolRound('c1', 'bash', { command: 'ls' }, 'out'); await host.assistant('all done') }
+    f.host.script = async host => { await host.toolRound({ id: 'c1', name: 'bash', args: { command: 'ls' }, output: 'out' }); await host.assistant('all done') }
     await (await f.session.submit({ input: 'first' })).result()
     await (await f.session.submit({ input: 'second' })).result()
     const page = await request(f.session, 'history/read', { limit: 3 })
@@ -262,7 +262,7 @@ test('compaction surfaces as notices outside a turn and as items inside one, and
 test('configured secrets are redacted from events and history', async () => {
   const f = await fixture({ secrets: ['TOPSECRET'] })
   try {
-    f.host.script = async host => { await host.toolRound('c1', 'bash', { command: 'echo TOPSECRET' }, 'TOPSECRET printed'); await host.assistant('the key is TOPSECRET') }
+    f.host.script = async host => { await host.toolRound({ id: 'c1', name: 'bash', args: { command: 'echo TOPSECRET' }, output: 'TOPSECRET printed' }); await host.assistant('the key is TOPSECRET') }
     await (await f.session.submit({ input: 'go' })).result()
     const history = await request(f.session, 'history/read', {})
     expect(JSON.stringify(f.events)).not.toContain('TOPSECRET')

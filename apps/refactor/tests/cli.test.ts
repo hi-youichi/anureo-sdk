@@ -118,8 +118,9 @@ test('graph adapter invokes the real subprocess interface and reads its JSON', a
   expect(graph.nodes[0]?.filePath).toBe('main.ts')
 })
 
-/** Launch the installed entry outside its target, then compare stdout with the persisted report.
- * Temporary repositories are fixture-owned; executable failures/timeouts reject the test. */
+/** Launch the installed entry outside its target with scripted Codex/repograph executables, then
+ * compare stdout with the persisted report. Temporary repositories are fixture-owned;
+ * executable failures/timeouts reject the test. No model calls or live indexing are involved. */
 test('installed CLI entry runs from an unrelated cwd through real Codex and graph process boundaries', async () => {
   const target = await temporary()
   const outside = await temporary()

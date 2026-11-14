@@ -3,6 +3,7 @@ import { createClient } from '@anureo/sdk'
 import { createScriptedAdapter } from '@anureo/conformance'
 import { AcpUpdateMapper, mcp } from '../src/mapping'
 import type { SessionState } from '@anureo/protocol'
+import type { SessionEventSink } from '@anureo/sdk'
 
 test('http and stdio MCP servers map to explicit native ACP entries', () => {
   expect(mcp([
@@ -77,4 +78,29 @@ test('ACP idle metadata patches preserve absent titles and explicitly clear, wit
     expect((await reader.next()).value).toMatchObject({ type: 'session/metadata', payload: { title: null } })
     expect(sink.snapshot).toMatchObject({ metadata: { title: null }, status: 'ready' })
   } finally { await reader.return?.(); await client.dispose() }
+})
+
+test('metadata publication failure rejects after applying the title patch', async () => {
+  const failure = new Error('publication failed')
+  const state = { metadata: { title: 'Before' } } as SessionState
+  let publications = 0
+  const sink = {
+    emit: async () => {
+      publications++
+      expect(state.metadata?.title).toBe('After')
+      throw failure
+    },
+  } as unknown as SessionEventSink
+  const mapper = new AcpUpdateMapper(
+    sink,
+    () => undefined,
+    () => state,
+    data => { state.metadata = { title: data.sessionTitle as string | null } },
+    false,
+  )
+  await expect(mapper.update({ sessionUpdate: 'session_info_update', title: 'After' })).rejects.toBe(failure)
+  expect(state.metadata?.title).toBe('After')
+  // Publication failure does not roll back the native state or make equal titles emit again.
+  await mapper.update({ sessionUpdate: 'session_info_update', title: 'After' })
+  expect(publications).toBe(1)
 })

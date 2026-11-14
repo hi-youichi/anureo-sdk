@@ -33,3 +33,21 @@ test('structured hunks without diff markers cannot prove positions and fall back
   expect(result.completeness).toBe('complete')
   expect(result.materials).toMatchObject([{ format: 'text', scope: 'fragment', oldText: 'old', newText: 'new' }])
 })
+
+test('file evidence keeps result precedence and distinguishes unsupported tools from missing paths', () => {
+  expect(claudeFileChanges('Bash', { file_path: 'input' })).toBeUndefined()
+  expect(claudeFileChanges('Edit', {})).toEqual([])
+  expect(claudeFileChanges('Write', { file_path: 'input' }, {
+    filePath: 'output', patch: '', oldText: null, newText: 'new',
+    type: 'create', content: 'contents', originalFile: null,
+    structuredPatch: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 1, lines: ['+new'] }],
+  })).toEqual([{ path: 'output', operation: 'modify', materials: [{ format: 'unified', patch: '' }], completeness: 'complete' }])
+})
+
+test.each(['declined', 'interrupted'] as const)('tool results preserve %s status and prefer structured evidence', status => {
+  const previous = { id: 'write', type: 'toolCall' as const, kind: 'fileChange' as const, title: 'Write', input: { file_path: 'a' }, status }
+  const content = { patch: 'less authoritative' }
+  const item = completeClaudeTool(previous, { is_error: true, content, structuredContent: { oldText: null, newText: 'created' } })
+  expect(item).toMatchObject({ status, output: content, fileChanges: [{ operation: 'add', materials: [{ scope: 'file', oldText: null, newText: 'created' }] }] })
+  expect(previous).toEqual({ id: 'write', type: 'toolCall', kind: 'fileChange', title: 'Write', input: { file_path: 'a' }, status })
+})

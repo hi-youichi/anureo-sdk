@@ -2,6 +2,7 @@
 // Mirrors what `dsh --profile acp` advertises on initialize so the adapter's
 // capability mapping and policy paths can be tested without a model account.
 import { createInterface } from 'node:readline';
+import { createRequester } from './jsonrpc.mjs';
 
 const flag = (name) => process.argv.includes(name);
 const value = (name, fallback) => (process.argv.includes(name) ? process.argv[process.argv.indexOf(name) + 1] : fallback);
@@ -17,11 +18,7 @@ const update = (sessionId, update) => send({ method: 'session/update', params: {
 const promptResponseIdsBySession = new Map();
 let nextId = 0;
 const pendingAgentRequestsById = new Map();
-const request = (method, params) => new Promise((resolve, reject) => {
-  const id = `agent:${++nextId}`;
-  pendingAgentRequestsById.set(id, { resolve, reject });
-  send({ id, method, params });
-});
+const request = createRequester(send, pendingAgentRequestsById, () => ++nextId);
 
 const createDefaultConfigOptions = () => [
   {
@@ -50,6 +47,7 @@ if (unsupportedNode) {
 const lines = createInterface({ input: process.stdin });
 lines.on('line', (line) => { void handle(JSON.parse(line)); });
 
+/** Settle outbound request replies or script standard ACP requests; held permission prompts remain active after cancel. */
 async function handle(frame) {
   if (!frame.method && pendingAgentRequestsById.has(frame.id)) {
     const wait = pendingAgentRequestsById.get(frame.id);

@@ -107,9 +107,9 @@ Missing or invalid structured output fails the turn with
 Native correction-limit exhaustion maps to
 `CLAUDE_STRUCTURED_OUTPUT_RETRIES_EXCEEDED`; interruption remains `interrupted`.
 The adapter never resubmits the task to repair output or recover a failed switch.
-When a session store is available, history also exposes saved validated output
+When a session store is available, history also exposes saved structured-output
 attachments linked to surviving `StructuredOutput` calls, including after resume
-or fork.
+or fork. Reading these saved attachments does not rerun schema validation.
 
 ## Exports
 
@@ -126,6 +126,17 @@ Resume, fork, and history need the official `SessionStore` contract. `FileSessio
 ### Model catalog
 
 `createClaudeCatalogSession(options)` opens a prompt-less connection to list supported models (including effort levels per model) without creating a product session; `adapter.listModels(cwd)` is the one-shot variant.
+
+## Code structure
+
+| Path | Responsibility |
+|---|---|
+| [`src/index.ts`](src/index.ts) | Assembles the application factories, adapter types, store and catalog exports. |
+| [`src/adapter.ts`](src/adapter.ts) | Implements the native adapter and its backend sessions, including input, events and query lifecycle. `ClaudeBackendSession` remains exported for compatibility; the adapter constructs it. |
+| [`src/options.ts`](src/options.ts) | Defines host launch options and query-factory extension contracts shared with catalog discovery. Hosts supply these contracts; adapter and catalog operations invoke the factories and close their queries. |
+| [`src/catalog.ts`](src/catalog.ts) | Owns reusable prompt-less discovery queries and cancellation, sharing adapter launch options through `queryOptions()`. |
+| [`src/store.ts`](src/store.ts) | Implements the public opaque session store used for resume, fork and history. |
+| [`src/file-changes.ts`](src/file-changes.ts), [`src/output-schema.ts`](src/output-schema.ts), [`src/turn-error.ts`](src/turn-error.ts) | Project native file changes, validate structured output and classify terminal failures. |
 
 ## Configuration options
 

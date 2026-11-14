@@ -6,6 +6,7 @@ const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const schemaProbe = process.env.FAKE_SCHEMA_PROBE === '1';
 // Configuring a catalog log also enables dynamic catalog probe responses.
 const catalogProbe = Boolean(process.env.FAKE_CATALOG_LOG);
+/** Read either CLI spelling so schema probes preserve the SDK's fresh/resume session identity. */
 const nativeArg = (flag) => {
   const index = process.argv.indexOf(flag);
   if (index >= 0) {

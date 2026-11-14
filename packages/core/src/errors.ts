@@ -6,8 +6,6 @@
  * uncertain native outcomes so consumers can assess whether retrying might duplicate work.
  */
 export class HarnessSdkError extends Error {
-  /** Stable discriminator for consumers that cannot use instanceof across package boundaries. */
-  readonly name = "HarnessSdkError";
   /**
    * Hosts, adapters and SDK policy checks supply a code and optional safe diagnostics. Store them
    * without validation, cloning or I/O; creating an error neither retries work nor releases resources.
@@ -24,6 +22,8 @@ export class HarnessSdkError extends Error {
     /** Already-sanitized structured diagnostics supplied by the owning subsystem. */
     readonly details?: Record<string, unknown>,
   ) { super(message); }
+  /** Stable discriminator for consumers that cannot use instanceof across package boundaries. */
+  readonly name = "HarnessSdkError";
 }
 
 /**
@@ -36,7 +36,7 @@ export class HarnessSdkError extends Error {
  *
  * Called by:
  * - Session.onRequestFailed to choose recovery state and publish safe submission failure status.
- * - InteractionRegistry.respond to classify responder/publication failures before publishing an
+ * - InteractionRegistry.deliverResponse to classify responder/publication failures before publishing an
  *   unknown outcome or rejecting waiters; the registry still owns publication and state transitions.
  * - checkRelease in structured-output/errors to throw safe failures after cleanup attempts settle.
  * Public consumers can apply the same normalization; callers own propagation, retries and cleanup.

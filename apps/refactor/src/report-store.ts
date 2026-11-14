@@ -3,7 +3,8 @@ import { rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { RefactorReport } from './results'
 
-/** Publish the supplied report as newline-terminated JSON for lifecycle/checkpoint callers.
+/** Internal snapshot writer awaited by checkpointStep and prepareModules before advancing phases,
+ * and by finalizeRun before lock release. Resolves after renaming newline-terminated JSON into place.
  * A sibling temporary file keeps readers on the previous complete snapshot until rename succeeds.
  * The run directory must already exist and callers must serialize writes under the writer lock:
  * the fixed temporary path cannot support concurrent saves. Serialization/filesystem errors reject

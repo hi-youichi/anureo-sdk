@@ -1,3 +1,4 @@
+/** Adapter acceptance runners and injectable fixtures for SDK, adapter and application tests. */
 export * from "./fake";
 export * from "./suite";
 export * from "./fixtures";

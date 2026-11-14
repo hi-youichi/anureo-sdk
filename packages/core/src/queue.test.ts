@@ -269,3 +269,40 @@ test("filter failure ends only its own subscription after buffered values drain"
   hub.end();
   expect((await sibling.next()).done).toBe(true);
 });
+
+/** A clone failure must close only the accepting observer, retaining its admitted data and allowing a filtered sibling to receive later events. */
+test("clone failure preserves buffered drain and isolates the accepting subscriber", async () => {
+  const hub = new EventHub<{ value: number; uncloneable?: () => void }>();
+  const failed = hub.subscribe();
+  const sibling = hub.subscribe({}, value => !value.uncloneable);
+  hub.publish({ value: 1 });
+  hub.publish({ value: 2, uncloneable: () => {} });
+  expect((await failed.next()).value).toEqual({ value: 1 });
+  await expect(failed.next()).rejects.toMatchObject({ name: "DataCloneError" });
+
+  hub.publish({ value: 3 });
+  expect((await sibling.next()).value).toEqual({ value: 1 });
+  expect((await sibling.next()).value).toEqual({ value: 3 });
+  hub.end();
+  expect((await sibling.next()).done).toBe(true);
+});
+
+/** Throw into observers with a blocked read or retained data; cancellation must release them before rejecting with the supplied cause, without affecting a sibling. */
+test("throwing into subscriptions completes blocked reads and skips buffered values", async () => {
+  const hub = new EventHub<number>();
+  const blocked = hub.subscribe();
+  const buffered = hub.subscribe();
+  const sibling = hub.subscribe();
+  const pending = blocked.next();
+  const failure = new Error("consumer failed");
+  await expect(blocked.throw?.(failure)).rejects.toBe(failure);
+  expect((await pending).done).toBe(true);
+
+  hub.publish(1);
+  await expect(buffered.throw?.(failure)).rejects.toBe(failure);
+  expect((await blocked.next()).done).toBe(true);
+  expect((await buffered.next()).done).toBe(true);
+  expect((await sibling.next()).value).toBe(1);
+  hub.end();
+  expect((await sibling.next()).done).toBe(true);
+});

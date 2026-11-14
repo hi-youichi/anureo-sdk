@@ -1,8 +1,11 @@
+/** Scripted native-lifecycle peer for real-stdio tests, including old-contract and early-terminal modes. */
 import { createInterface } from 'node:readline';
 const input = createInterface({ input: process.stdin });
 let binding, seq = 0, hasStartedTurn = false;
 const capabilities = { input: { delivery: ['native'], interrupt: { targets: ['session'], reportsPendingInputs: false } } };
+/** Write one newline-delimited RPC frame; stdout is reserved for protocol traffic. */
 const send = value => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\n');
+/** Publish with the fixture stream sequence; item events belong to its fixed native execution. */
 const event = (type, payload) => {
   const params = {
     sessionId: binding.sessionId,

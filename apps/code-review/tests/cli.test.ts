@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import { realpath } from 'node:fs/promises'
 import { HarnessSdkError } from '@anureo/sdk'
 import { createScriptedAdapter } from '@anureo/conformance'
 import type { ApprovalOption } from '@anureo/protocol'
@@ -81,6 +82,19 @@ test('CLI selects the requested harness and defaults to codex', async () => {
   expect(unknown.read().stderr).toContain('Available: codex, claude, hermes, pi')
 })
 
+test('directory preflight failures never initialize a backend', async () => {
+  const { cwd } = await fixture()
+  const canonicalFile = await realpath(`${cwd}/a.ts`)
+  const io = output()
+  let opened = 0
+  const dependencies = { ...io, createClient: async () => { opened++; throw new Error('Must not open') } }
+  expect(await runCli([`${cwd}/a.ts`], dependencies)).toBe(2)
+  expect(io.read().stderr).toContain(`Review directory is not a directory: ${canonicalFile}`)
+  expect(await runCli([`${cwd}/missing`], dependencies)).toBe(2)
+  expect(io.read().stdout).toBe('')
+  expect(opened).toBe(0)
+})
+
 test.each([
   { flags: ['--max-modules', '1'], moduleId: 'a' },
   { flags: ['--module', 'b'], moduleId: 'b' },
@@ -149,6 +163,60 @@ test('partial reviews retain failed coverage in JSON and exit 2', async () => {
   expect(report.status).toBe('incomplete')
   expect(report.modules[0].review.angles[0].status).toBe('failed')
   expect(adapter.disposeCount).toBe(1)
+})
+
+test('CLI retains progress callback errors in the report and still disposes its client', async () => {
+  const { client, cwd, adapter } = await fixture()
+  const io = output()
+  expect(await runCli([cwd, '--json'], {
+    stdout: io.stdout, stderr: () => { throw new Error('Progress output failed') }, createClient: async () => client,
+  })).toBe(0)
+  const report = JSON.parse(io.read().stdout)
+  expect(report.status).toBe('completed')
+  expect(report.progressErrors.length).toBeGreaterThan(0)
+  expect(report.progressErrors.every((error: { message: string }) => error.message === 'Progress output failed')).toBe(true)
+  expect(adapter.disposeCount).toBe(1)
+})
+
+test('CLI prints the report before disposal and waits for disposal before returning', async () => {
+  const { client, cwd, adapter } = await fixture()
+  const io = output()
+  const dispose = client.dispose.bind(client)
+  const disposalStarted = Promise.withResolvers<void>()
+  const finishDisposal = Promise.withResolvers<void>()
+  client.dispose = async () => { disposalStarted.resolve(); await finishDisposal.promise; await dispose() }
+  let settled = false
+  const pending = runCli([cwd, '--json'], { ...io, createClient: async () => client })
+  pending.then(() => { settled = true }, () => { settled = true })
+  try {
+    await disposalStarted.promise
+    await new Promise<void>(resolve => setImmediate(resolve))
+    expect(JSON.parse(io.read().stdout).status).toBe('completed')
+    expect(settled).toBe(false)
+    expect(adapter.disposeCount).toBe(0)
+    finishDisposal.resolve()
+    expect(await pending).toBe(0)
+    expect(adapter.disposeCount).toBe(1)
+  } finally {
+    finishDisposal.resolve()
+    await pending
+    client.dispose = dispose
+  }
+})
+
+test.each([false, true])('report-output failures still dispose the client (cleanup fails: %s)', async cleanupFails => {
+  const { client, cwd, adapter } = await fixture()
+  const dispose = client.dispose.bind(client)
+  client.dispose = async () => { await dispose(); if (cleanupFails) throw new Error('Cleanup failed') }
+  const io = output()
+  try {
+    expect(await runCli([cwd, '--json'], {
+      stdout: () => { throw new Error('Report output failed') }, stderr: io.stderr, createClient: async () => client,
+    })).toBe(2)
+    expect(io.read().stderr).toContain('anureo-review: Report output failed')
+    if (cleanupFails) expect(io.read().stderr).toContain('anureo-review: client cleanup failed: Cleanup failed')
+    expect(adapter.disposeCount).toBe(1)
+  } finally { client.dispose = dispose }
 })
 
 test('analysis failures and cleanup errors dispose the client and exit 2', async () => {

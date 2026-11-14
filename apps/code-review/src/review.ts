@@ -1,104 +1,87 @@
-import { execFile } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { promisify } from 'node:util'
+// Coordinates analysis, module review, serialized fixes and final verification.
 import { realpath, stat } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { HarnessSdkError, type Client } from '@anureo/sdk'
+import { HarnessSdkError } from '@anureo/sdk'
 import { agent, parallel, workflow } from '@anureo/workflow'
-import { defaultAngles, type ReviewAngle } from './angles'
 import { reviewFailure, type ReviewFailure } from './errors'
-import { fixFindings, type FixReport } from './fix'
+import { fixFindings } from './fix'
 import { DEFAULT_WORKFLOW_DIRECTORY } from './paths'
 import { buildAnalysisPrompt, readOnlyInstructions } from './prompts'
 import { createReviewSchedule, failedModuleReview, reviewModule, type ReviewExecutionOptions, type Schedule } from './review-execution'
-import { modulePlanSchema, type Finding, type ModulePlan, type ReviewModule } from './schema'
+import { modulePlanSchema, type ModulePlan, type ReviewModule } from './schema'
 import { validateOutput, validatePlan } from './validation'
+import { readGitStateFingerprint } from './git-state'
+import { validateReviewOptions, type ReviewOptions } from './options'
+import type { FixReport, ModuleOutcome, ModuleReview, ReviewReport } from './results'
 
+// Preserve direct source imports while shared contracts have independent owners.
 export type { ReviewFailure } from './errors'
+export { DEFAULT_REVIEW_CONCURRENCY } from './options'
+export type { ReviewOptions } from './options'
+export type { ReviewProgress } from './progress'
+export type { AngleReview, ModuleReview, ModuleOutcome, ReviewReport } from './results'
 
-export const DEFAULT_REVIEW_CONCURRENCY = 8
-
-export type AngleReview = { angle: ReviewAngle } & (
-  | { status: 'completed'; findings: Finding[] }
-  | { status: 'failed'; error: ReviewFailure }
-)
-
-export interface ModuleReview {
-  module: ReviewModule
-  angles: AngleReview[]
+/** Analyze source modules, review selected angles and optionally fix and recheck the final tree.
+ * Resolves after workflow persistence and agent cleanup; requested fixes can leave partial edits.
+ * Invalid preflight, analysis and workflow failures reject; returned angle/fix failures retain
+ * incomplete coverage. Synchronous observer exceptions are collected in progressErrors.
+ * Await completion or rejection before disposing the supplied client; inspect any partial fix edits. */
+export async function reviewCode(options: ReviewOptions): Promise<ReviewReport> {
+  const progressErrors: ReviewFailure[] = []
+  const prepared = await prepareReview({ ...options, onProgress: event => {
+    try { options.onProgress?.(event) }
+    catch (cause) { progressErrors.push(reviewFailure(cause)) }
+  } })
+  const { execution, fixRequested, moduleIds, maxModules } = prepared
+  // Bump revision when the persisted input/checkpoint contract changes.
+  // sourceVersion carries the Git state fingerprint; backendConfiguration remains reserved.
+  const completed = await workflow({
+    name: 'code-review', revision: '7', directory: execution.directory, input: prepared.workflowInput,
+  }, async (run): Promise<ReviewReport> => {
+    execution.onProgress?.({ stage: 'workflow', status: 'started', runId: run.runId, directory: execution.directory })
+    const plan = await analyzeModules(execution, prepared.analysisPrompt)
+    const selectedModules = selectModules(plan, moduleIds, maxModules)
+    const schedule = createReviewSchedule(execution.concurrency)
+    const runFix = fixRequested ? createFixRunner(execution, schedule, options.fixPermissionMode) : null
+    const outcomes = await reviewModules({ execution, modules: selectedModules, schedule, runFix })
+    await verifyFinalTree({ execution, outcomes, schedule })
+    return buildReviewReport({ runId: run.runId, execution, plan, selectedModules, outcomes, progressErrors })
+  })
+  return { ...completed.result, status: completed.status === 'incomplete' ? 'incomplete' : completed.result.status }
 }
 
-/** A module's original review, incremental fix, and final verification.
- * Fixes start as modules finish reviewing. Verification runs after all fixes settle. */
-export interface ModuleOutcome {
-  review: ModuleReview
-  /** Null when no fix was requested. */
-  fix: FixReport | null
-  /** Review of the final tree, including dependency changes from other modules.
-   * Null unless at least one module's fix was applied. */
-  verification: ModuleReview | null
+/** Await every module lifecycle, including queued fixes, before returning plan-ordered coverage.
+ * A rejected lifecycle becomes failed module coverage; workflow fatal state is handled by workflow. */
+async function reviewModules({ execution, modules, schedule, runFix }: Omit<LifecycleOptions, 'module'> & {
+  modules: readonly ReviewModule[]
+}): Promise<ModuleOutcome[]> {
+  const results = await parallel(modules.map(module => () => reviewModuleLifecycle({ execution, module, schedule, runFix })))
+  return modules.map((module, index) => results[index] ?? {
+    review: failedModuleReview(execution, module, `Module task for ${module.id} failed before producing a result`),
+    fix: null, verification: null,
+  })
 }
 
-export interface ReviewReport {
-  runId: string
-  workflowDirectory: string
-  cwd: string
-  /** 'completed' only when every module's review/verification angles completed
-   * and its fix (if requested) did not fail; engine-level interruption also
-   * downgrades to 'incomplete'. */
-  status: 'completed' | 'incomplete'
-  plan: ModulePlan
-  scope: { moduleIds: string[]; angleIds: string[] }
-  modules: ModuleOutcome[]
-  /** Errors thrown by onProgress. Observers do not change execution outcomes. */
-  progressErrors: ReviewFailure[]
-  /** Findings from final verification when any fix was applied, otherwise
-   * from the original reviews. */
-  findingCount: number
-}
-
-export type ReviewProgress =
-  | { stage: 'workflow'; status: 'started'; runId: string; directory: string }
-  | { stage: 'analysis'; status: 'started' | 'completed' }
-  | { stage: 'review' | 'verification'; status: 'started' | 'completed' | 'failed'; moduleId: string; angleId: string }
-  | { stage: 'fix'; status: 'started' | 'completed' | 'failed' | 'skipped'; moduleId: string }
-
-export interface ReviewOptions {
-  client: Client
-  cwd: string
-  model?: string
-  focus?: string
-  angles?: readonly ReviewAngle[]
-  /** Review only these exact IDs from the analyzed module plan. */
-  moduleIds?: readonly string[]
-  /** Review at most this many selected modules, in plan order. */
-  maxModules?: number
-  /** Fix each module's findings as soon as its review completes, then re-review
-   * the selected scope after all fixes settle. Defaults to false. */
-  fix?: boolean
-  /** Session permission mode for the fix agent (edits and checks). Harness-specific; see fixPermissionMode(). */
-  fixPermissionMode?: string
-  /** Shared limit across all modules, angles, and fix agents; defaults to DEFAULT_REVIEW_CONCURRENCY. */
-  concurrency?: number
-  /** Durable run storage. Defaults to <cwd>/.anureo/workflows. */
-  workflowDirectory?: string
-  /** Observational only: thrown errors are collected in the report's progressErrors. */
-  onProgress?: (event: ReviewProgress) => void
-}
-
-const execReview = promisify(execFile)
-
-/** Content-state fingerprint (HEAD + porcelain status). Null outside a git repository. */
-async function readGitStateFingerprint(cwd: string): Promise<string | null> {
-  try {
-    const head = await execReview('git', ['-C', cwd, 'rev-parse', 'HEAD'], { maxBuffer: 1 << 24 })
-    const status = await execReview('git', ['-C', cwd, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], { maxBuffer: 1 << 24 })
-    return createHash('sha256').update(head.stdout).update('\0').update(status.stdout).digest('hex')
-  } catch {
-    return null
+/** Recheck all selected modules only after an applied fix, since edits can affect unchanged callers.
+ * reviewCode calls this after reviewModules drains every writer. Capture one final provenance value
+ * and fill verification slots in place, preserving coverage even when a verification task rejects. */
+async function verifyFinalTree({ execution, outcomes, schedule }: {
+  execution: ReviewExecutionOptions
+  outcomes: ModuleOutcome[]
+  schedule: Schedule
+}): Promise<void> {
+  if (!outcomes.some(outcome => outcome.fix?.status === 'applied')) return
+  const finalExecution = { ...execution, sourceVersion: await readGitStateFingerprint(execution.cwd) }
+  const verifications = await parallel(outcomes.map(outcome => () => reviewModule({
+    options: finalExecution, module: outcome.review.module, phase: 'verification', schedule, previous: outcome.review,
+  })))
+  for (const [index, outcome] of outcomes.entries()) {
+    outcome.verification = verifications[index] ?? failedModuleReview(execution, outcome.review.module,
+      `Verification task for ${outcome.review.module.id} failed before producing a result`)
   }
 }
 
+/** Select plan entries in plan order, rejecting unknown requested IDs before review agents run. */
 function selectModules(plan: ModulePlan, moduleIds: readonly string[] | undefined, maxModules: number | undefined): ReviewModule[] {
   const available = new Set(plan.modules.map(module => module.id))
   const unknown = moduleIds?.filter(id => !available.has(id)) ?? []
@@ -109,30 +92,8 @@ function selectModules(plan: ModulePlan, moduleIds: readonly string[] | undefine
   return maxModules === undefined ? selected : selected.slice(0, maxModules)
 }
 
-function validateReviewOptions(options: ReviewOptions) {
-  const fixRequested = options.fix ?? false
-  const concurrency = options.concurrency ?? DEFAULT_REVIEW_CONCURRENCY
-  if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error('concurrency must be a positive safe integer')
-  const maxModules = options.maxModules
-  if (maxModules !== undefined && (!Number.isSafeInteger(maxModules) || maxModules < 1)) throw new Error('maxModules must be a positive safe integer')
-  const moduleIds = options.moduleIds ? [...options.moduleIds] : undefined
-  if (moduleIds && (moduleIds.length === 0 || moduleIds.some(id => !id.trim()) || new Set(moduleIds).size !== moduleIds.length)) {
-    throw new Error('moduleIds must contain unique nonempty module ids')
-  }
-  if (moduleIds && moduleIds.some(id => Buffer.byteLength(id) > 256)) {
-    throw new Error('moduleIds must be at most 256 bytes each (workflow step-key limit)')
-  }
-  const angles = (options.angles ?? defaultAngles).map(angle => ({ ...angle }))
-  if (angles.length === 0 || angles.some(angle => !angle.id.trim() || !angle.title.trim() || !angle.instructions.trim())
-    || new Set(angles.map(angle => angle.id)).size !== angles.length) {
-    throw new Error('Review angles must have unique nonempty ids and nonempty titles and instructions')
-  }
-  if (angles.some(angle => Buffer.byteLength(angle.id) > 256)) {
-    throw new Error('Review angle ids must be at most 256 bytes (workflow step-key limit)')
-  }
-  return { fixRequested, concurrency, maxModules, moduleIds, angles }
-}
-
+/** Validate selections, resolve the source directory and capture prompt provenance before starting
+ * the workflow. Filesystem/option failures reject without acquiring agent sessions. */
 async function prepareReview(options: ReviewOptions) {
   const selection = validateReviewOptions(options)
   const { fixRequested, concurrency, maxModules, moduleIds, angles } = selection
@@ -153,6 +114,8 @@ async function prepareReview(options: ReviewOptions) {
   } }
 }
 
+/** Await one analysis agent and filesystem validation, then return the normalized plan. Missing
+ * output and agent/validation failures reject the workflow before module dispatch. */
 async function analyzeModules(execution: ReviewExecutionOptions, prompt: string): Promise<ModulePlan> {
   execution.onProgress?.({ stage: 'analysis', status: 'started' })
   const analysis = await agent(prompt, {
@@ -164,8 +127,9 @@ async function analyzeModules(execution: ReviewExecutionOptions, prompt: string)
   return plan
 }
 
-/** Serialize writers before acquiring agent capacity, leaving queued fixes out
- * of the shared permit pool. A failed fix stops subsequent writers. */
+/** Supply reviewModuleLifecycle with a fix queue ordered by review completion. Acquire agent
+ * capacity only at the queue head so queued writers leave permits available for reviews. A failed result or
+ * rejection skips later writers; the current caller receives the original result or rejection. */
 function createFixRunner(execution: ReviewExecutionOptions, schedule: Schedule, permissionMode?: string) {
   let tail: Promise<void> = Promise.resolve()
   let stoppedBy: string | undefined
@@ -204,12 +168,14 @@ interface LifecycleOptions {
  * for every writer, since modules can read and depend on one another's files. */
 async function reviewModuleLifecycle(options: LifecycleOptions): Promise<ModuleOutcome> {
   const { execution, module, schedule, runFix } = options
-  const review = await reviewModule({ ...execution, sourceVersion: await readGitStateFingerprint(execution.cwd) },
-    module, 'review', schedule, undefined)
+  const review = await reviewModule({
+    options: { ...execution, sourceVersion: await readGitStateFingerprint(execution.cwd) }, module, phase: 'review', schedule,
+  })
   const fix = runFix ? await runFix(review) : null
   return { review, fix, verification: null }
 }
 
+/** Require completed angle coverage and no failed fix; a skipped fix alone does not fail the outcome. */
 function moduleOutcomeComplete(outcome: ModuleOutcome): boolean {
   const anglesComplete = (review: ModuleReview) => review.angles.every(angle => angle.status === 'completed')
   return anglesComplete(outcome.review)
@@ -217,6 +183,8 @@ function moduleOutcomeComplete(outcome: ModuleOutcome): boolean {
     && outcome.fix?.status !== 'failed'
 }
 
+/** Assemble plan-ordered outcomes and count findings from the authoritative pass: final verification
+ * after any applied fix, otherwise the original reviews. Does not publish or mutate outcomes. */
 function buildReviewReport(input: {
   runId: string
   execution: ReviewExecutionOptions
@@ -226,8 +194,7 @@ function buildReviewReport(input: {
   progressErrors: ReviewFailure[]
 }): ReviewReport {
   const { runId, execution, plan, selectedModules, outcomes, progressErrors } = input
-  const findingCount = outcomes.reduce((count, outcome) => count + (outcome.verification ?? outcome.review).angles.reduce(
-    (sum, angle) => sum + (angle.status === 'completed' ? angle.findings.length : 0), 0), 0)
+  const findingCount = outcomes.reduce((count, outcome) => count + countFindings(outcome.verification ?? outcome.review), 0)
   return {
     runId, workflowDirectory: execution.directory, cwd: execution.cwd, plan, modules: outcomes, progressErrors,
     scope: { moduleIds: selectedModules.map(module => module.id), angleIds: execution.angles.map(angle => angle.id) },
@@ -235,42 +202,7 @@ function buildReviewReport(input: {
   }
 }
 
-/** Analyze once, fix modules incrementally, then verify the final selected scope. */
-export async function reviewCode(options: ReviewOptions): Promise<ReviewReport> {
-  const progressErrors: ReviewFailure[] = []
-  const prepared = await prepareReview({ ...options, onProgress: event => {
-    try { options.onProgress?.(event) }
-    catch (cause) { progressErrors.push(reviewFailure(cause)) }
-  } })
-  const { execution, fixRequested, moduleIds, maxModules } = prepared
-  // Bump revision when the persisted input/checkpoint contract changes.
-  // sourceVersion carries the Git state fingerprint; backendConfiguration remains reserved.
-  const completed = await workflow({
-    name: 'code-review', revision: '7', directory: execution.directory, input: prepared.workflowInput,
-  }, async (run): Promise<ReviewReport> => {
-    execution.onProgress?.({ stage: 'workflow', status: 'started', runId: run.runId, directory: execution.directory })
-    const plan = await analyzeModules(execution, prepared.analysisPrompt)
-    const selectedModules = selectModules(plan, moduleIds, maxModules)
-    const schedule = createReviewSchedule(execution.concurrency)
-    const runFix = fixRequested ? createFixRunner(execution, schedule, options.fixPermissionMode) : null
-    const results = await parallel(selectedModules.map(module => () => reviewModuleLifecycle({
-      execution, module, schedule, runFix,
-    })))
-    // parallel preserves positions; retain coverage when a lifecycle task fails outside its agent calls.
-    const outcomes = selectedModules.map((module, index) => results[index] ?? {
-      review: failedModuleReview(execution, module, `Module task for ${module.id} failed before producing a result`),
-      fix: null, verification: null,
-    })
-    if (outcomes.some(outcome => outcome.fix?.status === 'applied')) {
-      const finalExecution = { ...execution, sourceVersion: await readGitStateFingerprint(execution.cwd) }
-      const verifications = await parallel(outcomes.map(outcome => () =>
-        reviewModule(finalExecution, outcome.review.module, 'verification', schedule, outcome.review)))
-      for (const [index, outcome] of outcomes.entries()) {
-        outcome.verification = verifications[index] ?? failedModuleReview(execution, outcome.review.module,
-          `Verification task for ${outcome.review.module.id} failed before producing a result`)
-      }
-    }
-    return buildReviewReport({ runId: run.runId, execution, plan, selectedModules, outcomes, progressErrors })
-  })
-  return { ...completed.result, status: completed.status === 'incomplete' ? 'incomplete' : completed.result.status }
+/** Count only observed findings; failed angle slots contribute zero without implying complete coverage. */
+function countFindings(review: ModuleReview): number {
+  return review.angles.reduce((count, angle) => count + (angle.status === 'completed' ? angle.findings.length : 0), 0)
 }

@@ -1,4 +1,4 @@
-// Adapts and validates repograph CLI exports; it must not schedule agent work or persist run reports.
+// Owns repograph CLI exports, graph validation and temporary export cleanup.
 import { mkdtemp, readFile, rm, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -6,6 +6,41 @@ import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { exec } from './process'
+
+/** Parsed shape of a repograph `--kind all` payload. loadGraph additionally checks repository
+ * identity, unique node IDs and edge endpoints; this type alone performs no runtime validation. */
+export type RepositoryGraph = z.infer<typeof graphSchema>
+
+/** Supply a validated graph for the canonical, absolute target directory as RefactorOptions.graphLoader.
+ * exportGraph awaits this instead of loadGraph, then writes the result as the phase's graph artifact.
+ * A rejection prevents agent dispatch and is recorded as an incomplete run. Implementations own
+ * validation and any processes, indexes or temporary resources they use; temporary cleanup must
+ * finish before settling. Orchestration serializes calls under its run lock. */
+export type GraphLoader = (cwd: string) => Promise<RepositoryGraph>
+
+/** Package-internal default for loadGraph and CLI help, resolved relative to this package at import
+ * time; a missing installation throws during module initialization. The pinned release places its
+ * CLI beside its exported library entry. Resolution starts no process; loadGraph accepts an override. */
+export const defaultRepographEntry = join(dirname(createRequire(import.meta.url).resolve('@youichi/repograph')), 'cli.js')
+
+/** Export an absolute target directory through the supplied absolute CLI entry, defaulting to the
+ * installed npm package, and return a validated graph. Both paths are passed unchanged to a child
+ * process started in a temporary directory. Callers must serialize exports sharing the same
+ * path/index; orchestration's exportGraph calls this under the run lock before writing an artifact.
+ * Creates export files in an OS temporary directory and removes that directory before settling,
+ * while retaining the path-derived external index for reuse. Process, parse, schema,
+ * repository identity, endpoint and filesystem failures reject. Cleanup is awaited on success
+ * and failure; a cleanup failure takes precedence over an earlier error. */
+export async function loadGraph(cwd: string, entry = defaultRepographEntry): Promise<RepositoryGraph> {
+  const temporary = await mkdtemp(join(tmpdir(), 'anureo-refactor-graph-'))
+  try {
+    const graph = await exportRepositoryGraph({ cwd, entry, temporary })
+    await validateRepositoryGraph(graph, cwd)
+    return graph
+  } finally {
+    await rm(temporary, { recursive: true, force: true })
+  }
+}
 
 /** Shape of the repograph `--kind all` export that this package relies on. Unknown extra fields
  * are dropped by zod, so every field an agent should see in the graph artifact is listed here. */
@@ -25,21 +60,11 @@ const graphSchema = z.object({
     properties: z.record(z.string(), z.unknown()).optional(),
   })),
 })
-/** Repograph payload consumed by orchestration and embedders after schema, repository identity
- * and endpoint validation. This type alone does not validate externally constructed values. */
-export type RepositoryGraph = z.infer<typeof graphSchema>
-/** Injectable graph exporter: resolve a validated graph for cwd or reject export/validation failures.
- * Orchestration awaits it under the run lock; implementations may launch processes or maintain an
- * index and must finish temporary-resource cleanup before settling the promise. */
-export type GraphLoader = (cwd: string) => Promise<RepositoryGraph>
-/** Installed @youichi/repograph CLI used by loadGraph and CLI help, resolved relative to this package
- * so target/caller cwd and PATH cannot select another installation. The pinned release places its
- * CLI beside its exported library entry. Consumers may override it; resolution starts no process. */
-export const defaultRepographEntry = join(dirname(createRequire(import.meta.url).resolve('@youichi/repograph')), 'cli.js')
 
 /** Export and parse the CLI payload for loadGraph using its caller-owned temporary directory.
- * Launches repograph, writes graph.json and retains the external index; process, filesystem,
- * JSON and schema failures reject. Repository identity and endpoint checks must follow parsing. */
+ * Awaits the repograph subprocess before reading graph.json and retains the external index;
+ * process, filesystem, JSON and schema failures reject. Repository identity and endpoint checks
+ * must follow parsing, and loadGraph owns temporary-directory cleanup even on rejection. */
 async function exportRepositoryGraph(input: { cwd: string; entry: string; temporary: string }): Promise<RepositoryGraph> {
   const { cwd, entry, temporary } = input
   const output = join(temporary, 'graph.json')
@@ -52,29 +77,11 @@ async function exportRepositoryGraph(input: { cwd: string; entry: string; tempor
 
 /** Check a parsed payload before loadGraph exposes it to callers; does not mutate the graph.
  * Resolves repository paths on disk, rejecting filesystem errors, a different repository,
- * duplicate node IDs or dangling edges so downstream agents cannot trust a corrupt artifact. */
+ * duplicate node IDs or dangling edges before downstream agents can consume a corrupt artifact. */
 async function validateRepositoryGraph(graph: RepositoryGraph, cwd: string): Promise<void> {
   if (await realpath(graph.repositoryPath) !== await realpath(cwd)) throw new Error('repograph returned a different repository')
   const ids = new Set(graph.nodes.map(node => node.id))
   if (ids.size !== graph.nodes.length || graph.edges.some(edge => !ids.has(edge.source) || !ids.has(edge.target))) {
     throw new Error('repograph returned duplicate nodes or missing edge endpoints')
-  }
-}
-
-/** Export cwd through the supplied CLI entry (or the installed npm package) and return a validated graph
- * to orchestration or embedders. Callers must serialize exports sharing the same path/index;
- * orchestration does so with its repository-wide run lock, which this adapter does not acquire.
- * Creates and removes temporary export files outside cwd so later indexing cannot treat them as
- * source, while retaining the path-derived external index for reuse. Process, parse, schema,
- * repository identity, endpoint and filesystem failures reject. Cleanup is awaited on success
- * and failure; a cleanup failure takes precedence over an earlier error. */
-export async function loadGraph(cwd: string, entry = defaultRepographEntry): Promise<RepositoryGraph> {
-  const temporary = await mkdtemp(join(tmpdir(), 'anureo-refactor-graph-'))
-  try {
-    const graph = await exportRepositoryGraph({ cwd, entry, temporary })
-    await validateRepositoryGraph(graph, cwd)
-    return graph
-  } finally {
-    await rm(temporary, { recursive: true, force: true })
   }
 }

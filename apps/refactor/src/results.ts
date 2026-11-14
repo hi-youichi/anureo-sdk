@@ -11,7 +11,7 @@ export interface CheckResult {
 }
 /** Error signals retained for callers deciding whether inspection is needed before another run. */
 export interface Failure {
-  /** SDK error code when supplied; ordinary errors retain null. */
+  /** String code on the caught object, or null when absent or not a string. */
   code: string | null
   /** The backend cannot confirm whether execution completed. */
   outcomeUnknown: boolean
@@ -19,11 +19,13 @@ export interface Failure {
   cleanupFailed: boolean
 }
 /** Agent-authored work plus host observations from one design or module session.
- * Orchestration fills this record before checkpoint publication; partial edits survive failures. */
+ * Orchestration fills this record before checkpoint publication; partial edits survive failures.
+ * Inherited summary, changes and deferred fields are agent claims, not host validation results. */
 export interface StepResult extends Work {
   /** Based on real file changes and execution/check failures, rather than the agent's claims. */
   status: 'applied' | 'unchanged' | 'failed'
-  /** Sorted Git-visible paths changed during the step, including partial edits on failure. */
+  /** Sorted Git-visible paths changed from the step baseline. Successful steps snapshot before
+   * checks; failed steps resnapshot after the error to include partial agent/check edits. */
   changedFiles: string[]
   /** Executed checks in command order; a failure stops subsequent checks. */
   checks: CheckResult[]
@@ -60,7 +62,8 @@ export interface RefactorReport {
   modules: ModuleResult[]
   /** Run-level errors; individual step errors also appear on their StepResult. */
   errors: string[]
-  /** Classification of the run-level error, independently of any failed step's classification. */
+  /** Classification of the run-level error, independently of any failed step's classification.
+   * A failed-step gate throws a new error, so inspect the step's failure for its original signals. */
   failure: Failure | null
   /** Synchronous observer callback errors retained in delivery order without interrupting work. */
   progressErrors: string[]

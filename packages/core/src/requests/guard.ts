@@ -38,16 +38,33 @@ function throwCapabilityUnsupported(): never {
  * including session interruption's optional queued-work cancellation. Never dispatch or mutate state.
  */
 function guardOperationCapability<M extends SessionMethod>(method: M, params: AhpRequestMap[M], capabilities: Capabilities): void {
-  if (method === "turn/steer" && !capabilities.input?.steer?.atomicMatch) throwCapabilityUnsupported();
-  if (method === "turn/interrupt" && !capabilities.input?.interrupt?.targets.includes("turn")) throwCapabilityUnsupported();
-  if (method === "session/revert" && !supportsCapability(capabilities, "session.revert", (params as AhpRequestMap["session/revert"]).scope)) throwCapabilityUnsupported();
-  if (method === "history/read" && !supportsCapability(capabilities, "session.history")) throwCapabilityUnsupported();
-  if ((method === "goal/set" || method === "goal/clear") && !supportsCapability(capabilities, "goal.actions", method.split("/")[1])) throwCapabilityUnsupported();
-  if (method === "compact/start" && !capabilities.compact) throwCapabilityUnsupported();
-  if (method === "review/start" && !capabilities.review) throwCapabilityUnsupported();
-  if (method === "session/interrupt") {
-    if (!capabilities.input?.interrupt?.targets.includes('session')) throwCapabilityUnsupported();
-    if ((params as AhpRequestMap['session/interrupt']).cancelQueued && !capabilities.input?.interrupt?.cancelQueued) throwCapabilityUnsupported();
+  switch (method) {
+    case "turn/steer":
+      if (!capabilities.input?.steer?.atomicMatch) throwCapabilityUnsupported();
+      return;
+    case "turn/interrupt":
+      if (!capabilities.input?.interrupt?.targets.includes("turn")) throwCapabilityUnsupported();
+      return;
+    case "session/revert":
+      if (!supportsCapability(capabilities, "session.revert", (params as AhpRequestMap["session/revert"]).scope)) throwCapabilityUnsupported();
+      return;
+    case "history/read":
+      if (!supportsCapability(capabilities, "session.history")) throwCapabilityUnsupported();
+      return;
+    case "goal/set":
+    case "goal/clear":
+      if (!supportsCapability(capabilities, "goal.actions", method.split("/")[1])) throwCapabilityUnsupported();
+      return;
+    case "compact/start":
+      if (!capabilities.compact) throwCapabilityUnsupported();
+      return;
+    case "review/start":
+      if (!capabilities.review) throwCapabilityUnsupported();
+      return;
+    case "session/interrupt":
+      if (!capabilities.input?.interrupt?.targets.includes("session")) throwCapabilityUnsupported();
+      if ((params as AhpRequestMap["session/interrupt"]).cancelQueued && !capabilities.input?.interrupt?.cancelQueued) throwCapabilityUnsupported();
+      return;
   }
 }
 

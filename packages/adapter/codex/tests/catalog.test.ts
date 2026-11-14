@@ -60,13 +60,14 @@ test('cancellation at spawn completion disposes the just-created process', async
 /** Supply native reply envelopes over in-memory streams and capture catalog effects; initialize is automatic, undefined leaves an RPC pending. Tests must dispose the session; no OS process is created. */
 function scriptedCatalog(reply: (call: NativeRecord) => NativeRecord | undefined) {
   const calls: NativeRecord[] = []
-  const children: Array<{ stdout: PassThrough; disposals: number }> = []
+  const children: Array<{ stdout: PassThrough; disposals: number; disposed: Promise<void> }> = []
   const session = createCodexCatalogSession({
     command: 'scripted-codex',
     /** Create a fresh transport per connection, leaving response order under the test's control. */
     processFactory: async () => {
       const stdout = new PassThrough(), stderr = new PassThrough()
-      const child = { stdout, disposals: 0 }
+      const disposed = Promise.withResolvers<void>()
+      const child = { stdout, disposals: 0, disposed: disposed.promise }
       children.push(child)
       const process: HarnessProcess = {
         pid: children.length, owned: true, stdout, stderr,
@@ -81,13 +82,29 @@ function scriptedCatalog(reply: (call: NativeRecord) => NativeRecord | undefined
         },
         async closeInput() {},
         /** End readers and count ownership release, allowing tests to observe racing cleanup. */
-        async dispose() { child.disposals++; stdout.end(); stderr.end() },
+        async dispose() { child.disposals++; stdout.end(); stderr.end(); disposed.resolve() },
       }
       return process
     },
   })
   return { session, calls, children }
 }
+
+/** Native EOF must release the completed connection without explicit disposal and let the next read establish its own handshake. */
+test('catalog reader EOF releases the process and the next query reconnects', async () => {
+  const f = scriptedCatalog(() => ({ result: { data: [] } }))
+  try {
+    await f.session.prepare()
+    const first = f.children[0]!
+    first.stdout.end()
+    await first.disposed
+    expect(first.disposals).toBe(1)
+    expect(await f.session.listModels()).toEqual([])
+    expect(f.children).toHaveLength(2)
+    expect(f.calls.filter(call => call.method === 'initialize')).toHaveLength(2)
+  } finally { await f.session.dispose() }
+  expect(f.children[1]?.disposals).toBe(1)
+})
 
 /** Pagination must retain native order and projection quirks while sending hidden-model and cursor parameters on the same connection. */
 test('catalog projects ordered model pages without normalizing optional metadata', async () => {

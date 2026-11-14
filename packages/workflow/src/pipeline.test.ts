@@ -125,6 +125,7 @@ test('validates arrays and all stages before processing nonempty input', async (
   expect(await pipeline([], undefined)).toEqual([])
 })
 
+/** Compile-only assertions for stage compatibility, context and nullable results; never invoked at runtime. */
 function checkTypes() {
   const firstStage = (value: string) => value.length
   const secondStage = (value: number) => value > 0

@@ -209,6 +209,30 @@ function sendHistoryItems(msg) {
   })
 }
 
+/** For model/list, emit hidden entries only when requested, or deliberately stall/repeat the cursor for discovery failure tests. No model state is retained; writes can throw. */
+function sendModels(msg) {
+  if (mode === 'model-hang') return
+  if (mode === 'model-loop') {
+    sendResult(msg, { data: [{ id: 'test-model', displayName: 'Test model' }], nextCursor: 'loop' })
+    return
+  }
+  sendResult(msg, { data: [
+    { id: 'test-model', displayName: 'Test model' },
+    { id: 'gpt-6.1-sol', displayName: 'GPT-6.1-Sol', isDefault: true, hidden: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'ultra', description: 'Deepest' }], serviceTiers: [{ id: 'standard' }, { id: 'priority' }] },
+    ...(msg.params?.includeHidden ? [{ id: 'gpt-reserve', displayName: 'GPT-Reserve', hidden: true }] : []),
+  ], nextCursor: null })
+}
+
+/** For native thread start/resume/fork, reject the configured start failure before mutation, otherwise update fork-visible history and reply with identity/title. State changes precede the write and write failures escape. */
+function openThread(msg) {
+  if (mode === 'open-fail' && msg.method === 'thread/start') {
+    send({ id: msg.id, error: { code: -32000, message: 'thread start failed' } })
+    return
+  }
+  if (msg.method === 'thread/fork') allowedHistory = msg.params.beforeTurnId ? [] : [msg.params.lastTurnId]
+  sendResult(msg, { thread: { id: threadId, ...(mode === 'titles' ? { name: 'Restored title' } : {}) } })
+}
+
 /** Dispatch one parsed input synchronously, mutating this fixture's thread/turn history and writing ordered responses. Interaction answers complete the current turn, initialized is ignored, and unknown methods get fixture errors. Handler/write failures escape to the process. */
 function handleMessage(msg) {
   if (!msg.method) {
@@ -221,27 +245,13 @@ function handleMessage(msg) {
       sendAccountStatus(msg)
       break
     case 'model/list':
-      if (mode === 'model-hang') break
-      if (mode === 'model-loop') {
-        sendResult(msg, { data: [{ id: 'test-model', displayName: 'Test model' }], nextCursor: 'loop' })
-        break
-      }
-      sendResult(msg, { data: [
-        { id: 'test-model', displayName: 'Test model' },
-        { id: 'gpt-6.1-sol', displayName: 'GPT-6.1-Sol', isDefault: true, hidden: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'ultra', description: 'Deepest' }], serviceTiers: [{ id: 'standard' }, { id: 'priority' }] },
-        ...(msg.params?.includeHidden ? [{ id: 'gpt-reserve', displayName: 'GPT-Reserve', hidden: true }] : []),
-      ], nextCursor: null })
+      sendModels(msg)
       break
     case 'initialize':
       sendResult(msg, { userAgent: 'codex/0.164.0' })
       break
     case 'thread/start': case 'thread/resume': case 'thread/fork':
-      if (mode === 'open-fail' && msg.method === 'thread/start') {
-        send({ id: msg.id, error: { code: -32000, message: 'thread start failed' } })
-        break
-      }
-      if (msg.method === 'thread/fork') allowedHistory = msg.params.beforeTurnId ? [] : [msg.params.lastTurnId]
-      sendResult(msg, { thread: { id: threadId, ...(mode === 'titles' ? { name: 'Restored title' } : {}) } })
+      openThread(msg)
       break
     case 'turn/start': case 'review/start':
       startTurn(msg)

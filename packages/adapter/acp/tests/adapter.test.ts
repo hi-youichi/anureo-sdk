@@ -6,6 +6,7 @@ import { createAcpAdapter, type AcpAdapterOptions } from '../src/index';
 import { rejectionOf } from './test-helpers';
 
 const executable = resolve(import.meta.dirname, './fixtures/fake-acp.mjs');
+/** Open a scripted peer and observe its events/interactions; callers must close the fixture, including after resume. */
 async function fixture(args: string[] = [], options: Partial<AcpAdapterOptions> = {}) {
   const adapter = createAcpAdapter({ command: process.execPath, args: [executable, ...args], ...options });
   const runtime = await createClient({adapter,identity:{adapterId:'acp',runtimeConfigId:'fixture'},interactions:{approval:undefined,userInput:undefined,elicitation:undefined,dynamicTool:undefined}});
@@ -14,6 +15,7 @@ async function fixture(args: string[] = [], options: Partial<AcpAdapterOptions> 
   const events: AhpEvent[] = [];
   let response: ((request: InteractionRequested) => InteractionResponse) | undefined;
   let eventPumpError: unknown;
+  /** Collect one attachment and answer configured interactions; until observes stream/response failures. */
   async function consume(observedSession: Session) {
     try {
       for await (const event of observedSession.events()) {
@@ -33,6 +35,7 @@ async function fixture(args: string[] = [], options: Partial<AcpAdapterOptions> 
   }
   const pumps = [consume(session)];
   let counter = 0;
+  /** Await an observed condition, failing early if the event pump cannot make progress. */
   const until = async (predicate: () => boolean) => {
     for (let i = 0; i < 500; i++) {
       if (predicate()) return;
@@ -46,6 +49,7 @@ async function fixture(args: string[] = [], options: Partial<AcpAdapterOptions> 
     adapter, runtime, initialized, events, get session() { return session; }, until,
     respondWith(handler: (request: InteractionRequested) => InteractionResponse) { response = handler; },
     async start(text: string) { return (await session.submit({input:text})).id; },
+    /** Await terminal publication, then include interaction resolutions associated by interaction ID. */
     async finished(turnId: string) {
       await until(() => events.some((event) => event.type === 'turn/completed' && event.payload.turnId === turnId));
 

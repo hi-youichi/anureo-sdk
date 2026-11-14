@@ -39,3 +39,24 @@ test('unknown categories and prototype property names fall back to CLAUDE_TURN_F
   expect(claudeTurnError(result(), 'constructor' as SDKAssistantMessageError)).toMatchObject({ code: 'CLAUDE_TURN_FAILED' })
   expect(claudeTurnError(result({ subtype: '__proto__' }))).toMatchObject({ code: 'CLAUDE_TURN_FAILED' })
 })
+
+test('assistant evidence outranks status while retryability follows the selected error code', () => {
+  expect(claudeTurnError(result({ api_error_status: 503 }), 'authentication_failed')).toEqual({
+    code: 'AUTH_REQUIRED', message: 'Claude model request failed', retryable: false, outcomeUnknown: false,
+    details: { httpStatusCode: 503 },
+  })
+  expect(claudeTurnError(result({ api_error_status: 401 }), 'rate_limit')).toMatchObject({ code: 'RATE_LIMITED', retryable: true })
+  expect(claudeTurnError(result({ api_error_status: 503 }), 'unknown')).toMatchObject({ code: 'NATIVE_SERVICE_UNAVAILABLE', retryable: true })
+})
+
+test.each([99, 600, 401.5, NaN, '401'])('invalid HTTP status %s cannot classify or populate error details', status => {
+  expect(claudeTurnError(result({ api_error_status: status }))).toEqual({
+    code: 'CLAUDE_TURN_FAILED', message: 'Claude model request failed', retryable: false, outcomeUnknown: false,
+  })
+})
+
+test('execution-error results ignore success-only HTTP status even for an API terminal reason', () => {
+  expect(claudeTurnError(result({ subtype: 'error_during_execution', terminal_reason: 'api_error', api_error_status: 401 }))).toEqual({
+    code: 'CLAUDE_TURN_FAILED', message: 'Claude model request failed', retryable: false, outcomeUnknown: false,
+  })
+})

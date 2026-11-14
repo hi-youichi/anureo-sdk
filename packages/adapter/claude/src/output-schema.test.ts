@@ -11,13 +11,18 @@ import { createClaudeAdapter, type ClaudeAdapterOptions, type ClaudeQuery } from
 
 const ANSWER = { type: 'object', properties: { answer: { type: 'integer' } }, required: ['answer'], additionalProperties: false }
 const LABEL = { type: 'object', properties: { label: { type: 'string' } }, required: ['label'] }
+/** Observe expected admission failures immediately while retaining the original promise for assertions. */
 const observe = <T>(promise: Promise<T>) => { void promise.catch(() => {}); return promise }
+/** Hold native cleanup/configuration at an explicit boundary until the test releases it. */
 function deferred() {
   let resolve!: () => void
   const promise = new Promise<void>(done => { resolve = done })
   return { promise, resolve }
 }
 
+/** Drive real adapter/client lifecycles through a scripted streaming query factory.
+ * Query creation order is observable independently of turns; tests control native input consumption
+ * and terminal results. The caller must await dispose to release the event reader and client. */
 async function fixture(options: ClaudeAdapterOptions = {}, open?: Partial<SessionOpenParams>) {
   // Query indices follow creation order from zero, not execution count; equal schemas reuse a Query.
   const queries: Array<{ query: ClaudeQuery; output: BoundedEventQueue<SDKMessage>; input: AsyncIterator<SDKUserMessage>; options: Options; closes: number; returns: number }> = []
@@ -43,23 +48,28 @@ async function fixture(options: ClaudeAdapterOptions = {}, open?: Partial<Sessio
   const session = await client.sessions.create({ cwd: process.cwd(), ...open })
   const events: AhpEvent[] = []
   const reader = session.events()[Symbol.asyncIterator]()
+  // Event failures belong to operation assertions; keep the collector awaitable during disposal.
   const reading = (async () => { try { for (;;) { const next = await reader.next(); if (next.done) break; events.push(next.value) } } catch {} })()
+  /** Wait for native query creation, including replacements admitted after asynchronous cleanup. */
   async function waitForQuery(queryIndex: number) {
     while (!queries[queryIndex]) await new Promise<void>(resolve => created.push(resolve))
     return queries[queryIndex]!
   }
+  /** Consume one dispatched native input, failing if the scripted query has already ended. */
   async function input(queryIndex: number) {
     const next = await (await waitForQuery(queryIndex)).input.next()
     if (next.done) throw new Error('Expected an input')
     return next.value
   }
   const send = (queryIndex: number, value: Record<string, unknown>) => queries[queryIndex]!.output.write(value as unknown as SDKMessage)
+  /** Echo consumed input UUIDs so the real adapter can associate and finish their execution. */
   const result = (queryIndex: number, ids: string[], extra: Record<string, unknown> = {}) => send(queryIndex, {
     type: 'result', subtype: 'success', is_error: false, result: 'Do not parse this prose', num_turns: 1, stop_reason: 'end_turn',
     user_message_uuids: ids, user_message_uuid: ids.at(-1), usage: { input_tokens: 7, output_tokens: 9 }, ...extra,
   })
   return {
     client, adapter, session, queries, events, waitForQuery, input, send, result,
+    /** Submit, consume and finish one execution, awaiting both dispatch association and terminal output. */
     async execute(schema: JsonSchema | undefined, queryIndex: number, extra: Record<string, unknown> = {}) {
       const pending = observe(session.submit({ input: 'task', ...(schema !== undefined ? { outputSchema: schema } : {}) }))
       const user = await input(queryIndex)
@@ -67,6 +77,7 @@ async function fixture(options: ClaudeAdapterOptions = {}, open?: Partial<Sessio
       const turn = await pending
       return { turn, result: await turn.result(), user }
     },
+    /** Stop collection before disposing the client; propagate resource-release failures to the test. */
     async dispose() { await reader.return?.(); await reading; await client.dispose() },
   }
 }

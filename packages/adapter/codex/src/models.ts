@@ -21,6 +21,24 @@ export type CodexModel = {
   serviceTiers?: string[]
 }
 
+/** For catalog listModels and CodexNativeAdapter.listModels, read model pages sequentially on an initialized client, retaining native order and hidden entries. Reject malformed entries, repeated cursors, more than 10,000 models or transport errors; never create threads or dispose the caller's client. */
+export async function readCodexModels(client: CodexJsonlClient): Promise<CodexModel[]> {
+  const models: CodexModel[] = []
+  let cursor: string | undefined
+  const seen = new Set<string>()
+  do {
+    const page = record(await client.request('model/list', { limit: 100, includeHidden: true, ...(cursor ? { cursor } : {}) }))
+    if (!Array.isArray(page.data)) throw new HarnessSdkError('PROTOCOL_ERROR')
+    for (const entry of page.data) models.push(decodeModel(entry))
+    // Validate the complete page before the limit/cursor checks to preserve failure precedence.
+    if (models.length > 10_000) throw new HarnessSdkError('MODEL_LIMIT_EXCEEDED')
+    cursor = string(page.nextCursor)
+    if (cursor && seen.has(cursor)) throw new HarnessSdkError('PROTOCOL_ERROR', 'Repeated native model cursor')
+    if (cursor) seen.add(cursor)
+  } while (cursor)
+  return models
+}
+
 /** Project one native page entry for the pagination reader without mutation or I/O. Reject missing/empty identities; omit invalid optional entries and empty effort IDs, retaining tier strings and native ordering. */
 function decodeModel(entry: unknown): CodexModel {
   const model = record(entry)
@@ -45,22 +63,4 @@ function decodeModel(entry: unknown): CodexModel {
     ...(defaultEffort ? { defaultEffort } : {}),
     ...(serviceTiers ? { serviceTiers } : {}),
   }
-}
-
-/** For catalog and adapter probes, read model pages sequentially on an initialized client, retaining native order and hidden entries. Reject malformed entries, repeated cursors, more than 10,000 models or transport errors; never create threads or dispose the caller's client. */
-export async function readCodexModels(client: CodexJsonlClient): Promise<CodexModel[]> {
-  const models: CodexModel[] = []
-  let cursor: string | undefined
-  const seen = new Set<string>()
-  do {
-    const page = record(await client.request('model/list', { limit: 100, includeHidden: true, ...(cursor ? { cursor } : {}) }))
-    if (!Array.isArray(page.data)) throw new HarnessSdkError('PROTOCOL_ERROR')
-    for (const entry of page.data) models.push(decodeModel(entry))
-    // Validate the complete page before the limit/cursor checks to preserve failure precedence.
-    if (models.length > 10_000) throw new HarnessSdkError('MODEL_LIMIT_EXCEEDED')
-    cursor = string(page.nextCursor)
-    if (cursor && seen.has(cursor)) throw new HarnessSdkError('PROTOCOL_ERROR', 'Repeated native model cursor')
-    if (cursor) seen.add(cursor)
-  } while (cursor)
-  return models
 }

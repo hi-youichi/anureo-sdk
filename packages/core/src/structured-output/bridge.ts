@@ -12,7 +12,7 @@ import { HarnessSdkError } from '../errors'
 // Preserve existing bridge imports while production callers depend on the tool contract directly.
 export { OUTPUT_SERVER_NAME, OUTPUT_TOOL, toolError } from './tool'
 
-/** Internal session endpoint and cleanup handle returned to OutputSession.open; the manager owns the shared listener. */
+/** Internal endpoint and cleanup handle retained by OutputSession.prepareBridge; the manager owns the shared listener. */
 export interface OutputBridgeLease {
   /** Native-reachable config contains lease credentials; callers must keep it out of public state/history. */
   readonly config: McpServer
@@ -24,7 +24,7 @@ export interface OutputBridgeLease {
 }
 
 /**
- * Internal bridge owner constructed by withStructuredOutput for one Client. OutputSession.open
+ * Internal bridge owner constructed by withStructuredOutput for one Client. OutputSession.prepareBridge
  * requests independent session leases; the adapter wrapper must dispose this manager after session
  * cleanup to release the shared listener, even when individual lease cleanup fails.
  */
@@ -34,7 +34,7 @@ export class OutputBridgeManager {
 
   /**
    * Allocate an authenticated endpoint and native MCP configuration, awaiting shared listener startup.
-   * OutputSession.open supplies a queued submitValue handler, injects config into native open
+   * OutputSession.prepareBridge supplies a queued submitValue handler, injects config into native open
    * params and handles setup rejection by releasing any lease and publishing an unavailable warning.
    * Stdio entry resolution happens before listener startup and can reject, as can startup or disposal
    * races. The caller must keep credentials private and dispose the returned lease after use.
@@ -73,16 +73,7 @@ export class OutputBridgeManager {
     this.leases.clear()
     if (this.starting) await this.starting.catch(() => {})
     const listener = this.listener
-    if (listener?.listening) {
-      const stopped = new Promise<void>((resolve, reject) => {
-        listener.close(error => {
-          if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') reject(error)
-          else resolve()
-        })
-      })
-      listener.closeAllConnections()
-      await stopped
-    }
+    if (listener?.listening) await stopListener(listener)
   }
 
   private listener?: HttpServer
@@ -144,7 +135,8 @@ export class OutputBridgeManager {
     if (req.headers.authorization !== `Bearer ${lease.credential}`) { res.writeHead(401).end(); return }
     const address = listener.address()
     const expectedHost = typeof address === 'object' && address ? `127.0.0.1:${address.port}` : ''
-    if (req.headers.host !== expectedHost || req.headers.origin && req.headers.origin !== `http://${expectedHost}`) { res.writeHead(403).end(); return }
+    const origin = req.headers.origin
+    if (req.headers.host !== expectedHost || (origin && origin !== `http://${expectedHost}`)) { res.writeHead(403).end(); return }
     if (req.method !== 'POST') { res.writeHead(405).end(); return }
     if (lease.requests >= 32) { res.writeHead(429).end(); return }
     return lease
@@ -187,7 +179,7 @@ export class OutputBridgeManager {
     await transport.handleRequest(req, res, body)
   }
   /**
-   * The returned lease callback delegates here when OutputSession.release or open awaits
+   * The returned lease callback delegates here when OutputSession.release or prepareBridge awaits
    * disposal. Revoke this endpoint before awaiting closes, clear its server registry after settlement
    * and reject RESOURCE_RELEASE_FAILED on any close rejection. Revocation is permanent even on failure.
    */
@@ -201,7 +193,7 @@ export class OutputBridgeManager {
   }
 }
 
-/** OutputSession.open supplies a serialized submitValue callback; MCP consumes its result as the tool response. */
+/** OutputSession.prepareBridge supplies a serialized submitValue callback; MCP consumes its result as the tool response. */
 type Handler = (args: unknown) => Promise<CallToolResult>
 
 /** Mutable session lease state; requests counts admitted handlers until dispatch/error handling settles. */
@@ -223,4 +215,20 @@ function bridgeConfig({ transport, url, credential }: { transport: ResolvedTrans
  */
 function closeLeaseServers(lease: Lease): Promise<PromiseSettledResult<void>[]> {
   return Promise.allSettled([...lease.active].map(server => server.close()))
+}
+
+/**
+ * Stop a listening server after OutputBridgeManager.dispose settles protocol cleanup and startup.
+ * Force remaining connections closed so idle HTTP peers cannot hold disposal open; resolve after
+ * listener closure, ignoring an already-stopped race, and reject other listener shutdown errors.
+ */
+function stopListener(listener: HttpServer): Promise<void> {
+  const stopped = new Promise<void>((resolve, reject) => {
+    listener.close(error => {
+      if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') reject(error)
+      else resolve()
+    })
+  })
+  listener.closeAllConnections()
+  return stopped
 }

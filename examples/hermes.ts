@@ -1,6 +1,8 @@
 import { createClient } from '@anureo/sdk'
 import { createHermesAdapter } from '@anureo/adapter-hermes'
 
+// Run one arithmetic turn through a configured Hermes gateway and print its terminal text.
+// HERMES_BIN selects the CLI; HERMES_PROFILE and HERMES_MODEL override the profile and model.
 const client = await createClient({
   adapter: createHermesAdapter({
     command: process.env.HERMES_BIN ?? 'hermes',
@@ -21,5 +23,6 @@ try {
   console.log(result.text)
   await session.close()
 } finally {
+  // Release the SDK-owned session and adapter even when the result wait or native close fails.
   await client.dispose()
 }

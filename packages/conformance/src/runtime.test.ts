@@ -4,12 +4,14 @@ import type { AhpEvent, GoalState, InteractionRequested, InteractionResponse, Se
 import { createScriptedAdapter, FAKE_CAPABILITIES, type FakeAdapterOptions } from "./fake";
 
 const OPEN: SessionOpenParams = { requestId: "open", mode: "new", binding: { sessionId: "s", adapterId: "fake", runtimeConfigId: "r" }, cwd: "/tmp" };
+/** Open an isolated scripted session; each test owns returning its event readers and disposing runtime. */
 async function setup(options?: FakeAdapterOptions, runtimeOptions?: RuntimeOptions) {
   const adapter = createScriptedAdapter(options);
   const runtime = await createClient({ adapter, identity: OPEN.binding, runtime: runtimeOptions,
     interactions: { approval: undefined, userInput: undefined, elicitation: undefined, dynamicTool: undefined } });
   const session = await runtime.openSession(OPEN); return { adapter, runtime, session, sink: adapter.sinks.get("s")! };
 }
+/** Consume at most 100 events to find the expected publication; early stream closure fails the test. */
 async function nextType(reader: AsyncIterator<AhpEvent>, type: AhpEvent["type"]): Promise<AhpEvent> {
   for (let i = 0; i < 100; i++) { const event = await reader.next(); if (event.done) throw new Error(`Stream ended before ${type}`); if (event.value.type === type) return event.value; }
   throw new Error(`Missing ${type}`);

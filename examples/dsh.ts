@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline/promises'
-import { createClient } from '@anureo/sdk'
+import { createClient, type Session } from '@anureo/sdk'
 import { createDshAcpAdapter } from '@anureo/adapter-acp'
 
 // Real-backend example: talk to DeepSeek Harness (DSH) through its built-in ACP profile.
@@ -23,9 +23,14 @@ const client = await createClient({
   }),
   identity: { adapterId: 'dsh-acp', runtimeConfigId: 'local' },
   interactions: {
-    // DSH offers exactly two permission options, allow_once and reject_once, for every
-    // tool call. A host has to answer each request; otherwise the turn waits until the
-    // interaction expires. Auto-approval would also work, but this example asks a human.
+    /**
+     * Registered with createClient, this handler is invoked by Session.startInteractionHandler
+     * after interaction/requested is published for an ACP permission request.
+     * Return the advertised allow-once option only for "y"; deny other answers and
+     * noninteractive requests. Missing choices or terminal failures reject the handler,
+     * which makes the SDK cancel the actionable interaction. The script owns the terminal;
+     * SDK cancellation does not stop a pending question in this handler.
+     */
     approval: async (request) => {
       const allow = request.options.find((option) => option.semantic === 'allowOnce') ?? request.options.find((option) => option.id === 'allow-once')
       const deny = request.options.find((option) => option.semantic === 'deny') ?? request.options.find((option) => option.id === 'reject-once')
@@ -48,59 +53,72 @@ try {
     ...(process.env.ANUREO_DSH_MODEL ? { model: process.env.ANUREO_DSH_MODEL } : {}),
   })
   const configured = Object.fromEntries((session.capabilities.config?.options ?? []).map((option) => [option.id, option.value]))
-  // DSH builds advertise the model either as a `provider/model` string or as a JSON
-  // tuple such as `["deepseek-official","deepseek-v4-flash"]`; show both readably.
-  const readable = (value: unknown): string => {
-    const join = (entries: unknown[]) => entries.map(String).join('/')
-    if (Array.isArray(value)) return join(value)
-    if (typeof value === 'string' && value.startsWith('[')) {
-      try {
-        const parsed: unknown = JSON.parse(value)
-        if (Array.isArray(parsed)) return join(parsed)
-      } catch { /* not a JSON tuple; show it as-is */ }
-    }
-    return value === undefined ? 'default' : String(value)
-  }
-  console.log(`[session] model=${readable(session.snapshot.model ?? configured.model)} reasoning_effort=${readable(configured.reasoning_effort)}`)
+  console.log(`[session] model=${formatConfigValue(session.snapshot.model ?? configured.model)} reasoning_effort=${formatConfigValue(configured.reasoning_effort)}`)
 
-  // Consume events before submitting input so the bounded queue never fills up.
-  // Only agent messages are the answer; reasoning chunks stream as their own items
-  // and stay out of stdout so the demo output is the reply alone.
-  const answerItemIds = new Set<string>()
-  let hasWrittenAnswerText = false
-  const eventConsumptionTask = (async () => {
-    for await (const event of session.events()) {
-      if (event.type === 'item/started') {
-        if (event.payload.item.type === 'agentMessage') answerItemIds.add(event.payload.item.id)
-        if (event.payload.item.type === 'toolCall') process.stdout.write(`\n[tool] ${event.payload.item.title}\n`)
-      }
-      if (event.type === 'item/delta' && event.payload.kind === 'text' && event.payload.text && answerItemIds.has(event.payload.itemId)) {
-        process.stdout.write(event.payload.text); hasWrittenAnswerText = true
-      }
-      if (event.type === 'notice') {
-        process.stderr.write(`[${event.payload.severity}] ${event.payload.code}: ${event.payload.message}\n`)
-      }
-      if (event.type === 'turn/completed') return event.payload
-    }
-    throw new Error('Event stream ended without a terminal event')
-  })()
+  // Subscribe before submitting: session events are live and are not replayed.
+  const eventConsumptionTask = streamAnswer(session)
   // Event consumption may fail before submit returns, so observe rejection now.
   // The later await on the original task still propagates its error.
   void eventConsumptionTask.catch(() => {})
 
   const turn = await session.submit({ input: process.env.ANUREO_DSH_PROMPT ?? 'In one sentence: what are you, and what can you do?' })
-  await eventConsumptionTask
+  const hasWrittenAnswerText = await eventConsumptionTask
   const result = await turn.result()
   if (!hasWrittenAnswerText) process.stdout.write(result.text)
   process.stdout.write(`\n[turn] ${result.status}\n`)
 
-  // DSH may report an error as `end_turn`; trust the AHP terminal status, not the stream end.
+  // A terminal event can carry a failed or interrupted outcome; inspect the result status.
   if (result.status !== 'completed') {
     process.exitCode = 1
     process.stderr.write(`[turn] stopped without success (${result.status}${result.status === 'failed' ? `: ${result.error.message}` : ''})\n`)
   }
   await session.close()
 } finally {
+  // The terminal belongs to this script; client disposal releases SDK-owned sessions and transport.
   terminal.close()
   await client.dispose()
+}
+
+/**
+ * Format model/configuration values for the session log above: arrays and JSON-encoded
+ * arrays become slash-separated names, undefined becomes "default", and other values
+ * retain their string form. Malformed JSON is displayed as supplied rather than rejected.
+ */
+function formatConfigValue(value: unknown): string {
+  const join = (entries: unknown[]) => entries.map(String).join('/')
+  if (Array.isArray(value)) return join(value)
+  if (typeof value === 'string' && value.startsWith('[')) {
+    try {
+      const parsed: unknown = JSON.parse(value)
+      if (Array.isArray(parsed)) return join(parsed)
+    } catch { /* not a JSON tuple; show it as-is */ }
+  }
+  return value === undefined ? 'default' : String(value)
+}
+
+/**
+ * Subscribe before the DSH run submits input and print agent-message deltas and tool
+ * titles to stdout, with notices on stderr. Resolve at any turn/completed event with
+ * whether answer text was printed, so the caller can fall back to Turn.result().text;
+ * reject read failures or premature stream end. The loop releases its subscription;
+ * the caller checks the terminal result status and owns session/client cleanup.
+ */
+async function streamAnswer(session: Session): Promise<boolean> {
+  const answerItemIds = new Set<string>()
+  let hasWrittenAnswerText = false
+  for await (const event of session.events()) {
+    if (event.type === 'item/started') {
+      if (event.payload.item.type === 'agentMessage') answerItemIds.add(event.payload.item.id)
+      if (event.payload.item.type === 'toolCall') process.stdout.write(`\n[tool] ${event.payload.item.title}\n`)
+    }
+    if (event.type === 'item/delta' && event.payload.kind === 'text' && event.payload.text && answerItemIds.has(event.payload.itemId)) {
+      process.stdout.write(event.payload.text)
+      hasWrittenAnswerText = true
+    }
+    if (event.type === 'notice') {
+      process.stderr.write(`[${event.payload.severity}] ${event.payload.code}: ${event.payload.message}\n`)
+    }
+    if (event.type === 'turn/completed') return hasWrittenAnswerText
+  }
+  throw new Error('Event stream ended without a terminal event')
 }

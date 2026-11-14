@@ -1,3 +1,4 @@
+import { createFixture } from './test-helpers'
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
@@ -12,22 +13,19 @@ import { workflow, pipeline, parallel, agent, type WorkflowOptions } from './ind
 import { canonicalJson, digest } from './persistence/json'
 
 const clients: Client[] = []
+const fixture = createFixture(clients)
 const roots: string[] = []
 afterEach(async () => {
   await Promise.all(clients.splice(0).map(client => client.dispose()))
   await Promise.all(roots.splice(0).map(path => rm(path, { recursive: true, force: true })))
 })
+/** Create isolated run storage; afterEach removes it after disposing the test's clients. */
 async function setup() {
   const directory = await mkdtemp(join(tmpdir(), 'anureo-workflow-'))
   roots.push(directory)
   return { directory, name: 'test', revision: '1', input: {} }
 }
-async function fixture(options?: FakeAdapterOptions) {
-  const adapter = createScriptedAdapter(options)
-  const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: randomUUID() } })
-  clients.push(client)
-  return { client, adapter }
-}
+
 /** Emits a failed terminal turn outcome, mirroring native failures. */
 function failingExecute(error: HarnessError): NonNullable<FakeAdapterOptions['execute']> {
   return async (call, sink) => {
@@ -344,6 +342,7 @@ test('an interrupted run reuses the unchanged call prefix in original order', as
   expect(result.status).toBe('completed')
 })
 
+/** Compile-only consumer checks for context and awaited body-result inference; never invoked. */
 function typeChecks(options: WorkflowOptions<{ files: string[] }>) {
   const run = workflow(options, async context => {
     const file: string = context.input.files[0]!

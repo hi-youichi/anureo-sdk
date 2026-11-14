@@ -4,7 +4,7 @@ import { publicValue, type JsonValue } from '@anureo/protocol'
 /** Unvalidated fields for native decoders and projections; this type promises neither plain objects nor validated contents. */
 export type NativeRecord = Record<string, unknown>
 
-/** Let native decoders inspect non-array objects without cloning; other values become empty records. Does not validate fields, mutate inputs or perform I/O. */
+/** Inspect a non-array object without cloning or field validation; other values become empty records. The returned object aliases the input, so decoders must validate fields before use and avoid mutating shared native data. */
 export function record(value: unknown): NativeRecord {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as NativeRecord : {}
 }
@@ -19,7 +19,7 @@ export function json(value: unknown): JsonValue {
   return value === undefined ? null : JSON.parse(JSON.stringify(value)) as JsonValue
 }
 
-/** For public payload builders, clone before protocol redaction so sanitization cannot mutate native data. Runs JSON hooks and propagates serialization errors; performs no I/O itself. */
+/** Build a JSON-compatible payload with protocol redaction for public items/events. mapItems and CodexBackendSession.notification embed the result in their projections; callers still choose which native fields to expose. JSON normalization runs hooks and propagates serialization errors before redaction. */
 export function safe(value: unknown): JsonValue {
   return publicValue(json(value))
 }

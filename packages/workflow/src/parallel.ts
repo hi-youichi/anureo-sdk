@@ -1,4 +1,11 @@
-/** Await every callback and preserve input positions, using null for failed tasks. */
+/**
+ * Start every callback without waiting for earlier callbacks, then return awaited results in input order.
+ * Snapshot and validate the task array before invoking callbacks; invalid input rejects with TypeError.
+ * Callbacks may return values or promises. Synchronous throws and rejections become null at their
+ * positions, indistinguishable from returned null; other falsy values are preserved. Empty input returns [].
+ * Completion waits for every callback to settle, including siblings of failed callbacks.
+ * Callers supply any concurrency limits, cancellation, retries and resource cleanup inside their callbacks.
+ */
 export async function parallel<const Tasks extends readonly (() => unknown)[]>(
   tasks: Tasks,
 ): Promise<{ -readonly [K in keyof Tasks]: Awaited<ReturnType<Tasks[K]>> | null }> {

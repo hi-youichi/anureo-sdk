@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import type { Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
-import { createClaudeCatalogSession } from './catalog'
-import type { ClaudeQuery } from './index'
+import { createClaudeCatalogSession } from './index'
+import type { ClaudeQuery } from './options'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -95,4 +95,66 @@ test('spawn failures dispose the half-opened connection before surfacing', async
   await expect(session.listModels()).rejects.toThrow('spawn failed')
   await expect(session.listModels()).rejects.toThrow('spawn failed')
   await session.dispose()
+})
+
+test('disposal ends input, shares the native return wait and allows later discovery', async () => {
+  let queries = 0, closes = 0, disposed = false
+  let releaseReturn = () => {}, notifyReturn = () => {}
+  const returnGate = new Promise<void>(resolve => { releaseReturn = resolve })
+  const returnStarted = new Promise<void>(resolve => { notifyReturn = resolve })
+  const pendingInputs: Array<Promise<IteratorResult<SDKUserMessage>>> = []
+  const session = createClaudeCatalogSession({ queryFactory: ({ prompt }) => {
+    const id = ++queries
+    pendingInputs.push((prompt as AsyncIterable<SDKUserMessage>)[Symbol.asyncIterator]().next())
+    return {
+      supportedModels: async () => [{ value: `model-${id}`, displayName: `M${id}`, description: '' }],
+      close: () => { closes++ },
+      return: async () => {
+        notifyReturn()
+        await returnGate
+        return { done: true, value: undefined }
+      },
+    } as unknown as ClaudeQuery
+  } })
+  try {
+    await session.prepare()
+    const pendingDispose = session.dispose()
+    expect(session.dispose()).toBe(pendingDispose)
+    void pendingDispose.then(() => { disposed = true })
+    await returnStarted
+    expect(await pendingInputs[0]).toEqual({ done: true, value: undefined })
+    expect(closes).toBe(1)
+    expect(disposed).toBe(false)
+
+    releaseReturn()
+    await pendingDispose
+    expect((await session.listModels())[0]?.value).toBe('model-2')
+    expect(queries).toBe(2)
+  } finally { releaseReturn(); await session.dispose() }
+  expect(closes).toBe(2)
+  expect(await pendingInputs[1]).toEqual({ done: true, value: undefined })
+})
+
+test('a refresh failure awaits cleanup and surfaces a native return failure before retry', async () => {
+  const refreshFailure = new Error('refresh failed'), cleanupFailure = new Error('cleanup failed')
+  let queries = 0, closes = 0, returns = 0
+  const session = createClaudeCatalogSession({ queryFactory: () => {
+    const id = ++queries
+    return {
+      supportedModels: async () => [{ value: `model-${id}`, displayName: `M${id}`, description: '' }],
+      reinitialize: async () => { throw refreshFailure },
+      close: () => { closes++ },
+      return: async () => {
+        returns++
+        if (id === 1) throw cleanupFailure
+        return { done: true, value: undefined }
+      },
+    } as unknown as ClaudeQuery
+  } })
+  try {
+    expect((await session.listModels())[0]?.value).toBe('model-1')
+    await expect(session.listModels()).rejects.toBe(cleanupFailure)
+    expect({ closes, returns }).toEqual({ closes: 1, returns: 1 })
+    expect((await session.listModels())[0]?.value).toBe('model-2')
+  } finally { await session.dispose() }
 })

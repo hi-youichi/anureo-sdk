@@ -1,21 +1,18 @@
-// Maps session-local native identities to SDK identities; must not own sessions, events, or execution lifetimes.
+// Maps opaque native identities to SDK identities within an adapter-owned session.
 import { HarnessSdkError } from "../errors";
 
 /**
- * Root-exported helper for adapters translating native turn/item IDs to SDK IDs.
+ * Translate native turn/item IDs to SDK IDs when implementing an adapter.
  * Identifiers are opaque strings; this map does not validate or normalize them.
  * All state is in memory and scoped to this instance. Adapters own event ordering,
  * failure handling and clearing the map after no later event needs its identities.
  */
 export class NativeIdentityMap {
-  private readonly turnIdsByNativeTurnId = new Map<string, string>();
-  private readonly nativeTurnIdsByTurnId = new Map<string, string>();
-  private readonly items = new Map<string, string>();
-
   /**
    * Adapters supply a synchronous SDK item ID allocator when creating a session-local
    * map. Construction does not invoke it; item() invokes it on a cache miss and
    * propagates its failures. Supply nonempty IDs to make subsequent lookups reuse them.
+   * The allocator owns ID uniqueness; its results are not checked for collisions.
    */
   constructor(private readonly createId: () => string) {}
 
@@ -23,8 +20,9 @@ export class NativeIdentityMap {
    * Adapters record an SDK/native turn pair before translating it through turn()
    * or nativeTurn(). Rebinding the same pair is harmless. A conflicting nonempty
    * stored ID throws HarnessSdkError with code PROTOCOL_ERROR before either map
-   * changes; existing empty values do not reject rebinding. Returns no value and
-   * publishes no events; the adapter decides how to handle a conflict.
+   * changes; existing empty values do not reject rebinding. Rebinding writes only
+   * the supplied pair and does not remove older entries involving empty IDs.
+   * The adapter decides how to handle a conflict.
    */
   bindTurn(turnId: string, nativeTurnId: string): void {
     const existingTurnId = this.turnIdsByNativeTurnId.get(nativeTurnId);
@@ -79,4 +77,8 @@ export class NativeIdentityMap {
     this.nativeTurnIdsByTurnId.clear();
     this.items.clear();
   }
+
+  private readonly turnIdsByNativeTurnId = new Map<string, string>();
+  private readonly nativeTurnIdsByTurnId = new Map<string, string>();
+  private readonly items = new Map<string, string>();
 }

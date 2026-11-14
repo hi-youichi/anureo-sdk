@@ -8,7 +8,8 @@ export { safeCatalogErrorCode } from './diagnostics/errors'
 
 /**
  * Observe an adapter's catalog probe and resolve with its value after reporting success, or reject
- * with its original failure after reporting it. Emit started before checking cancellation, await work,
+ * with its original failure after reporting it. Invoke work at most once, catching synchronous throws
+ * as well as promise rejections. Emit started before checking cancellation, await work,
  * then check cancellation again before reporting success. An aborted signal skips work or discards
  * its successful result with an RPC_ABORTED rejection; cancellation never interrupts pending work.
  * A failed work promise retains its cause even when the signal is aborted (the report is cancelled).
@@ -16,6 +17,9 @@ export { safeCatalogErrorCode } from './diagnostics/errors'
  * The probe owner must enforce deadlines and release native resources, including when cancellation
  * discards a result. Logger and synchronous observer failures are isolated. Failures reading cause
  * or signal properties can replace the rejection and prevent a terminal report.
+ *
+ * Codex and Claude catalog sessions await this during preparation and return its model-query result;
+ * the sessions retain connection ownership, and their callers must dispose them.
  */
 export async function catalogPhase<T>(options: CatalogProbeOptions, phase: CatalogProbeEvent['phase'], work: () => Promise<T>): Promise<T> {
   const started = performance.now()

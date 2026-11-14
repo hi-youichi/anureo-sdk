@@ -21,7 +21,9 @@ export function safeCatalogErrorCode(cause: unknown): string {
  * the phase rejection before its terminal report is emitted.
  */
 export function readNativeRpcCode(cause: unknown): number | undefined {
-  return cause && typeof cause === 'object' && 'rpcCode' in cause && typeof cause.rpcCode === 'number' ? cause.rpcCode : undefined
+  if (!cause || typeof cause !== 'object' || !('rpcCode' in cause)) return undefined
+  if (typeof cause.rpcCode !== 'number') return undefined
+  return cause.rpcCode
 }
 
 /** Keep safeCatalogErrorCode's disclosure policy in one allowlist, independent of native messages. */

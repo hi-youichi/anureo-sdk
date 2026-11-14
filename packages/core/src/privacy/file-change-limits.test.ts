@@ -216,3 +216,60 @@ test('UTF-8 truncation retains complete lines and reserves canonical bytes befor
   expect(source).toEqual(original)
   expect(validateDefinition('Item', result)).toBe(true)
 })
+
+/** A rejected patch must preserve the earlier text-buffer update so extraction cannot silently change failure ordering. */
+test('delta text updates its prefix before an Item-shaped patch fails validation', () => {
+  const filter = new SecretRedactor()
+  filter.rememberResponse({ kind: 'userInput', interactionId: 'secret', questions: [{ id: 'key', prompt: 'Key', secret: true }] }, { kind: 'userInput', answers: { key: 'secret' } })
+  expect(() => filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'patch', text: 'sec', value: { type: 'toolCall' } } }, 'turn')).toThrow('Invalid AHP Item')
+  expect(filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'text', text: 'ret' } }, 'turn')).toMatchObject({ payload: { text: '[redacted]' } })
+})
+
+/** Complete matches take priority over longer pending candidates, while complete scans never retain an unmatched prefix. */
+test('overlapping secrets prefer the longest complete match without waiting for a longer candidate', () => {
+  const filter = new SecretRedactor()
+  filter.rememberResponse({ kind: 'elicitation', interactionId: 'secret', mode: 'form', schema: { secret: true } }, { kind: 'elicitation', action: 'accept', content: { short: 'sec', long: 'secret' } })
+  expect(filter.text('secret sec se')).toBe('[redacted] [redacted] se')
+  expect(filter.delta('stream', 'se')).toBe('')
+  expect(filter.delta('stream', 'c')).toBe('[redacted]')
+  expect(filter.delta('stream', 'ret')).toBe('ret')
+})
+
+/** Capacity failures must precede the host hook, retain earlier registrations and still permit duplicate values at capacity. */
+test('scalar registration enforces distinct-value and UTF-8 limits before persistence', () => {
+  const request: InteractionRequested = { kind: 'elicitation', interactionId: 'secret', mode: 'form', schema: { secret: true } }
+  const remembered: string[] = []
+  const filter = new SecretRedactor(value => remembered.push(value))
+  const values = Array.from({ length: 129 }, (_, index) => `value-${index};`)
+  expect(() => filter.rememberResponse(request, { kind: 'elicitation', action: 'accept', content: { values } })).toThrow('Marked secret limit exceeded')
+  expect(remembered).toEqual(values.slice(0, 128))
+  filter.rememberResponse(request, { kind: 'elicitation', action: 'accept', content: { duplicate: values[0]! } })
+  expect(remembered).toHaveLength(128)
+  expect(filter.text(values[128]!)).toBe(values[128]!)
+  expect(filter.text(values[0]!)).toBe('[redacted]')
+
+  const byteValues: string[] = []
+  const byteFilter = new SecretRedactor(value => byteValues.push(value))
+  const atLimit = '🙂'.repeat(16 * 1024)
+  byteFilter.rememberResponse(request, { kind: 'elicitation', action: 'accept', content: { atLimit } })
+  expect(() => byteFilter.rememberResponse(request, { kind: 'elicitation', action: 'accept', content: { overflow: 'x' } })).toThrow('Marked secret limit exceeded')
+  expect(byteValues).toEqual([atLimit])
+  expect(byteFilter.text(atLimit)).toBe('[redacted]')
+  expect(byteFilter.text('x')).toBe('x')
+})
+
+/** Discarding an incomplete replacement must not refund bytes already consumed by either side. */
+test('unavailable replacement material keeps its reserved bytes ahead of later mirrors', () => {
+  const source = makeFileChangeItem()
+  const oldText = `${'a'.repeat(FILE_CHANGE_TEXT_LIMIT - 8)}\n`
+  source.fileChanges![0]!.materials = [{ format: 'text', scope: 'fragment', oldText, newText: 'bb\nmore\n' }]
+  source.input = 'é\n'
+  source.output = 'x\n'
+  const result = boundFileChangeItem(source)
+  if (result.type !== 'toolCall') throw Error('unexpected item')
+  expect(result.fileChanges![0]!.materials).toEqual([{ format: 'unavailable', reason: 'tooLarge' }])
+  expect(result.input).toBe('é\n')
+  expect(result.output).toBe('')
+  expect(result.extensions?.['x-anureo/fileChangesTruncated']).toBe(true)
+  expect(validateDefinition('Item', result)).toBe(true)
+})

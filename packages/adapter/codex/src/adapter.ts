@@ -11,34 +11,11 @@ import { readAccountStatus } from './account'
 import { readCodexModels, type CodexModel } from './models'
 import { CodexBackendSession } from './session'
 
-/** Reconciliation evidence returned to SDK hosts; an inconclusive read must never claim execution stopped. */
-type ExecutionInspection = { stopped: false } | { stopped: true; status: 'completed'|'interrupted'|'failed'; turnId: string }
-
-/** Shared terminal-status rule for reconciliation; preserve native string coercion without normalizing the returned status. */
-function isTerminalStatus(status: unknown): boolean {
-  return ['completed', 'interrupted', 'failed'].includes(String(status))
-}
-
-/** For inspectExecution, evaluate a read-only thread snapshot without mutation or I/O. Require exact identities, explicit idle state and no unfinished turns; absent evidence returns stopped:false. */
-function inspectThread(thread: NativeRecord, { threadId, nativeTurnId }: { threadId: string; nativeTurnId: string }): ExecutionInspection {
-  if (thread.id !== threadId || record(thread.status).type !== 'idle' || !Array.isArray(thread.turns)) return { stopped: false }
-  const turns = thread.turns.map(record)
-  if (turns.some(turn => !isTerminalStatus(turn.status))) return { stopped: false }
-  const target = turns.find(turn => turn.id === nativeTurnId)
-  if (!target || !isTerminalStatus(target.status)) return { stopped: false }
-  return { stopped: true, status: target.status as 'completed'|'interrupted'|'failed', turnId: nativeTurnId }
-}
-
 /** Host-facing adapter owner: initialize before opening sessions, then dispose to release owned session processes. Read-only probes own separate short-lived clients; native policy and projections live below this class. */
 export class CodexNativeAdapter implements HarnessAdapter {
-  private disposed = false
-  private version = ''
-  private clientInfo?: InitializeParams['clientInfo']
-  private initialized?: Promise<InitializeResult>
-  private readonly sessions = new Set<CodexBackendSession>()
   /** Accept host launch options without starting a process; initialize must precede session opening and dispose releases owned sessions. */
   constructor(readonly options: CodexAdapterOptions) {}
-  /** Validate every host negotiation synchronously, then share the first version-probe promise, including rejection. Disposed use rejects; the first caller supplies session clientInfo. Starts only a probe process, never a session. */
+  /** Validate every host negotiation synchronously, then share the first version-probe promise, including rejection. Disposed use rejects; the first caller supplies session clientInfo. A nonempty version override skips probing; initialization never opens a session. */
   initialize(params: InitializeParams): Promise<InitializeResult> {
     if (this.disposed) return Promise.reject(new HarnessSdkError('RUNTIME_DISPOSED'))
     assertRequest("initialize", params)
@@ -96,7 +73,7 @@ export class CodexNativeAdapter implements HarnessAdapter {
     if (resolved) params = { ...params, fork: resolved.fork }
     const process = await this.launchProcess(params.cwd)
     if (this.disposed) { await process.dispose(); throw new HarnessSdkError('RUNTIME_DISPOSED') }
-    const session = new CodexBackendSession(params, sink, { profile: native.profile ?? CODEX_PROFILES[0]!, verified: native.verified }, capabilities, this.options)
+    const session = new CodexBackendSession({ params, sink, native: { profile: native.profile ?? CODEX_PROFILES[0]!, verified: native.verified }, capabilities, options: this.options })
     if (resolved?.source) session.importTurnMap(resolved.source)
     const client = new CodexJsonlClient(process, {
       notification: (method, values) => session.notification(method, values),
@@ -112,6 +89,19 @@ export class CodexNativeAdapter implements HarnessAdapter {
       return session
     } catch (cause) { await client.dispose(); throw cause }
   }
+  /** For host teardown, prevent future initialization/opening, dispose registered sessions concurrently, then clear registration. After all settle, reject the first failure in registration order; process cleanup does not claim native interruption. Already-started opens and independent probes are not awaited. */
+  async dispose(): Promise<void> {
+    this.disposed = true
+    const results = await Promise.allSettled([...this.sessions].map(session => session.dispose()))
+    this.sessions.clear()
+    const failure = results.find((value): value is PromiseRejectedResult => value.status === 'rejected')
+    if (failure) throw failure.reason
+  }
+  private disposed = false
+  private version = ''
+  private clientInfo?: InitializeParams['clientInfo']
+  private initialized?: Promise<InitializeResult>
+  private readonly sessions = new Set<CodexBackendSession>()
   /** For openSession after capability admission, resolve a required fork boundary before launching a process. Return copied fork params and its observed source without mutation or I/O; throw BOUNDARY_NATIVE_ID_REQUIRED when neither supplied nor observed evidence exists. */
   private resolveFork(fork: NonNullable<SessionOpenParams['fork']>): { fork: NonNullable<SessionOpenParams['fork']>; source?: CodexBackendSession } {
     const source = [...this.sessions].find(session => session.binding.sessionId === fork.sourceSessionId)
@@ -136,14 +126,24 @@ export class CodexNativeAdapter implements HarnessAdapter {
     await client.request('initialize', { clientInfo, capabilities: { experimentalApi: true } })
     await client.notify('initialized')
   }
-  /** For host teardown, prevent future initialization/opening, dispose registered sessions concurrently, then clear registration. After all settle, reject the first failure in registration order; process cleanup does not claim native interruption. Already-started opens and independent probes are not awaited. */
-  async dispose(): Promise<void> {
-    this.disposed = true
-    const results = await Promise.allSettled([...this.sessions].map(session => session.dispose()))
-    this.sessions.clear()
-    const failure = results.find((value): value is PromiseRejectedResult => value.status === 'rejected')
-    if (failure) throw failure.reason
-  }
 }
 /** For SDK hosts, construct an uninitialized adapter without I/O; caller must initialize before opening sessions and dispose it after use. */
 export function createCodexAdapter(options: CodexAdapterOptions): CodexNativeAdapter { return new CodexNativeAdapter(options) }
+
+/** Reconciliation evidence returned to SDK hosts; an inconclusive read must never claim execution stopped. */
+type ExecutionInspection = { stopped: false } | { stopped: true; status: 'completed'|'interrupted'|'failed'; turnId: string }
+
+/** Shared terminal-status rule for reconciliation; preserve native string coercion without normalizing the returned status. */
+function isTerminalStatus(status: unknown): boolean {
+  return ['completed', 'interrupted', 'failed'].includes(String(status))
+}
+
+/** For inspectExecution, evaluate a read-only thread snapshot without mutation or I/O. Require exact identities, explicit idle state and no unfinished turns; absent evidence returns stopped:false. */
+function inspectThread(thread: NativeRecord, { threadId, nativeTurnId }: { threadId: string; nativeTurnId: string }): ExecutionInspection {
+  if (thread.id !== threadId || record(thread.status).type !== 'idle' || !Array.isArray(thread.turns)) return { stopped: false }
+  const turns = thread.turns.map(record)
+  if (turns.some(turn => !isTerminalStatus(turn.status))) return { stopped: false }
+  const target = turns.find(turn => turn.id === nativeTurnId)
+  if (!target || !isTerminalStatus(target.status)) return { stopped: false }
+  return { stopped: true, status: target.status as 'completed'|'interrupted'|'failed', turnId: nativeTurnId }
+}

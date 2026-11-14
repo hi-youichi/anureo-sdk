@@ -79,6 +79,7 @@ test('snapshots the callbacks before one callback mutates the input array', asyn
   expect(await parallel(callbacks)).toEqual([1, 2])
 })
 
+/** Compile-only assertions for positional inference and nullable failures; never invoked at runtime. */
 function checkTypes() {
   const values = parallel([() => 1, async () => 'two', () => true])
   const tuple: Promise<[number | null, string | null, boolean | null]> = values

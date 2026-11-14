@@ -1,19 +1,21 @@
-// Discovers and executes ordered validation gates; it must not schedule agents or publish reports.
+// Discovers and executes ordered shell validation gates for changed refactor steps.
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { message } from './errors'
 import { exec } from './process'
 import type { CheckResult } from './results'
 
-/** Validate commands for CLI/library entry points before resource acquisition, returning void.
+/** Reject blank commands before resource acquisition in refactorCode and CLI parseCliInput.
  * Throws a labeled error for any blank command; undefined and empty lists are allowed.
  * Does not mutate input, read files or start processes. */
 export function validateChecks(commands: readonly string[] | undefined, label = 'check'): void {
   if (commands?.some(command => !command.trim())) throw new Error(`${label} commands must be nonempty`)
 }
 
-/** Read the target's package scripts for orchestration, returning typecheck before test.
- * Uses a recognized declared package manager or npm; reads no parent packages and starts no process.
+/** Discover typecheck then test for refactorCode when checks are omitted outside review-only mode.
+ * Includes only string-valued scripts in the target package.json. A packageManager declaration
+ * starting with bun@, npm@, pnpm@ or yarn@ selects that runner; otherwise uses npm.
+ * Reads no parent packages and starts no process.
  * Missing package.json yields no checks; malformed JSON and other filesystem errors reject. */
 export async function defaultChecks(cwd: string): Promise<string[]> {
   let pkg: { packageManager?: string; scripts?: Record<string, unknown> }
@@ -27,10 +29,13 @@ export async function defaultChecks(cwd: string): Promise<string[]> {
 }
 
 /** Execute explicit shell commands serially, appending bounded output to the caller's results array.
- * Orchestration calls this after edits and awaits completion; commands may modify files or start
- * other processes. Resolves void after all checks; the first failed command is recorded before
- * rejection and stops later commands. Each process has a five-minute timeout and an eight-MiB
- * output limit; only the final 4,000 characters are retained for report size. */
+ * runStep awaits this after observed edits outside review-only mode and converts rejection into
+ * a failed step, stopping later phases. Commands may modify files or start other processes.
+ * Resolves void after all checks; the first failed command is recorded before rejection and stops
+ * later commands. Each process has a five-minute timeout and an eight-MiB
+ * limit on each output stream. Reports concatenate stdout then stderr, followed by the error
+ * message on failure, and retain only the final 4,000 characters. An empty command list resolves
+ * without changing results; existing entries are retained. */
 export async function runChecks(cwd: string, commands: readonly string[], results: CheckResult[]): Promise<void> {
   for (const command of commands) {
     try {

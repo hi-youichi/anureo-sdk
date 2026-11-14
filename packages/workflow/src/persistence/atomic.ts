@@ -3,13 +3,18 @@ import { open, rename, unlink } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { canonicalJson } from './json'
 
-/** Windows supports file flushes, but Node does not provide directory fsync there. */
+/** Flush directory-entry changes and close the directory handle; I/O failures reject.
+ * Windows skips this step because Node does not provide directory fsync there. */
 export async function syncDirectory(path: string): Promise<void> {
   if (process.platform === 'win32') return
   const directory = await open(path, 'r')
   try { await directory.sync() } finally { await directory.close() }
 }
 
+/** Replace a file with canonical JSON after flushing a sibling temporary file, then flush
+ * its parent directory. The caller must create the parent and serialize competing writes.
+ * Rejections can occur after replacement; temporary-file cleanup failures aggregate with
+ * the original failure, so rejection does not guarantee the destination was unchanged. */
 export async function atomicPublish(path: string, value: unknown): Promise<void> {
   const text = `${canonicalJson(value)}\n`
   const temporary = `${path}.${randomUUID()}.tmp`

@@ -24,7 +24,13 @@ const client = await createClient({
   }),
   identity: { adapterId: 'codex', runtimeConfigId: 'local' },
 })
-// Use client.sessions.create(...) and session.submit(...); dispose in finally.
+try {
+  const session = await client.sessions.create({ cwd: '/workspace' })
+  const turn = await session.submit({ input: 'Summarize this repository.' })
+  console.log(await turn.result())
+} finally {
+  await client.dispose()
+}
 ```
 
 The adapter probes the binary's version during initialization (or trusts an explicit `options.version` from a host probe) and derives its capabilities from a native behavior profile.
@@ -47,12 +53,25 @@ Use `resolveCodexProfile(version)` and `codexCapabilities(version)` to inspect t
 
 | Entry | Contents |
 |---|---|
-| `@anureo/adapter-codex` | `createCodexAdapter`, `CodexAdapterOptions`, `CodexProfile`, `resolveCodexProfile`, `codexCapabilities`, `createCodexCatalogSession`, `CodexModel`, `CodexJsonlClient`, `CodexRpcError`, `mapItems`, `mapUsage` |
+| `@anureo/adapter-codex` | `createCodexAdapter`, `CodexNativeAdapter` (the factory result implementation), `CodexAdapterOptions`, `CodexProfile`, `resolveCodexProfile`, `codexCapabilities`, `createCodexCatalogSession`, `CodexModel`, `CodexJsonlClient`, `CodexRpcError`, `mapItems`, `mapUsage` |
 | `@anureo/adapter-codex/jsonl` | The low-level JSONL client over the child process |
 | `@anureo/adapter-codex/mapping` | Native record → AHP item/usage mapping helpers |
 | `@anureo/adapter-codex/catalog` | Model catalog session (`createCodexCatalogSession`) |
 
 `CodexAdapterOptions` extends the JSONL options (`timeoutMs`, `maxFrameBytes`, `maxPending`, `maxServerRequests`) with `command`, `args`, `cwd`, `env`, `version`, `processFactory` (for injected transports and tests), `diagnostic`, and `maxHistoryItems`.
+
+## Code structure
+
+| Path | Responsibility |
+|---|---|
+| [`src/index.ts`](src/index.ts) | Assembles the package root exports. The root also re-exports `CodexNativeAdapter`, the implementation returned by `createCodexAdapter()`. |
+| [`src/adapter.ts`](src/adapter.ts), [`src/options.ts`](src/options.ts) | Own adapter initialization, native client ownership and host launch configuration. |
+| [`src/session.ts`](src/session.ts) | Dispatches session requests and routes native notifications into SDK events. |
+| [`src/jsonl.ts`](src/jsonl.ts) | Implements the `./jsonl` entry: request correlation, server requests and stdio connection cleanup. |
+| [`src/mapping.ts`](src/mapping.ts), [`src/usage.ts`](src/usage.ts), [`src/file-changes.ts`](src/file-changes.ts) | Implement item, usage and file-change projections; `./mapping` exposes the mapping helpers. |
+| [`src/catalog.ts`](src/catalog.ts), [`src/models.ts`](src/models.ts), [`src/account.ts`](src/account.ts) | Own the `./catalog` query lifecycle and model/account projections. |
+| [`src/profile.ts`](src/profile.ts), [`src/version.ts`](src/version.ts), [`src/settings.ts`](src/settings.ts) | Select native behavior profiles, probe executable versions and translate session settings. |
+| [`protocol/`](protocol/), [`scripts/protocol-check.ts`](scripts/protocol-check.ts) | Retain and verify pinned native schemas and their provenance. |
 
 ## Configuration options
 
