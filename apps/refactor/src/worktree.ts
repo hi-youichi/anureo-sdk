@@ -2,74 +2,94 @@
 import { copyFile, cp, mkdir, mkdtemp, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, sep } from 'node:path'
-import { fileFingerprint, git, gitFiles, gitProcessOptions, inspectGitPath, isSnapshotPath } from './git-tree'
+import { inspectGitPath, isSnapshotPath } from './git-path'
+import { fileFingerprint } from './git-tree'
+import { git, gitFiles, gitProcessOptions } from './git'
 import { exec } from './process'
 
+/** Phase-owned snapshot shared by planning, agent checkouts and patch integration. */
 export interface WorktreeBaseline {
+  /** Canonical Git repository root, used for registry updates and patch application. */
   root: string
+  /** Target directory relative to the root, empty when the target is the root. */
   scope: string
+  /** Commit used to register detached worktrees, including a synthetic commit for an unborn branch. */
   head: string
+  /** Scratch directory owned and removed by withWorktreeBaseline. */
   directory: string
+  /** Root of the copied working files, before applying the target scope. */
   source: string
+  /** Whether the scratch directory contains a copy of the repository's index. */
   hasIndex: boolean
+  /** Enqueue a Git registry mutation for this baseline and return its result or rejection.
+   * A rejected update still releases the next queued update. */
+  updateWorktreeRegistry: (update: () => Promise<string>) => Promise<string>
 }
 
+/** Linked checkout and scratch paths owned by the caller of createAgentWorktree. */
 export interface AgentWorktree {
+  /** Scoped directory supplied to the agent session. */
   cwd: string
+  /** Full checkout root used to detect changes outside the scope and unregister the checkout. */
   root: string
+  /** Scratch parent containing the checkout and any patch staging files. */
   directory: string
 }
 
-/** Freeze the current source and index once so every session in a phase sees the same dirty tree. */
+/** Snapshot the index and Git-visible working files once before invoking a phase callback.
+ * runDesign uses its snapshot for the design session and integration. refactorCode takes a new
+ * one for planning, module work and ordered integration. The callback must await all worktree
+ * use and removal before settling. Capture is sequential and assumes a stable source tree.
+ * Returns the callback's result after scratch removal. Setup and callback failures reject, and
+ * a scratch removal failure takes precedence. */
 export async function withWorktreeBaseline<T>(cwd: string, use: (baseline: WorktreeBaseline) => Promise<T>): Promise<T> {
   const root = await realpath((await git(cwd, 'rev-parse', '--show-toplevel')).replace(/\r?\n$/, ''))
   const scope = relative(root, cwd)
   const directory = await temporary('baseline')
-  const source = join(directory, 'source')
   try {
-    await mkdir(join(source, scope), { recursive: true })
-    const head = await baselineHead(root, directory)
-    const index = (await git(root, 'rev-parse', '--path-format=absolute', '--git-path', 'index')).replace(/\r?\n$/, '')
-    const hasIndex = await copyFile(index, join(directory, 'index')).then(() => true, (error: NodeJS.ErrnoException) => {
-      if (error.code === 'ENOENT') return false
-      throw error
-    })
-    for (const file of await gitFiles(root)) {
-      if (isSnapshotPath(file)) await copyEntry(root, source, file)
-    }
-    return await use({ root, scope, head, directory, source, hasIndex })
+    const baseline = await snapshotBaseline({ root, scope, directory })
+    return await use(baseline)
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
 }
 
-/** Create a detached linked checkout without running checkout hooks or transforming dirty files. */
+/** Register a detached checkout, restore the frozen index if present and copy the frozen working files.
+ * Git skips checkout so hooks and filters cannot transform the copied files. inAgentWorktree passes
+ * the scoped cwd to planning, and runAgentWork fingerprints the full root before starting the agent.
+ * Both await removeAgentWorktree after use. Setup failures reject after attempting cleanup, and a
+ * cleanup failure takes precedence. */
 export async function createAgentWorktree(baseline: WorktreeBaseline): Promise<AgentWorktree> {
   const directory = await temporary('agent')
   const root = join(directory, 'checkout')
   const worktree = { cwd: join(root, baseline.scope), root, directory }
-  let registered = false
   try {
-    await git(baseline.root, '-c', 'core.hooksPath=' + join(directory, 'hooks'),
-      'worktree', 'add', '--detach', '--no-checkout', root, baseline.head)
-    registered = true
+    await baseline.updateWorktreeRegistry(() => git(baseline.root, '-c', 'core.hooksPath=' + join(directory, 'hooks'),
+      'worktree', 'add', '--detach', '--no-checkout', root, baseline.head))
+  } catch (cause) {
+    await rm(directory, { recursive: true, force: true })
+    throw cause
+  }
+  try {
     if (baseline.hasIndex) {
-      const index = (await git(root, 'rev-parse', '--path-format=absolute', '--git-path', 'index')).replace(/\r?\n$/, '')
+      const index = await gitIndexPath(root)
       await copyFile(join(baseline.directory, 'index'), index)
     }
     await cp(baseline.source, root, { recursive: true, verbatimSymlinks: true })
     return worktree
   } catch (cause) {
-    if (registered) await removeAgentWorktree(baseline, worktree)
-    else await rm(directory, { recursive: true, force: true })
+    await removeAgentWorktree(baseline, worktree)
     throw cause
   }
 }
 
-/** Remove a linked checkout through Git before deleting its scratch directory. */
+/** Release a checkout after the session and any patch capture settle. Unregister it through Git
+ * before deleting its scratch directory. Failures reject with RESOURCE_RELEASE_FAILED and the
+ * original cause. runAgentWork records the cleanup failure on the step, while inAgentWorktree
+ * propagates it to planning. */
 export async function removeAgentWorktree(baseline: WorktreeBaseline, worktree: AgentWorktree): Promise<void> {
   try {
-    await git(baseline.root, 'worktree', 'remove', '--force', worktree.root)
+    await baseline.updateWorktreeRegistry(() => git(baseline.root, 'worktree', 'remove', '--force', worktree.root))
     await rm(worktree.directory, { recursive: true, force: true })
   } catch (cause) {
     throw Object.assign(new Error(`Could not remove refactor worktree at ${worktree.root}`, { cause }), {
@@ -78,24 +98,33 @@ export async function removeAgentWorktree(baseline: WorktreeBaseline, worktree: 
   }
 }
 
-/** Capture a binary-capable patch while the agent's checkout is still available. */
+/** Compare only the supplied scope-relative paths against the frozen baseline and return Git patch bytes.
+ * For observed edits in edit mode, runAgentWork persists those bytes before removing the checkout,
+ * even if the agent failed.
+ * Requires a fresh checkout scratch directory for the before/after trees. Copy/diff failures and
+ * empty output reject. The caller owns scratch cleanup through removeAgentWorktree. */
 export async function captureWorktreePatch(
   baseline: WorktreeBaseline, worktree: AgentWorktree, files: readonly string[],
 ): Promise<Buffer> {
   const before = join(worktree.directory, 'before')
   const after = join(worktree.directory, 'after')
+  const source = join(baseline.source, baseline.scope)
   await mkdir(before)
   await mkdir(after)
   for (const file of files) {
-    await copyEntry(join(baseline.source, baseline.scope), before, file)
+    await copyEntry(source, before, file)
     await copyEntry(worktree.cwd, after, file)
   }
-  const patch = await diff(worktree.directory)
+  const patch = await diffPatchTrees(worktree.directory)
   if (!patch.length) throw new Error('Git could not represent the observed worktree changes')
   return patch
 }
 
-/** Apply one patch to the target working files after comparing them with the frozen baseline. */
+/** Apply a saved patch to the scoped working files after checking the supplied paths against the
+ * baseline, including ignored local paths. The caller must pair the patch with its observed path
+ * list and coordinate writers through the check and apply. Fingerprint errors, mismatches and
+ * Git failures reject. integrateAgentWork records failures on the step and only runs checks after
+ * a successful apply to a successful step. */
 export async function applyWorktreePatch(
   baseline: WorktreeBaseline, files: readonly string[], patchPath: string,
 ): Promise<void> {
@@ -110,11 +139,49 @@ export async function applyWorktreePatch(
   await git(baseline.root, 'apply', '-p2', ...scope, '--whitespace=nowarn', patchPath)
 }
 
-async function temporary(kind: string): Promise<string> {
+/** Allocate a scratch directory under the canonical temporary root. Callers own removal. */
+async function temporary(kind: 'baseline' | 'agent'): Promise<string> {
   return mkdtemp(join(await realpath(tmpdir()), `anureo-refactor-${kind}-`))
 }
 
-/** Linked worktrees need a commit even when the target has an unborn branch. */
+/** Populate the caller-owned scratch directory before exposing the baseline. Capture the index
+ * before walking the working files, preserving Git's tracked and unignored untracked view.
+ * Filesystem and Git failures reject so withWorktreeBaseline can remove partial snapshots. */
+async function snapshotBaseline({ root, scope, directory }: Pick<WorktreeBaseline, 'root' | 'scope' | 'directory'>): Promise<WorktreeBaseline> {
+  const source = join(directory, 'source')
+  await mkdir(join(source, scope), { recursive: true })
+  const head = await baselineHead(root, directory)
+  const index = await gitIndexPath(root)
+  const hasIndex = await copyFile(index, join(directory, 'index')).then(() => true, (error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return false
+    throw error
+  })
+  for (const file of await gitFiles(root)) {
+    if (isSnapshotPath(file)) await copyEntry(root, source, file)
+  }
+  return { root, scope, head, directory, source, hasIndex, updateWorktreeRegistry: createRegistryQueue() }
+}
+
+/** Resolve the index for the specific checkout, since linked worktrees have their own index paths.
+ * Git failures reject. */
+async function gitIndexPath(cwd: string): Promise<string> {
+  return (await git(cwd, 'rev-parse', '--path-format=absolute', '--git-path', 'index')).replace(/\r?\n$/, '')
+}
+
+/** Serialize worktree add and remove callbacks within one baseline. Give each caller its own
+ * outcome while allowing later registry operations to proceed after a rejection. */
+function createRegistryQueue(): WorktreeBaseline['updateWorktreeRegistry'] {
+  let registryReady = Promise.resolve()
+  return update => {
+    const result = registryReady.then(update)
+    registryReady = result.then(() => {}, () => {})
+    return result
+  }
+}
+
+/** Resolve HEAD for snapshotBaseline. If Git reports it missing, write an empty tree and a
+ * synthetic commit to the repository object store so linked checkouts can detach at a commit.
+ * Ref pointers stay in place. Other Git and filesystem failures reject. */
 async function baselineHead(root: string, directory: string): Promise<string> {
   try {
     return (await git(root, 'rev-parse', '--verify', '--quiet', 'HEAD')).trim()
@@ -128,7 +195,9 @@ async function baselineHead(root: string, directory: string): Promise<string> {
     '-c', 'commit.gpgSign=false', 'commit-tree', tree, '-m', 'Empty refactor baseline')).trim()
 }
 
-/** Copy one Git path without traversing symlink ancestors or recursively copying submodules. */
+/** Copy a Git path into a caller-owned staging tree, skipping missing entries so deletions stay
+ * visible. Preserve final symlink text and represent directory entries without recursing into
+ * submodules. Linked ancestors, unsupported entry types and filesystem failures reject. */
 async function copyEntry(from: string, to: string, file: string): Promise<void> {
   const { path, info, linkedAncestor } = await inspectGitPath(from, file)
   if (linkedAncestor) throw new Error(`Symlink ancestors are unsupported: ${file}`)
@@ -141,8 +210,9 @@ async function copyEntry(from: string, to: string, file: string): Promise<void> 
   else throw new Error(`Unsupported Git path: ${file}`)
 }
 
-/** Git returns status 1 for an ordinary no-index diff. Preserve the bytes for application. */
-async function diff(cwd: string): Promise<Buffer> {
+/** Diff the before/after trees for captureWorktreePatch. Git status 1 denotes a difference and
+ * returns the buffered patch bytes. Other process failures propagate. */
+async function diffPatchTrees(cwd: string): Promise<Buffer> {
   try {
     const { stdout } = await exec('git', ['diff', '--no-index', '--no-renames', '--no-ext-diff',
       '--no-textconv', '--no-color', '--binary', '--src-prefix=a/', '--dst-prefix=b/', '--', 'before', 'after'],

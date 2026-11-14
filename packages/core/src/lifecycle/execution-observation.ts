@@ -1,33 +1,34 @@
-// Defines the Session-to-Turn observation port; must not dispatch requests or own execution resources.
 import type { AhpEvent } from '@anureo/protocol';
 import type { EventHub } from './events';
 import type { Input, RequestOptions, TurnResult } from '../types';
 
 /**
- * Internal contract supplied by Session.context and passed to Turn by Session.submitExecution.
- * Session.retainEvent publishes events and resolves completion; Session.endObservation rejects
- * unfinished observations on closure. Turn reads the shared port while owning only local cancellation.
- * Implementations retain native execution, ordering and resource-release responsibilities.
+ * Internal port allocated by Session.context and passed to Turn by Session.submitExecution when
+ * association resolves. Turn uses it for live subscriptions, terminal results and explicit controls.
+ * Session owns event ordering, shared settlement and native resources. Each Turn owns its wait
+ * and subscription cancellation.
  */
 export interface ExecutionObservation {
-  /** Stable native execution identity, shared across submissions that associate with the same turn. */
+  /** Stable execution ID reported by the adapter and shared by submissions bound to the same turn. */
   readonly id: string;
   /** Session-owned live producer hub; Turn.events creates an isolated subscription without replay. */
   readonly events: EventHub<AhpEvent>;
-  /** Terminal snapshot or observation failure shared by all handles; local waits cannot settle it. */
+  /** Session.retainEvent resolves the frozen snapshot at native completion. Session.endObservation rejects unfinished results on closure. */
   readonly result: Promise<TurnResult>;
-  /** Native completion marker maintained by Session.retainEvent; observation closure alone leaves it false. */
+  /** Session.retainEvent sets this on turn/completed before publishing the terminal event and ending its stream. */
   readonly terminal: boolean;
   /**
    * Turn.steer explicitly invokes the callback installed by Session.context. It normalizes input and
-   * awaits Session.request('turn/steer') for this execution, discarding the receipt on success and
-   * propagating admission/dispatch/wait rejection. Caller cancellation does not cancel admitted work.
+   * awaits Session.request('turn/steer') with this execution as the atomic target. It discards the
+   * validated receipt and propagates normalization, admission, dispatch and wait rejections. Native
+   * work continues if the caller ends its wait after admission.
    */
   steer(input: Input, wait?: RequestOptions): Promise<void>;
   /**
    * Turn.interrupt explicitly invokes the callback installed by Session.context. It awaits
-   * Session.request('turn/interrupt'), discarding the receipt or propagating rejection; terminal events
-   * still settle result. Observation cleanup never invokes this control implicitly.
+   * Session.request('turn/interrupt') for this execution, discarding the validated receipt or
+   * propagating admission, dispatch and wait rejections. Session.retainEvent settles result
+   * separately when the terminal event arrives.
    */
   interrupt(wait?: RequestOptions): Promise<void>;
 }

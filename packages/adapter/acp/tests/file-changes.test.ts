@@ -10,11 +10,15 @@ test('ACP typed content preserves empty existing and null new-file semantics', (
     { type: 'diff', path: 'existing', oldText: '', newText: 'b' },
     { type: 'text', text: '@@ -1 +1 @@\n-a\n+b' }, // Text content is ignored, even when it resembles a diff.
     { type: 'diff', path: 'omitted', newText: 'c' },
+    { type: 'diff', path: 'emptied', oldText: 'c', newText: '' },
+    { type: 'diff', path: 'invalid-old', oldText: 0, newText: 'c' },
+    { type: 'diff', path: 'missing-new', oldText: 'c' },
   ])
   expect(changes).toMatchObject([
     { operation: 'add', materials: [{ scope: 'file', oldText: null }] },
     { operation: 'modify', materials: [{ oldText: '' }] },
     { path: 'omitted', operation: 'add', materials: [{ oldText: null }] },
+    { path: 'emptied', operation: 'modify', materials: [{ oldText: 'c', newText: '' }] },
   ])
 })
 
@@ -44,13 +48,28 @@ test('tool updates preserve omitted source, replace explicit empty content, and 
     fileChanges: [{ path: 'a' }],
     locations: [{ path: 'a', line: 0 }, { path: 'b' }],
   } } })
+  await mapper.update({
+    sessionUpdate: 'tool_call_update', toolCallId: 'edit', rawOutput: null,
+    content: [{ type: 'diff', path: 'replacement', newText: 'new' }],
+  })
+  expect(events[3]).toMatchObject({ type: 'item/delta', payload: { value: {
+    fileChanges: [{ path: 'replacement' }], output: null,
+  } } })
   await mapper.update({ sessionUpdate: 'tool_call_update', toolCallId: 'edit', content: [], status: 'completed' })
-  expect(events[3]).toMatchObject({ type: 'item/completed', payload: { item: {
+  expect(events[4]).toMatchObject({ type: 'item/completed', payload: { item: {
     fileChanges: [], output: [], status: 'completed',
     locations: [{ path: 'a', line: 0 }, { path: 'b' }],
   } } })
   // Late native patches and the final flush must not emit a second completion.
   await mapper.update({ sessionUpdate: 'tool_call_update', toolCallId: 'edit', title: 'Late patch' })
   await mapper.complete()
-  expect(events).toHaveLength(4)
+  expect(events).toHaveLength(5)
+
+  mapper.reset()
+  expect(events).toHaveLength(5)
+  await mapper.update({ sessionUpdate: 'tool_call', toolCallId: 'edit' })
+  expect(events[5]).toEqual({
+    type: 'item/started',
+    payload: { item: { id: 'edit', type: 'toolCall', kind: 'other', title: 'ACP tool', status: 'running' } },
+  })
 })

@@ -1,35 +1,34 @@
-/** Owns version profiles and advertised capabilities; it must not probe binaries or mutate live support. */
+/** Maps binary versions to native request policies and initial capability advertisements. */
 import type { Capabilities } from '@anureo/protocol'
 import { PERMISSION_MODES } from './settings'
 
 /**
- * Native method policy consumed by adapter initialization and session request builders, without I/O.
- * A version uses the newest profile whose `since` it reaches so patch and newer releases keep working.
- * Profile selection and exact-schema verification are separate; consumers must not mutate templates.
+ * Native methods and fork relations for a compatible line of Codex releases. Treat a profile
+ * returned by resolveCodexProfile as read-only because sessions share its template.
  */
 export type CodexProfile = {
   /** Lowest normalized binary version that uses this profile. */
   since: string
   /** Supported fork boundary relations advertised by this native line. */
   fork: Array<'before' | 'through'>
-  /** thread/read (0.148) or thread/turns/list (0.164+) for full turn snapshots. */
+  /** Native method for a complete turn list. */
   turns: 'thread/read' | 'thread/turns/list'
-  /** thread/rollback(numTurns) or thread/revert(beforeTurnId). */
+  /** Revert strategy. The thread/revert profile resolves through boundaries to the next turn. */
   revert: 'thread/rollback' | 'thread/revert'
   /** Paged thread/items/list, or history rebuilt from turns. */
   history: 'thread/items/list' | 'turns'
-  /** Live session settings: thread/settings/update, or per-turn overrides applied to the next turn. */
+  /** Apply settings through a native update RPC or retain them for subsequent turns. */
   settings: 'thread/settings/update' | 'per-turn'
 }
-/** Package-internal ascending compatibility profiles shared by capability selection and session fallback; callers must not mutate these templates. */
-export const CODEX_PROFILES: CodexProfile[] = [
+/** Internal compatibility profiles in ascending order. openSession uses the oldest template for pre-profile session requests. Treat the templates as read-only. */
+export const CODEX_PROFILES: [CodexProfile, ...CodexProfile[]] = [
   { since: '0.148.0', fork: ['through'], turns: 'thread/read', revert: 'thread/rollback', history: 'turns', settings: 'per-turn' },
   { since: '0.164.0', fork: ['before', 'through'], turns: 'thread/turns/list', revert: 'thread/revert', history: 'thread/items/list', settings: 'thread/settings/update' },
 ]
 /**
- * For adapter/session initialization and capability advertisement, return the newest compatible profile
- * and exact-schema verification flag. Versions below the baseline have no profile; unmatched probe text
- * retains numeric comparison fallback. No I/O or validation errors; returned templates must not be mutated.
+ * Check which profile a binary version reaches and whether that exact version was verified against
+ * a pinned schema. Use the numeric version text as input. Below-baseline versions have no profile.
+ * The returned profile is a shared template and must be treated as read-only.
  */
 export function resolveCodexProfile(version: string): { profile?: CodexProfile; verified: boolean } {
   const profile = [...CODEX_PROFILES].reverse().find(item => compareVersions(version, item.since) >= 0)
@@ -37,9 +36,10 @@ export function resolveCodexProfile(version: string): { profile?: CodexProfile; 
 }
 
 /**
- * For initialization and session opening, return advertised capabilities for a binary version, with a
- * conservative baseline when no profile matches. No I/O or validation errors; session owners must clone
- * the result before mutation because fork relations share the profile template.
+ * Preview capabilities advertised for a numeric binary version without launching it. Versions below
+ * the oldest profile get a conservative baseline. A live session can revoke optional capabilities
+ * after a native method-not-found response. Copy the result before mutation because fork relations
+ * share the profile template.
  */
 export function codexCapabilities(version: string): Capabilities {
   const { profile } = resolveCodexProfile(version)
@@ -51,8 +51,7 @@ export function codexCapabilities(version: string): Capabilities {
     interactions: ['approval'],
     config: { options: [] },
   }
-  // The baseline and the optional native methods are open for any profiled version. A method the
-  // runtime rejects as method-not-found is closed by CodexBackendSession.optional at call time, not by version number.
+  // CodexBackendSession.optional revokes a capability when its native method reports method-not-found.
   return {
     session: { resume: true, fork: profile.fork, revert: ['conversation'], history: true },
     input: { delivery: ['native'], steer: { target: 'turn', atomicMatch: true }, interrupt: { targets: ['turn'], reportsPendingInputs: false } },
@@ -70,13 +69,13 @@ export function codexCapabilities(version: string): Capabilities {
 /** Exact versions checked against the pinned native schema; other versions stay unverified even when a compatibility profile matches. */
 const VERIFIED_VERSIONS: readonly string[] = ['0.148.0', '0.164.0']
 /**
- * For profile selection, compare dotted numeric components with absent components treated as zero;
- * return a signed ordering or NaN without I/O or validation. Unmatched probe text deliberately follows
- * JavaScript's numeric/NaN comparison behavior to retain the existing profile fallback.
+ * Compare dotted components for resolveCodexProfile, treating missing components as zero.
+ * A nonnumeric component at the first differing position yields NaN, so that candidate fails the
+ * minimum-version check and an older profile can still match on an earlier numeric component.
  */
-const compareVersions = (a: string, b: string) => {
-  const left = a.split('.').map(Number)
-  const right = b.split('.').map(Number)
+function compareVersions(version: string, minimum: string): number {
+  const left = version.split('.').map(Number)
+  const right = minimum.split('.').map(Number)
   for (let i = 0; i < Math.max(left.length, right.length); i++) {
     const leftPart = left[i] ?? 0
     const rightPart = right[i] ?? 0

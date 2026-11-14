@@ -19,7 +19,7 @@ test('a gateway advertising session MCP connects to the SDK bridge with isolated
     const editors = state.createParams.map(params => params.editor as { mcp_servers: Array<{ url: string; headers: unknown }> })
     expect(editors[0]!.mcp_servers[0]!.url).not.toBe(editors[1]!.mcp_servers[0]!.url)
     expect(state.inputs).toHaveLength(2)
-    // This gateway only allows replaying an identical editor specification on resume.
+    // The SDK provisions a session MCP bridge on creation. Resuming an observation does not provision a new bridge.
     const reference = a.reference
     await a.close()
     const resumed = await client.sessions.resume(reference)

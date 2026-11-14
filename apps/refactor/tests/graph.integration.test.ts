@@ -1,4 +1,4 @@
-// Optionally verifies the real repograph adapter; it must not run a live backend in the default suite.
+// Exercises the real Repograph exporter only when REPOGRAPH_INTEGRATION=1.
 import { expect, test } from 'bun:test'
 import { realpath, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -6,10 +6,6 @@ import { loadGraph, resolveRepographEntry } from '../src/graph'
 import { exec } from '../src/process'
 import { temporary } from './helpers'
 
-/** Opt-in live-backend check for adapter maintainers using the installed package or REPOGRAPH_CLI.
- * Creates a fixture repository and index, then checks caller edges and index counts. Assertions,
- * process and backend failures reject; shared temporary() cleanup removes the repository, while
- * the finally block deletes the external index only after loadGraph has returned its identity. */
 const fixtures = [
   { language: 'TypeScript', extension: 'ts', main: 'import { save } from "./store";\nexport function main() { return save() }\n',
     store: 'export function save() { return 1 }\nexport function isolated() { return 2 }\n' },
@@ -17,6 +13,8 @@ const fixtures = [
     store: 'def save():\n    return 1\n\ndef isolated():\n    return 2\n' },
 ]
 
+// Each live case uses the installed CLI or REPOGRAPH_CLI. The shared temporary() hook removes
+// its Git repository, and the test uses the returned index report to attempt project deletion.
 test.skipIf(process.env.REPOGRAPH_INTEGRATION !== '1').each(fixtures)('real repograph exports $language cross-file callers', async ({ extension, main, store }) => {
   const cwd = await realpath(await temporary())
   await exec('git', ['init', '-q', cwd])
@@ -31,9 +29,9 @@ test.skipIf(process.env.REPOGRAPH_INTEGRATION !== '1').each(fixtures)('real repo
     expect(graph.indexReport.nodes).toBe(graph.nodes.length)
     expect(graph.indexReport.edges).toBe(graph.edges.length)
   } finally {
-    // Test-only cleanup through the package's backend (or a TS source override);
-    // production uses only the public CLI and reuses one index per target repo.
-    const { runTool } = await import(join(dirname(entry), entry.endsWith('.ts') ? 'cbm.ts' : 'cbm.js'))
+    // Use the sibling backend matching the CLI's source or installed layout to delete the index.
+    const backend = entry.endsWith('.ts') ? 'cbm.ts' : 'cbm.js'
+    const { runTool } = await import(join(dirname(entry), backend))
     await runTool('delete_project', { project: graph.indexReport.project })
   }
 }, 120_000)

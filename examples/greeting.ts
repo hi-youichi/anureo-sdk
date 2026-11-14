@@ -15,17 +15,17 @@ const client = await createClient({
   }),
 })
 try {
-  const session = await client.sessions.create({cwd:process.cwd()})
+  const session = await client.sessions.create({ cwd: process.cwd() })
 
   // Subscribe before submitting: session events are live and are not replayed.
-  const consume = streamGreeting(session)
-  // Handle early rejection now; awaiting the original consume below propagates it
-  // only if turn.result() succeeds. If turn.result() rejects, that await is skipped.
-  void consume.catch(() => {})
+  const eventConsumptionTask = streamGreeting(session)
+  // Observe rejection while waiting for submission and the result. Awaiting the original
+  // task afterward still propagates stream failures when those waits succeed.
+  void eventConsumptionTask.catch(() => {})
 
-  const turn = await session.submit({input:'こんにちは！用一句话打个招呼。'})
+  const turn = await session.submit({ input: 'こんにちは！用一句话打个招呼。' })
   await turn.result()
-  await consume
+  await eventConsumptionTask
   await session.close()
 } finally {
   // Disposal also releases the session if submission, observation or close rejects.
@@ -33,25 +33,37 @@ try {
 }
 
 /**
- * Print live text for the greeting run above, using completed message text only until
- * a text delta has been printed. Call before submit to subscribe synchronously; resolve
- * at turn completion and reject failed/interrupted turns, read failures or premature
- * stream end. The loop releases its subscription; the caller still owns client cleanup.
+ * Print live text for the greeting. Subscribe before the example submits its single
+ * turn, and use completed agent-message text as a fallback until the first nonempty text
+ * delta. Resolve at the first terminal event for a completed turn. Reject failed or
+ * interrupted outcomes, read failures, or premature stream end. The example awaits
+ * this after Turn.result(), relying on the stream to check the terminal status. The
+ * loop releases its subscription, and the example still owns session and client cleanup.
  */
 async function streamGreeting(session: Session): Promise<void> {
-  let streamed = false
+  let hasWrittenDelta = false
   for await (const event of session.events()) {
-    if (event.type === 'item/delta' && event.payload.kind === 'text' && event.payload.text) {
-      process.stdout.write(event.payload.text)
-      streamed = true
-    }
-    if (event.type === 'item/completed' && event.payload.item.type === 'agentMessage') {
-      if (!streamed) process.stdout.write(event.payload.item.text ?? '')
-      process.stdout.write('\n')
-    }
-    if (event.type === 'turn/completed') {
-      if (event.payload.status !== 'completed') throw new Error(`Turn ended: ${event.payload.status}`)
-      return
+    switch (event.type) {
+      case 'item/delta': {
+        const delta = event.payload
+        if (delta.kind === 'text' && delta.text) {
+          process.stdout.write(delta.text)
+          hasWrittenDelta = true
+        }
+        break
+      }
+      case 'item/completed': {
+        const { item } = event.payload
+        if (item.type !== 'agentMessage') break
+        if (!hasWrittenDelta) process.stdout.write(item.text ?? '')
+        process.stdout.write('\n')
+        break
+      }
+      case 'turn/completed': {
+        const { status } = event.payload
+        if (status !== 'completed') throw new Error(`Turn ended: ${status}`)
+        return
+      }
     }
   }
   throw new Error('Event stream ended without a terminal event')

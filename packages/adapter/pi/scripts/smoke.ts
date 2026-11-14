@@ -3,6 +3,7 @@
  *
  *   bun scripts/smoke.ts                       offline: opens an in-memory Pi session, lists models, disposes
  *   PI_SMOKE_MODEL=provider/id bun scripts/smoke.ts   also runs one real prompt (needs credentials in Pi's agentDir/env)
+ * Set PI_SMOKE_USE_HOME_AGENT_DIR to a nonempty value to use Pi's usual agent directory.
  */
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'

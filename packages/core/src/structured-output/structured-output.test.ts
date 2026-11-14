@@ -1,4 +1,3 @@
-// Exercises native, direct-tool and MCP output integration. Admission and commitment policy remain in production modules.
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js'
@@ -88,7 +87,11 @@ async function fixture(run: (params: AhpRequestMap['input/submit'], sink: Sessio
     get tool() { return tool },
   }
 }
-/** Integration run callbacks await item then terminal admission through the native sink. The wrapper may hold both until binding. Sink failures reject run, while status selects the simulated native completion outcome. */
+/**
+ * Script an adapter final item followed by its terminal. Await each sink call so the wrapper can
+ * retain the final or buffer events for late binding before the fixture returns its receipt.
+ * A sink failure rejects the simulated native dispatch.
+ */
 async function final(sink: SessionEventSink, turnId: string, text = 'Task done', status: 'completed' | 'failed' | 'interrupted' = 'completed') {
   await sink.emit({ type: 'item/completed', payload: { item: { id: `message:${turnId}`, type: 'agentMessage', phase: 'final', text } } }, { turnId })
   await sink.emit({ type: 'turn/completed', payload: { turnId, status, ...(status === 'failed' ? { error: { code: 'NATIVE_FAILED', message: 'failed', retryable: false, outcomeUnknown: false } } : {}) } })

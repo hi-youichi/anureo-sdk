@@ -6,7 +6,7 @@ import {
   AHP_PROTOCOL_CONTRACT, AHP_METHODS, AHP_METHOD_DEFINITIONS, assertInteractionResponse, assertRequest, assertResult, itemIdentity,
   negotiateVersion, publicEvent, publicInteraction, publicValue, supportsCapability, supportsExtension,
   validateDefinition, validateEvent, validateInteractionResponse, validateJsonSchema, validateRequest, validateResult,
-  type AhpEvent, type AhpMethod, type AhpRequestMap, type AhpResultMap, type InteractionRequested, type Item,
+  type AhpEvent, type AhpRequestMap, type AhpResultMap, type InteractionRequested, type Item,
 } from '../src'
 
 const binding = { sessionId: 's', adapterId: 'fake', runtimeConfigId: 'fake-1' }
@@ -151,6 +151,7 @@ describe('interactions and private payload projection', () => {
     const form: InteractionRequested = { interactionId: 'f', kind: 'elicitation', mode: 'form', schema: { type: 'object', properties: { count: { type: 'integer' } }, required: ['count'] } }
     expect(validateInteractionResponse(form, { kind: 'elicitation', action: 'accept', content: { count: 'oops' } })).toBe(false)
     expect(validateInteractionResponse(form, { kind: 'elicitation', action: 'decline' })).toBe(true)
+    expect(validateInteractionResponse({ ...form, schema: false }, { kind: 'elicitation', action: 'accept', content: { count: 1 } })).toBe(false)
     expect(validateInteractionResponse({ interactionId: 'd', kind: 'dynamicTool', toolName: 'example', arguments: {} }, { kind: 'dynamicTool', content: [{ type: 'text', text: 'result' }] })).toBe(true)
   })
   test('question presence is independent of truthiness and empty option lists allow free answers', () => {
@@ -214,14 +215,15 @@ describe('JSON-RPC wire', () => {
 
 
 test('public interaction preserves secret classification booleans without exposing secret values', () => {
-  const request: InteractionRequested = {
+  const request = {
     interactionId: 'secret-question',
-    kind: 'userInput',
-    questions: [{ id: 'q', prompt: 'Credential', secret: true }],
+    kind: 'userInput' as const,
+    questions: [{ id: 'q', prompt: 'Credential', secret: true, default: 'private-default' }],
     privatePayload: { secret: 'actual-credential' },
   }
   const safe = publicInteraction(request)
   expect(safe.kind === 'userInput' && safe.questions[0]?.secret).toBe(true)
+  expect(safe.kind === 'userInput' && safe.questions[0]?.default).toBe('[redacted]')
   expect(validateDefinition('InteractionRequested', safe)).toBe(true)
   expect(JSON.stringify(safe)).not.toContain('actual-credential')
 })
@@ -229,7 +231,13 @@ test('public interaction preserves secret classification booleans without exposi
 test('result assertions, public values and broken schemas fail closed', () => {
   expect(() => assertResult('input/submit', { bad: true })).toThrow('Invalid AHP InputSubmitResult')
   expect(validateJsonSchema({ $ref: '#/definitions/nonexistent' }, {})).toBe(false)
-  expect(publicValue({ token: 'credential', nested: [{ apiKey: 'k', url: 'https://x.test/a?token=SECRET' }] })).toEqual({ token: '[redacted]', nested: [{ apiKey: '[redacted]', url: 'https://x.test/a' }] })
+  expect(publicValue({
+    token: 'credential',
+    nested: [{ apiKey: 'k', url: 'https://x.test/a?token=SECRET', plainUrl: 'https://x.test/b', redirect: 'Open https://x.test/c#private now' }],
+  })).toEqual({
+    token: '[redacted]',
+    nested: [{ apiKey: '[redacted]', url: 'https://x.test/a', plainUrl: 'https://x.test/b', redirect: 'Open https://x.test/c now' }],
+  })
 })
 
 test('file-change source material is optional and validates every discriminated variant', () => {

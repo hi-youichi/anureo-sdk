@@ -1,4 +1,3 @@
-// Reports observation loss and cleanup failures; must not release resources or choose teardown order.
 import { HarnessSdkError, sdkError } from '../errors';
 
 /**
@@ -17,10 +16,10 @@ export function observationClosed({ executionStopped = 'unconfirmed' }: { execut
 
 /**
  * Construct a package-internal aggregate of cleanup failures without releasing resources.
- * Client.dispose and Session.finishClose throw this after their release attempts; the client's
- * rethrowAfterCleanup uses it when setup and cleanup both fail. Return a privacy-safe SDK aggregate,
- * deduplicating cause identity and flattening nested release codes in order. Callers own every
- * cleanup attempt and propagation to the host; this function only constructs the error.
+ * Client.dispose and Session.finishClose throw this after their release attempts. The client's
+ * rethrowAfterCleanup uses it when setup and cleanup both fail. Deduplicate input causes and
+ * flatten nested release diagnostics in order. The returned error contains codes and unknown-outcome
+ * flags so raw failure messages stay out of aggregate diagnostics.
  */
 export function combined(causes: unknown[]): HarnessSdkError {
   const errors = [...new Set(causes)].flatMap(releaseDiagnostics);

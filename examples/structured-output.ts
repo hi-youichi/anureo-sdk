@@ -20,27 +20,35 @@ const cwd = process.cwd()
 const timeoutMs = 180_000
 
 for (const backend of selected === 'all' ? ['codex', 'claude'] : [selected]) {
-  const adapter = backend === 'codex'
-    ? createCodexAdapter({ command: process.env.CODEX_BIN ?? 'codex', cwd })
-    : createClaudeAdapter({ command: process.env.CLAUDE_BIN ?? 'claude', defaultHome: true, env: process.env })
-  const model = backend === 'codex' ? process.env.CODEX_MODEL : process.env.CLAUDE_MODEL
+  const { adapter, ...sessionOptions } = backend === 'codex'
+    ? {
+        adapter: createCodexAdapter({ command: process.env.CODEX_BIN ?? 'codex', cwd }),
+        model: process.env.CODEX_MODEL,
+        permissionMode: 'read-only',
+      }
+    : {
+        adapter: createClaudeAdapter({ command: process.env.CLAUDE_BIN ?? 'claude', defaultHome: true, env: process.env }),
+        model: process.env.CLAUDE_MODEL,
+        permissionMode: 'dontAsk',
+      }
   const client = await createClient({ adapter, identity: { adapterId: backend, runtimeConfigId: 'local' } })
   try {
     const session = await client.sessions.create({
-      cwd, model,
-      permissionMode: backend === 'codex' ? 'read-only' : 'dontAsk',
+      cwd,
+      ...sessionOptions,
       instructions: 'Answer directly without reading files or running commands.',
     })
     const turn = await session.submit({ input: 'Calculate 17 + 25.', outputSchema }, { timeoutMs })
+    // Submission returns on turn association. The SDK validates final output before
+    // publishing a successful result.
     const result = await turn.result({ timeoutMs })
     if (result.status === 'failed') throw new Error(result.error.message)
     if (result.status !== 'completed') throw new Error(`Turn ${result.status}`)
 
-    // submit returns a turn handle; result waits for completion and schema validation.
-    // A completed result carries JSON text such as {"sum":42}, ready for parsing.
+    // The completed result carries validated JSON text such as {"sum":42}.
     console.log(backend, JSON.parse(result.text))
   } finally {
-    // Each backend's client owns its session and adapter, including on turn/parse failure.
+    // Release this backend's session and adapter before advancing or propagating failure.
     await client.dispose()
   }
 }

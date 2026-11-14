@@ -1,4 +1,4 @@
-/** Implements scenario-driven native stdio responses for adapter, catalog and conformance tests; it must not execute tools or access real accounts. */
+/** Simulates the native stdio server for Codex adapter, catalog, conformance and workflow tests. */
 import readline from 'node:readline'
 import { appendFileSync } from 'node:fs'
 const mode = process.env.FAKE_SCENARIO ?? 'normal'
@@ -9,11 +9,11 @@ let counter = 0
 let allowedHistory = ['native-turn-1','native-turn-2']
 /** For fixture emitters, serialize a supplied frame to stdout in call order and return its backpressure boolean without waiting for drain. Serialization errors throw; stream failures remain process errors. */
 const send = value => process.stdout.write(JSON.stringify(value) + '\n')
-/** For scenario handlers, write a method/params notification scoped to this fixture thread without awaiting interaction answers. Supplied params retain override precedence; stdout/serialization failures propagate. */
+/** Queue a notification with the fixture's thread ID as the default. Scenario params can override it to test thread filtering. */
 const notify = (method, params) => send({ method, params: { threadId, ...params } })
-/** For scenario emission and interaction replies, write final output then completion for the current process-owned turn. This ordering makes the authoritative item visible before the terminal event; stream errors propagate. */
-const emitFinalAnswerAndCompleteCurrentTurn = () => {
-  notify('item/completed', { turnId: currentTurnId, item: { id: 'message', type: 'agentMessage', text: 'authoritative final', phase: 'final_answer' } })
+/** Publish final text before completing the current turn so the adapter receives the authoritative item first. Omitted text uses the fixture's default answer. */
+function emitFinalAnswerAndCompleteCurrentTurn(text = 'authoritative final') {
+  notify('item/completed', { turnId: currentTurnId, item: { id: 'message', type: 'agentMessage', text, phase: 'final_answer' } })
   notify('turn/completed', { turn: { id: currentTurnId, status: 'completed', items: [] } })
 }
 
@@ -72,10 +72,15 @@ function sendResult(msg, result) {
   send({ id: msg.id, result })
 }
 
+/** Reject a fixture RPC with its original ID and the scenario's native code and message. Queues stdout without waiting for drain. */
+function sendRpcError(msg, code, message) {
+  send({ id: msg.id, error: { code, message } })
+}
+
 /** For turn/start and review/start, reject a busy held turn or allocate the next turn, notify before acknowledging, then emit its scenario. Mutates process-owned turn identity/counter; write failures propagate. */
 function startTurn(msg) {
   if (mode === 'hold' && msg.method === 'turn/start' && counter > 0) {
-    send({ id: msg.id, error: { code: -32602, message: 'Native busy' } })
+    sendRpcError(msg, -32602, 'Native busy')
     return
   }
   currentTurnId = msg.method === 'review/start' ? 'native-review' : `native-turn-${++counter}`
@@ -85,7 +90,7 @@ function startTurn(msg) {
   emitTurnScenario(msg)
 }
 
-/** For startTurn, emit the configured scenario after its start acknowledgement. Some modes intentionally stay pending or schedule a delayed exit/oversized frame; interactions complete only when handleMessage receives their response. Writes can throw. */
+/** Emit the scenario after startTurn acknowledges the RPC. Some modes leave the turn pending or schedule exit or an oversized frame. Interactive scenarios wait for handleMessage to receive the response. */
 function emitTurnScenario(msg) {
   switch (mode) {
     case 'titles':
@@ -100,8 +105,7 @@ function emitTurnScenario(msg) {
       return
     case 'workflow-schema': {
       const schema = msg.params.outputSchema
-      notify('item/completed', { turnId: currentTurnId, item: { id: 'message', type: 'agentMessage', text: JSON.stringify({ answer: schema?.properties?.answer?.const ?? 42 }), phase: 'final_answer' } })
-      notify('turn/completed', { turn: { id: currentTurnId, status: 'completed', items: [] } })
+      emitFinalAnswerAndCompleteCurrentTurn(JSON.stringify({ answer: schema?.properties?.answer?.const ?? 42 }))
       return
     }
     case 'disconnect':
@@ -148,7 +152,7 @@ function emitDefaultTurnTranscript() {
   notify('item/started', { turnId: currentTurnId, item: { id: 'message', type: 'agentMessage', text: '', phase: 'commentary' } })
   const notificationLine = JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId, turnId: currentTurnId, itemId: 'message', delta: 'hello 日本語' } }) + '\n'
   const notificationBytes = Buffer.from(notificationLine)
-  // Split inside 本's UTF-8 bytes to exercise decoding across writes, rather than splitting only at frame boundaries.
+  // Split inside 本's UTF-8 bytes to exercise decoding across writes.
   const splitOffset = notificationBytes.length - 8
   process.stdout.write(notificationBytes.subarray(0, splitOffset))
   process.stdout.write(notificationBytes.subarray(splitOffset))
@@ -169,7 +173,7 @@ function sendAccountStatus(msg) {
   switch (mode) {
     case 'auth-timeout': return
     case 'auth-unavailable':
-      send({ id: msg.id, error: { code: -32601, message: 'No account method' } })
+      sendRpcError(msg, -32601, 'No account method')
       return
     case 'auth-not-required':
       sendResult(msg, { account: null, requiresOpenaiAuth: false })
@@ -185,7 +189,7 @@ function sendAccountStatus(msg) {
 /** For thread/items/list, page the process's currently visible history, retaining reused item IDs and optional native timestamps. No history mutation; unsupported mode emits an RPC error and stdout failures propagate. */
 function sendHistoryItems(msg) {
   if (mode === 'no-history') {
-    send({ id: msg.id, error: { code: -32601, message: 'No optional native history method' } })
+    sendRpcError(msg, -32601, 'No optional native history method')
     return
   }
   if (!allowedHistory.length) {
@@ -226,14 +230,64 @@ function sendModels(msg) {
 /** For native thread start/resume/fork, reject the configured start failure before mutation, otherwise update fork-visible history and reply with identity/title. State changes precede the write and write failures escape. */
 function openThread(msg) {
   if (mode === 'open-fail' && msg.method === 'thread/start') {
-    send({ id: msg.id, error: { code: -32000, message: 'thread start failed' } })
+    sendRpcError(msg, -32000, 'thread start failed')
     return
   }
   if (msg.method === 'thread/fork') allowedHistory = msg.params.beforeTurnId ? [] : [msg.params.lastTurnId]
   sendResult(msg, { thread: { id: threadId, ...(mode === 'titles' ? { name: 'Restored title' } : {}) } })
 }
 
-/** Dispatch one parsed input synchronously, mutating this fixture's thread/turn history and writing ordered responses. Interaction answers complete the current turn, initialized is ignored, and unknown methods get fixture errors. Handler/write failures escape to the process. */
+/** For revert and rollback, clear visible history before acknowledging so later thread reads see the change. A write failure leaves the history cleared. */
+function clearThreadHistory(msg) {
+  allowedHistory = []
+  sendResult(msg, { thread: { id: threadId } })
+}
+
+/** Simulate revert timing out or being unavailable without changing visible history. Otherwise apply the same history change as rollback. */
+function revertThread(msg) {
+  if (mode === 'timeout-revert') return
+  if (mode === 'missing-optional') {
+    sendRpcError(msg, -32601, 'No method')
+    return
+  }
+  clearThreadHistory(msg)
+}
+
+/** Reply to thread/read with the scenario's status and current visible turns. Reuse item IDs across turns to exercise adapter history scoping. */
+function sendThreadSnapshot(msg) {
+  let type = 'idle'
+  if (mode === 'not-loaded') type = 'notLoaded'
+  else if (mode === 'still-active') type = 'active'
+  const turns = allowedHistory.map((id, i) => ({
+    id,
+    status: 'completed',
+    items: [{ id: 'reused', type: 'agentMessage', text: `history ${i}` }],
+  }))
+  sendResult(msg, { thread: { id: threadId, status: { type }, turns } })
+}
+
+/** Send a scripted thread/turns/list page. In turns-paged mode, the initial query advertises a cursor for the adapter to follow. Pages are independent of visible history. */
+function sendTurnPage(msg) {
+  if (mode === 'turns-paged' && !msg.params.cursor) {
+    sendResult(msg, { data: [{ id: 'native-turn-1', status: 'completed', items: [] }], nextCursor: 'page-two' })
+    return
+  }
+  const data = ['native-turn-1', 'native-turn-2'].map(id => ({ id, status: 'completed', items: [] }))
+  sendResult(msg, { data, nextCursor: null })
+}
+
+/** Acknowledge compact/start before publishing maintenance events. The timer keeps acknowledgement and terminal evidence separate, and compact-hang leaves only the acknowledgement. */
+function startCompaction(msg) {
+  sendResult(msg, {})
+  if (mode === 'compact-hang') return
+  notify('turn/started', { turn: { id: 'compact-turn', status: 'inProgress', items: [] } })
+  setTimeout(() => {
+    notify('thread/compacted', { turnId: 'compact-turn' })
+    notify('turn/completed', { turn: { id: 'compact-turn', status: 'completed' } })
+  }, 10)
+}
+
+/** Dispatch one parsed input from stdin. A reply with a fixture interaction ID completes the current turn. The initialized notification needs no reply, and unknown methods get an RPC error. Synchronous handler failures escape to the process. */
 function handleMessage(msg) {
   if (!msg.method) {
     if (msg.id === 'server-request' || msg.id === 901) emitFinalAnswerAndCompleteCurrentTurn()
@@ -265,27 +319,20 @@ function handleMessage(msg) {
       notify('turn/completed', { turn: { id: currentTurnId, status: 'interrupted', items: [] } })
       break
     case 'thread/settings/update':
-      if (mode === 'missing-optional') send({ id: msg.id, error: { code: -32601, message: 'No method' } })
+      if (mode === 'missing-optional') sendRpcError(msg, -32601, 'No method')
       else sendResult(msg, {})
       break
     case 'thread/revert':
-      if (mode === 'timeout-revert') break
-      if (mode === 'missing-optional') send({ id: msg.id, error: { code: -32601, message: 'No method' } })
-      else {
-        allowedHistory = []
-        sendResult(msg, { thread: { id: threadId } })
-      }
+      revertThread(msg)
       break
     case 'thread/rollback':
-      allowedHistory = []
-      sendResult(msg, { thread: { id: threadId } })
+      clearThreadHistory(msg)
       break
     case 'thread/read':
-      sendResult(msg, { thread: { id: threadId, status: { type: mode === 'not-loaded' ? 'notLoaded' : mode === 'still-active' ? 'active' : 'idle' }, turns: allowedHistory.map((id, i) => ({ id, status: 'completed', items: [{ id: 'reused', type: 'agentMessage', text: `history ${i}` }] })) } })
+      sendThreadSnapshot(msg)
       break
     case 'thread/turns/list':
-      if (mode === 'turns-paged' && !msg.params.cursor) sendResult(msg, { data: [{ id: 'native-turn-1', status: 'completed', items: [] }], nextCursor: 'page-two' })
-      else sendResult(msg, { data: ['native-turn-1','native-turn-2'].map(id => ({ id, status: 'completed', items: [] })), nextCursor: null })
+      sendTurnPage(msg)
       break
     case 'thread/items/list':
       sendHistoryItems(msg)
@@ -297,20 +344,13 @@ function handleMessage(msg) {
       sendResult(msg, { cleared: true })
       break
     case 'thread/compact/start':
-      sendResult(msg, {})
-      if (mode === 'compact-hang') break
-      notify('turn/started', { turn: { id: 'compact-turn', status: 'inProgress', items: [] } })
-      /** Timer callback publishes compaction before completion without changing currentTurnId; the delay forces callers to await events after acknowledgement. Stdout failures escape to the process. */
-      setTimeout(() => {
-        notify('thread/compacted', { turnId: 'compact-turn' })
-        notify('turn/completed', { turn: { id: 'compact-turn', status: 'completed' } })
-      }, 10)
+      startCompaction(msg)
       break
     case 'thread/unsubscribe':
       sendResult(msg, { status: 'unsubscribed' })
       break
     default:
-      send({ id: msg.id, error: { code: -32601, message: 'Method missing' } })
+      sendRpcError(msg, -32601, 'Method missing')
   }
 }
 

@@ -5,10 +5,13 @@ import { message } from './errors'
 import { exec } from './process'
 import type { CheckResult } from './results'
 
-/** A command string for the platform shell, or an executable and literal arguments for direct execution. */
+/** Configure validation after an applied patch. Strings go to the platform shell. Objects
+ * launch the named executable directly with literal arguments, defaulting to no arguments. */
 export type CheckCommand = string | { executable: string; args?: readonly string[] }
 
-/** Validate commands before run setup. Empty lists disable validation. */
+/** Reject a blank command or executable, or a NUL in a command, executable or literal argument.
+ * refactorCode runs this before repository preflight and parseCliInput uses it before client
+ * creation. Omitted and empty lists pass this check. Only omission allows script discovery. */
 export function validateChecks(commands: readonly CheckCommand[] | undefined, label = 'check'): void {
   for (const command of commands ?? []) {
     const executable = typeof command === 'string' ? command : command.executable

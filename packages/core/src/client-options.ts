@@ -1,16 +1,17 @@
-// Defines host configuration and submission inputs; must not dispatch native work or retain session state.
 import type { AhpRequestMap, InteractionRequested, InteractionResponse, SessionBinding } from '@anureo/protocol';
 import type { HarnessAdapter, RuntimeOptions } from './ports';
 import type { Input } from './types';
 
 /**
- * Hosts register these callbacks in ClientOptions.interactions; Client.initialize advertises own
- * keys, including undefined values for manual responses. Session.requestInteraction schedules a
- * supplied handler through startInteractionHandler after publishing interaction/requested.
- * Handlers receive a detached native request, including private fields needed to answer it.
- * Resolve a matching answer for native delivery; rejection triggers cancellation while actionable.
- * Observe the signal to stop host-owned work after settlement/teardown: late answers are ignored,
- * but handler capacity stays occupied until the host promise settles. The SDK owns native settlement.
+ * Register automatic interaction handlers in ClientOptions.interactions. An enumerable own key
+ * with value undefined advertises manual handling through interaction/requested events and
+ * Session.request('interaction/respond', ...). Omit a kind to leave it unsupported.
+ *
+ * Session.requestInteraction publishes interaction/requested before scheduling a handler with a
+ * detached native request, including any private fields needed to answer it. Resolve an answer
+ * matching the request kind for native delivery. Rejection triggers cancellation while actionable.
+ * Stop host work when the signal aborts on settlement or teardown. The SDK ignores late answers
+ * and holds the handler slot until the handler's promise settles.
  */
 export type InteractionHandlers = {
   [K in InteractionRequested['kind']]?: (
@@ -19,29 +20,30 @@ export type InteractionHandlers = {
   ) => Promise<Extract<InteractionResponse, { kind: K }>>;
 };
 /**
- * Hosts pass these options to Client/createClient, transferring adapter cleanup to the client.
- * Construction checks identity, interaction registrations and retention limits before native setup;
- * session/runtime consumers apply their own budgets later. Hosts still own callback side effects
- * and must await Client.dispose after successful construction/use.
+ * Configure an SDK client and transfer adapter cleanup to it when construction succeeds.
+ * Client validates identity, interaction registrations and retention limits before native setup.
+ * Await Client.dispose to release owned resources. Host callbacks retain responsibility for their
+ * own effects and cleanup.
  */
 export interface ClientOptions {
   /** Client-owned native integration, initialized before opens and disposed after owned sessions. */
   adapter: HarnessAdapter;
-  /** Nonblank adapter/configuration IDs checked by Client.validateOpen; excludes individual session identity. */
+  /** Nonblank adapter and runtime configuration IDs that every session binding must match. */
   identity: Pick<SessionBinding, 'adapterId' | 'runtimeConfigId'>;
   /** Host hooks and resource budgets used by this client and each opened session. */
   runtime?: RuntimeOptions;
-  /** An own key with undefined advertises native interactions without an automatic host handler. */
+  /** Interaction kinds and automatic handlers to advertise during initialization. */
   interactions?: InteractionHandlers;
   /** Positive safe-integer retention budgets; capacity checks reject rather than evict unresolved work. */
   limits?: {
-    /** Maximum retained execution snapshots per session, including pinned terminals; defaults to 128. */
+    /** Maximum tracked executions per session, including active executions and pinned results. Defaults to 128. */
     maxExecutions?: number;
     /** Maximum retained submission/association records per session; defaults to 1024. */
     maxSubmissions?: number;
     /**
-     * Shared execution-result budget per session in serialized UTF-8 bytes; defaults to 16 MiB.
-     * Output wrapping applies this budget independently to its own retention.
+     * Budget for retained execution item snapshots in serialized UTF-8 bytes. Defaults to 16 MiB.
+     * Applies within each execution and across the session. Structured output uses a separate
+     * retention budget of the same size.
      */
     maxResultBytes?: number;
     /** Maximum distinct retained items per execution; defaults to 2048. */
@@ -49,19 +51,19 @@ export interface ClientOptions {
   };
 }
 /**
- * Hosts pass input and per-submission policy to Session.submit, which normalizes/clones input and
- * validates advertised capabilities before dispatch. Its promise returns a Turn on native association,
- * independently of receipt or terminal timing. Invalid policy and wait failures reject; dispatch
- * failure rejects association only if it has not already resolved. OutputSession handles final-schema
- * validation; callers use Turn.result to observe that outcome.
+ * Supply input and per-submission policy to Session.submit. It validates the request before dispatch
+ * and resolves with a Turn when it observes the native execution association, which can precede
+ * the receipt or follow completion. Invalid input, unsupported policy and wait failures reject.
+ * Dispatch failure can reject an unresolved association. Use Turn.result for the terminal outcome,
+ * including structured-output validation, and dispose the Turn to release its local observations.
  */
 export interface SubmitOptions {
   /** Text or protocol blocks to detach and validate before native dispatch. */
   input: Input;
-  /** Native delivery policy; omitted uses native delivery rather than SDK queueing. */
+  /** Capability-gated delivery policy. Omission selects 'native', which can queue input or join an existing execution. */
   delivery?: AhpRequestMap['input/submit']['delivery'];
   /** Per-turn overrides checked against advertised capability keys. */
   overrides?: AhpRequestMap['input/submit']['overrides'];
-  /** Final JSON contract enforced by OutputSession using native output or fallback, including revalidation after privacy projection. */
+  /** Require valid JSON matching this schema in the final result. Requires session.capabilities.turn.outputSchema. */
   outputSchema?: AhpRequestMap['input/submit']['outputSchema'];
 }

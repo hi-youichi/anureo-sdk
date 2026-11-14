@@ -7,32 +7,33 @@ import type { FileChange, Item, JsonObject, JsonValue } from '@anureo/protocol'
  */
 export const FILE_CHANGE_MATERIAL_LIMIT = 50
 /**
- * createRetentionBudget initializes each boundFileChangeItem pass with this UTF-8 text budget.
+ * Per-item UTF-8 text budget used by boundFileChangeItem.
  * Canonical material reserves bytes before mirrors; JSON keys and item metadata are outside the cap.
  */
 export const FILE_CHANGE_TEXT_LIMIT = 256 * 1024
 
 /**
- * SecretRedactor.toolCall calls this after projecting marked content, so live events and history share one
- * retention rule. Return a bounded copy of a file-change tool item, or the original unrelated item;
- * preserve metadata while marking incomplete material. Canonical material consumes the shared byte
- * budget before input, output, raw and extensions, in that order. The caller owns protocol validation
- * and publication; this synchronous pass performs no I/O and does not mutate the input. Exceeding a
- * cap marks x-anureo/fileChangesTruncated; affected changes and their stats become partial. Mirror-only
- * overflow sets the item marker without downgrading complete canonical changes.
+ * Bound a tool call's file-change evidence without mutating the input. Items without fileChanges
+ * and non-tool items pass through by identity. Canonical material consumes the shared byte budget
+ * before input, output, raw and extensions, in that order. Overflow sets x-anureo/fileChangesTruncated.
+ * Only loss of canonical material downgrades a change's completeness and existing stat accuracy.
+ * SecretRedactor.toolCall calls this after redaction, so live events and history get the same
+ * retention rules. Callers own protocol validation and publication.
  */
 export function boundFileChangeItem(item: Item): Item {
   if (item.type !== 'toolCall' || item.fileChanges === undefined) return item
-  const budget = createRetentionBudget()
-  const fileChanges = item.fileChanges.map(change => boundChange(change, budget))
-  const result = {
-    ...item,
-    fileChanges,
-    ...(item.input !== undefined ? { input: boundMirror(item.input, budget) } : {}),
-    ...(item.output !== undefined ? { output: boundMirror(item.output, budget) } : {}),
-    ...(item.raw !== undefined ? { raw: boundMirror(item.raw, budget) } : {}),
-    ...(item.extensions ? { extensions: boundMirror(item.extensions, budget) as JsonObject } : {}),
+  const budget: RetentionBudget = {
+    bytes: FILE_CHANGE_TEXT_LIMIT,
+    materials: 0,
+    truncated: false,
+    encoder: new TextEncoder(),
   }
+  const fileChanges = item.fileChanges.map(change => boundChange(change, budget))
+  const result = { ...item, fileChanges }
+  if (item.input !== undefined) result.input = boundMirror(item.input, budget)
+  if (item.output !== undefined) result.output = boundMirror(item.output, budget)
+  if (item.raw !== undefined) result.raw = boundMirror(item.raw, budget)
+  if (item.extensions) result.extensions = boundMirror(item.extensions, budget) as JsonObject
   if (budget.truncated) result.extensions = { ...result.extensions, 'x-anureo/fileChangesTruncated': true }
   return result
 }
@@ -56,14 +57,6 @@ interface TakenText {
 }
 
 /**
- * boundFileChangeItem allocates this once per file-change item. Create per-item retention state;
- * canonical material must consume it before mirrors to preserve source priority.
- */
-function createRetentionBudget(): RetentionBudget {
-  return { bytes: FILE_CHANGE_TEXT_LIMIT, materials: 0, truncated: false, encoder: new TextEncoder() }
-}
-
-/**
  * boundMaterial and boundMirror use this shared accounting rather than independent budgets. Return
  * text within the remaining UTF-8 allowance and debit it. Overflow sets the sticky truncation flag
  * and keeps only complete newline-terminated lines, dropping any split UTF-8 character with its line.
@@ -75,9 +68,8 @@ function takeText(budget: RetentionBudget, value: string): TakenText {
     budget.bytes -= encoded.byteLength
     return { value, complete: true }
   }
-  let prefix = new TextDecoder().decode(encoded.subarray(0, budget.bytes))
-  const end = prefix.lastIndexOf('\n')
-  prefix = end < 0 ? '' : prefix.slice(0, end + 1)
+  const decoded = new TextDecoder().decode(encoded.subarray(0, budget.bytes))
+  const prefix = decoded.slice(0, decoded.lastIndexOf('\n') + 1)
   budget.bytes -= budget.encoder.encode(prefix).byteLength
   budget.truncated = true
   return { value: prefix, complete: false }
@@ -85,8 +77,9 @@ function takeText(budget: RetentionBudget, value: string): TakenText {
 
 /**
  * boundChange calls this in source order with the item-wide budget. Return retained material and a
- * partial flag, omitting over-count material. Replacement sides must both fit to remain usable;
- * their consumed bytes stay reserved even when the replacement becomes unavailable metadata.
+ * partial flag, omitting material beyond the count cap. An empty retained patch becomes unavailable.
+ * Replacement sides must both fit to remain usable. Their consumed bytes stay reserved even when
+ * the replacement becomes unavailable metadata.
  */
 function boundMaterial(material: FileChange['materials'][number], budget: RetentionBudget): {
   material?: FileChange['materials'][number]
@@ -126,11 +119,12 @@ function boundChange(change: FileChange, budget: RetentionBudget): FileChange {
     if (retained.material) materials.push(retained.material)
   }
   if (!materials.length && change.materials.length) materials.push({ format: 'unavailable', reason: 'tooLarge' })
-  return {
-    ...change,
-    materials,
-    ...(partial ? { completeness: 'partial', ...(change.stats ? { stats: { ...change.stats, accuracy: 'partial' } } : {}) } : {}),
+  const result = { ...change, materials }
+  if (partial) {
+    result.completeness = 'partial'
+    if (change.stats) result.stats = { ...change.stats, accuracy: 'partial' }
   }
+  return result
 }
 
 /**

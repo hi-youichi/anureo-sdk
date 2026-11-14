@@ -20,11 +20,14 @@ export class SecretRedactor {
   constructor(private readonly onRemember?: (secret: string) => void) {}
   /**
    * Register answers marked secret/writeOnly by the request before exposing or delivering them.
-   * Empty strings, null and duplicates are ignored; at most 128 distinct scalar strings and 64 KiB
-   * of UTF-8 text are retained. Exceeding either budget throws BACKPRESSURE_EXCEEDED; hook exceptions
-   * also propagate, leaving earlier registrations intact. Schema traversal stops beyond depth 32.
-   * Session installs this as InteractionRegistry's pre-response check, which runs after validation
-   * and before replay/native delivery. Direct consumers must validate and deliver responses themselves.
+   * Marked containers contribute their scalar descendants. Numbers and booleans register by string
+   * value, while empty strings, null and duplicates are ignored. At most 128 distinct values and
+   * 64 KiB of UTF-8 text are retained. Exceeding either cap throws a HarnessSdkError with code
+   * BACKPRESSURE_EXCEEDED. Hook exceptions also propagate, leaving earlier registrations intact.
+   * Schema traversal stops beyond depth 32, with the request schema at depth zero.
+   * Session installs this as InteractionRegistry's pre-response check. InteractionRegistry.respond
+   * invokes it after validation and rejects on failure before looking up a replay or starting native
+   * delivery. Direct consumers own validation and delivery.
    */
   rememberResponse(request: InteractionRequested, response: InteractionResponse): void {
     if (request.kind === "userInput" && response.kind === "userInput") {
@@ -42,8 +45,8 @@ export class SecretRedactor {
   /**
    * Replace complete secret matches with [redacted], preferring the longest match at each position.
    * Unmatched trailing prefixes are emitted without retaining stream state. Session.projectOutput
-   * and projectSubmissionStatus use this before exposure; OutputSession.publishOutput revalidates
-   * projected JSON and owns any resulting schema failure.
+   * and Session.projectSubmissionStatus use this before exposure. OutputSession.publishOutput
+   * revalidates JSON returned through projectOutput and converts schema failures into failed turns.
    */
   text(value: string): string { return this.values.size ? this.scan(value, "complete").text : value; }
   /**
@@ -60,10 +63,10 @@ export class SecretRedactor {
     return result.text;
   }
   /**
-   * Return recursively projected JSON content, including keys and marked scalar values, without
-   * mutating input; preserve unmarked scalars.
-   * Marked numbers/booleans become the string [redacted]. Session.projectSubmissionStatus and the
-   * protocol projections select content fields; direct callers must do the same to preserve identity.
+   * Return recursively projected JSON without mutating the input. Marked numbers and booleans become
+   * the string [redacted]. If projected keys collide, the last entry in traversal order wins.
+   * Session.projectSubmissionStatus selects receipt and error content. Direct callers should also
+   * pass only content fields to preserve protocol identity.
    */
   json(value: JsonValue): JsonValue {
     if (typeof value === "string") return this.text(value);
@@ -113,10 +116,10 @@ export class SecretRedactor {
     };
   }
   /**
-   * Project configuration/goal results, passing other method results through unchanged. History
-   * requires history instead. Session.projectRequestResult calls this before executeRequest stores
-   * config/goal state and validates/freezes the result. IDs, revisions and schema constraints remain
-   * authoritative; direct consumers own result validation and storage.
+   * Project a validated configuration or goal result according to its method. Other results pass
+   * through by identity. Session.projectRequestResult routes history to history() and calls this
+   * for other projectable results. Session.executeRequest stores projected configuration or goal
+   * state and validates and freezes the returned result. Direct callers own validation and storage.
    */
   result<M extends AhpMethod>(method: M, value: AhpResultMap[M]): AhpResultMap[M] {
     if (method === "session/config/set") return this.state(value as SessionState) as AhpResultMap[M];
@@ -134,22 +137,35 @@ export class SecretRedactor {
     switch (item.type) {
       case "agentMessage": return { ...item, text: this.text(item.text) };
       case "userMessage": return { ...item, content: item.content.map((block) => this.input(block)) };
-      case "reasoning": return { ...item, ...(item.text ? { text: this.text(item.text) } : {}), ...(item.summary ? { summary: this.text(item.summary) } : {}) };
+      case "reasoning": return {
+        ...item,
+        ...(item.text ? { text: this.text(item.text) } : {}),
+        ...(item.summary ? { summary: this.text(item.summary) } : {}),
+      };
       case "toolCall": return this.toolCall(item);
       case "plan": return { ...item, steps: item.steps.map((step) => ({ ...step, text: this.text(step.text) })) };
-      case "subagent": return { ...item, ...(item.name ? { name: this.text(item.name) } : {}), ...(item.task ? { task: this.text(item.task) } : {}) };
+      case "subagent": return {
+        ...item,
+        ...(item.name ? { name: this.text(item.name) } : {}),
+        ...(item.task ? { task: this.text(item.task) } : {}),
+      };
       case "review": return { ...item, ...(item.text ? { text: this.text(item.text) } : {}) };
       case "compaction": return { ...item, ...(item.summary ? { summary: this.text(item.summary) } : {}) };
-      case "hook": return { ...item, name: this.text(item.name), ...(item.input !== undefined ? { input: this.json(item.input) } : {}), ...(item.output !== undefined ? { output: this.json(item.output) } : {}) };
+      case "hook": return {
+        ...item,
+        name: this.text(item.name),
+        ...(item.input !== undefined ? { input: this.json(item.input) } : {}),
+        ...(item.output !== undefined ? { output: this.json(item.output) } : {}),
+      };
       case "notice": return { ...item, text: this.text(item.text) };
     }
   }
   /**
    * Project public request content while preserving identifiers, answer keys and protocol alternatives.
    * event calls this after Session.requestInteraction applies protocol publicInteraction; direct
-   * consumers must likewise remove private protocol fields before projection. This does not register
-   * answers or deliver them natively. InteractionRegistry retains the native request for validation
-   * and marked-field lookup.
+   * consumers must likewise apply protocol privacy rules first. If a privatePayload is supplied
+   * directly, this method projects its JSON content and retains the field. InteractionRegistry
+   * retains the native request for response validation and marked-field lookup.
    */
   interaction(request: InteractionRequested): InteractionRequested {
     const common = {
@@ -181,11 +197,11 @@ export class SecretRedactor {
   }
   /**
    * Project validated events in publication order, clearing an item's buffered prefix on completion.
-   * Supply turnId to isolate reused item IDs across turns; omission uses an item-only stream key.
+   * Supply turnId to isolate reused item IDs across turns. Omission uses an item-only stream key.
    * Session.publish invokes this after lifecycle admission and before retaining/publishing results.
-   * Item-shaped patch validation failures throw and reject Session.emit; direct consumers own event
-   * validation, ordering and publication. Completed snapshots, rather than buffered prefixes, supply
-   * authoritative item content.
+   * An invalid Item-shaped patch throws ProtocolValidationError and rejects Session.emit, which
+   * starts observation teardown. Direct consumers own event validation, ordering and publication.
+   * Completed snapshots supply authoritative item content.
    */
   event(event: AhpEventPayload, turnId?: string): AhpEventPayload {
     switch (event.type) {
@@ -194,7 +210,14 @@ export class SecretRedactor {
         return { ...event, payload: { item: this.item(event.payload.item) } };
       }
       case "item/delta": return { ...event, payload: this.itemDelta(event.payload, turnId) };
-      case "notice": return { ...event, payload: { ...event.payload, message: this.text(event.payload.message), ...(event.payload.raw !== undefined ? { raw: this.json(event.payload.raw) } : {}) } };
+      case "notice": return {
+        ...event,
+        payload: {
+          ...event.payload,
+          message: this.text(event.payload.message),
+          ...(event.payload.raw !== undefined ? { raw: this.json(event.payload.raw) } : {}),
+        },
+      };
       case "extension": return { ...event, payload: { ...event.payload, data: this.json(event.payload.data) } };
       case "session/metadata": return { ...event, payload: this.json(event.payload as JsonObject) as typeof event.payload };
       case "session/state": return { ...event, payload: this.state(event.payload) };
@@ -236,9 +259,13 @@ export class SecretRedactor {
     if (value === undefined || value === null) return;
     if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
       this.rememberScalar(value);
+      return;
     }
-    else if (Array.isArray(value)) value.forEach((entry) => this.remember(entry));
-    else for (const entry of Object.values(value)) this.remember(entry);
+    if (Array.isArray(value)) {
+      value.forEach((entry) => this.remember(entry));
+      return;
+    }
+    for (const entry of Object.values(value)) this.remember(entry);
   }
   /**
    * Accept a new nonempty scalar only after capacity checks and the synchronous persistence hook
@@ -257,9 +284,9 @@ export class SecretRedactor {
     this.secretBytes += bytes;
   }
   /**
-   * fromSchema uses the returned node for marked-value traversal without validating the response.
-   * Resolve a local JSON-pointer schema reference without fetching external data; return undefined
-   * when a token is missing or a traversed node is not an object. The caller checks the node's shape.
+   * Resolve a reference beginning with #/ against the original request schema. Decode JSON Pointer
+   * escapes and follow object keys. A missing key or non-object intermediate yields undefined.
+   * fromSchema checks the returned node's shape before visiting it.
    */
   private resolveLocalReference(reference: string, root: JsonSchema): JsonValue | undefined {
     let target: JsonValue | undefined = root;
@@ -289,25 +316,9 @@ export class SecretRedactor {
         this.fromSchema(target, value, children);
       }
     }
-    // Referenced schemas are visited first; sibling keywords still apply below.
     if (isJsonObject(value)) this.rememberObjectProperties(schema, value, children);
-    if (
-      Array.isArray(value) && schema.items &&
-      (typeof schema.items === "boolean" || (typeof schema.items === "object" && !Array.isArray(schema.items)))
-    ) {
-      for (const child of value) {
-        this.fromSchema(schema.items, child, children);
-      }
-    }
-    for (const key of ["allOf", "anyOf", "oneOf"] as const) {
-      if (Array.isArray(schema[key])) {
-        for (const branch of schema[key]) {
-          if (isJsonSchema(branch)) {
-            this.fromSchema(branch, value, children);
-          }
-        }
-      }
-    }
+    if (Array.isArray(value)) this.rememberArrayItems(schema, value, children);
+    this.rememberComposedSchemas(schema, value, children);
   }
   /**
    * fromSchema calls this between reference and array/composition visits. Register declared
@@ -330,6 +341,30 @@ export class SecretRedactor {
     }
   }
   /**
+   * fromSchema visits array elements in order under the same items schema and next-depth context.
+   * Tuple arrays and absent items rules contribute no registrations. Registration failures propagate.
+   */
+  private rememberArrayItems(schema: JsonObject, value: JsonValue[], context: SchemaTraversal): void {
+    if (!schema.items || !isJsonSchema(schema.items)) return;
+    for (const child of value) {
+      this.fromSchema(schema.items, child, context);
+    }
+  }
+  /**
+   * fromSchema visits composition branches after reference, object and array rules. Visit every
+   * schema branch in keyword and array order without selecting a validation match. Registration
+   * failures stop the remaining visits.
+   */
+  private rememberComposedSchemas(schema: JsonObject, value: JsonValue, context: SchemaTraversal): void {
+    for (const key of ["allOf", "anyOf", "oneOf"]) {
+      const branches = schema[key];
+      if (!Array.isArray(branches)) continue;
+      for (const branch of branches) {
+        if (isJsonSchema(branch)) this.fromSchema(branch, value, context);
+      }
+    }
+  }
+  /**
    * text consumes the complete scan; delta stores a stream scan's pending prefix for the next chunk.
    * Return longest complete matches as redactions. Stream mode withholds an unmatched trailing
    * prefix so it cannot leak before the next chunk arrives; complete mode emits that prefix.
@@ -342,19 +377,26 @@ export class SecretRedactor {
       const candidates = secretsByDescendingLength.filter((secret) => secret[0] === value[offset]);
       // Prefer the longest complete match, even if a longer secret is still incomplete.
       const completeMatch = candidates.find((entry) => value.startsWith(entry, offset));
-      if (completeMatch) { output.push("[redacted]"); offset += completeMatch.length; continue; }
-      const unprocessedSuffix = value.slice(offset);
-      // Hold a possible secret prefix only when no complete match exists; complete scans emit it.
-      if (mode === "stream" && candidates.some((entry) => entry.startsWith(unprocessedSuffix))) return { text: output.join(""), pending: unprocessedSuffix };
-      output.push(value[offset]!); offset++;
+      if (completeMatch) {
+        output.push("[redacted]");
+        offset += completeMatch.length;
+        continue;
+      }
+      if (mode === "stream" && candidates.length) {
+        const suffix = value.slice(offset);
+        if (candidates.some((entry) => entry.startsWith(suffix))) {
+          return { text: output.join(""), pending: suffix };
+        }
+      }
+      output.push(value.charAt(offset));
+      offset++;
     }
     return { text: output.join(""), pending: "" };
   }
   /**
    * capabilities calls this for config-option schemas before exposing state. Project schema
    * annotations/defaults recursively while preserving constraints and property names; privacy must not
-   * silently change validation rules. Return a copy without mutating the native schema; annotations
-   * are content, while property names and validation keywords remain authoritative.
+   * silently change validation rules. Object schemas are copied and boolean schemas pass through.
    */
   private schema(schema: JsonSchema): JsonSchema {
     if (typeof schema === "boolean") return schema;
@@ -440,14 +482,12 @@ export class SecretRedactor {
   }
   /**
    * itemDelta calls this for JSON-valued payloads before Session retains or publishes the event.
-   * Validate Item-shaped patches before applying item privacy/limits; project arbitrary extension
-   * JSON as content. Throw protocol validation failure to Session.publish before malformed snapshots
-   * can be retained; emit rejects publication and observes the failure through Session.fail.
+   * A patch object with type or fileChanges must pass Item validation before item projection.
+   * Item-shaped validation failures throw ProtocolValidationError. Other values receive ordinary
+   * JSON projection.
    */
-  private deltaValue(kind: string, value: JsonValue): JsonValue {
+  private deltaValue(kind: ItemDeltaPayload["kind"], value: JsonValue): JsonValue {
     if (kind === "patch" && isJsonObject(value) && ("type" in value || "fileChanges" in value)) {
-      // Item-shaped snapshots must not bypass source limits through generic JSON.
-      // Arbitrary extension JSON without Item discriminators remains compatible.
       assertDefinition<Item>("Item", value);
       return this.item(value) as unknown as JsonValue;
     }
@@ -459,11 +499,14 @@ export class SecretRedactor {
    * rolled back. Non-Item JSON still receives ordinary content projection.
    */
   private itemDelta(payload: ItemDeltaPayload, turnId?: string): ItemDeltaPayload {
-    return {
-      ...payload,
-      ...(payload.text !== undefined ? { text: this.delta(streamKey(payload.itemId, turnId), payload.text) } : {}),
-      ...(payload.value !== undefined ? { value: this.deltaValue(payload.kind, payload.value) } : {}),
-    };
+    const projected = { ...payload };
+    if (payload.text !== undefined) {
+      projected.text = this.delta(streamKey(payload.itemId, turnId), payload.text);
+    }
+    if (payload.value !== undefined) {
+      projected.value = this.deltaValue(payload.kind, payload.value);
+    }
+    return projected;
   }
 }
 

@@ -23,11 +23,12 @@ export function hermesCapabilities(): Capabilities {
  * completion remain independent. The owner must dispose this observation, including after open fails.
  */
 export class HermesSession implements BackendSession {
+  /** Native session capabilities read by OutputSession before it applies any structured-output fallback. */
   readonly capabilities = hermesCapabilities()
   /** SDK identity augmented with the native reference after snapshot validation. */
   binding: SessionBinding
 
-  /** Register lazy interaction callbacks; open must establish a description before they are invoked. */
+  /** Set up local observation state for HermesAdapter.openSession. Call open before dispatching native requests. */
   constructor({ params, sink, options, profileId, released }: {
     params: SessionOpenParams
     sink: SessionEventSink
@@ -36,14 +37,18 @@ export class HermesSession implements BackendSession {
     /** Remove this handle from HermesAdapter's tracked sessions when local disposal finishes. */
     released: () => void
   }) {
-    this.params = params; this.sink = sink; this.options = options; this.profileId = profileId; this.released = released
+    this.params = params
+    this.sink = sink
+    this.options = options
+    this.profileId = profileId
+    this.released = released
     this.binding = structuredClone(params.binding)
     this.model = params.model
     this.interactions = new HermesInteractions({ sessionId: () => this.nativeId, rpc: () => this.channel(), sink,
       turnId: generation => [...this.turns.values()].find(value => value.epoch === this.description?.epoch && value.generation === generation)?.id,
       epoch: () => this.description!.epoch, options })
   }
-  /** Attachment snapshot consumed by Session.attach, including executions restored from native pending rows. */
+  /** Supply OutputSession with the native attachment snapshot, including active turns restored from pending rows. */
   get state(): SessionState {
     return { binding: this.binding, status: this.disposed ? 'closed' : 'ready', config: {}, capabilities: this.capabilities,
       capabilityRevision: 0, activeTurnIds: [...this.turns.values()].filter(value => !value.terminal).map(value => value.id),
@@ -63,32 +68,21 @@ export class HermesSession implements BackendSession {
     this.holding = false
   }
   /**
-   * OutputSession.execute awaits native receipts here, while sink events may arrive independently.
-   * Close detaches observation without stopping execution; interrupt validates the active generation.
-   * Reject unsupported requests and native failures, preserving unknown-outcome submission errors.
+   * Handle a native submission, interrupt or observation close for OutputSession.execute. A queued
+   * receipt confirms admission, and a later native claim publishes its turn binding. Interrupt
+   * acknowledges the targeted generation, while turn completion arrives through the sink.
+   * Close attempts detach and disposes local observation with execution stop unconfirmed.
+   * Reject invalid bindings, unsupported requests and native failures with their outcome uncertainty.
    */
   async execute<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
     assertRequest(method, params)
     if (params.sessionId !== this.binding.sessionId) throw new HarnessSdkError('SESSION_BINDING_MISMATCH')
-    if (method === 'input/submit') return await this.submit(params as AhpRequestMap['input/submit']) as AhpResultMap[M]
-    if (method === 'session/close') {
-      try {
-        if (this.channel().connected) await this.channel().request('session.detach', { session_id: this.nativeId, subscription_id: this.subscriptionId })
-      } catch { this.options.diagnostic?.('HERMES_DETACH_UNCONFIRMED') }
-      await this.dispose()
-      return { closed: true, observationClosed: true, executionStopped: 'unconfirmed' } as AhpResultMap[M]
+    switch (method) {
+      case 'input/submit': return await this.submit(params as AhpRequestMap['input/submit']) as AhpResultMap[M]
+      case 'session/close': return await this.closeObservation() as AhpResultMap[M]
+      case 'turn/interrupt': return await this.interrupt(params as AhpRequestMap['turn/interrupt']) as AhpResultMap[M]
+      default: throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
     }
-    if (method === 'turn/interrupt') {
-      await this.ready()
-      const request = params as AhpRequestMap['turn/interrupt']
-      const turn = [...this.turns.values()].find(value => value.id === request.turnId)
-      if (!turn || turn.terminal || turn.epoch !== this.description!.epoch) throw new HarnessSdkError('TURN_NOT_ACTIVE')
-      const response = object(await this.channel().request('session.interrupt', { session_id: this.nativeId, execution_generation: turn.generation }, true))
-      const ref = object(response.ref)
-      if (ref.session_id !== this.nativeId || ref.profile_id !== this.profileId || response.execution_generation !== turn.generation || response.authority_epoch !== turn.epoch) throw protocolError()
-      return { accepted: true, turnId: turn.id } as AhpResultMap[M]
-    }
-    throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
   }
   /** Idempotently abort local work, drop retained evidence and release adapter tracking; native execution is left running. */
   async dispose(): Promise<void> {
@@ -118,7 +112,32 @@ export class HermesSession implements BackendSession {
   private readonly abort = new AbortController()
   private title?: string
   private model?: string
-  /** Build new-session configuration only after capability discovery; resume never replays editor configuration. */
+
+  /**
+   * Ask a connected owner to detach, then release local observation. Report an unconfirmed detach
+   * through the diagnostic callback. A callback exception rejects close before disposal.
+   */
+  private async closeObservation(): Promise<AhpResultMap['session/close']> {
+    try {
+      if (this.channel().connected) await this.channel().request('session.detach', { session_id: this.nativeId, subscription_id: this.subscriptionId })
+    } catch { this.options.diagnostic?.('HERMES_DETACH_UNCONFIRMED') }
+    await this.dispose()
+    return { closed: true, observationClosed: true, executionStopped: 'unconfirmed' }
+  }
+  /**
+   * After channel recovery, interrupt only a live turn in the current authority. Verify the ACK
+   * against the original turn, which may have completed while the request was in flight.
+   */
+  private async interrupt(request: AhpRequestMap['turn/interrupt']): Promise<AhpResultMap['turn/interrupt']> {
+    await this.ready()
+    const turn = [...this.turns.values()].find(value => value.id === request.turnId)
+    if (!turn || turn.terminal || turn.epoch !== this.description!.epoch) throw new HarnessSdkError('TURN_NOT_ACTIVE')
+    const response = object(await this.channel().request('session.interrupt', { session_id: this.nativeId, execution_generation: turn.generation }, true))
+    const ref = object(response.ref)
+    if (ref.session_id !== this.nativeId || ref.profile_id !== this.profileId || response.execution_generation !== turn.generation || response.authority_epoch !== turn.epoch) throw protocolError()
+    return { accepted: true, turnId: turn.id }
+  }
+  /** Request the initial attachment snapshot. Only creation sends editor configuration, after capability discovery. */
   private async openSnapshot(rpc: HermesRpc): Promise<NativeObject> {
     if (this.params.mode === 'new') return object(await rpc.request('session.create', this.createParameters(), true))
     if (this.binding.nativeRef?.provider !== 'hermes') throw new HarnessSdkError('SESSION_BINDING_MISMATCH')
@@ -147,9 +166,10 @@ export class HermesSession implements BackendSession {
     return this.rpc
   }
   /**
-   * Attach and describe the expected profile. RPC invokes these serial event/request callbacks only
-   * for the current channel; its failure callback either starts recovery or ends observation via sink.fail.
-   * The session owns successful channels and disposes them on retry or teardown.
+   * Attach and describe the expected profile. HermesRpc invokes these event/request callbacks
+   * serially. Process traffic only from the current channel while the session is live. The RPC
+   * failure callback starts recovery or reports observation loss through sink.fail. The session
+   * owns successful channels and disposes them on retry or teardown.
    */
   private async connect(mode: AttachMode): Promise<void> {
     const grant = await attachGateway(this.options, mode, this.abort.signal)
@@ -170,7 +190,7 @@ export class HermesSession implements BackendSession {
     try { this.description = describe(await channel.request('runtime.describe'), grant) }
     catch (cause) { channel.dispose(); throw cause }
   }
-  /** Bound live traffic held during setup/recovery; overflow throws rather than silently dropping correlation evidence. */
+  /** Reject overflow during setup or recovery because dropping held traffic would lose correlation evidence. */
   private hold(value: NativeEvent | ServerRequest): void {
     const bytes = Buffer.byteLength(JSON.stringify(value))
     if (this.held.length >= (this.options.maxEvents ?? 2048) || this.heldBytes + bytes > (this.options.maxBufferedBytes ?? 16 * 1024 * 1024)) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED')
@@ -210,7 +230,8 @@ export class HermesSession implements BackendSession {
       if (this.retired.size > 1024) this.retired.delete(this.retired.values().next().value!)
     }
     const turn = new HermesTurn({ admissionId: admission, epoch, generation, sessionId: this.nativeId, sink: this.sink, options: this.options })
-    this.turns.set(admission, turn); return turn
+    this.turns.set(admission, turn)
+    return turn
   }
   /**
    * Match receipt evidence to local inputs, publish bindings and project any supplied terminal result.
@@ -224,14 +245,11 @@ export class HermesSession implements BackendSession {
       if (inputs.some(([, input]) => input)) throw new HarnessSdkError('HERMES_CORRELATION_UNSUPPORTED', 'A queued input was transferred by another viewer', false, true)
       return undefined
     }
-    for (const [, input] of inputs) {
-      if (!input) continue
-      if (input.admission && input.admission.id !== value.id) throw protocolError()
-      input.admission = value
-    }
+    this.recordAdmission(value, inputs)
     if (value.status === 'unknown') throw new HarnessSdkError('HERMES_EXECUTION_UNKNOWN', 'Hermes execution outcome is unknown', false, true)
     if (value.generation === undefined) {
-      if (value.status === 'terminal') for (const [id, input] of inputs) if (input && !input.rejected) {
+      if (value.status === 'terminal') for (const [id, input] of inputs) {
+        if (!input || input.rejected) continue
         input.rejected = true
         await this.sink.emit({ type: 'submission/status', payload: { submissionId: id, status: 'rejected',
           error: { code: 'INPUT_CANCELLED', message: 'Hermes input cancelled before execution', retryable: false, outcomeUnknown: false } } })
@@ -244,6 +262,14 @@ export class HermesSession implements BackendSession {
     for (const [id, input] of inputs) if (input) await turn.bind(id, input.input)
     if (value.status === 'terminal' && !turn.terminal && value.result) await turn.fromReceipt(value.result, value.outcome)
     return turn
+  }
+  /** Record evidence before publishing a binding or reporting uncertainty. A known input cannot change admissions. */
+  private recordAdmission(value: Receipt, inputs: ReadonlyArray<readonly [string, Submission | undefined]>): void {
+    for (const [, input] of inputs) {
+      if (!input) continue
+      if (input.admission && input.admission.id !== value.id) throw protocolError()
+      input.admission = value
+    }
   }
   /** Validate admission evidence against this observation's profile and native session. */
   private parseReceipt(value: unknown): Receipt { return receipt(value, this.profileId, this.nativeId) }
@@ -261,43 +287,64 @@ export class HermesSession implements BackendSession {
     }
     await this.interactions.snapshot(array(snapshot.prompts), snapshot.open_requests == null ? [] : array(snapshot.open_requests))
   }
-  /** Keep another viewer's queue as native state, associating input ids only when this session submitted them. */
+  /** Trust the pending row's explicit input id only for a locally tracked submission. */
   private async associatePending(value: unknown): Promise<void> {
     const pending = this.parseReceipt(value)
     await this.associate(pending, pending.inputId && this.submissions.has(pending.inputId) ? pending.inputId : undefined)
   }
-  /** Validate replay continuity before dispatch and advance the cursor only after all resulting publications succeed. */
+  /** Apply live or replayed traffic, advancing the cursor only after all resulting publications succeed. */
   private async apply(event: NativeEvent, continuity: ReplayContinuity = 'contiguous'): Promise<void> {
-    if (event.session_id !== this.nativeId) return
-    if (event.type === 'session.replay_gap') throw new HarnessSdkError('HERMES_REPLAY_GAP', 'Hermes event replay is required', false, true)
-    const epoch = identity(event.replay_epoch), sequence = integer(event.seq)
-    if (epoch === this.cursor.epoch && sequence <= this.cursor.sequence) return
-    if (epoch !== this.cursor.epoch || sequence !== this.cursor.sequence + 1) {
+    const position = this.eventPosition(event)
+    if (!position) return
+    if (position.epoch !== this.cursor.epoch || position.sequence !== this.cursor.sequence + 1) {
       if (continuity === 'contiguous') throw new HarnessSdkError('HERMES_REPLAY_GAP', 'Hermes event sequence changed', false, true)
       await this.reportProgressGap()
     }
     const payload = event.payload
-    if (event.type === 'session.info') {
-      if (Array.isArray(payload.pending)) for (const value of payload.pending) await this.associatePending(value)
-      if (typeof payload.title === 'string') {
-        this.title = payload.title
-        await this.sink.emit({ type: 'session/metadata', payload: { title: payload.title } })
-      }
-    } else if (event.type === 'approval.request' || event.type === 'clarify.request') {
-      await this.interactions.prompt({ ...payload, kind: event.type === 'approval.request' ? 'approval' : 'clarify', authority_epoch: event.authority_epoch ?? this.description!.epoch })
-    } else if (event.type === 'approval.settled' || event.type === 'clarify.settled') {
-      await this.interactions.settled(identity(payload.prompt_id), 'prompt', 'resolved', integer(payload.execution_generation))
-    } else if (event.type === 'request.cancel') {
-      await this.interactions.settled(identity(payload.id), 'request', identity(payload.reason))
-    } else if (event.type === 'session.usage') {
-      if (payload.usage != null) await sessionUsage(this.sink, object(payload.usage))
-    } else if (['message.start', 'message.delta', 'message.interim', 'message.complete', 'reasoning.delta', 'tool.start', 'tool.complete'].includes(event.type)) {
-      await this.applyTurnEvent(event)
-    } else if (event.type === 'error') {
-      // A bare error does not identify an execution's terminal state.
-      throw new HarnessSdkError('HERMES_REPLAY_GAP', 'Hermes execution requires reconciliation', false, true)
+    switch (event.type) {
+      case 'session.info':
+        if (Array.isArray(payload.pending)) for (const value of payload.pending) await this.associatePending(value)
+        if (typeof payload.title === 'string') {
+          this.title = payload.title
+          await this.sink.emit({ type: 'session/metadata', payload: { title: payload.title } })
+        }
+        break
+      case 'approval.request':
+      case 'clarify.request':
+        await this.interactions.prompt({ ...payload, kind: event.type === 'approval.request' ? 'approval' : 'clarify', authority_epoch: event.authority_epoch ?? this.description!.epoch })
+        break
+      case 'approval.settled':
+      case 'clarify.settled':
+        await this.interactions.settled({ wire: 'prompt', nativeId: identity(payload.prompt_id), generation: integer(payload.execution_generation) }, 'resolved')
+        break
+      case 'request.cancel':
+        await this.interactions.settled({ wire: 'request', nativeId: identity(payload.id) }, identity(payload.reason))
+        break
+      case 'session.usage':
+        if (payload.usage != null) await sessionUsage(this.sink, object(payload.usage))
+        break
+      case 'message.start':
+      case 'message.delta':
+      case 'message.interim':
+      case 'message.complete':
+      case 'reasoning.delta':
+      case 'tool.start':
+      case 'tool.complete':
+        await this.applyTurnEvent(event)
+        break
+      case 'error':
+        // A bare error does not identify an execution's terminal state.
+        throw new HarnessSdkError('HERMES_REPLAY_GAP', 'Hermes execution requires reconciliation', false, true)
     }
-    this.cursor = { epoch, sequence }
+    this.cursor = position
+  }
+  /** Ignore unrelated or already applied events, but send explicit replay gaps back through recovery. */
+  private eventPosition(event: NativeEvent): typeof this.cursor | undefined {
+    if (event.session_id !== this.nativeId) return undefined
+    if (event.type === 'session.replay_gap') throw new HarnessSdkError('HERMES_REPLAY_GAP', 'Hermes event replay is required', false, true)
+    const epoch = identity(event.replay_epoch), sequence = integer(event.seq)
+    if (epoch === this.cursor.epoch && sequence <= this.cursor.sequence) return undefined
+    return { epoch, sequence }
   }
   /**
    * Associate native execution evidence before projecting progress. A terminal event waits only for
@@ -318,9 +365,9 @@ export class HermesSession implements BackendSession {
     }
     const turn = this.turn(admissionId, integer(event.authority_epoch), generation)
     const submissionId = payload.persisted_turn == null ? undefined : object(payload.persisted_turn).submission_id
-    if (typeof submissionId === 'string' && this.submissions.has(submissionId)) {
-      const input = this.submissions.get(submissionId)!
-      await this.associate({ id: admissionId, sequence: input.admission?.sequence ?? 0, status: 'started', outcome: null, epoch: turn.epoch, generation }, submissionId)
+    if (typeof submissionId === 'string') {
+      const input = this.submissions.get(submissionId)
+      if (input) await this.associate({ id: admissionId, sequence: input.admission?.sequence ?? 0, status: 'started', outcome: null, epoch: turn.epoch, generation }, submissionId)
     }
     if (event.type === 'message.complete') await this.interactions.waitResponders()
     await turn.apply(event)
@@ -343,7 +390,7 @@ export class HermesSession implements BackendSession {
     void task.finally(() => { if (this.recovery === task) this.recovery = undefined }).catch(() => {})
     return task
   }
-  /** Finish the old serial reader before retrying; backoff is abortable and failed attempts dispose their channels. */
+  /** Wait for the old reader and run the retry budget. Dispose failed channels and propagate the first non-retryable failure or the final retryable one. */
   private async retryRecovery(old: HermesRpc): Promise<void> {
     await old.finished
     let last: unknown = new HarnessSdkError('CONNECTION_CLOSED', 'Hermes connection lost', false, true)
@@ -352,14 +399,7 @@ export class HermesSession implements BackendSession {
       if (this.disposed) throw new HarnessSdkError('SESSION_CLOSED')
       if (attempt) await delay((this.options.reconnectDelayMs ?? 100) * 2 ** (attempt - 1), undefined, { signal: this.abort.signal })
       try {
-        const mode = this.recoveryMode(attempt)
-        this.held = []; this.heldBytes = 0
-        await this.connect(mode)
-        const rpc = this.channel()
-        const continuity = await this.replaySnapshot(rpc)
-        await this.reconcileAdmissions(rpc)
-        await this.flush(continuity)
-        this.holding = false
+        await this.recoverObservation(this.recoveryMode(attempt))
         return
       } catch (cause) {
         this.rpc?.dispose(); last = cause
@@ -367,6 +407,17 @@ export class HermesSession implements BackendSession {
       }
     }
     throw last
+  }
+  /** Open a replacement channel and reconcile execution evidence before restoring live delivery. */
+  private async recoverObservation(mode: AttachMode): Promise<void> {
+    this.held = []
+    this.heldBytes = 0
+    await this.connect(mode)
+    const rpc = this.channel()
+    const continuity = await this.replaySnapshot(rpc)
+    await this.reconcileAdmissions(rpc)
+    await this.flush(continuity)
+    this.holding = false
   }
   /** Try attachment first; subsequent attempts may request owner recovery within the rolling per-session budget. */
   private recoveryMode(attempt: number): AttachMode {
@@ -397,7 +448,7 @@ export class HermesSession implements BackendSession {
     }
     return continuity
   }
-  /** Recover terminal evidence for known admissions without resubmitting input or declaring missing results complete. */
+  /** Query known admissions during recovery. Reject if terminal evidence still leaves an associated turn unfinished. */
   private async reconcileAdmissions(rpc: HermesRpc): Promise<void> {
     const admissions = new Set([...this.submissions.values()].filter(value => !value.rejected).map(value => value.admission?.id).filter((id): id is string => !!id))
     for (const turn of this.turns.values()) if (!turn.terminal) admissions.add(turn.admissionId)
@@ -416,7 +467,10 @@ export class HermesSession implements BackendSession {
   private async reportProgressGap(): Promise<void> {
     for (const turn of this.turns.values()) await turn.gap()
   }
-  /** Retain input through acknowledgement/association, dispatch once, and release text after rejection or terminal evidence. */
+  /**
+   * Dispatch a text-only native input once. Resolve a queued or started admission after reconciling
+   * available evidence, or reject while retaining correlation for uncertain acceptance.
+   */
   private async submit(params: AhpRequestMap['input/submit']): Promise<AhpResultMap['input/submit']> {
     if (params.delivery !== 'native' || params.outputSchema !== undefined || params.input.some(value => value.type !== 'text') || Object.keys(params.overrides ?? {}).length) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
     await this.ready()
@@ -456,7 +510,7 @@ export class HermesSession implements BackendSession {
     this.submissions.set(params.submissionId, input)
     return input
   }
-  /** On lost submit acknowledgement, recover existing evidence once; uncertain acceptance must never cause a resend. */
+  /** Recover evidence after a retryable submit failure. Return the recovered admission or reject with an unknown outcome. */
   private async submitReceipt(submissionId: string, input: Submission): Promise<Receipt> {
     try {
       return this.parseReceipt(await this.channel().request('prompt.submit', { session_id: this.nativeId, text: input.input, submission_id: submissionId }, true))

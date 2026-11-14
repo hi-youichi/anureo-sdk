@@ -1,16 +1,34 @@
-// Progress events delivered by review and fix execution to caller-supplied observers.
-/** Synchronous observer events from reviewCode. Angle events may interleave; verification starts
- * after all fixes settle if any fix was applied. Applications supply onProgress; the CLI registers
- * a callback that writes these events to stderr. Callback returns are ignored and synchronous
- * exceptions are retained in ReviewReport.progressErrors. A rejected run may omit terminal events;
- * consume reviewCode's result or rejection to determine completion. */
+/** Observe reviewCode through ReviewOptions.onProgress. Events are synchronous and concurrent
+ * angle events may interleave. Verification starts after the module tasks and queued fixes settle
+ * if a fix outcome records changes in the original work tree. The CLI's reviewAndPrintReport
+ * registers an observer that writes to stderr. Callback returns are ignored and synchronous
+ * exceptions are collected in ReviewReport.progressErrors. Await reviewCode for the final result
+ * or rejection, since an interrupted run may omit terminal events. */
 export type ReviewProgress =
-  /** The durable workflow has started; directory is its storage root and runId identifies this run. */
-  | { stage: 'workflow'; status: 'started'; runId: string; directory: string }
-  /** Analysis completes only after the proposed module plan passes host validation. */
-  | { stage: 'analysis'; status: 'started' | 'completed' }
-  /** Angle completion includes host validation of its findings, not just the agent response. */
-  | { stage: 'review' | 'verification'; status: 'started' | 'completed' | 'failed'; moduleId: string; angleId: string }
-  /** Fix 'completed' means allowed edits were observed, not that verification passed. 'skipped'
-   * also covers FixReport's 'not-needed'; inspect the report for the distinction. */
-  | { stage: 'fix'; status: 'started' | 'completed' | 'failed' | 'skipped'; moduleId: string }
+  | {
+      stage: 'workflow'
+      status: 'started'
+      /** Identifies the run within directory. */
+      runId: string
+      /** Absolute root of the durable workflow storage. */
+      directory: string
+    }
+  | {
+      stage: 'analysis'
+      /** Completion follows host validation of the proposed module plan and any worktree cleanup. */
+      status: 'started' | 'completed'
+    }
+  | {
+      stage: 'review' | 'verification'
+      /** Completion follows agent execution, host validation and any worktree cleanup. */
+      status: 'started' | 'completed' | 'failed'
+      moduleId: string
+      angleId: string
+    }
+  | {
+      stage: 'fix'
+      /** 'completed' means validated edits reached the original work tree and cleanup finished.
+       * 'skipped' also covers FixReport's 'not-needed'. Check the report for verification results. */
+      status: 'started' | 'completed' | 'failed' | 'skipped'
+      moduleId: string
+    }

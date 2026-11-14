@@ -14,8 +14,9 @@ for (const flavor of ["codex", "acp", "ahp"] as const) test(`fake ${flavor} JSON
     input: [JSON.stringify({ id: 7, method: "custom/test", params: { value: "correct" } })],
   });
   expect(exit.code).toBe(0);
-  expect(JSON.parse(output)).toMatchObject({ id: 7, result: { value: "correct" } });
-  expect(JSON.parse(output).jsonrpc).toBe(flavor === "codex" ? undefined : "2.0");
+  const reply = JSON.parse(output);
+  expect(reply).toMatchObject({ id: 7, result: { value: "correct" } });
+  expect(reply.jsonrpc).toBe(flavor === "codex" ? undefined : "2.0");
 });
 
 test("wire defaults and parse recovery leave the next scripted step pending", async () => {
@@ -88,7 +89,7 @@ test("fake Claude query streams typed messages and records control calls without
   expect(query.calls.map((call) => call.method)).toEqual(["input", "setModel", "interrupt", "rewindFiles", "close"]);
 });
 
-/** Run a bounded JSONL exchange and own its temporary script, process and timeout, including failed exchanges. */
+/** Write the fixture and launch its peer. Remove the temporary directory after the exchange and process cleanup. */
 async function exchangeWithFake({ flavor, script, input }: {
   flavor: Exclude<WireFlavor, "claude">;
   script: readonly NativeFixtureFrame[];
@@ -98,24 +99,39 @@ async function exchangeWithFake({ flavor, script, input }: {
   try {
     const fixture = join(directory, "script.json");
     await writeFile(fixture, JSON.stringify(script));
-    const child = await spawnHarnessProcess({ command: process.execPath, args: [fileURLToPath(new URL(`../scripts/fake-${flavor}.ts`, import.meta.url))], env: { ...process.env, HARNESS_FIXTURE_SCRIPT: fixture, HARNESS_FIXTURE_READY: "1" } });
-    const observation = observeFakeOutput(child);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const exchangeCompletion = completeExchange({ child, observation, input });
-      // The exchange can reject after timeout while disposal closes its pipes.
-      void exchangeCompletion.catch(() => {});
-      const exchangeTimeout = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`Fake ${flavor} did not complete its JSONL exchange`)), 4000);
-      });
-      return await Promise.race([exchangeCompletion, exchangeTimeout]);
-    } finally {
-      if (timer) clearTimeout(timer);
-      await child.dispose();
-      await Promise.allSettled([observation.read, observation.readErrors]);
-    }
+    const child = await spawnHarnessProcess({
+      command: process.execPath,
+      args: [fileURLToPath(new URL(`../scripts/fake-${flavor}.ts`, import.meta.url))],
+      env: { ...process.env, HARNESS_FIXTURE_SCRIPT: fixture, HARNESS_FIXTURE_READY: "1" },
+    });
+    return await exchangeWithChild({ child, flavor, input });
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Take ownership of the spawned peer and give the exchange four seconds to reach exit and
+ * pipe EOF. The deadline includes waiting for readiness. Dispose before returning, and
+ * propagate disposal failure even if the peer already exited or the deadline fired.
+ */
+async function exchangeWithChild({ child, flavor, input }: {
+  child: HarnessProcess;
+  flavor: Exclude<WireFlavor, "claude">;
+  input: readonly string[];
+}) {
+  const observation = observeFakeOutput(child);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const exchangeCompletion = completeExchange({ child, observation, input });
+    const exchangeTimeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Fake ${flavor} did not complete its JSONL exchange`)), 4000);
+    });
+    return await Promise.race([exchangeCompletion, exchangeTimeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    await child.dispose();
+    await Promise.allSettled([observation.read, observation.readErrors]);
   }
 }
 
@@ -124,8 +140,7 @@ function observeFakeOutput(child: HarnessProcess) {
   let output = "", diagnostics = "";
   const decoder = new TextDecoder();
   const stderrDecoder = new TextDecoder();
-  let ready!: () => void;
-  const listening = new Promise<void>((resolve) => { ready = resolve; });
+  const { promise: listening, resolve: ready } = Promise.withResolvers<void>();
   const read = (async () => {
     for await (const chunk of child.stdout) output += decoder.decode(chunk, { stream: true });
   })();

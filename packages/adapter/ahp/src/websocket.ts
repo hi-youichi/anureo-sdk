@@ -3,23 +3,25 @@ import { BoundedEventQueue, HarnessSdkError } from "@anureo/sdk";
 import type { AhpTransport } from "./wire";
 
 /**
- * Open a text-frame transport for AhpAdapterOptions.connect or direct AhpWire use. Resolve after
- * open, without negotiating AHP; the returned transport's owner must close it. Accept wss: or
- * loopback ws: without credentials, query or fragment. Invalid addresses, unavailable WebSocket,
- * factory/queue failures and handshake error/close/timeout reject; a timeout initiates socket close.
- * Incoming binary frames or queue overflow end reads with failure and initiate socket close.
- * Buffer at most 2048 incoming frames; buffered frames drain before read failure. send resolves
- * after socket.send, without waiting for drain. close initiates closure without awaiting its event;
- * native send/close exceptions reject their respective operations.
+ * Open a text-frame transport for AhpAdapterOptions.connect or direct AhpWire use. Resolve once
+ * the socket is open, before AHP negotiation. The owner must close the returned transport.
+ * Accept wss: or loopback ws: and reject parsed credentials or nonempty query/fragment components.
+ * Address, construction and queue setup failures reject setup. An error or close before open
+ * rejects with RPC_CONNECTION_FAILED. At the deadline the socket is closed before reporting
+ * RPC_TIMEOUT, so a synchronous close event may report RPC_CONNECTION_FAILED first.
+ * Native error and close events end reads. Non-text or rejected frames also initiate socket close.
+ * Buffer up to 2048 incoming frames and drain buffered frames before reporting read failure.
+ * Send resolves after socket.send accepts data. Close resolves after initiating native closure.
+ * A native exception during either operation rejects that operation.
  */
 export async function createWebSocketTransport(url: string, options: {
-  /** Supply a WebSocket implementation; omitted uses the runtime global, if available. */
+  /** Construct a socket from the original validated URL. Omission uses the global WebSocket or rejects if unavailable. */
   factory?: (url: string) => WebSocket;
-  /** Handshake timeout in milliseconds; defaults to 30,000. */
+  /** Socket open timeout in milliseconds. Defaults to 30,000. */
   timeoutMs?: number;
-  /** Incoming UTF-8 frame budget; defaults to 8 MiB and must be a positive safe integer. */
+  /** Incoming UTF-8 frame budget. Defaults to 8 MiB and must be a positive safe integer. */
   maxFrameBytes?: number;
-  /** Incoming byte budget and outgoing bufferedAmount threshold; defaults to 16 MiB, a positive safe integer. */
+  /** Incoming byte budget and outgoing bufferedAmount threshold. Defaults to 16 MiB and must be a positive safe integer. */
   maxBufferedBytes?: number;
 } = {}): Promise<AhpTransport> {
   validateWebSocketAddress(url);
@@ -30,7 +32,12 @@ export async function createWebSocketTransport(url: string, options: {
   return transport;
 }
 
-/** Reject address features that could expose credentials or allow plaintext connections off loopback. */
+const DEFAULT_MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Check address policy before the factory receives the URL. Propagate URL parse failures and
+ * throw INVALID_PARAMS for unsupported protocols, restricted URL components or remote plaintext.
+ */
 function validateWebSocketAddress(url: string): void {
   const address = new URL(url);
   const isSupportedProtocol = ["ws:", "wss:"].includes(address.protocol);
@@ -43,15 +50,18 @@ function validateWebSocketAddress(url: string): void {
 }
 
 /**
- * Register source listeners before waiting for open so early frames/failures are retained. This
- * scope owns the queue and close state; ending reads on error does not itself close the socket.
+ * Set up framed reads and local close state before createWebSocketTransport waits for open,
+ * so early frames and failures are retained. Invalid queue budgets throw during construction.
  */
 function createSocketTransport(socket: WebSocket, options: { maxFrameBytes?: number; maxBufferedBytes?: number }): AhpTransport {
-  const queue = new BoundedEventQueue<string>({ maxFrameBytes: options.maxFrameBytes, maxBytes: options.maxBufferedBytes ?? 16 * 1024 * 1024, maxEvents: 2048 }, v => new TextEncoder().encode(v).byteLength);
+  const queue = new BoundedEventQueue<string>({
+    maxFrameBytes: options.maxFrameBytes,
+    maxBytes: options.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES,
+    maxEvents: 2048,
+  }, frame => new TextEncoder().encode(frame).byteLength);
   let closed = false;
-  /** Native error/close events fail reads after buffered frames have drained. */
-  const fail = () => { queue.end(new HarnessSdkError("RPC_CONNECTION_CLOSED", "RPC_CONNECTION_CLOSED", false, true)); };
-  socket.addEventListener("message", event => {
+  /** Message events admit text frames. Failure ends the queue with the cause before native close can fire. */
+  const receiveFrame = (event: MessageEvent<unknown>) => {
     try {
       if (typeof event.data !== "string") throw new HarnessSdkError("PROTOCOL_ERROR");
       queue.push(event.data);
@@ -59,22 +69,32 @@ function createSocketTransport(socket: WebSocket, options: { maxFrameBytes?: num
       queue.end(cause);
       socket.close();
     }
+  };
+
+  /** Native errors and closes fail reads after buffered frames drain. The owner still handles socket release. */
+  const failReads = () => {
+    queue.end(new HarnessSdkError("RPC_CONNECTION_CLOSED", "RPC_CONNECTION_CLOSED", false, true));
+  };
+
+  socket.addEventListener("message", receiveFrame);
+  socket.addEventListener("close", () => {
+    closed = true;
+    failReads();
   });
-  socket.addEventListener("close", () => { closed = true; fail(); });
-  socket.addEventListener("error", fail);
+  socket.addEventListener("error", failReads);
   return {
     messages: queue,
-    /** Resolve once socket.send accepts the frame; reject closed state, excess bufferedAmount or native send failure. */
+    /** Reject unless open or if bufferedAmount exceeds the threshold before sending. Native send failures propagate. */
     async send(message) {
       if (closed || socket.readyState !== 1) {
         throw new HarnessSdkError("RPC_CONNECTION_CLOSED", "RPC_CONNECTION_CLOSED", false, true);
       }
-      if (socket.bufferedAmount > (options.maxBufferedBytes ?? 16 * 1024 * 1024)) {
+      if (socket.bufferedAmount > (options.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES)) {
         throw new HarnessSdkError("BACKPRESSURE_EXCEEDED");
       }
       socket.send(message);
     },
-    /** Idempotently initiate native close and end reads; completion does not wait for the close event. */
+    /** Mark closed before invoking native close to prevent duplicate close calls. End reads after native close returns. */
     async close() {
       if (closed) return;
       closed = true;
@@ -85,25 +105,29 @@ function createSocketTransport(socket: WebSocket, options: { maxFrameBytes?: num
 }
 
 /**
- * Own the temporary handshake listeners and timer. Error/close rejects RPC_CONNECTION_FAILED;
- * timeout closes first, so a synchronous close event can win over its RPC_TIMEOUT rejection.
+ * Await socket readiness for createWebSocketTransport, accepting an already-open factory socket.
+ * Open/error/close settle setup and remove the temporary listeners. The timer initiates close
+ * before rejecting, preserving native error/close ordering.
  */
 function waitForConnection(socket: WebSocket, timeoutMs: number): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => { socket.close(); reject(new HarnessSdkError("RPC_TIMEOUT")); }, timeoutMs);
-    /** Open/error/close listeners detach the handshake callbacks without affecting source listeners. */
-    const cleanupConnectionWait = () => {
+    const timeout = setTimeout(() => {
+      socket.close();
+      reject(new HarnessSdkError("RPC_TIMEOUT"));
+    }, timeoutMs);
+    /** Detach setup callbacks and clear the deadline when a socket event settles setup. */
+    const removeHandshakeListeners = () => {
       clearTimeout(timeout);
       socket.removeEventListener("open", onOpen);
       socket.removeEventListener("error", onConnectionFailure);
       socket.removeEventListener("close", onConnectionFailure);
     };
     const onOpen = () => {
-      cleanupConnectionWait();
+      removeHandshakeListeners();
       resolve();
     };
     const onConnectionFailure = () => {
-      cleanupConnectionWait();
+      removeHandshakeListeners();
       reject(new HarnessSdkError("RPC_CONNECTION_FAILED"));
     };
     socket.addEventListener("open", onOpen);

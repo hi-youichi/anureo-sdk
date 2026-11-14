@@ -6,22 +6,23 @@ import { HarnessSdkError } from '../errors'
 
 /**
  * Prepare a detached schema and synchronous candidate checks without network I/O or source mutation.
- * This package-internal compiler defaults to draft-07 and supports explicit 2020-12; formats are not
- * validated. Unsupported or invalid definitions throw INVALID_PARAMS; cloning failures propagate
- * directly. OutputSession.prepareOutput compiles before retaining submission state or dispatching
- * input, then retains the returned operations until submission cleanup. No disposal is required.
+ * This package-internal compiler defaults to draft-07, supports explicit 2020-12 and ignores
+ * formats during value checks. Unsupported or invalid definitions throw INVALID_PARAMS. Cloning
+ * failures propagate directly. OutputSession.prepareOutput compiles before retaining submission state
+ * or dispatching input. The returned checks require no disposal.
  */
 export function compileOutputSchema(source: JsonSchema) {
   const schema = structuredClone(source)
   const validate = compileValidator(schema)
   /**
-   * Admit a value without coercion or default insertion; throw STRUCTURED_OUTPUT_INVALID with at
+   * Check a value without coercion or default insertion. Throw STRUCTURED_OUTPUT_INVALID with at
    * most sixteen path/keyword issues on mismatch. OutputSession.submitCandidate converts failures
-   * into retry decisions; publishOutput converts them into failed terminals before serialization.
+   * into retry decisions. OutputSession.publishOutput converts them into failed terminals before serialization.
    */
   const check = (value: unknown): void => {
-    if (!validate(value)) throw new HarnessSdkError('STRUCTURED_OUTPUT_INVALID', 'Output does not match its schema', false, false,
-      { issues: validate.errors?.slice(0, 16).map(error => ({ path: error.instancePath, code: error.keyword })) ?? [] })
+    if (validate(value)) return
+    const issues = validate.errors?.slice(0, 16).map(error => ({ path: error.instancePath, code: error.keyword })) ?? []
+    throw new HarnessSdkError('STRUCTURED_OUTPUT_INVALID', 'Output does not match its schema', false, false, { issues })
   }
   return {
     schema,
@@ -44,14 +45,13 @@ export function compileOutputSchema(source: JsonSchema) {
 }
 
 /**
- * Compile an already cloned schema for compileOutputSchema, normalizing definition/compilation
- * failures to INVALID_PARAMS without wrapping later candidate failures in the same error boundary.
+ * Compile an already cloned schema for compileOutputSchema. Normalize definition and compilation
+ * failures to INVALID_PARAMS, leaving an existing HarnessSdkError intact.
  */
 function compileValidator(schema: JsonSchema) {
   try {
-    validateSchemaDefinition(schema)
-    const dialect = typeof schema === 'object' ? schema.$schema : undefined
-    const engine = dialect === 'https://json-schema.org/draft/2020-12/schema' ? Ajv2020 : Ajv
+    validateSchemaNode(schema, 0)
+    const engine = schemaEngine(schema)
     const ajv = new engine({ allErrors: true, strict: false, validateFormats: false, multipleOfPrecision: 6, logger: false })
     return ajv.compile(schema)
   } catch (cause) {
@@ -61,40 +61,51 @@ function compileValidator(schema: JsonSchema) {
 }
 
 /**
- * compileValidator invokes this before choosing Ajv and converts its failures to INVALID_PARAMS.
- * Reject external references, async schemas, excessive nesting and unsupported root dialects without
- * changing the schema. Instance annotations are skipped because their contents need not be schemas.
+ * Choose the Ajv implementation for the root dialect after traversal. An absent dialect uses
+ * draft-07, including for boolean schemas. compileValidator normalizes unsupported dialect errors.
  */
-function validateSchemaDefinition(schema: JsonSchema): void {
-  validateSchemaNode(schema, 0)
+function schemaEngine(schema: JsonSchema): typeof Ajv | typeof Ajv2020 {
   const dialect = typeof schema === 'object' ? schema.$schema : undefined
-  if (dialect !== undefined && dialect !== 'http://json-schema.org/draft-07/schema#' && dialect !== 'https://json-schema.org/draft/2020-12/schema') throw new Error('dialect')
+  switch (dialect) {
+    case undefined:
+    case 'http://json-schema.org/draft-07/schema#':
+      return Ajv
+    case 'https://json-schema.org/draft/2020-12/schema':
+      return Ajv2020
+    default:
+      throw new Error('dialect')
+  }
 }
 
 /**
- * Reject external references, async schemas and traversal beyond 128 levels for
- * validateSchemaDefinition. Follow only schema-bearing keywords so example/default instance data
+ * Reject non-fragment references and async schemas at visited nodes, and traversal beyond 128
+ * levels, for compileValidator. Follow the supported child keywords so example/default instance data
  * stays opaque. Check depth even for absent or scalar children to preserve the traversal bound.
  */
 function validateSchemaNode(node: unknown, depth: number): void {
   if (depth > 128) throw new Error('depth')
   if (!node || typeof node !== 'object') return
   const value = node as Record<string, unknown>
-  for (const key of ['$ref', '$dynamicRef']) {
-    if (typeof value[key] === 'string' && !value[key].startsWith('#')) throw new Error('external reference')
-  }
+  assertLocalReference(value.$ref)
+  assertLocalReference(value.$dynamicRef)
   if (value.$async) throw new Error('async schema')
+  const visitChild = (child: unknown) => validateSchemaNode(child, depth + 1)
   for (const key of ['properties', 'patternProperties', 'definitions', '$defs', 'dependentSchemas']) {
     const children = value[key]
-    if (children && typeof children === 'object') Object.values(children).forEach(child => validateSchemaNode(child, depth + 1))
+    if (children && typeof children === 'object') Object.values(children).forEach(visitChild)
   }
   for (const key of ['allOf', 'anyOf', 'oneOf', 'prefixItems']) {
     const children = value[key]
-    if (Array.isArray(children)) children.forEach(child => validateSchemaNode(child, depth + 1))
+    if (Array.isArray(children)) children.forEach(visitChild)
   }
   for (const key of ['items', 'contains', 'additionalProperties', 'additionalItems', 'propertyNames', 'not', 'if', 'then', 'else']) {
     const child = value[key]
-    if (Array.isArray(child)) child.forEach(item => validateSchemaNode(item, depth + 1))
-    else validateSchemaNode(child, depth + 1)
+    if (Array.isArray(child)) child.forEach(visitChild)
+    else visitChild(child)
   }
+}
+
+/** Restrict string references to local fragments during traversal. Ajv checks malformed keyword values. */
+function assertLocalReference(reference: unknown): void {
+  if (typeof reference === 'string' && !reference.startsWith('#')) throw new Error('external reference')
 }

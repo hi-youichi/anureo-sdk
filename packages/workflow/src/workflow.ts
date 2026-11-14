@@ -8,14 +8,18 @@ import { openFileRun, type RunHandle } from './persistence/store'
 
 /**
  * Run a body with a durable identity, frozen JSON input and journaled agent calls.
- * The initial manifest is saved before body entry. Resume reruns the body in a new run,
- * reusing eligible agent results from the source journal rather than its final result.
- * Input and the awaited body result must be strict JSON values; lossy values reject.
- * Resolves after registered agent work settles, the result is published and the writer lock
- * is released. Caught ordinary agent failures can produce an incomplete result; body errors,
- * fatal agent failures and persistence or lock-release failures reject with runId and directory
- * in the error details. Keep borrowed clients alive until settlement and dispose them separately.
- * Await other background work in the body; only registered agent work participates in the drain.
+ * After saving the initial manifest, invoke the body with the new run's ID and input.
+ * On resume, the body runs from the beginning and eligible agent calls reuse source journal results.
+ * The body owns any side effects outside those reused calls and must account for re-execution.
+ * Supply strict JSON for the input and the awaited body result, and await any background work
+ * other than registered agent calls inside the body. Keep borrowed clients alive until the
+ * workflow promise settles and dispose them separately.
+ *
+ * Resolve with a JSON copy of the body result after registered agent work settles, publication
+ * succeeds and the writer lock is released. Drops and recovered ordinary agent failures can
+ * yield an incomplete result. Invalid inputs, body errors, fatal agent failures, and storage
+ * failures reject. Run failures report the run ID and storage root in SDK error details. A
+ * lock-release failure can reject after the result and terminal manifest have been published.
  */
 export async function workflow<Input, Result>(
   options: WorkflowOptions<Input>,
@@ -24,45 +28,53 @@ export async function workflow<Input, Result>(
   const runId = options?.runId ?? randomUUID()
   const state = new RunState()
   let handle: RunHandle | undefined
-  let value: Awaited<Result> | undefined
+  let publishedResult: Awaited<Result> | undefined
   try {
-    const prepared = prepareRun(options, body)
-    handle = await openFileRun({ ...options, runId, input: prepared.input as JsonValue, resumeFrom: prepared.resumeFrom })
-    value = await completeRun({ handle, state, body, context: { runId, input: prepared.input } })
+    const { storageOptions, context } = prepareRun(options, body, runId)
+    handle = await openFileRun(storageOptions)
+    publishedResult = await completeRun({ handle, state, body, context })
   } catch (cause) {
     await abortRun({ cause, state, handle })
   } finally {
     if (handle) {
       try { await handle.close() }
-      catch { state.stop(new HarnessSdkError('WORKFLOW_STORAGE_FAILED')) }
+      catch { state.noteStorageFailure() }
     }
   }
   const failure = state.failure
   if (failure) {
-    throw new HarnessSdkError(failure.code, failure.message, false, failure.outcomeUnknown,
-      { ...failure.details, runId, directory: handle?.identity.directory ?? options?.directory })
+    throw new HarnessSdkError(failure.code, failure.message, false, failure.outcomeUnknown, {
+      ...failure.details,
+      runId,
+      directory: handle?.identity.directory ?? options?.directory,
+    })
   }
-  return { runId, status: state.status, result: value as Awaited<Result> }
+  // A failed publication also stops the run, so only published results reach this return.
+  return { runId, status: state.status, result: publishedResult as Awaited<Result> }
 }
 
-/** Snapshot caller-owned input and resume coordinates before workflow acquires a run handle.
- * Non-object options, a non-function body or non-JSON input throw before storage or body execution. */
+/** Prepare workflow's storage options and body context from the same frozen input snapshot.
+ * Missing or non-object options, a non-function body or non-JSON input throw before storage opens. */
 function prepareRun<Input, Result>(
   options: WorkflowOptions<Input>,
   body: (run: WorkflowContext<Input>) => Result | Promise<Result>,
-) {
+  runId: string,
+): { storageOptions: WorkflowOptions<JsonValue> & { runId: string }; context: WorkflowContext<Input> } {
   if (!options || typeof options !== 'object' || typeof body !== 'function') {
     throw new HarnessSdkError('INVALID_PARAMS')
   }
   const input = freezeJson(jsonCopy(options.input))
   const resumeFrom = options.resumeFrom && typeof options.resumeFrom === 'object'
     ? { ...options.resumeFrom } : options.resumeFrom
-  return { input, resumeFrom }
+  return {
+    storageOptions: { ...options, runId, input: input as JsonValue, resumeFrom },
+    context: { runId, input },
+  }
 }
 
-/** Execute workflow's body in the ambient journal, then drain before checking fatal state.
- * Body failures stop dispatch but still wait for registered work. Publication happens only
- * after a successful drain and JSON copy; failures reject for workflow to abort and release. */
+/** Run workflow's body in the journal context and stop dispatch if it throws or rejects.
+ * Drain before checking sticky failure so agent settlement can still change the outcome.
+ * Return the JSON copy after publication. A rejection sends workflow through abortRun before release. */
 async function completeRun<Input, Result>({ handle, state, body, context }: {
   handle: RunHandle
   state: RunState
@@ -82,9 +94,9 @@ async function completeRun<Input, Result>({ handle, state, body, context }: {
   return result as Awaited<Result>
 }
 
-/** Record workflow's failure and drain before marking an acquired run failed.
- * Abort publication errors join the sticky failures; workflow still owns handle closure
- * and reports the aggregate after closure. Initialization failures may have no handle. */
+/** Record workflow's failure and drain before publishing the aggregate to an acquired handle.
+ * Initialization failures can arrive before a handle exists. An abort publication error is
+ * recorded as a storage failure. workflow still releases the handle and reports the final aggregate. */
 async function abortRun({ cause, state, handle }: {
   cause: unknown
   state: RunState
@@ -95,6 +107,6 @@ async function abortRun({ cause, state, handle }: {
   await state.closeAndDrain()
   if (handle) {
     try { await handle.abort(storedFailure(state.failure ?? error)) }
-    catch { state.stop(new HarnessSdkError('WORKFLOW_STORAGE_FAILED')) }
+    catch { state.noteStorageFailure() }
   }
 }

@@ -1,6 +1,6 @@
-// Checks privacy projection and shared file-change retention contracts; must not implement production policy.
+// Checks privacy projection and shared file-change retention contracts.
 import { expect, test } from 'bun:test'
-import { validateDefinition, type Item, type InteractionRequested, type JsonSchema } from '@anureo/protocol'
+import { validateDefinition, type Item, type InteractionRequested, type JsonSchema, type JsonValue } from '@anureo/protocol'
 import { SecretRedactor } from './secrets'
 import { boundFileChangeItem, FILE_CHANGE_TEXT_LIMIT } from './file-change-limits'
 
@@ -36,7 +36,7 @@ test('new material and every snapshot/history path use marked-secret filtering',
   const filter = new SecretRedactor()
   filter.rememberResponse({ kind: 'userInput', interactionId: 'request', questions: [{ id: 'key', prompt: 'Key', secret: true }] } as InteractionRequested, { kind: 'userInput', answers: { key: 'secret' } })
   expect(JSON.stringify(filter.item(makeFileChangeItem()))).not.toContain('secret')
-  const delta = filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'patch', value: makeFileChangeItem() as unknown as import('@anureo/protocol').JsonValue } })
+  const delta = filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'patch', value: makeFileChangeItem() as unknown as JsonValue } })
   expect(JSON.stringify(delta)).not.toContain('secret')
   expect(JSON.stringify(filter.history({ items: [{ turnId: 'turn', item: makeFileChangeItem() }], snapshotToken: 'token' }))).not.toContain('secret')
 })
@@ -75,7 +75,7 @@ test('malformed Item-shaped patch snapshots fail before returning a retained eve
   source.input = { patch: huge }; source.output = huge; source.raw = { patch: huge }
   const value = { ...source, fileChanges: [{ ...source.fileChanges![0], operation: 'unsupported' }] }
   let retained: unknown
-  expect(() => { retained = filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'patch', value: value as unknown as import('@anureo/protocol').JsonValue } }) }).toThrow('Invalid AHP Item')
+  expect(() => { retained = filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'patch', value: value as unknown as JsonValue } }) }).toThrow('Invalid AHP Item')
   expect(retained).toBeUndefined()
   expect(filter.event({ type: 'item/delta', payload: { itemId: 'extension', kind: 'patch', value: { custom: 'compatible JSON' } } })).toMatchObject({ payload: { value: { custom: 'compatible JSON' } } })
 })
@@ -112,7 +112,7 @@ test('started, completed, full delta and history all apply the same source budge
       name: 'full delta',
       value: filter.event({
         type: 'item/delta',
-        payload: { itemId: 'edit', kind: 'patch', value: source as unknown as import('@anureo/protocol').JsonValue },
+        payload: { itemId: 'edit', kind: 'patch', value: source as unknown as JsonValue },
       }),
     },
     {
@@ -162,7 +162,7 @@ test('metadata hook failure preserves earlier registrations without accepting th
   const failure = new Error('metadata unavailable')
   let fail = true
   const remembered: string[] = []
-  /** SecretRedactor.remember invokes this before storing each value; fail the second value once to exercise retry semantics. */
+  // Fail the second registration once to exercise retry semantics.
   const filter = new SecretRedactor(value => {
     remembered.push(value)
     if (fail && value === 'second') throw failure
@@ -271,5 +271,18 @@ test('unavailable replacement material keeps its reserved bytes ahead of later m
   expect(result.input).toBe('é\n')
   expect(result.output).toBe('')
   expect(result.extensions?.['x-anureo/fileChangesTruncated']).toBe(true)
+  expect(validateDefinition('Item', result)).toBe(true)
+})
+
+test('mirror overflow marks the item while canonical changes keep their completeness and stats', () => {
+  const source = makeFileChangeItem()
+  const change = source.fileChanges![0]!
+  change.stats = { added: 1, removed: 1, accuracy: 'exact' }
+  source.extensions = { mirror: 'x'.repeat(FILE_CHANGE_TEXT_LIMIT) }
+
+  const result = boundFileChangeItem(source)
+  if (result.type !== 'toolCall') throw Error('unexpected item')
+  expect(result.fileChanges).toEqual(source.fileChanges)
+  expect(result.extensions).toEqual({ mirror: '', 'x-anureo/fileChangesTruncated': true })
   expect(validateDefinition('Item', result)).toBe(true)
 })

@@ -15,10 +15,9 @@ capabilities before using optional features such as fork, revert, or steering.
 
 ## Getting started
 
-> This README describes the unreleased workspace API, including `createClient`,
-> `Session`, `Turn`, and `@anureo/workflow`. The published 0.2.0 API differs;
-> see the [changelog](CHANGELOG.md) for release and migration details. Use the
-> source checkout below to run these examples.
+The `0.3.0` API includes `createClient`, `Session`, `Turn`, and `@anureo/workflow`.
+See the [changelog](CHANGELOG.md) for migration details from `0.2.0`.
+Use the source checkout below to run the examples.
 
 Requirements: Node.js 22+ with npm, Bun 1.4.2+, Git, and the Codex CLI on PATH.
 The example uses your Codex account and makes a real model request.

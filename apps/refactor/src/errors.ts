@@ -1,23 +1,33 @@
-// Normalizes caught errors for reports and presentation; it must not choose recovery or cleanup actions.
+// Normalizes caught errors for reports and diagnostics.
 import type { Failure } from './results'
 
-/** Internal display conversion used by agent work, run lifecycle, checks and CLI diagnostics.
- * Uses Error.message or String conversion; custom conversion/accessors can still throw. */
-export function message(cause: unknown): string { return cause instanceof Error ? cause.message : String(cause) }
-/** Internal classification recorded by agent work and run lifecycle alongside caught error text.
- * Returns signals from object values, or null code and false flags for primitives and functions.
- * Cleanup recognizes the resource-release code, explicit true flag or nonempty cleanup-error array;
- * execution uncertainty requires explicit true and remains independent. Custom accessors can throw. */
+/** Convert a caught value for display using Error.message or String conversion.
+ * Custom accessors or conversions can throw. */
+export function message(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause)
+}
+
+/** Extract execution and resource-release signals independently from a caught object.
+ * executeRun stores the result on the report. markFailed stores it on the first step failure
+ * and merges later cleanup signals into that failure. Primitives and functions yield a null code
+ * and false flags. Execution uncertainty requires an explicit true. Custom accessors can throw. */
 export function failure(cause: unknown): Failure {
-  const error = (cause && typeof cause === 'object' ? cause : {}) as {
-    outcomeUnknown?: boolean
-    code?: unknown
-    details?: Record<string, unknown>
-  }
+  const error = (cause && typeof cause === 'object' ? cause : {}) as FailureSource
   return {
     code: typeof error.code === 'string' ? error.code : null,
     outcomeUnknown: error.outcomeUnknown === true,
-    cleanupFailed: error.code === 'RESOURCE_RELEASE_FAILED' || error.details?.cleanupFailed === true
-      || (Array.isArray(error.details?.cleanupErrors) && error.details.cleanupErrors.length > 0),
+    cleanupFailed: hasCleanupFailure(error),
   }
+}
+
+interface FailureSource {
+  outcomeUnknown?: unknown
+  code?: unknown
+  details?: Record<string, unknown>
+}
+
+/** Recognize resource-release failures reported by code, explicit flag, or cleanup errors. */
+function hasCleanupFailure(error: FailureSource): boolean {
+  return error.code === 'RESOURCE_RELEASE_FAILED' || error.details?.cleanupFailed === true
+    || (Array.isArray(error.details?.cleanupErrors) && error.details.cleanupErrors.length > 0)
 }

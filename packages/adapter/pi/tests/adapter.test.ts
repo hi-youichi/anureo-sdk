@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { fixture, observe, request, types, until } from './test-helpers'
+import { collect, fixture, observe, request, types, until } from './test-helpers'
 import { fakeFactory } from './fake-host'
 import { createClient } from '@anureo/sdk'
 import { createPiAdapter } from '../src/index'
@@ -133,27 +133,34 @@ test('closing during an active turn aborts, disposes the host and leaks no liste
   } finally { await f.dispose() }
 })
 
-test('a native prompt failure rejects the submission with a typed error and the session still closes', async () => {
+test('a native prompt failure rejects with a typed error and releases the idle reservation', async () => {
   const f = await fixture()
   try {
     f.host.promptError = new Error('no api key configured for sk-live-999')
     await expect(f.session.submit({ input: 'x' })).rejects.toMatchObject({ code: 'PI_SUBMIT_FAILED' })
+    f.host.promptError = undefined
+    const next = await f.session.submit({ input: 'try again' }, { timeoutMs: 2000 })
+    expect((await next.result()).text).toBe('done: try again')
+    expect(f.host.calls.filter(call => call.method === 'prompt').map(call => call.value)).toEqual(['x', 'try again'])
     await expect(f.session.close()).resolves.toMatchObject({ closed: true })
     expect(f.host.disposed).toBe(true)
   } finally { await f.dispose() }
 })
 
-test('a prompt handled by an extension is accepted without a turn', async () => {
+test('a prompt handled by an extension releases the idle reservation without starting a turn', async () => {
   const f = await fixture()
   try {
     f.host.promptDisposition = 'handled'
     const turn = f.session.submit({ input: '/command' }, { timeoutMs: 100 })
     await expect(turn).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT' })
     expect(f.events.some(e => e.type === 'turn/started')).toBe(false)
+    f.host.promptDisposition = 'started'
+    const next = await f.session.submit({ input: 'next' }, { timeoutMs: 2000 })
+    expect((await next.result()).text).toBe('done: next')
   } finally { await f.dispose() }
 })
 
-test('structured output schemas and file inputs are rejected explicitly', async () => {
+test('structured output schemas are rejected on hosts without a direct tool', async () => {
   const f = await fixture()
   try {
     await expect(f.session.submit({ input: 'x', outputSchema: { type: 'object' } } as never)).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' })
@@ -186,6 +193,8 @@ test('config changes apply to Pi and invalid values leave the previous one', asy
     expect(f.host.model).toBe('fake/small')
     await expect(request(f.session, 'session/config/set', { patch: { thinkingLevel: 'high' } })).rejects.toMatchObject({ code: 'INVALID_PARAMS' })
     expect(f.host.thinkingLevel).toBe('medium')
+    await expect(request(f.session, 'session/config/set', { patch: { model: 'fake/big', thinkingLevel: 'max' } })).rejects.toMatchObject({ code: 'INVALID_PARAMS' })
+    expect(f.host.model).toBe('fake/small')
     await request(f.session, 'session/config/set', { patch: { model: 'fake/big', thinkingLevel: 'high' } })
     expect(f.host.thinkingLevel).toBe('high')
   } finally { await f.dispose() }
@@ -216,13 +225,16 @@ test('fork keeps history up to the boundary and events flow for the new session'
     const one = await f.session.submit({ input: 'one' }); await one.result()
     const two = await f.session.submit({ input: 'two' }); await two.result()
     const forked = await f.client.sessions.fork(f.session.reference, { boundary: { turnId: one.id, relation: 'through' } })
-    const forkEvents: typeof f.events = []
-    const reader = forked.events()[Symbol.asyncIterator]()
-    void (async () => { try { for (;;) { const n = await reader.next(); if (n.done) break; forkEvents.push(n.value) } } catch { /* closed */ } })()
-    const history = await request(forked, 'history/read', {})
-    expect(history.items.map(entry => entry.item.type === 'userMessage' ? entry.item.content[0] : entry.item.type)).toEqual([{ type: 'text', text: 'one' }, 'agentMessage'])
-    const turn = await forked.submit({ input: 'branch' }); expect((await turn.result()).text).toBe('done: branch')
-    await until(() => forkEvents.some(e => e.type === 'turn/completed'))
+    const forkEvents = collect(forked)
+    try {
+      const history = await request(forked, 'history/read', {})
+      expect(history.items.map(entry => entry.item.type === 'userMessage' ? entry.item.content[0] : entry.item.type)).toEqual([{ type: 'text', text: 'one' }, 'agentMessage'])
+      const turn = await forked.submit({ input: 'branch' })
+      expect((await turn.result()).text).toBe('done: branch')
+      await until(() => forkEvents.events.some(e => e.type === 'turn/completed'))
+    } finally {
+      await forkEvents.stop()
+    }
     const before = await f.client.sessions.fork(f.session.reference, { boundary: { turnId: two.id, relation: 'before' } })
     expect((await request(before, 'history/read', {})).items).toHaveLength(2)
     const empty = await f.client.sessions.fork(f.session.reference, { boundary: { turnId: one.id, relation: 'before' } })

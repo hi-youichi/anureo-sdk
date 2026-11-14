@@ -1,14 +1,15 @@
-/** Classifies native turn failures into safe public errors; diagnostic disclosure and retry execution must not happen here. */
+/** Classifies native terminal evidence for public turn errors. */
 import type { HarnessError } from '@anureo/protocol'
 import { record } from './native-values'
 
 /**
- * Return an AHP terminal error with fixed public text and outcomeUnknown false, using recognized
- * native categories and valid HTTP status evidence. Unknown evidence produces NATIVE_TURN_FAILED;
- * provider messages and unknown category text are not disclosed. This returns an error value,
- * without throwing it, retrying, performing I/O or mutating the input.
- * CodexBackendSession.completeTurn includes the result in turn/completed, using empty evidence
- * when a failed turn has no error payload. Callers decide whether to retry from retryable.
+ * Return an AHP error value with fixed public text and outcomeUnknown false. Recognized native
+ * categories and HTTP statuses determine code and retryable. Unknown evidence defaults to
+ * NATIVE_TURN_FAILED. Details include only validated HTTP status evidence.
+ *
+ * CodexBackendSession.completeTurn publishes this value in turn/completed and supplies empty
+ * evidence for failed turns with no error payload. Failed and interrupted turn results can
+ * carry the error. Consumers decide whether to act on retryable.
  */
 export function mapTurnError(value: unknown): HarnessError {
   const failure = nativeTurnFailure(value)
@@ -19,40 +20,48 @@ export function mapTurnError(value: unknown): HarnessError {
   }
 }
 
-/** Extracted category and validated HTTP evidence for classification; provider diagnostics are excluded. */
+/** Classification evidence retained from native categories and connection errors. */
 type NativeTurnFailure = {
   nativeCode?: string
   httpStatusCode?: number
-  /** A recognized connection variant remains retryable even without a valid HTTP status. */
+  /** Whether a recognized connection variant was present, independently of its status code. */
   hasHttpFailure: boolean
 }
 
-/** Read classification evidence for mapTurnError without effects. Preserve the first recognized connection entry in native order; an invalid status must not erase evidence of a connection failure. */
+/** Read the native category and the first recognized connection entry in native order, even if its status is invalid. */
 function nativeTurnFailure(value: unknown): NativeTurnFailure {
   const info = record(value).codexErrorInfo
   const entries = info && typeof info === 'object' && !Array.isArray(info) ? Object.entries(info) : []
-  const httpEntry = entries.find(([key]) => [
-    'httpConnectionFailed',
-    'responseStreamConnectionFailed',
-    'responseStreamDisconnected',
-    'responseTooManyFailedAttempts',
-  ].includes(key))
+  const httpEntry = entries.find(([key]) => isConnectionFailure(key))
   const httpStatusCode = httpEntry ? record(httpEntry[1]).httpStatusCode : undefined
   return {
-    nativeCode: typeof info === 'string' ? info : httpEntry?.[0],
+    nativeCode: typeof info === 'string' ? info : undefined,
     httpStatusCode: validHttpStatusCode(httpStatusCode),
     hasHttpFailure: httpEntry !== undefined,
   }
 }
 
-/** Accept only integer HTTP statuses in 100–599 for nativeTurnFailure; malformed evidence stays absent rather than being coerced or disclosed. */
+/** Recognize the native object variants that independently establish a connection failure. */
+function isConnectionFailure(key: string): boolean {
+  switch (key) {
+    case 'httpConnectionFailed':
+    case 'responseStreamConnectionFailed':
+    case 'responseStreamDisconnected':
+    case 'responseTooManyFailedAttempts':
+      return true
+    default:
+      return false
+  }
+}
+
+/** Accept only integer HTTP statuses in 100–599 for public error details and classification. */
 function validHttpStatusCode(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
     ? value
     : undefined
 }
 
-/** Choose fixed public text for mapTurnError without effects. Keep precedence explicit: auth status wins before native usage/rate categories, and recognized connection failures are the final retryable fallback. */
+/** Select fixed public text and a retry hint. Specific HTTP and category rules take precedence over the connection fallback. */
 function classifyTurnFailure({ nativeCode, httpStatusCode: status, hasHttpFailure }: NativeTurnFailure): Pick<HarnessError, 'code' | 'message' | 'retryable'> {
   if (nativeCode === 'unauthorized' || status === 401) {
     return { code: 'AUTH_REQUIRED', message: 'Sign in to the independent Codex runtime before sending', retryable: false }

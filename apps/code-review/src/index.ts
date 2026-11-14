@@ -1,5 +1,28 @@
-/** Library entry point for running reviews with a caller-owned client and consuming their reports.
- * The anureo-review executable owns its client and delegates to the same reviewCode operation. */
+/**
+ * Run a modular code review with an initialized SDK client. Inspect the report status for incomplete
+ * coverage, and release the client when finished. To render the report yourself, use formatReport.
+ * The anureo-review executable calls the same review operation and manages its own client.
+ *
+ * With a configured Codex CLI on PATH:
+ * ```ts
+ * import { createCodexAdapter } from '@anureo/adapter-codex'
+ * import { createClient } from '@anureo/sdk'
+ * import { formatReport, reviewCode } from '@anureo/code-review'
+ *
+ * const cwd = process.cwd()
+ * const client = await createClient({
+ *   adapter: createCodexAdapter({ command: 'codex', cwd }),
+ *   identity: { adapterId: 'codex', runtimeConfigId: 'review-example' },
+ * })
+ * try {
+ *   const report = await reviewCode({ client, cwd })
+ *   process.stdout.write(formatReport(report))
+ *   if (report.status === 'incomplete') process.exitCode = 2
+ * } finally {
+ *   await client.dispose()
+ * }
+ * ```
+ */
 export { reviewCode } from './review'
 export type { ReviewOptions } from './options'
 export type { ReviewReport, ModuleOutcome, ModuleReview, AngleReview, FixReport } from './results'

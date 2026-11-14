@@ -2,13 +2,14 @@
 import { codexFileChanges } from './file-changes'
 import type { InputBlock, Item } from '@anureo/protocol'
 import { HarnessSdkError } from '@anureo/sdk'
-import { safe, record, string, type NativeRecord } from './native-values'
+import { record, safe, string, type NativeRecord } from './native-values'
+
 export { json, safe } from './native-values'
 export { nativeInput } from './input'
 export { mapUsage } from './usage'
 export { mapTurnError } from './turn-error'
 
-/** Normalize a native item status; completed is envelope evidence used only when the status is unrecognized. Explicit native statuses take precedence. */
+/** Normalize a native item status. Use the envelope's completion flag only for missing or unrecognized statuses. */
 export function itemStatus(value: unknown, completed: boolean): 'running' | 'completed' | 'failed' | 'declined' | 'interrupted' {
   switch (value) {
     case 'inProgress': case 'in_progress': case 'running': case 'pending': return 'running'
@@ -21,19 +22,20 @@ export function itemStatus(value: unknown, completed: boolean): 'running' | 'com
 }
 
 /**
- * Convert one native snapshot to AHP items without I/O or retained state. Collaboration snapshots
- * expand in receiver order (or state-key order) and may produce no items; unknown kinds become
- * sanitized tool calls. A nonempty string id is required, otherwise this throws PROTOCOL_ERROR.
- * JSON hooks run during sanitization, and serialization/redaction failures propagate.
+ * Convert one native snapshot to AHP items. Collaboration snapshots expand in receiver order,
+ * falling back to state-key order, and may produce no items. Unknown kinds become tool calls
+ * with sanitized native payloads. A missing, non-string, or empty id throws PROTOCOL_ERROR.
+ * Sanitization can invoke JSON hooks and propagate serialization or redaction errors.
  *
- * completed supplies fallback item status and determines plan-step completion. history defaults to
- * false; when true, an undefined native status stays absent despite completed envelope evidence.
- * timing.startedAtMs is in epoch milliseconds: null/undefined fall back to native time, while an
- * invalid non-nullish override suppresses it. This does not reconcile timestamps across snapshots.
+ * Pass completed to supply fallback item status and determine plan-step completion. Set history
+ * to true to omit status when the native field is undefined. For live items, the default is false.
+ * Supply timing.startedAtMs in epoch milliseconds. Null or undefined uses the native timestamp,
+ * and any other invalid override omits the start time.
  *
- * CodexBackendSession.projectItem publishes these items as live events; historyEntryItems wraps
- * them in history envelopes. Both propagate projection failures. Callers own event ordering,
- * snapshot retention and timing reconciliation.
+ * CodexBackendSession.projectItem reconciles start times and publishes these items in order.
+ * CodexBackendSession.historyEntryItems wraps them for history reads. A projection failure
+ * rejects a history read or reaches JSONL stream failure handling for live notifications.
+ * Callers own ordering across snapshots.
  */
 export function mapItems(value: unknown, completed: boolean, history = false, timing: { startedAtMs?: unknown } = {}): Item[] {
   const raw = record(value)
@@ -86,41 +88,9 @@ export function mapItems(value: unknown, completed: boolean, history = false, ti
       input: safe({ command: raw.command, cwd: raw.cwd }),
       output: safe(raw.aggregatedOutput ?? raw.output),
     }]
-    case 'fileChange': return [{
-      ...common,
-      type: 'toolCall',
-      kind: 'fileChange',
-      title: 'File changes',
-      fileChanges: codexFileChanges(raw.changes),
-      input: safe(raw.changes),
-      output: safe(raw.output),
-      locations: fileChangeLocations(raw.changes),
-    }]
-    case 'mcpToolCall': {
-      const server = string(raw.server) ?? 'mcp'
-      const tool = string(raw.tool) ?? 'tool'
-      return [{
-        ...common,
-        type: 'toolCall',
-        kind: 'mcp',
-        mcp: { server, tool },
-        title: `${server}/${tool}`,
-        input: safe(raw.arguments),
-        output: safe(raw.result ?? raw.error),
-      }]
-    }
-    case 'dynamicToolCall': {
-      const tool = string(raw.tool)
-      return [{
-        ...common,
-        type: 'toolCall',
-        kind: 'dynamic',
-        ...(tool ? { toolName: tool } : {}),
-        title: tool ?? 'Dynamic tool',
-        input: safe(raw.arguments),
-        output: safe(raw.contentItems ?? raw.result),
-      }]
-    }
+    case 'fileChange': return [fileChangeItem(raw, common)]
+    case 'mcpToolCall': return [mcpToolItem(raw, common)]
+    case 'dynamicToolCall': return [dynamicToolItem(raw, common)]
     case 'webSearch': return [{
       ...common,
       type: 'toolCall',
@@ -141,20 +111,14 @@ export function mapItems(value: unknown, completed: boolean, history = false, ti
   }
 }
 
-/** Project state for subagentItems without effects; this vocabulary deliberately leaves declined and cancelled running, unlike itemStatus. */
-function subagentState(value: string): 'running' | 'completed' | 'failed' | 'interrupted' {
-  switch (value) {
-    case 'completed': return 'completed'
-    case 'errored': case 'failed': return 'failed'
-    case 'closed': case 'interrupted': return 'interrupted'
-    default: return 'running'
-  }
-}
-
-/** Shared fields for every item emitted from one native snapshot; history may lack status. */
+/** Fields shared by items expanded from the same native snapshot. History items may omit status. */
 type ItemMetadata = Pick<Item, 'id' | 'status' | 'startedAt' | 'durationMs'>
 
-/** Build mapItems metadata without mutation. A non-nullish timing override wins even when invalid; only valid nonnegative epoch milliseconds become an ISO start time. History omits status only when the native field is undefined; numeric durationMs passes through unchanged. */
+/**
+ * Build metadata shared by mapItems projections. A non-nullish override selects the start
+ * timestamp even if invalid. Nonnegative epoch milliseconds within the Date range produce an ISO string.
+ * History omits status only for an undefined native field, and numeric durationMs passes through.
+ */
 function itemMetadata(raw: NativeRecord, options: {
   id: string
   status: ReturnType<typeof itemStatus>
@@ -172,7 +136,7 @@ function itemMetadata(raw: NativeRecord, options: {
   }
 }
 
-/** Project a user-message block for mapItems without effects; unsupported blocks retain their position using a visible text placeholder. Local paths remain native paths. */
+/** Keep each user-message block in position, using text placeholders for unsupported blocks and native paths for local images. */
 function userContentBlock(value: unknown): InputBlock {
   const block = record(value)
   if (block.type === 'text') return { type: 'text', text: string(block.text) ?? '' }
@@ -181,17 +145,22 @@ function userContentBlock(value: unknown): InputBlock {
   return { type: 'text', text: '[unsupported native input]' }
 }
 
-/** Read reasoning text or summary for mapItems without coercion or effects; non-string fragments are omitted while native string order and line breaks survive. */
+/** Join reasoning fragments in native order with newline separators, skipping non-string values. */
 function reasoningText(value: unknown): string {
   return Array.isArray(value) ? value.filter(v => typeof v === 'string').join('\n') : ''
 }
 
-/** Expand mapItems collaboration snapshots without mutation. A nonempty list of string receivers wins over state keys and preserves order and duplicates; receiver IDs are scoped to the parent item. */
+/**
+ * Expand collaboration items in receiver order, preserving duplicate string IDs. When there
+ * are no string receivers, use state keys. Scope each item ID to the parent snapshot.
+ */
 function subagentItems(raw: NativeRecord, context: { common: ItemMetadata; status: ReturnType<typeof itemStatus> }): Item[] {
-  const ids = Array.isArray(raw.receiverThreadIds) ? raw.receiverThreadIds.filter((v): v is string => typeof v === 'string') : []
+  const ids = Array.isArray(raw.receiverThreadIds)
+    ? raw.receiverThreadIds.filter((v): v is string => typeof v === 'string')
+    : []
   const states = record(raw.agentsStates)
   return (ids.length ? ids : Object.keys(states)).map(
-    /** Project one receiver using status, then legacy state, then the normalized parent status; no mutation or I/O. */
+    /** Pick receiver status, falling back to legacy state and then the normalized parent status. */
     subagentId => {
       const state = record(states[subagentId])
       const nativeState = string(state.status) ?? string(state.state) ?? context.status
@@ -208,7 +177,83 @@ function subagentItems(raw: NativeRecord, context: { common: ItemMetadata; statu
   )
 }
 
-/** Project an image branch for mapItems; a nonempty fileId suppresses inline generated data and viewed images never acquire it. The first non-nullish savedPath/path is used only if it is a nonempty string. JSON hook and serialization errors propagate during sanitization; no I/O. */
+/** Use the collaboration state vocabulary. Unrecognized states, including declined and cancelled, map to running. */
+function subagentState(value: string): 'running' | 'completed' | 'failed' | 'interrupted' {
+  switch (value) {
+    case 'completed': return 'completed'
+    case 'errored': case 'failed': return 'failed'
+    case 'closed': case 'interrupted': return 'interrupted'
+    default: return 'running'
+  }
+}
+
+/**
+ * Return a file-change tool item with structured patch evidence and source locations.
+ * Read the evidence before sanitization invokes JSON hooks and the locations after sanitizing the
+ * tool input and output. Serialization and redaction errors propagate to mapItems.
+ */
+function fileChangeItem(raw: NativeRecord, common: ItemMetadata): Item {
+  return {
+    ...common,
+    type: 'toolCall',
+    kind: 'fileChange',
+    title: 'File changes',
+    fileChanges: codexFileChanges(raw.changes),
+    input: safe(raw.changes),
+    output: safe(raw.output),
+    locations: fileChangeLocations(raw.changes),
+  }
+}
+
+/** Collect locations in native order, including the source path of a rename. */
+function fileChangeLocations(changes: unknown): { path: string }[] {
+  if (!Array.isArray(changes)) return []
+  return changes.flatMap(value => {
+    const change = record(value)
+    return typeof change.path === 'string' ? [{ path: change.path }] : []
+  })
+}
+
+/**
+ * Return an MCP tool item with a server-qualified title, preserving explicit empty names.
+ * Use the native error as output when the result is nullish. JSON projection errors propagate.
+ */
+function mcpToolItem(raw: NativeRecord, common: ItemMetadata): Item {
+  const server = string(raw.server) ?? 'mcp'
+  const tool = string(raw.tool) ?? 'tool'
+  return {
+    ...common,
+    type: 'toolCall',
+    kind: 'mcp',
+    mcp: { server, tool },
+    title: `${server}/${tool}`,
+    input: safe(raw.arguments),
+    output: safe(raw.result ?? raw.error),
+  }
+}
+
+/**
+ * Return a dynamic tool item with an optional nonempty toolName and a title that preserves
+ * an explicit empty name. Prefer supplied content items to the result. JSON projection errors propagate.
+ */
+function dynamicToolItem(raw: NativeRecord, common: ItemMetadata): Item {
+  const tool = string(raw.tool)
+  return {
+    ...common,
+    type: 'toolCall',
+    kind: 'dynamic',
+    ...(tool ? { toolName: tool } : {}),
+    title: tool ?? 'Dynamic tool',
+    input: safe(raw.arguments),
+    output: safe(raw.contentItems ?? raw.result),
+  }
+}
+
+/**
+ * Return image metadata. Only generation can include inline PNG data, and a nonempty fileId
+ * takes precedence. Use a nonempty path from the first non-nullish savedPath or path value.
+ * JSON projection errors propagate when sanitizing the prompt or failure.
+ */
 function imageItem(raw: NativeRecord, common: ItemMetadata, nativeType: 'imageGeneration' | 'imageView'): Item {
   const generated = nativeType === 'imageGeneration'
   const fileId = string(raw.fileId)
@@ -231,16 +276,4 @@ function imageItem(raw: NativeRecord, common: ItemMetadata, nativeType: 'imageGe
     },
     ...(raw.failure ? { output: safe({ failure: raw.failure }) } : {}),
   }
-}
-
-/** Collect native source locations for mapItems without effects; renamed destinations belong to fileChanges, while locations retain each supplied source path in order. */
-function fileChangeLocations(changes: unknown): { path: string }[] {
-  if (!Array.isArray(changes)) return []
-  return changes.flatMap(
-    /** Ignore malformed locations without inventing a path or consulting the filesystem. */
-    value => {
-      const change = record(value)
-      return typeof change.path === 'string' ? [{ path: change.path }] : []
-    },
-  )
 }

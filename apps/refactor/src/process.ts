@@ -1,4 +1,3 @@
-// Runs child processes for adapters and checks; it must not own repository or validation policy.
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 

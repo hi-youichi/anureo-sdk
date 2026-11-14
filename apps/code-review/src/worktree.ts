@@ -1,35 +1,30 @@
 // Creates a private Git checkout of the current source for one agent session.
-import { execFile } from 'node:child_process'
 import { copyFile, lstat, mkdir, mkdtemp, realpath, rm, readlink, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, relative, resolve } from 'node:path'
-import { promisify } from 'node:util'
 import { HarnessSdkError } from '@anureo/sdk'
-import { isInsideDirectory, OPERATIONAL_PATH_SEGMENTS } from './paths'
+import { reviewGit } from './git'
+import { hasOperationalPathSegment, isInsideDirectory } from './paths'
 
-const exec = promisify(execFile)
-const maxBuffer = 1 << 24
-// Git hooks and wrappers can export these for their caller's checkout.
-const repositoryEnvironment = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
-  'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_IMPLICIT_WORK_TREE',
-  'GIT_PREFIX', 'GIT_GRAFT_FILE', 'GIT_SHALLOW_FILE']
-
+/** Internal checkout paths valid during the withAgentWorktree callback. */
 export interface AgentWorktree {
+  /** Absolute Git root of the detached checkout. */
   root: string
+  /** Absolute parent directory where applyFix stages its baseline and patch. */
   scratch: string
 }
 
-export async function reviewRepositoryRoot(cwd: string): Promise<string> {
-  try {
-    return await realpath((await reviewGit(cwd, 'rev-parse', '--show-toplevel')).replace(/\r?\n$/, ''))
-  } catch (cause) {
-    throw new HarnessSdkError('REVIEW_FIX_INVALID',
-      'Fix requires a usable git repository in the review directory', false, false, { cause })
-  }
-}
-
-/** Run against a freshly materialized source view when root is supplied. Remove the checkout
- * after the session settles, including on validation and execution failures. */
+/** Run one agent operation and await its result and any checkout cleanup.
+ * Supply cwd and the workflow storage directory as absolute paths. If supplied, root must be
+ * the canonical Git root containing cwd.
+ * With a root, the callback receives a checkout-local cwd and any in-repository storage path
+ * is remapped for validation. Without a root, the callback receives the original paths and
+ * no checkout handle. Await all checkout access inside the callback, including patch staging.
+ *
+ * analyzeModules uses the returned plan before dispatching reviews. reviewAngle and applyFix
+ * report checkout rejections as failed angle or fix results, respectively.
+ * Setup or callback failures propagate even if cleanup also fails. Cleanup alone rejects with
+ * REVIEW_FIX_CLEANUP and can leave files behind, even after applyFix patches the original tree. */
 export async function withAgentWorktree<T>(
   options: { root?: string; cwd: string; directory: string },
   use: (cwd: string, directory: string, worktree?: AgentWorktree) => Promise<T>,
@@ -38,19 +33,18 @@ export async function withAgentWorktree<T>(
   if (root === undefined) return use(cwd, directory)
   const scratch = await mkdtemp(resolve(await realpath(tmpdir()), 'anureo-review-'))
   const checkout = resolve(scratch, 'checkout')
+  const worktree = { root: checkout, scratch }
   let registered = false
   let failed = false
   try {
-    const head = await reviewGit(root, 'rev-parse', '--verify', 'HEAD').then(value => value.trim(), () => emptyCommit(root, scratch))
-    await reviewGit(root, '-c', 'core.hooksPath=' + resolve(scratch, 'hooks'),
-      'worktree', 'add', '--detach', '--no-checkout', checkout, head)
+    const head = await registerCheckout(root, worktree)
     registered = true
     await reviewGit(checkout, 'read-tree', head)
     await copySource(root, checkout, directory)
     const localCwd = resolve(checkout, relative(root, cwd))
     const localDirectory = isInsideDirectory(root, directory) ? resolve(checkout, relative(root, directory)) : directory
     await mkdir(localCwd, { recursive: true })
-    return await use(localCwd, localDirectory, { root: checkout, scratch })
+    return await use(localCwd, localDirectory, worktree)
   } catch (cause) {
     failed = true
     throw cause
@@ -61,18 +55,25 @@ export async function withAgentWorktree<T>(
     } catch (cause) {
       if (!failed) throw new HarnessSdkError('REVIEW_FIX_CLEANUP',
         `Could not remove temporary worktree at ${checkout}`, false, false, { cause })
-      // Preserve the primary agent/validation error. A failed removal leaves its checkout for inspection.
+      // A secondary cleanup failure must not hide a setup or callback failure.
     }
   }
 }
 
-/** Git output is used for path lists and metadata. Patches are handled as bytes. */
-export async function reviewGit(cwd: string, ...args: string[]): Promise<string> {
-  const env = { ...process.env }
-  for (const name of repositoryEnvironment) delete env[name]
-  return (await exec('git', ['-C', cwd, ...args], { maxBuffer, env })).stdout
+/** Register a detached checkout with hooks disabled and return the baseline for its index.
+ * Fall back to an empty commit if HEAD lookup fails, including on an unborn branch. Reject on
+ * registration failure. withAgentWorktree owns index initialization, source copying and removal. */
+async function registerCheckout(root: string, worktree: AgentWorktree): Promise<string> {
+  const head = await reviewGit(root, 'rev-parse', '--verify', 'HEAD').then(
+    value => value.trim(), () => emptyCommit(root, worktree.scratch),
+  )
+  await reviewGit(root, '-c', 'core.hooksPath=' + resolve(worktree.scratch, 'hooks'),
+    'worktree', 'add', '--detach', '--no-checkout', worktree.root, head)
+  return head
 }
 
+/** Write a fallback tree and commit into the source repository's object store without updating
+ * refs. registerCheckout awaits the commit ID and propagates filesystem and Git failures. */
 async function emptyCommit(root: string, scratch: string): Promise<string> {
   const empty = resolve(scratch, 'empty')
   await writeFile(empty, '')
@@ -81,32 +82,46 @@ async function emptyCommit(root: string, scratch: string): Promise<string> {
     '-c', 'commit.gpgSign=false', 'commit-tree', tree, '-m', 'Empty review baseline')).trim()
 }
 
+/** Copy current tracked and non-ignored untracked files before withAgentWorktree invokes its
+ * callback. Exclude operational paths and both the configured and resolved workflow storage
+ * paths. Reads are sequential and acquire no lock. Git or unexpected copy failures reject. */
 async function copySource(root: string, checkout: string, directory: string): Promise<void> {
   const storage = await realpath(directory).catch(() => directory)
   const files = new Set((await reviewGit(root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard')).split('\0'))
   for (const file of files) {
-    if (!file || file.split('/').some(part => (OPERATIONAL_PATH_SEGMENTS as readonly string[]).includes(part))) continue
+    if (!file || hasOperationalPathSegment(file.split('/'))) continue
     const source = resolve(root, file)
     if (isInsideDirectory(storage, source) || isInsideDirectory(directory, source)) continue
-    const parent = dirname(source)
-    try {
-      // Git can list old indexed children of a directory replaced by a symlink.
-      if (await realpath(parent) !== parent) continue
-      const info = await lstat(source)
-      const target = resolve(checkout, file)
-      if (info.isFile()) {
-        await mkdir(dirname(target), { recursive: true })
-        await copyFile(source, target)
-      } else if (info.isSymbolicLink()) {
-        const link = resolve(parent, await readlink(source))
-        if (!isInsideDirectory(root, link)) continue
-        await mkdir(dirname(target), { recursive: true })
-        const localLink = relative(dirname(target), resolve(checkout, relative(root, link))) || '.'
-        const type = await lstat(link).then(value => value.isDirectory() ? 'dir' : 'file', () => 'file')
-        await symlink(localLink, target, type)
-      }
-    } catch (cause) {
-      if (!(cause && typeof cause === 'object' && 'code' in cause && ['ENOENT', 'ENOTDIR'].includes(String(cause.code)))) throw cause
+    await copySourceEntry({ root, checkout, file, source })
+  }
+}
+
+/** Materialize regular files and symlinks with lexical targets inside root, rebasing links to
+ * the checkout. Treat ENOENT and ENOTDIR as absent entries because the index can still list
+ * deleted paths. Other copy failures propagate to copySource. */
+async function copySourceEntry({ root, checkout, file, source }: {
+  root: string; checkout: string; file: string; source: string
+}): Promise<void> {
+  const parent = dirname(source)
+  try {
+    // Git can list old indexed children of a directory replaced by a symlink.
+    if (await realpath(parent) !== parent) return
+    const info = await lstat(source)
+    const target = resolve(checkout, file)
+    const targetParent = dirname(target)
+    if (info.isFile()) {
+      await mkdir(targetParent, { recursive: true })
+      await copyFile(source, target)
+    } else if (info.isSymbolicLink()) {
+      const link = resolve(parent, await readlink(source))
+      if (!isInsideDirectory(root, link)) return
+      await mkdir(targetParent, { recursive: true })
+      const localLink = relative(targetParent, resolve(checkout, relative(root, link))) || '.'
+      const type = await lstat(link).then(value => value.isDirectory() ? 'dir' : 'file', () => 'file')
+      await symlink(localLink, target, type)
     }
+  } catch (cause) {
+    const code = cause && typeof cause === 'object' && 'code' in cause ? String(cause.code) : undefined
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') throw cause
   }
 }

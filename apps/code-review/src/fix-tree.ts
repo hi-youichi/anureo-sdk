@@ -1,24 +1,23 @@
-// Captures fix baselines and reconciles allowed edits, including pre-existing changes and storage exclusions.
-import { createHash } from 'node:crypto'
-import { lstat, readFile, readlink } from 'node:fs/promises'
-import { resolve } from 'node:path'
-import { reviewGit } from './worktree'
+// Reconciles fix edits against the isolated checkout's pre-agent state.
+import { fileState, type TreeState } from './file-state'
+import { reviewGit } from './git'
 
-/** Baseline of the isolated worktree. Files and diagnostics use Git-root-relative paths. */
-interface WorkingTreeBaseline {
-  root: string
-  allowed: readonly string[]
-  states: ReadonlyMap<string, TreeState>
-}
-
-/** Include selected files and preexisting Git-visible changes in the isolated checkout. */
+/** Capture selected files and existing Git-visible changes in the isolated checkout before
+ * agent dispatch. captureFixBaseline retains this snapshot for the post-agent comparison.
+ * root is the Git root and allowed paths are relative to it. Git and file-read failures reject.
+ */
 export async function captureWorkingTreeBaseline(root: string, allowed: readonly string[]): Promise<WorkingTreeBaseline> {
   const files = new Set([...allowed, ...(await treeEntries(root)).keys()])
   const states = new Map(await Promise.all([...files].map(async file => [file, await fileState(root, file)] as const)))
   return { root, allowed, states }
 }
 
-/** Only existing selected files that remain regular files can become an applied edit. */
+/** Compare baseline paths and current Git-visible changes after agent settlement. Including
+ * baseline paths detects edits that restore a dirty file to its committed contents. Return
+ * sorted Git-root-relative paths for selected files that were and remain regular, plus
+ * diagnostics for other detected changes. checkFixChanges rejects those diagnostics before
+ * integration. Git and file-read failures reject here.
+ */
 export async function inspectWorkingTreeChanges(baseline: WorkingTreeBaseline): Promise<{ changedFiles: string[]; violations: string[] }> {
   const { root, allowed, states: before } = baseline
   const scope = new Set(allowed)
@@ -35,31 +34,19 @@ export async function inspectWorkingTreeChanges(baseline: WorkingTreeBaseline): 
   return { changedFiles: changedFiles.sort(), violations }
 }
 
-interface TreeState {
-  fingerprint: string | null
-  regular: boolean
+/** Isolated checkout snapshot from before agent execution. All paths except root are
+ * Git-root-relative. states includes the allowed paths even when Git status is clean.
+ */
+interface WorkingTreeBaseline {
+  root: string
+  allowed: readonly string[]
+  states: ReadonlyMap<string, TreeState>
 }
 
-/** Disable rename detection so additions and removals are compared independently. */
+/** Map changed Git paths to status codes for scope discovery and diagnostics. Disable rename
+ * detection so additions and removals can be compared independently. Git failures reject.
+ */
 async function treeEntries(root: string): Promise<Map<string, string>> {
   const entries = await reviewGit(root, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames')
   return new Map(entries.split('\0').filter(Boolean).map(entry => [entry.slice(3), entry.slice(0, 2)]))
-}
-
-/** Fingerprint mode plus regular-file bytes or symlink text for scope comparison. Missing paths
- * return a null fingerprint; other filesystem failures reject rather than silently omit an edit.
- * Git change discovery supplies individual file paths. */
-export async function fileState(cwd: string, file: string): Promise<TreeState> {
-  const path = resolve(cwd, file)
-  try {
-    const info = await lstat(path)
-    const content = info.isFile() ? await readFile(path) : info.isSymbolicLink() ? await readlink(path) : ''
-    const fingerprint = createHash('sha256').update(String(info.mode)).update('\0').update(content).digest('hex')
-    return { fingerprint, regular: info.isFile() }
-  } catch (cause) {
-    if (cause && typeof cause === 'object' && 'code' in cause && cause.code === 'ENOENT') {
-      return { fingerprint: null, regular: false }
-    }
-    throw cause
-  }
 }

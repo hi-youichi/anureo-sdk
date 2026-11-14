@@ -1,16 +1,18 @@
-// Adapts CLI input/output and owns the client lifecycle; it must not implement refactor phases or shared validation policy.
+// Admits CLI commands and owns the client used to execute them.
 import { resolve } from 'node:path'
-import { parseArgs } from 'node:util'
+import { parseArgs, type ParseArgsOptionsConfig } from 'node:util'
 import type { Client } from '@anureo/sdk'
 import { validateChecks, type CheckCommand } from './checks'
 import { createRefactorClient, harnessPermissions, refactorHarnesses, type HarnessSelection } from './client'
 import { message } from './errors'
 import type { GraphLoader } from './graph'
+import { validateConcurrency, validateGraphOptions, type RefactorOptions } from './options'
 import { refactorCode } from './refactor'
 import { formatReport } from './report'
 
-/** Internal executable entry point; bin/anureo-refactor.ts awaits its result as process.exitCode.
- * Returns 0 for help/completion, 2 for incomplete runs or caught argument/run/cleanup failures.
+/** Run an installed CLI command with arguments after the executable path.
+ * bin/anureo-refactor.ts awaits the result as its exit code. Returns 0 for help or completion
+ * and 2 for incomplete runs or caught argument, run, output or cleanup failures.
  * Help and argument errors acquire no client; disposal of an acquired client is awaited before this settles.
  * Orchestration may edit files and start processes. Supplied output callbacks run synchronously,
  * and an error diagnostic callback that throws still rejects. */
@@ -45,6 +47,7 @@ Options:
   --edit-permission-mode <mode>  Override the backend mode for editing sessions
   --review-only          Ask agents to propose changes; enforcement depends on the backend mode
   --model <name>         Override the selected harness model (Codex also reads CODEX_MODEL)
+  --concurrency <number>  Maximum simultaneous module tasks (default: all modules)
   --repograph <entry>    Override the installed repograph CLI with a JS/TS entry path
   --no-graph             Inspect source directly without exporting a graph
   --include <glob>       Select Git-relative text paths (repeatable, slash separators)
@@ -71,8 +74,8 @@ interface CliDependencies {
   graphLoader?: GraphLoader
   /** Base directory for relative repository and repograph paths; defaults to process.cwd(). */
   cwd?: string
-  /** CODEX_MODEL lookup; defaults to process.env. A supplied object replaces this lookup entirely;
-   * it does not change the environment used to create the client or launch subprocesses. */
+  /** Environment for the fallback CODEX_MODEL lookup. Omit to read process.env.
+   * Client creation and subprocess launch still use the process environment. */
   env?: Record<string, string | undefined>
   /** Synchronous help/report sink; a thrown error enters CLI error reporting. */
   stdout?: (text: string) => void
@@ -80,42 +83,54 @@ interface CliDependencies {
   stderr?: (text: string) => void
 }
 
-/** Parse and validate runCli input before resource acquisition, returning help or a run command.
- * Reads the base cwd only for runs; invalid syntax, extra paths and blank checks throw. Help
- * bypasses run-only validation so it remains available even with an unusable target. */
+const cliOptions = {
+  help: { type: 'boolean', short: 'h' }, json: { type: 'boolean' }, 'review-only': { type: 'boolean' },
+  model: { type: 'string' }, repograph: { type: 'string' }, concurrency: { type: 'string' },
+  'no-graph': { type: 'boolean' }, check: { type: 'string', multiple: true },
+  'check-argv': { type: 'string', multiple: true },
+  include: { type: 'string', multiple: true }, exclude: { type: 'string', multiple: true },
+  harness: { type: 'string' }, 'harness-command': { type: 'string' },
+  'harness-arg': { type: 'string', multiple: true }, 'harness-url': { type: 'string' },
+  'read-permission-mode': { type: 'string' }, 'edit-permission-mode': { type: 'string' },
+} as const satisfies ParseArgsOptionsConfig
+
+/** Parse strict option syntax for runCli. Help bypasses run-only admission and path resolution.
+ * For runs, throw on invalid options or extra paths before runCli acquires a client. */
 function parseCliInput(args: string[], dependencies: CliDependencies) {
-  const { values, positionals, tokens } = parseArgs({ args, strict: true, allowPositionals: true, tokens: true, options: {
-    help: { type: 'boolean', short: 'h' }, json: { type: 'boolean' }, 'review-only': { type: 'boolean' },
-    model: { type: 'string' }, repograph: { type: 'string' },
-    'no-graph': { type: 'boolean' }, check: { type: 'string', multiple: true },
-    'check-argv': { type: 'string', multiple: true },
-    include: { type: 'string', multiple: true }, exclude: { type: 'string', multiple: true },
-    harness: { type: 'string' }, 'harness-command': { type: 'string' },
-    'harness-arg': { type: 'string', multiple: true }, 'harness-url': { type: 'string' },
-    'read-permission-mode': { type: 'string' }, 'edit-permission-mode': { type: 'string' },
-  } })
+  const { values, positionals, tokens } = parseArgs({ args, strict: true, allowPositionals: true, tokens: true, options: cliOptions })
   if (values.help) return { kind: 'help' as const }
   if (positionals.length > 1) throw new Error('Expected at most one repository directory')
-  const id = refactorHarnesses.find(id => id === (values.harness ?? 'codex'))
+  const concurrency = values.concurrency === undefined ? undefined : Number(values.concurrency)
+  validateConcurrency(concurrency, '--concurrency')
+  const requestedHarness = values.harness ?? 'codex'
+  const id = refactorHarnesses.find(id => id === requestedHarness)
   if (!id) throw new Error(`Unknown harness: ${values.harness}. Available: ${refactorHarnesses.join(', ')}`)
   const harness: HarnessSelection = { id, command: values['harness-command'], args: values['harness-arg'], url: values['harness-url'] }
   validateHarness(harness)
-  if (values['no-graph'] && (values.repograph !== undefined || dependencies.graphLoader)) {
-    throw new Error('--no-graph cannot be combined with a graph exporter')
-  }
-  const checks: CheckCommand[] = []
-  for (const token of tokens) {
-    if (token.kind !== 'option') continue
-    if (token.name === 'check') checks.push(token.value!)
-    if (token.name === 'check-argv') checks.push(parseCheckArgv(token.value!))
-  }
-  validateChecks(checks, '--check')
+  validateGraphOptions(values['no-graph'], values.repograph !== undefined || Boolean(dependencies.graphLoader), '--no-graph')
   return {
-    kind: 'refactor' as const, values, harness, checks: checks.length ? checks : undefined,
+    kind: 'refactor' as const, values, harness, concurrency, checks: parseChecks(tokens),
     cwd: resolve(dependencies.cwd ?? process.cwd(), positionals[0] ?? '.'),
   }
 }
 
+type CliTokens = ReturnType<typeof parseArgs<{ tokens: true; options: typeof cliOptions; allowPositionals: true }>>['tokens']
+
+/** Read check flags in token order so shell commands and argv commands can be interleaved.
+ * Throw on malformed argv or invalid commands. Return undefined when the CLI should discover checks. */
+function parseChecks(tokens: Readonly<CliTokens>): CheckCommand[] | undefined {
+  const checks: CheckCommand[] = []
+  for (const token of tokens) {
+    if (token.kind !== 'option') continue
+    if (token.name === 'check') checks.push(token.value)
+    if (token.name === 'check-argv') checks.push(parseCheckArgv(token.value))
+  }
+  validateChecks(checks, '--check')
+  return checks.length ? checks : undefined
+}
+
+/** Enforce CLI transport admission before passing the selection to the client factory.
+ * ACP requires stdio, and AHP requires stdio or a WebSocket URL. Invalid combinations throw. */
 function validateHarness({ id, command, args, url }: HarnessSelection): void {
   if (url !== undefined && (id !== 'ahp' || command !== undefined || args !== undefined || !url.trim())) {
     throw new Error('--harness-url requires ahp and cannot be combined with stdio options')
@@ -129,15 +144,16 @@ function validateHarness({ id, command, args, url }: HarnessSelection): void {
   }
 }
 
-/** Parse an executable and its literal arguments without interpreting shell syntax. */
+/** Decode an argv check without interpreting shell syntax. Throw on invalid JSON or array shape.
+ * parseChecks validates the executable and arguments after decoding all argv flags. */
 function parseCheckArgv(value: string): CheckCommand {
   let argv: unknown
   try { argv = JSON.parse(value) } catch {}
-  if (!Array.isArray(argv) || !argv.length || !argv.every(arg => typeof arg === 'string')) {
+  const [executable, ...args] = Array.isArray(argv) ? argv : []
+  if (typeof executable !== 'string' || !args.every(arg => typeof arg === 'string')) {
     throw new Error('--check-argv requires a JSON array of strings beginning with the executable')
   }
-  const [executable, ...args] = argv as string[]
-  return { executable: executable!, args }
+  return { executable, args }
 }
 
 /** Validated execution input; help commands cannot acquire a client. */
@@ -149,40 +165,50 @@ interface CliOutput {
   stderr: (text: string) => void
 }
 
-/** Execute a validated command and print its report, returning 0 complete or 2 incomplete.
- * Called only by runCli; acquires and always awaits disposal of its client after orchestration
- * and output. Acquisition/run/output failures reject; disposal rejects after a returned report,
- * but is diagnosed separately when preserving an earlier rejection. Diagnostics may also throw. */
+/** Run a validated command for runCli, print its report and return 0 for completion or 2 for an
+ * incomplete run. Acquire a client and await disposal after orchestration and report delivery.
+ * A disposal error rejects after a returned report, including an incomplete report. If execution
+ * throws, report a disposal error separately and preserve the execution error when that sink succeeds. */
 async function executeRefactor(command: RefactorCommand, dependencies: CliDependencies, output: CliOutput): Promise<number> {
-  const { cwd, values, harness } = command
   const { stdout, stderr } = output
-  const client = await (dependencies.createClient ?? createRefactorClient)(cwd, harness)
-  let failed = false
+  const client = await (dependencies.createClient ?? createRefactorClient)(command.cwd, command.harness)
+  let executionThrew = false
   try {
-    const permissions = harnessPermissions[harness.id]
-    const report = await refactorCode({
-      client, cwd, reviewOnly: values['review-only'],
-      model: values.model ?? (harness.id === 'codex' ? (dependencies.env ?? process.env).CODEX_MODEL : undefined),
-      readPermissionMode: values['read-permission-mode'] ?? permissions?.readPermissionMode,
-      editPermissionMode: values['edit-permission-mode'] ?? permissions?.editPermissionMode,
-      repographEntry: values.repograph === undefined ? undefined : resolve(dependencies.cwd ?? process.cwd(), values.repograph),
-      graphLoader: dependencies.graphLoader, noGraph: values['no-graph'], checks: command.checks,
-      include: values.include, exclude: values.exclude,
-      /** Route orchestration progress to stderr so stdout remains a parseable report. */
-      onProgress: event => stderr(`[refactor] ${event}\n`),
-    })
-    stdout(values.json ? `${JSON.stringify(report, null, 2)}\n` : formatReport(report))
+    const report = await refactorCode(resolveRunOptions({ command, dependencies, client, stderr }))
+    stdout(command.values.json ? `${JSON.stringify(report, null, 2)}\n` : formatReport(report))
     return report.status === 'incomplete' ? 2 : 0
   } catch (cause) {
-    failed = true
+    executionThrew = true
     throw cause
-  }
-  finally {
+  } finally {
     try { await client.dispose() }
     catch (cause) {
-      // An incomplete report is a returned result, not an exception: disposal is still primary.
-      if (!failed) throw cause
+      if (!executionThrew) throw cause
       stderr(`anureo-refactor: cleanup failed: ${message(cause)}\n`)
     }
+  }
+}
+
+/** Resolve CLI defaults just before executeRefactor starts orchestration with an acquired client.
+ * Relative exporter paths use the invocation directory. An option resolution throw follows the
+ * same client cleanup path as a failed run. */
+function resolveRunOptions({ command, dependencies, client, stderr }: {
+  command: RefactorCommand
+  dependencies: CliDependencies
+  client: Client
+  stderr: CliOutput['stderr']
+}): RefactorOptions {
+  const { cwd, values, harness } = command
+  const permissions = harnessPermissions[harness.id]
+  return {
+    client, cwd, concurrency: command.concurrency, reviewOnly: values['review-only'],
+    model: values.model ?? (harness.id === 'codex' ? (dependencies.env ?? process.env).CODEX_MODEL : undefined),
+    readPermissionMode: values['read-permission-mode'] ?? permissions?.readPermissionMode,
+    editPermissionMode: values['edit-permission-mode'] ?? permissions?.editPermissionMode,
+    repographEntry: values.repograph === undefined ? undefined : resolve(dependencies.cwd ?? process.cwd(), values.repograph),
+    graphLoader: dependencies.graphLoader, noGraph: values['no-graph'], checks: command.checks,
+    include: values.include, exclude: values.exclude,
+    // Keep progress on stderr so stdout can be consumed as a single JSON document.
+    onProgress: event => stderr(`[refactor] ${event}\n`),
   }
 }

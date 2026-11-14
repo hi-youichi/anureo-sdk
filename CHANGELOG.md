@@ -8,6 +8,12 @@ marked **BREAKING**.
 
 ## Unreleased
 
+## [0.3.0] - 2026-11-14
+
+- Publish the Hermes and Pi adapters, workflow primitives, and the code-review
+  and refactor CLI packages. Review and refactor run their editing agents in
+  separate Git worktrees and integrate validated changes into the target tree.
+
 - **BREAKING** Replace the explicit `run.step()` checkpoint API with an automatic
   agent-call journal. `WorkflowContext` now exposes only `runId` and `input`;
   every `agent()` call inside a `workflow()` body is checkpointed by a chained
@@ -159,4 +165,5 @@ packages this codebase was extracted from): package names, the `x-anureo/`
 extension prefix, the `Ahp*` / `createAhpAdapter` naming, and the schema
 `$id` changed; old-brand extension names are not compatible.
 
+[0.3.0]: https://www.npmjs.com/package/@anureo/sdk/v/0.3.0
 [0.2.0]: https://github.com/hi-youichi/anureo-sdk/releases/tag/v0.2.0

@@ -1,16 +1,13 @@
-// Clones and freezes observation snapshots; must not validate protocol values or manage resources.
 /**
- * Return a detached clone with enumerable object/array descendants frozen. These callers supply
- * acyclic protocol data; this is not a general-purpose immutability wrapper for collection objects.
- * Cloning/freezing failures throw to the caller without mutating the input.
+ * Clone acyclic protocol data and freeze enumerable object and array descendants. Cloning or
+ * freezing failures throw and leave the original value untouched.
  *
  * Called by:
  * - Client.initialize to store negotiated capabilities; failure rejects initialization.
  * - Session's constructor/attach and binding/reference/capabilities/snapshot getters to detach stored
  *   or exposed state. Session.executeRequest returns frozen receipts; failure rejects its request.
- * - ResultAccumulator.finish to return a retained terminal snapshot for Session.retainEvent to resolve
- *   to Turn.result. The accumulator keeps its mutable retention separate from this snapshot.
- * Callers still own validation, publication and any failure cleanup.
+ * - ResultAccumulator.finish to return a terminal snapshot. Session.retainEvent settles the shared
+ *   Turn result with that snapshot, or lets a failure propagate through ordered publication.
  */
 export function immutable<T>(value: T): T {
   const copy = structuredClone(value);

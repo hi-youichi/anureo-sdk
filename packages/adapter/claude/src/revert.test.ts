@@ -10,19 +10,27 @@ function deferred() {
 }
 const history: SessionMessage[] = [{ type: 'user', uuid: 'historical', session_id: 'native', parent_tool_use_id: null, parent_agent_id: null, message: { role: 'user', content: 'old' } }];
 /** Expose each query generation so revert tests can pause history reads and drive old/new streams.
- * The injected history reader owns its gates; tests release them and dispose the client in finally. */
-async function fixture(getSessionMessages: NonNullable<ClaudeAdapterOptions['getSessionMessages']> = async () => history) {
+ * Tests release any history or cleanup gates before disposing the client in finally. */
+async function fixture({
+  getSessionMessages = async () => history,
+  onFirstQueryReturn,
+}: {
+  getSessionMessages?: ClaudeAdapterOptions['getSessionMessages'];
+  onFirstQueryReturn?: () => Promise<void>;
+} = {}) {
   const queries: Array<{ output: BoundedEventQueue<SDKMessage>; input: AsyncIterator<SDKUserMessage>; closed: number }> = [];
   const client = await createClient({
     adapter: createClaudeAdapter({ sessionStore: new InMemorySessionStore(), getSessionMessages, queryFactory: ({ prompt }) => {
       if (typeof prompt === 'string') throw new Error('Expected streaming input');
       const q = { output: new BoundedEventQueue<SDKMessage>(), input: prompt[Symbol.asyncIterator](), closed: 0 };
+      const onReturn = queries.length === 0 ? onFirstQueryReturn : undefined;
       queries.push(q);
       const query: ClaudeQuery = {
         [Symbol.asyncIterator]: () => q.output[Symbol.asyncIterator](),
         close: () => { q.closed++; q.output.end(); }, interrupt: async () => undefined,
         setModel: async () => {}, setPermissionMode: async () => {}, setMaxThinkingTokens: async () => {}, applyFlagSettings: async () => {},
         supportedModels: async () => [], rewindFiles: async () => ({ canRewind: true }),
+        ...(onReturn ? { return: onReturn } : {}),
       };
       return query;
     } }),
@@ -40,7 +48,7 @@ async function fixture(getSessionMessages: NonNullable<ClaudeAdapterOptions['get
 
 test('Claude rejects revert for pending and active inputs, then creates a distinct execution after idle revert', async () => {
   let reads = 0;
-  const f = await fixture(async () => { reads++; return history; });
+  const f = await fixture({ getSessionMessages: async () => { reads++; return history; } });
   try {
     const pending = f.session.submit({ input: 'first' });
     const firstInputUuid = await f.nextInputUuid(0);
@@ -66,24 +74,40 @@ test('Claude rejects revert for pending and active inputs, then creates a distin
 });
 
 test('Claude holds revert admission across awaits and rejects competing input, config and revert', async () => {
-  const entered = deferred(), release = deferred();
-  const f = await fixture(async () => { entered.resolve(); await release.promise; return history; });
+  const lookupEntered = deferred(), releaseLookup = deferred();
+  const cleanupEntered = deferred(), releaseCleanup = deferred();
+  const f = await fixture({
+    getSessionMessages: async () => { lookupEntered.resolve(); await releaseLookup.promise; return history; },
+    onFirstQueryReturn: async () => { cleanupEntered.resolve(); await releaseCleanup.promise; },
+  });
   try {
     const reverting = f.revert('first');
-    await entered.promise;
+    await lookupEntered.promise;
     await expect(f.session.submit({ input: 'racing input' })).rejects.toMatchObject({ code: 'SESSION_BUSY' });
     await expect(f.revert('second')).rejects.toMatchObject({ code: 'SESSION_BUSY' });
     await expect(f.session.request('session/config/set', { sessionId: f.session.id, requestId: 'config', patch: { model: 'new-model' } })).rejects.toMatchObject({ code: 'SESSION_BUSY' });
-    release.resolve(); await reverting;
+
+    releaseLookup.resolve();
+    await cleanupEntered.promise;
+    expect(f.queries).toHaveLength(1);
+    expect(f.queries[0]!.closed).toBe(1);
+    await expect(f.session.submit({ input: 'input during cleanup' })).rejects.toMatchObject({ code: 'SESSION_BUSY' });
+    releaseCleanup.resolve();
+    await reverting;
+
     const next = f.session.submit({ input: 'after revert' });
     const inputUuid = await f.nextInputUuid(1);
     await f.result(1, inputUuid, 'new execution');
     expect((await (await next).result()).text).toBe('new execution');
-  } finally { release.resolve(); await f.client.dispose(); }
+  } finally {
+    releaseLookup.resolve();
+    releaseCleanup.resolve();
+    await f.client.dispose();
+  }
 });
 
 test('a failed Claude boundary lookup releases revert admission without replacing the query', async () => {
-  const f = await fixture(async () => { throw new HarnessSdkError('TURN_NOT_FOUND'); });
+  const f = await fixture({ getSessionMessages: async () => { throw new HarnessSdkError('TURN_NOT_FOUND'); } });
   try {
     await expect(f.revert('missing')).rejects.toMatchObject({ code: 'TURN_NOT_FOUND' });
     expect(f.session.snapshot.status).toBe('ready');
@@ -97,7 +121,7 @@ test('a failed Claude boundary lookup releases revert admission without replacin
 
 test('disposing Claude during a boundary lookup cannot create a replacement query later', async () => {
   const lookupEntered = deferred(), releaseLookup = deferred(), lookupReturning = deferred();
-  const f = await fixture(async () => { lookupEntered.resolve(); await releaseLookup.promise; lookupReturning.resolve(); return history; });
+  const f = await fixture({ getSessionMessages: async () => { lookupEntered.resolve(); await releaseLookup.promise; lookupReturning.resolve(); return history; } });
   try {
     const reverting = f.revert('closing');
     const rejected = reverting.catch(cause => cause as unknown);

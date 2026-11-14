@@ -1,26 +1,28 @@
 import { BoundedEventQueue } from "@anureo/sdk";
 import type { JsonObject, JsonValue } from "@anureo/protocol";
 
-/** Configure a credential-free query fixture; only initial messages are cloned. */
+/** Configure the initial output, input behavior and simulated capabilities of a Claude query fixture. */
 export interface ClaudeQueryScript {
-  /** Initial messages admitted synchronously, in order, within the default BoundedEventQueue limits. */
+  /** Initial messages cloned and buffered in order within the default BoundedEventQueue limits. */
   messages: JsonObject[];
   /**
-   * streamInput records each input, then awaits this callback before reading the next.
-   * Await emit to admit output under backpressure; admission does not wait for consumption.
-   * Emitted objects are retained by reference and must not be mutated while buffered.
+   * Supply a response script that streamInput awaits after recording each input.
+   * Await emit to buffer a message or deliver it to a waiting reader. It can wait for
+   * queue capacity and reject on closure or admission failure. Keep emitted objects stable
+   * while buffered. Callback failures reject streamInput and leave admitted output available.
    */
   onInput?: (input: JsonValue, emit: (message: JsonObject) => Promise<void>) => Promise<void>;
   /** Returned by reference when supplied, including an empty list; omission selects the fake model. */
   models?: Array<{ value: string; displayName: string; description: string }>;
-  /** Truthy reports rewind availability; omission or false returns a "No checkpoint" denial. */
+  /** Set true to allow simulated rewind. Omission or false returns a "No checkpoint" denial. */
   canRewind?: boolean;
 }
 /**
- * Drive conformance consumers through a minimal Claude query surface without launching a peer.
- * Configuration, interrupt and rewind calls record observations without native effects. This is a partial SDK facade;
- * consumers adapting it to an SDK interface supply the remaining structural requirements.
- * Drain or return the sole output iterator and call finish or close to end output explicitly.
+ * Script a Claude query for a test without launching a peer. Controls record observations
+ * for assertions. To use one with a Claude adapter's queryFactory, bridge the factory's
+ * prompt into streamInput, project the output as native SDK messages and supply additional
+ * Query methods the adapter requires, such as applyFlagSettings.
+ * Direct callers end output with finish or close and drain or return the output iterator.
  */
 export class ScriptedClaudeQuery implements AsyncIterable<JsonObject> {
   /** Ordered input/control observations; input values are retained by reference. */
@@ -32,13 +34,15 @@ export class ScriptedClaudeQuery implements AsyncIterable<JsonObject> {
   }
 
   /**
-   * Claim exclusive output reads; a second owner throws until the first drains completion or returns.
-   * Overlapping pending reads reject; returning an iterator releases ownership without ending output.
+   * Claim exclusive output reads. A second acquisition throws EVENT_STREAM_ALREADY_OWNED
+   * until the first iterator releases ownership. Overlapping pending reads reject with
+   * CONCURRENT_EVENT_READ. Call return when stopping early. If finish or close settled
+   * an already pending read, call return or next again to release ownership.
    */
   [Symbol.asyncIterator](): AsyncIterator<JsonObject> { return this.queue[Symbol.asyncIterator](); }
 
   /**
-   * Consume inputs sequentially, resolving after EOF and all onInput callbacks complete.
+   * Consume one input stream in order, resolving at EOF after its onInput calls complete.
    * Input, callback and awaited emit failures reject without closing output. The caller
    * owns input cancellation and output closure; consume output concurrently if emits fill the queue.
    */
@@ -62,25 +66,24 @@ export class ScriptedClaudeQuery implements AsyncIterable<JsonObject> {
     this.calls.push({ method: "rewindFiles", value: id });
     return this.script.canRewind ? { canRewind: true } : { canRewind: false, error: "No checkpoint" };
   }
-  /** Resolve with the configured list or the single fake model without recording a control call. */
+  /** Resolve with the supplied list by reference or a fresh single-model list. This adds no call record. */
   async supportedModels() { return this.script.models ?? [{ value: "fake-model", displayName: "Fake", description: "Fixture" }]; }
 
-  /** Idempotently end output admission; buffered messages still drain and input is not cancelled. */
+  /** End output admission once and wake blocked emits to reject. Buffered messages still drain and input stays open. */
   finish(): void { this.queue.end(); }
   /** Record close once and end output admission; buffered messages still drain and input is not cancelled. */
   close(): void {
-    if (!this.closeCalled) {
-      this.closeCalled = true;
-      this.calls.push({ method: "close" });
-      this.queue.end();
-    }
+    if (this.closeCalled) return;
+    this.closeCalled = true;
+    this.calls.push({ method: "close" });
+    this.queue.end();
   }
 
   private readonly queue = new BoundedEventQueue<JsonObject>();
   private closeCalled = false;
 }
 
-/** Create an independently buffered query; initial admission can throw, and the caller owns output closure. */
+/** Create a query with its own call log and output queue. Initial cloning or admission failures throw synchronously. */
 export function createFakeClaudeQuery(script: ClaudeQueryScript): ScriptedClaudeQuery {
   return new ScriptedClaudeQuery(script);
 }

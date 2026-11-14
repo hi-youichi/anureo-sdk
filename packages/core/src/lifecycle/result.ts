@@ -1,49 +1,69 @@
-// Retains bounded execution results; must not validate wire events, publish events or own session lifetimes.
+// Retains ordered item content and usage for one execution's terminal result.
 import type { AhpEvent, Item, Usage } from '@anureo/protocol';
 import { HarnessSdkError } from '../errors';
 import type { TurnResult } from '../types';
 import { immutable } from './immutable';
 
 /**
- * Session.context creates one accumulator per execution; Session.retainEvent feeds privacy-projected
- * events in publication order and resolves its terminal snapshot to Turn.result. Retention is detached
- * and bounded, but Session still owns wire validation, shared budgets, publication and reclamation.
+ * Session.context creates one accumulator per execution. Session.retainEvent supplies privacy-projected
+ * events in publication order and uses the terminal snapshot to resolve the promise read by Turn.result.
+ * Session owns event validation, publication, shared budgets and reclamation.
  */
 export class ResultAccumulator {
   /**
-   * Session.context supplies validated positive byte/item limits for one execution. Construction
-   * allocates no native resources; Session must feed validated events in publication order.
+   * Session.context supplies positive safe integers for serialized bytes and distinct items.
+   * Omitted session limits default to 16 MiB and 2,048 items before construction.
    */
   constructor(private readonly maxBytes: number, private readonly maxItems: number) {}
   /**
-   * Session.retainEvent measures retention changes here; Session.reclaimExecution subtracts this count
-   * on eviction. Count materialized item JSON bytes, including buffered text but excluding usage and
-   * the terminal result envelope; reading does not materialize buffers.
+   * Return the UTF-8 JSON byte total of the individual items as if buffered text were materialized.
+   * Session.retainEvent uses the difference across an update for its shared budget, and
+   * Session.reclaimExecution subtracts the total on eviction. Usage and envelope bytes are excluded.
    */
   get size(): number { return this.bytes; }
   /**
-   * Session.retainEvent calls before execution-event publication. Retain detached turn usage and item
-   * content; conflicting patches or item/byte overflow throw into Session.emit's failure chain, which
-   * rejects unfinished Turn.result waits through Session.fail. Completed items ignore later deltas;
-   * Session remains responsible for validating event order and enforcing its shared byte budget.
+   * Retain detached turn usage and item content before Session.retainEvent publishes the event.
+   * Snapshots replace buffered content and completed items ignore subsequent deltas. A conflicting
+   * patch throws PROTOCOL_ERROR. Exceeding either limit throws RESULT_BUDGET_EXCEEDED. These throws
+   * reject Session.emit and reach Session.fail, which rejects unfinished Turn.result waits.
+   * Serialization and clone failures also propagate to Session.emit.
    */
   accept(event: AhpEvent): void {
-    if (event.type === 'usage/updated' && event.payload.scope === 'turn') this.usage = structuredClone(event.payload);
-    this.acceptItemEvent(event);
+    switch (event.type) {
+      case 'usage/updated':
+        if (event.payload.scope === 'turn') this.usage = structuredClone(event.payload);
+        break;
+      case 'item/started':
+      case 'item/completed':
+        this.retainSnapshot(event.payload.item);
+        // Mark completion only after retention succeeds, so a rejected snapshot cannot suppress deltas.
+        if (event.type === 'item/completed') this.completed.add(event.payload.item.id);
+        break;
+      case 'item/delta':
+        if (!this.completed.has(event.payload.itemId)) this.acceptDelta(event.payload);
+        break;
+    }
   }
   /**
-   * Session.retainEvent resolves the shared completion promise with this value before publishing the
-   * terminal execution event and ending its hub. Return a detached frozen snapshot without consuming
-   * retention: terminal turn usage takes precedence, final text follows first-seen item order, and
-   * native failed/interrupted statuses resolve values rather than reject Turn.result. Missing failure
-   * details get TURN_FAILED; cloning/freezing failures instead throw into Session.emit's failure chain.
+   * Build a detached, frozen snapshot from the current retention. Turn-scoped usage in the terminal
+   * event takes precedence over the latest retained turn usage. Final messages are joined with
+   * newlines in first-seen order. Failed results without native error details get TURN_FAILED.
+   * Session.retainEvent resolves the promise read by Turn.result with this snapshot for every native
+   * terminal status, then publishes the terminal event and ends the execution stream. If cloning or
+   * freezing throws, Session.emit rejects before the snapshot or event is delivered.
    */
   finish(payload: Extract<AhpEvent, { type: 'turn/completed' }>['payload']): TurnResult {
     const items = [...this.items.values()].map(materializeItem);
     const usage = payload.usage?.scope === 'turn' ? payload.usage : this.usage;
     const common = { text: finalMessageText(items), items, ...(usage ? { usage } : {}) };
     if (payload.status === 'failed') {
-      return immutable({ ...common, status: 'failed', error: payload.error ?? { code: 'TURN_FAILED', message: 'Turn failed', retryable: false, outcomeUnknown: false } });
+      const error = payload.error ?? {
+        code: 'TURN_FAILED',
+        message: 'Turn failed',
+        retryable: false,
+        outcomeUnknown: false,
+      };
+      return immutable({ ...common, status: 'failed', error });
     }
     if (payload.status === 'interrupted') {
       return immutable({ ...common, status: 'interrupted', ...(payload.error ? { error: payload.error } : {}) });
@@ -51,9 +71,8 @@ export class ResultAccumulator {
     return immutable({ ...common, status: payload.status });
   }
   /**
-   * Direct tests call this reset; no production caller currently reuses accumulators. Clear retained
-   * items, completion markers, usage and byte accounting synchronously. Previously returned snapshots
-   * stay independent; Session.reclaimExecution instead releases its whole execution registry entry.
+   * Reset retained items, completion markers, usage and bytes for reuse. Previously returned snapshots
+   * stay independent.
    */
   clear(): void {
     this.items.clear();
@@ -67,52 +86,50 @@ export class ResultAccumulator {
   private bytes = 0;
   private usage?: Usage;
   /**
-   * accept routes item events here after usage handling. Replace authoritative snapshots before
-   * marking completion so failed retention cannot suppress later deltas; put failures propagate.
+   * Apply a delta for an item without a completion marker. Snapshot patches take the replacement
+   * path. Text deltas buffer only their matching field on a retained item. Retention failures
+   * propagate to accept.
    */
-  private acceptItemEvent(event: AhpEvent): void {
-    if (event.type === 'item/started' || event.type === 'item/completed') {
-      this.put(event.payload.item);
-      if (event.type === 'item/completed') this.completed.add(event.payload.item.id);
-      return;
-    }
-    if (event.type !== 'item/delta' || this.completed.has(event.payload.itemId)) return;
-    this.acceptDelta(event);
-  }
-  /**
-   * acceptItemEvent passes unfinished deltas here. Item-shaped patches must preserve the retained ID
-   * and family or throw PROTOCOL_ERROR; valid patches replace provisional content through put. Text
-   * deltas append only to their matching family/field; missing items and unsupported kinds are inert.
-   * Retention failures propagate to accept rather than publishing a partially applied delta.
-   */
-  private acceptDelta(event: Extract<AhpEvent, { type: 'item/delta' }>): void {
-    const { itemId, kind, value, text } = event.payload;
+  private acceptDelta({ itemId, kind, value, text }: ItemDelta): void {
     const entry = this.items.get(itemId);
-    const item = entry?.snapshot;
-    if (kind === 'patch' && value && typeof value === 'object' && !Array.isArray(value) && 'type' in value) {
-      // The event/privacy boundary validates shape; this layer enforces continuity with the retained item.
-      if (!item || value.id !== item.id || value.type !== item.type) throw new HarnessSdkError('PROTOCOL_ERROR', 'Conflicting item snapshot');
-      this.put(value as unknown as Item);
+    if (kind === 'patch') {
+      this.applySnapshotPatch(entry?.snapshot, value);
       return;
     }
-    if (!entry || !item || text === undefined) return;
+    if (!entry || text === undefined) return;
+    const item = entry.snapshot;
     if (item.type === 'agentMessage' && kind === 'text') this.append(entry, 'text', item.text, text);
     else if (item.type === 'reasoning' && kind === 'reasoningSummary') this.append(entry, 'summary', item.summary, text);
     else if (item.type === 'toolCall' && kind === 'output') this.append(entry, 'output', item.output, text);
   }
   /**
-   * acceptDelta supplies a matching field and its authoritative value. Reserve the exact byte change
-   * before mutating buffers/accounting, throwing RESULT_BUDGET_EXCEEDED without retaining the chunk.
-   * Empty chunks still establish absent/non-string fields, but must not erase a buffered surrogate tail.
+   * acceptDelta passes patch values here after Session.publish has projected them.
+   * Only a patch object with a type discriminator can replace a snapshot. SecretRedactor.deltaValue
+   * validates its shape upstream. Throw PROTOCOL_ERROR on a missing base item or a mismatch in ID
+   * or family. A valid patch replaces the snapshot and discards its text buffer.
+   */
+  private applySnapshotPatch(current: Item | undefined, value: ItemDelta['value']): void {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || !('type' in value)) return;
+    if (!current || value.id !== current.id || value.type !== current.type) {
+      throw new HarnessSdkError('PROTOCOL_ERROR', 'Conflicting item snapshot');
+    }
+    this.retainSnapshot(value as unknown as Item);
+  }
+  /**
+   * acceptDelta supplies a matching field and its snapshot value. Check the exact JSON byte change
+   * before updating the buffer or accounting. Throw RESULT_BUDGET_EXCEEDED without retaining the
+   * chunk on overflow. An empty chunk can establish an absent or non-string field. Preserve a
+   * buffered surrogate tail across empty chunks so a later chunk can complete the pair.
    */
   private append(entry: RetainedItem, field: TextField, previous: unknown, chunk: string): void {
     const pending = entry.bufferedText;
     if (!chunk.length && (pending || typeof previous === 'string')) return;
-    const prefix = typeof previous === 'string' ? previous : '';
-    const lastCodeUnit = pending ? pending.lastCodeUnit : prefix.charCodeAt(prefix.length - 1);
-    const serializedByteDelta = serializedTextAppendByteDelta({ field, previous, chunk, lastCodeUnit, bufferedText: pending });
+    const serializedByteDelta = serializedTextAppendByteDelta({ field, previous, chunk, bufferedText: pending });
     if (this.bytes + serializedByteDelta > this.maxBytes) throw new HarnessSdkError('RESULT_BUDGET_EXCEEDED');
-    const bufferedText = pending ?? { field, chunks: [prefix], lastCodeUnit };
+    const bufferedText: NonNullable<RetainedItem['bufferedText']> = pending ?? {
+      field,
+      chunks: [typeof previous === 'string' ? previous : ''],
+    };
     bufferedText.chunks.push(chunk);
     if (chunk.length) bufferedText.lastCodeUnit = chunk.charCodeAt(chunk.length - 1);
     entry.bufferedText = bufferedText;
@@ -120,12 +137,12 @@ export class ResultAccumulator {
     this.bytes += serializedByteDelta;
   }
   /**
-   * acceptItemEvent and acceptDelta's patch path replace authoritative content here. Check capacity and
-   * clone before mutation; budget failure throws RESULT_BUDGET_EXCEEDED and serialization/clone
-   * failures propagate. Replacing an existing Map entry preserves first-seen order and discards its
-   * provisional buffer, so finish uses the authoritative snapshot at the original position.
+   * accept and applySnapshotPatch store detached snapshots here. Check capacity and clone before
+   * mutation. Budget failure throws RESULT_BUDGET_EXCEEDED and serialization or clone failures
+   * propagate. Replacing an existing entry discards its provisional buffer while preserving its
+   * first-seen position for finish.
    */
-  private put(item: Item): void {
+  private retainSnapshot(item: Item): void {
     const size = Buffer.byteLength(JSON.stringify(item));
     const previous = this.items.get(item.id);
     const bytes = this.bytes - (previous?.serializedBytes ?? 0) + size;
@@ -135,7 +152,9 @@ export class ResultAccumulator {
   }
 }
 
-/** Fields acceptDelta can reconstruct provisionally; authoritative snapshots replace their buffers. */
+type ItemDelta = Extract<AhpEvent, { type: 'item/delta' }>['payload'];
+
+/** Fields acceptDelta can reconstruct provisionally. */
 type TextField = 'text' | 'summary' | 'output';
 /** Mutable retention owned by ResultAccumulator; finish materializes buffers without changing this state. */
 interface RetainedItem {
@@ -153,17 +172,17 @@ interface RetainedItem {
 }
 
 /**
- * ResultAccumulator.append uses this pure calculation before reserving bytes. Inputs describe the
- * authoritative field and any existing buffer; return the exact JSON byte change for the new chunk.
- * Accounting must join split UTF-16 pairs just as eventual string materialization does.
+ * Return the JSON byte change that append uses to check capacity, including the structural cost of
+ * establishing a text field and any surrogate pair formed with the end of the existing text.
  */
-function serializedTextAppendByteDelta({ field, previous, chunk, lastCodeUnit, bufferedText }: {
+function serializedTextAppendByteDelta({ field, previous, chunk, bufferedText }: {
   field: TextField;
   previous: unknown;
   chunk: string;
-  lastCodeUnit: number | undefined;
   bufferedText: RetainedItem['bufferedText'];
 }): number {
+  const prefix = typeof previous === 'string' ? previous : '';
+  const lastCodeUnit = bufferedText ? bufferedText.lastCodeUnit : prefix.charCodeAt(prefix.length - 1);
   const chunkContentBytes = Buffer.byteLength(JSON.stringify(chunk)) - 2; // Exclude string quotes.
   const surrogatePairByteDelta = splitSurrogateByteAdjustment(lastCodeUnit, chunk);
   let fieldStructureByteDelta = 0;

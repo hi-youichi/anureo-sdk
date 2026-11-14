@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InMemorySessionStore, getSessionMessages, forkSession, renameSession, type Options, type SDKMessage, type SDKUserMessage, type SessionMessage, type SessionStore, type SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
-import { BoundedEventQueue, HarnessSdkError, createClient, type Session, type SessionEventSink } from "@anureo/sdk";
+import { BoundedEventQueue, HarnessSdkError, createClient, type Session } from "@anureo/sdk";
 import type { AhpEvent, InteractionRequested, InteractionResponse, SessionOpenParams } from "@anureo/protocol";
 import { createClaudeAdapter, type ClaudeAdapterOptions, type ClaudeQuery, type ClaudeQueryFactory } from "./index";
 import { FileSessionStore } from "./store";
@@ -11,54 +11,91 @@ import { runConformance, type ConformanceScenario } from "@anureo/conformance";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-/** Script native input handling while exposing controls and output for adapter assertions.
- * close ends observation; onInput rejection ends the output stream and is consumed by the adapter pump. */
+/** Implement the query created by ClaudeBackendSession.startQuery or ClaudeNativeAdapter.listModels.
+ * Each caller closes its own query. Input scripts write SDK messages for the backend pump to consume. */
 class FakeQuery implements ClaudeQuery {
   readonly output = new BoundedEventQueue<SDKMessage>();
   readonly calls: Array<{ method: string; value?: unknown }> = [];
   current?: SDKUserMessage;
   closed = false;
   rewindAllowed = true;
-  constructor(readonly options: Options, prompt: string | AsyncIterable<SDKUserMessage>, onInput: (input: SDKUserMessage, query: FakeQuery) => Promise<void>) {
-    if (typeof prompt !== "string") {
-      const consumeInputs = async () => {
-        try {
-          for await (const input of prompt) {
-            if (this.closed) return;
-            this.current = input;
-            this.calls.push({ method: "input", value: input });
-            await onInput(input, this);
-          }
-        } catch (cause) {
-          this.output.end(cause);
-        }
-      };
-      void consumeInputs();
-    }
+  constructor(
+    readonly options: Options,
+    prompt: string | AsyncIterable<SDKUserMessage>,
+    onInput: (input: SDKUserMessage, query: FakeQuery) => Promise<void>,
+  ) {
+    if (typeof prompt !== "string") void this.consumeInputs(prompt, onInput);
   }
+  /** Enqueue a fixture message, including partial native frames used to exercise the adapter's projection. */
   emit(value: Record<string, unknown>): Promise<void> { return this.output.write(value as unknown as SDKMessage); }
   [Symbol.asyncIterator]() { return this.output[Symbol.asyncIterator](); }
+  /** Complete the scripted current input as interrupted when the backend requests session interruption. */
   async interrupt() { this.calls.push({ method: "interrupt" }); await this.result("", "interrupted"); return undefined; }
   async setModel(value?: string) { this.calls.push({ method: "model", value }); }
   async setPermissionMode(value: Parameters<ClaudeQuery["setPermissionMode"]>[0]) { this.calls.push({ method: "permission", value }); }
   async setMaxThinkingTokens(value: number | null) { this.calls.push({ method: "thinking", value }); }
   async applyFlagSettings(value: Parameters<ClaudeQuery["applyFlagSettings"]>[0]) { this.calls.push({ method: "flags", value }); }
-  async rewindFiles(value: string, options?: { dryRun?: boolean }) { this.calls.push({ method: options?.dryRun ? "rewind-preview" : "rewind", value }); return { canRewind: this.rewindAllowed, filesChanged: [] }; }
+  /** Report configured checkpoint availability and distinguish previews from attempted rewinds in the call log. */
+  async rewindFiles(value: string, options?: { dryRun?: boolean }) {
+    this.calls.push({ method: options?.dryRun ? "rewind-preview" : "rewind", value });
+    return { canRewind: this.rewindAllowed, filesChanged: [] };
+  }
   async supportedModels() { return [{ value: "fake-model", displayName: "Fixture", description: "No network" }]; }
+  /** End the output iterator once so the adapter pump can finish on close. */
   close() { if (!this.closed) { this.closed = true; this.calls.push({ method: "close" }); this.output.end(); } }
-  async text(value: string, messageId = "assistant") { await this.emit({ type: "assistant", uuid: `${messageId}-uuid`, session_id: this.current?.session_id ?? this.options.sessionId ?? this.options.resume, user_message_uuid: this.current?.uuid, parent_tool_use_id: null, message: { id: messageId, role: "assistant", content: [{ type: "text", text: value }] } }); }
-  async result(value = "conformance", reason = "end_turn") { await this.emit({ type: "result", subtype: "success", is_error: false, result: value, stop_reason: reason, user_message_uuid: this.current?.uuid, uuid: "result", session_id: this.current?.session_id, usage: { input_tokens: 7, output_tokens: 9, cache_read_input_tokens: 2, cache_creation_input_tokens: 1 } }); }
+  /** Emit an authoritative assistant reply, echoing the current input UUID when present. */
+  async text(value: string, messageId = "assistant") {
+    await this.emit({
+      type: "assistant", uuid: `${messageId}-uuid`, session_id: this.current?.session_id ?? this.options.sessionId ?? this.options.resume,
+      user_message_uuid: this.current?.uuid, parent_tool_use_id: null,
+      message: { id: messageId, role: "assistant", content: [{ type: "text", text: value }] },
+    });
+  }
+  /** Emit a native terminal for the current input with fixed usage and an overridable stop reason. */
+  async result(value = "conformance", reason = "end_turn") {
+    await this.emit({
+      type: "result", subtype: "success", is_error: false, result: value, stop_reason: reason,
+      user_message_uuid: this.current?.uuid, uuid: "result", session_id: this.current?.session_id,
+      usage: { input_tokens: 7, output_tokens: 9, cache_read_input_tokens: 2, cache_creation_input_tokens: 1 },
+    });
+  }
+
+  /** Await each script in prompt order so its replies keep the current UUID. End the output with
+   * a script failure so ClaudeBackendSession.pump reports it through SDK observation. */
+  private async consumeInputs(
+    prompt: AsyncIterable<SDKUserMessage>,
+    onInput: (input: SDKUserMessage, query: FakeQuery) => Promise<void>,
+  ) {
+    try {
+      for await (const input of prompt) {
+        if (this.closed) return;
+        this.current = input;
+        this.calls.push({ method: "input", value: input });
+        await onInput(input, this);
+      }
+    } catch (cause) {
+      this.output.end(cause);
+    }
+  }
 }
-/** Retain every scripted query, including discovery/replacement queries, for lifecycle assertions. */
-function factory(onInput: (input: SDKUserMessage, query: FakeQuery) => Promise<void> = async (_, stream) => { await stream.text("conformance"); await stream.result(); }) {
+/** Supply a fresh query for each launch and retain it for assertions, including discovery and
+ * replacement queries. By default each input receives a text reply and a successful terminal. */
+function factory(onInput: (input: SDKUserMessage, query: FakeQuery) => Promise<void> = async (_, stream) => {
+  await stream.text("conformance");
+  await stream.result();
+}) {
   const queries: FakeQuery[] = [];
-  const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => { const stream = new FakeQuery(options ?? {}, prompt, onInput); queries.push(stream); return stream; };
+  const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => {
+    const stream = new FakeQuery(options ?? {}, prompt, onInput);
+    queries.push(stream);
+    return stream;
+  };
   return { queries, queryFactory };
 }
 
 test('native lifecycle sends overlapping inputs into the SDK channel and binds results by user UUID', async () => {
-  let release!: () => void;
-  const gate = new Promise<void>(resolve => { release = resolve; }); let n = 0;
+  const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+  let n = 0;
   const fake = factory(async (_input, stream) => {
     const index = ++n;
     await stream.text(`preview-${index}`);
@@ -70,7 +107,10 @@ test('native lifecycle sends overlapping inputs into the SDK channel and binds r
     const session = await client.sessions.create({ cwd: process.cwd() });
     const one = session.submit({ input: 'one' }), first = await one;
     const two = session.submit({ input: 'two' });
-    let bound = false; void two.then(() => { bound = true; }); await new Promise(resolve => setTimeout(resolve, 5)); expect(bound).toBe(false);
+    let bound = false;
+    void two.then(() => { bound = true; }, () => {});
+    await new Promise(resolve => setTimeout(resolve, 5));
+    expect(bound).toBe(false);
     release(); const second = await two;
     expect(first.id).not.toBe(second.id);
     expect((await first.result()).text).toBe('final-1'); expect((await second.result()).text).toBe('final-2');
@@ -101,54 +141,76 @@ function readerFor(session: Session) {
   }
   return reader;
 }
-const turnIdsByAlias = new WeakMap<Session, Map<string, string>>();
-/** Resolve test aliases only after observed native binding; fail rather than substitute input identity. */
-function requireBoundTurnId(session: Session, alias: string): string {
-  const turnId = turnIdsByAlias.get(session)?.get(alias);
-  if (!turnId) throw new Error(`Execution ${alias} is not bound`);
-  return turnId;
+/** Open a scripted session with manual interactions and subscribe before dispatch.
+ * Tests own runtime disposal. */
+async function setup(
+  options: ClaudeAdapterOptions = {},
+  onInput?: (input: SDKUserMessage, query: FakeQuery) => Promise<void>,
+) {
+  const fake = factory(onInput);
+  const adapter = createClaudeAdapter({ ...options, queryFactory: fake.queryFactory });
+  const runtime = await createClient({
+    adapter,
+    identity: OPEN.binding,
+    interactions: { approval: undefined, userInput: undefined, elicitation: undefined, dynamicTool: undefined },
+  });
+  const session = await runtime.openSession(OPEN);
+  readerFor(session);
+  return { ...fake, adapter, runtime, session };
 }
-/** Open a scripted session with manual interactions and an event subscription installed before input.
- * Tests own runtime disposal; collect services interaction requests while waiting for terminal events. */
-async function setup(options: ClaudeAdapterOptions = {}, onInput?: (input: SDKUserMessage, query: FakeQuery) => Promise<void>) {
-  const fake = factory(onInput); const adapter = createClaudeAdapter({ ...options, queryFactory: fake.queryFactory });
-  const runtime = await createClient({adapter, identity: OPEN.binding, interactions: {approval:undefined,userInput:undefined,elicitation:undefined,dynamicTool:undefined}});
-  const session = await runtime.openSession(OPEN); readerFor(session); return { ...fake, adapter, runtime, session };
-}
-/** Read through one terminal, optionally answering manual interactions; always renew the subscription
- * before returning so the next submission cannot publish into a gap between collectors. */
+
+/** Consume through the next terminal, answering manual interaction requests in stream order.
+ * Read and response failures reject. Renew the subscription after releasing it so the next
+ * submission cannot publish into a gap between collectors. */
 async function collect(session: Session, answer?: (request: InteractionRequested) => InteractionResponse): Promise<AhpEvent[]> {
-  const reader = readerFor(session), events: AhpEvent[] = [];
+  const reader = readerFor(session);
+  const events: AhpEvent[] = [];
   try {
-    for(let i=0;i<100;i++) {
-      const entry=await reader.next(); if(entry.done)throw new Error('Missing terminal'); const event=entry.value;events.push(event);
-      if(event.type==='interaction/requested'&&answer)await session.request('interaction/respond',{requestId:`answer:${event.payload.interactionId}`,sessionId:session.id,interactionId:event.payload.interactionId,response:answer(event.payload)});
-      if(event.type==='turn/completed')return events;
+    for (let i = 0; i < 100; i++) {
+      const entry = await reader.next();
+      if (entry.done) throw new Error("Missing terminal");
+      const event = entry.value;
+      events.push(event);
+      if (event.type === "interaction/requested" && answer) {
+        await session.request("interaction/respond", {
+          requestId: `answer:${event.payload.interactionId}`,
+          sessionId: session.id,
+          interactionId: event.payload.interactionId,
+          response: answer(event.payload),
+        });
+      }
+      if (event.type === "turn/completed") return events;
     }
-    throw new Error('Event limit');
+    throw new Error("Event limit");
   } finally {
-    // Cancel this collection's subscription before replacing it.
     await reader.return?.();
-    // Evict the closed reader so readerFor creates a fresh subscription.
     readers.delete(session);
-    // Subscribe before the next submission can emit events, even if collection failed.
     readerFor(session);
   }
 }
-/** Dispatch without waiting for binding so collect can answer interactions needed by native progress.
- * Retain the eventual bound turn under alias and observe rejection until the test inspects events. */
-async function submitAndYield(session: Session, alias: string) {
+
+/** Subscribe and submit, then yield for dispatch without waiting for binding. A native callback
+ * may need the collector to answer an interaction before the query can emit UUID evidence. */
+async function submitAndYield(session: Session) {
   readerFor(session);
-  const pending = session.submit({ input: 'conformance' });
-  void pending.catch(() => {});
-  void pending.then(turn => {
-    const sessionTurnIds = turnIdsByAlias.get(session) ?? new Map();
-    sessionTurnIds.set(alias, turn.id);
-    turnIdsByAlias.set(session, sessionTurnIds);
-  }).catch(() => {});
-  // Yield for dispatch without explicitly waiting for turn binding or completion.
-  // The pre-installed reader lets collect service native interaction callbacks next.
+  let turnId: string | undefined;
+  void session.submit({ input: "conformance" }).then(turn => { turnId = turn.id; }, () => {});
   await new Promise(resolve => setImmediate(resolve));
+  return {
+    /** Require binding at the point of assertion, with no extra wait that could hide late binding. */
+    requireTurnId() {
+      if (!turnId) throw new Error("Execution is not bound");
+      return turnId;
+    },
+  };
+}
+
+/** Collect the next scripted terminal while servicing manual interactions. The result includes
+ * the collected events and a check for the submission's observed binding. */
+async function submitAndCollect(session: Session, answer?: (request: InteractionRequested) => InteractionResponse) {
+  const submission = await submitAndYield(session);
+  const events = await collect(session, answer);
+  return { ...submission, events };
 }
 
 test("Claude streams partial text and authoritative final output with native UUID and exact provided usage", async () => {
@@ -158,8 +220,8 @@ test("Claude streams partial text and authoritative final output with native UUI
     await stream.emit({ type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } } });
     await stream.text("authority", "message"); await stream.result("authority");
   });
-  await submitAndYield(session, "t"); const events = await collect(session);
-  expect(events.find((event) => event.type === "turn/started")?.payload).toMatchObject({ turnId: requireBoundTurnId(session,"t") });
+  const { events, requireTurnId } = await submitAndCollect(session);
+  expect(events.find((event) => event.type === "turn/started")?.payload).toMatchObject({ turnId: requireTurnId() });
   expect(events.filter((event) => event.type === "item/completed").map((event) => event.payload.item)).toMatchObject([{ type: "agentMessage", text: "authority", phase: "final" }]);
   expect(events.find((event) => event.type === "usage/updated")?.payload).toMatchObject({ provider: "claude", scope: "turn", input: 7, output: 9, cacheRead: 2, cacheWrite: 1 });
   expect(queries[0]!.options.env?.ANTHROPIC_API_KEY).toBeUndefined(); expect(queries[0]!.options.settingSources).toEqual([]);
@@ -180,16 +242,16 @@ test("native tool results, task/hook lifecycle, compaction and unknown blocks re
     await stream.emit({ type: "assistant", uuid: "unknown", parent_tool_use_id: null, message: { id: "future", content: [{ type: "futureContent", safeField: "preserved" }] } });
     await stream.result();
   });
-  await submitAndYield(session, "t"); const events = await collect(session); const completed = events.filter((event) => event.type === "item/completed").map((event) => event.payload.item);
+  const { events } = await submitAndCollect(session); const completed = events.filter((event) => event.type === "item/completed").map((event) => event.payload.item);
   expect(completed).toEqual(expect.arrayContaining([expect.objectContaining({ type: "toolCall", kind: "command", output: "done" }), expect.objectContaining({ type: "subagent", subagentId: "child", state: "completed" }), expect.objectContaining({ type: "hook", name: "PreToolUse", status: "completed" }), expect.objectContaining({ type: "compaction", trigger: "auto" }), expect.objectContaining({ type: "toolCall", kind: "other", nativeType: "futureContent" })]));
   expect(JSON.stringify(events)).not.toContain("PRIVATE"); await runtime.dispose();
 });
 
 test("steer never appends Claude input; interrupt preserves the current turn identity", async () => {
-  const { runtime, session, queries } = await setup({}, async (_,stream) => {await stream.text("working");}); await submitAndYield(session, "t");
-  await expect(session.request("turn/steer", { requestId: "steer", sessionId: "s", submissionId:"steer-input", expectedTurnId: requireBoundTurnId(session,"t"), input: [{ type: "text", text: "do not enqueue" }] })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
+  const { runtime, session, queries } = await setup({}, async (_,stream) => {await stream.text("working");}); const submission = await submitAndYield(session);
+  await expect(session.request("turn/steer", { requestId: "steer", sessionId: "s", submissionId:"steer-input", expectedTurnId: submission.requireTurnId(), input: [{ type: "text", text: "do not enqueue" }] })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
   await session.interrupt(); const events = await collect(session);
-  expect(events.at(-1)?.payload).toMatchObject({ turnId: requireBoundTurnId(session,"t"), status: "interrupted" }); expect(queries[0]!.calls.filter((call) => call.method === "input")).toHaveLength(1); await runtime.dispose();
+  expect(events.at(-1)?.payload).toMatchObject({ turnId: submission.requireTurnId(), status: "interrupted" }); expect(queries[0]!.calls.filter((call) => call.method === "input")).toHaveLength(1); await runtime.dispose();
 });
 
 test("canUseTool requests approval and only selected options enter the native callback", async () => {
@@ -198,7 +260,7 @@ test("canUseTool requests approval and only selected options enter the native ca
     permission = await stream.options.canUseTool!("Bash", { command: "fixture" }, { signal: new AbortController().signal, toolUseID: "approval", requestId: "native-approval" });
     await stream.result();
   });
-  await submitAndYield(session, "t"); const events = await collect(session, () => ({ kind: "approval", optionId: "deny" }));
+  const { events } = await submitAndCollect(session, () => ({ kind: "approval", optionId: "deny" }));
   expect(permission).toMatchObject({ behavior: "deny" }); expect(events.some((event) => event.type === "interaction/resolved" && event.payload.outcome === "responded")).toBe(true); await runtime.dispose();
 });
 
@@ -209,45 +271,57 @@ test("AskUserQuestion and URL elicitation use typed interactions with private UR
     native.push(await stream.options.onElicitation!({ serverName: "mcp", message: "Authenticate", mode: "url", url: "https://example.com/auth?token=PRIVATE" }, { signal: new AbortController().signal, requestId: "url" }));
     await stream.result();
   });
-  await submitAndYield(session, "t"); const events = await collect(session, (request) => request.kind === "userInput" ? { kind: "userInput", answers: { q0: "A" } } : { kind: "elicitation", action: "cancel" });
+  const { events } = await submitAndCollect(session, (request) => request.kind === "userInput" ? { kind: "userInput", answers: { q0: "A" } } : { kind: "elicitation", action: "cancel" });
   expect(native[0]).toMatchObject({ behavior: "allow", updatedInput: { answers: { Choose: "A" } } }); expect(native[1]).toMatchObject({ action: "cancel" });
   expect(events.find((event) => event.type === "interaction/requested" && event.payload.kind === "elicitation")?.payload).toMatchObject({ privatePayloadAvailable: true }); await runtime.dispose();
 });
 
 test("form elicitation projects scalar answers; unrepresentable values cancel natively", async () => {
-  const native: unknown[] = [];
-  const good = await setup({}, async (_, stream) => {
-    native.push(await stream.options.onElicitation!({ serverName: "mcp", message: "Configure", mode: "form" }, { signal: new AbortController().signal, requestId: "form" }));
-    await stream.result();
-  });
+  const good = await setupFormElicitation({ message: "Configure", requestId: "form" });
   try {
-    await submitAndYield(good.session, "t");
-    const events = await collect(good.session, () => ({ kind: "elicitation", action: "accept", content: { name: "Ada", count: 2, enabled: true, tags: ["a", "b"] } }));
-    expect(native[0]).toMatchObject({ action: "accept", content: { name: "Ada", count: 2, enabled: true, tags: ["a", "b"] } });
+    const { events } = await submitAndCollect(good.session, () => ({ kind: "elicitation", action: "accept", content: { name: "Ada", count: 2, enabled: true, tags: ["a", "b"] } }));
+    expect(good.native[0]).toMatchObject({ action: "accept", content: { name: "Ada", count: 2, enabled: true, tags: ["a", "b"] } });
     expect(events.filter((event) => event.type === "interaction/resolved" && event.payload.outcome === "responded")).toHaveLength(1);
   } finally { await good.runtime.dispose(); }
-  const bad = await setup({}, async (_, stream) => {
-    native.push(await stream.options.onElicitation!({ serverName: "mcp", message: "Unsupported", mode: "form" }, { signal: new AbortController().signal, requestId: "unsupported" }));
-    await stream.result();
-  });
+
+  const bad = await setupFormElicitation({ message: "Unsupported", requestId: "unsupported" });
   try {
-    await submitAndYield(bad.session, "t");
+    await submitAndYield(bad.session);
     const reader = readerFor(bad.session);
-    let interactionId = "";
-    while (true) {
-      const entry = await reader.next(); if (entry.done) throw new Error("Missing interaction");
-      if (entry.value.type === "interaction/requested") { interactionId = entry.value.payload.interactionId; break; }
-    }
-    await expect(bad.session.request("interaction/respond", { requestId: "bad", sessionId: bad.session.binding.sessionId, interactionId, response: { kind: "elicitation", action: "accept", content: { nested: { deep: true } } } })).rejects.toMatchObject({ message: "Elicitation response cannot be represented by MCP" });
-    let completed = false;
-    while (!completed) {
-      const entry = await reader.next(); if (entry.done) throw new Error("Missing terminal");
-      completed = entry.value.type === "turn/completed";
-    }
-    await reader.return?.();
-    expect(native[1]).toMatchObject({ action: "cancel" });
+    try {
+      const request = await readThroughEvent(reader, "interaction/requested");
+      await expect(bad.session.request("interaction/respond", {
+        requestId: "bad",
+        sessionId: bad.session.binding.sessionId,
+        interactionId: request.payload.interactionId,
+        response: { kind: "elicitation", action: "accept", content: { nested: { deep: true } } },
+      })).rejects.toMatchObject({ message: "Elicitation response cannot be represented by MCP" });
+      await readThroughEvent(reader, "turn/completed");
+      expect(bad.native[0]).toMatchObject({ action: "cancel" });
+    } finally { await reader.return?.(); }
   } finally { await bad.runtime.dispose(); }
 });
+
+/** Invoke the adapter's native elicitation callback before emitting a terminal. The test answers
+ * through the SDK and can inspect the native callback's return after the terminal arrives. */
+async function setupFormElicitation({ message, requestId }: { message: string; requestId: string }) {
+  const native: unknown[] = [];
+  const fixture = await setup({}, async (_, stream) => {
+    if (!stream.options.onElicitation) throw new Error("Missing native elicitation callback");
+    native.push(await stream.options.onElicitation({ serverName: "mcp", message, mode: "form" }, { signal: new AbortController().signal, requestId }));
+    await stream.result();
+  });
+  return { ...fixture, native };
+}
+
+/** Consume through one event on the caller's subscription. End of stream without it is a failure. */
+async function readThroughEvent<T extends AhpEvent["type"]>(reader: AsyncIterator<AhpEvent>, type: T) {
+  for (;;) {
+    const entry = await reader.next();
+    if (entry.done) throw new Error(`Missing ${type} event`);
+    if (entry.value.type === type) return entry.value as Extract<AhpEvent, { type: T }>;
+  }
+}
 
 test("unmapped system notices surface as typed warnings without private content", async () => {
   const { runtime, session } = await setup({}, async (_, stream) => {
@@ -257,7 +331,7 @@ test("unmapped system notices surface as typed warnings without private content"
     await stream.emit({ type: "system", subtype: "future_system" });
     await stream.result();
   });
-  await submitAndYield(session, "t"); const events = await collect(session);
+  const { events } = await submitAndCollect(session);
   const notices = events.filter((event) => event.type === "notice").map((event) => event.payload);
   expect(notices.map((notice) => notice.code)).toEqual(["CLAUDE_TASK_STARTED", "CLAUDE_HOOK_RESPONSE", "CLAUDE_RATE_LIMIT_RETRY", "CLAUDE_FUTURE_SYSTEM"]);
   expect(notices.map((notice) => notice.severity)).toEqual(["info", "info", "warning", "info"]);
@@ -335,41 +409,62 @@ test("FileSessionStore atomically preserves opaque entries, dedupes UUIDs, and i
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-/** Keep an in-memory transcript and exact inclusive fork cutoffs for history/revert tests. */
+/** Supply in-memory history to ClaudeBackendSession.messages and exact inclusive cutoffs to
+ * open/revert. Scripted inputs seed the transcript before emitting their native result. */
 function historyApi() {
-  const histories = new Map<string, SessionMessage[]>(); const forks: Array<{ source: string; point?: string }> = [];
-  const sessionMessages: NonNullable<ClaudeAdapterOptions["getSessionMessages"]> = async (id) => structuredClone(histories.get(id) ?? []);
+  const histories = new Map<string, SessionMessage[]>();
+  /** Return an isolated transcript snapshot. An unknown native session has no recorded history. */
+  const sessionMessages: NonNullable<ClaudeAdapterOptions["getSessionMessages"]> = async id => structuredClone(histories.get(id) ?? []);
+  /** Copy through a known message UUID so fork/revert assertions can distinguish adjacent cutoffs. */
   const fork: NonNullable<ClaudeAdapterOptions["forkSession"]> = async (source, options) => {
-    const messages = histories.get(source); const index = messages?.findIndex((message) => message.uuid === options?.upToMessageId) ?? -1;
+    const messages = histories.get(source);
+    const point = options?.upToMessageId;
+    const index = messages?.findIndex(message => message.uuid === point) ?? -1;
     if (!messages || index < 0) throw new Error("Unknown exact fork point");
-    const sessionId = randomUUID(); histories.set(sessionId, structuredClone(messages.slice(0, index + 1))); forks.push({ source, point: options?.upToMessageId }); return { sessionId };
+    const sessionId = randomUUID();
+    histories.set(sessionId, structuredClone(messages.slice(0, index + 1)));
+    return { sessionId };
   };
-  const append = (input: SDKUserMessage) => {
-    const id = input.session_id!; const rows = histories.get(id) ?? [];
-    rows.push({ type: "user", uuid: input.uuid!, session_id: id, message: input.message, parent_tool_use_id: null, parent_agent_id: null }, { type: "assistant", uuid: `${input.uuid}:reply`, session_id: id, message: { role: "assistant", content: [{ type: "text", text: "conformance" }] }, parent_tool_use_id: null, parent_agent_id: null });
+  /** Seed the native transcript with one prompt/reply pair under the dispatched input's identity. */
+  function append(input: SDKUserMessage) {
+    const { session_id: id, uuid } = input;
+    if (!id || !uuid) throw new Error("History fixture requires a native session ID and input UUID");
+    const rows = histories.get(id) ?? [];
+    rows.push(
+      { type: "user", uuid, session_id: id, message: input.message, parent_tool_use_id: null, parent_agent_id: null },
+      { type: "assistant", uuid: `${uuid}:reply`, session_id: id, message: { role: "assistant", content: [{ type: "text", text: "conformance" }] }, parent_tool_use_id: null, parent_agent_id: null },
+    );
     histories.set(id, rows);
-  };
-  return { histories, forks, getSessionMessages: sessionMessages, forkSession: fork, append };
+  }
+  /** Seed history before emitting the reply and terminal that make it observable to SDK readers. */
+  async function reply(input: SDKUserMessage, stream: FakeQuery) {
+    append(input);
+    await stream.text("conformance");
+    await stream.result();
+  }
+  return { histories, getSessionMessages: sessionMessages, forkSession: fork, append, reply };
 }
 
 test("resume, before/through fork, paged history and conversation revert preserve verified native boundaries", async () => {
   const history = historyApi();
-  const { runtime, session, queries } = await setup({ sessionStore: new InMemorySessionStore(), getSessionMessages: history.getSessionMessages, forkSession: history.forkSession }, async (input, stream) => { history.append(input); await stream.text("conformance"); await stream.result(); });
-  await submitAndYield(session, "t1"); const first = await collect(session); const firstStart = first.find((event) => event.type === "turn/started")!;
-  await submitAndYield(session, "t2"); await collect(session);
+  const { runtime, session, queries } = await setup({ sessionStore: new InMemorySessionStore(), getSessionMessages: history.getSessionMessages, forkSession: history.forkSession }, history.reply);
+  const first = await submitAndCollect(session);
+  const firstStart = first.events.find((event) => event.type === "turn/started");
+  if (!firstStart) throw new Error("Missing first turn start");
+  const second = await submitAndCollect(session);
   const page1 = await session.request("history/read", { requestId: "history", sessionId: "s", limit: 1 });
   expect(page1.items).toHaveLength(1); expect(page1.nextCursor).toBe("1");
   const page2 = await session.request("history/read", { requestId: "history2", sessionId: "s", cursor: page1.nextCursor!, snapshotToken: page1.snapshotToken, limit: 10 });
-  expect(page2.items.some((entry) => entry.turnId === requireBoundTurnId(session,"t2"))).toBe(true);
-  const before = await runtime.openSession({ ...OPEN, requestId: "before", mode: "fork", binding: { ...session.binding, sessionId: "before" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: requireBoundTurnId(session,"t1"), relation: "before", nativeTurnId: firstStart.type === "turn/started" ? firstStart.payload.nativeTurnId : undefined } } });
+  expect(page2.items.some((entry) => entry.turnId === second.requireTurnId())).toBe(true);
+  const before = await runtime.openSession({ ...OPEN, requestId: "before", mode: "fork", binding: { ...session.binding, sessionId: "before" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: first.requireTurnId(), relation: "before", nativeTurnId: firstStart.payload.nativeTurnId } } });
   expect((await before.request("history/read", { requestId: "before-history", sessionId: "before" })).items).toHaveLength(0); await before.close();
-  const through = await runtime.openSession({ ...OPEN, requestId: "through", mode: "fork", binding: { ...session.binding, sessionId: "through" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: requireBoundTurnId(session,"t1"), relation: "through" } } });
+  const through = await runtime.openSession({ ...OPEN, requestId: "through", mode: "fork", binding: { ...session.binding, sessionId: "through" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: first.requireTurnId(), relation: "through" } } });
   const forkHistory = await through.request("history/read", { requestId: "through-history", sessionId: "through" });
-  expect(forkHistory.items.some((entry) => entry.turnId === requireBoundTurnId(session,"t1"))).toBe(true); expect(forkHistory.items.some((entry) => entry.turnId === requireBoundTurnId(session,"t2"))).toBe(false); await through.close();
+  expect(forkHistory.items.some((entry) => entry.turnId === first.requireTurnId())).toBe(true); expect(forkHistory.items.some((entry) => entry.turnId === second.requireTurnId())).toBe(false); await through.close();
   const oldRef = session.binding.nativeRef!.value;
-  const reverted = await session.request("session/revert", { requestId: "revert", sessionId: "s", scope: "conversation", boundary: { turnId: requireBoundTurnId(session,"t2"), relation: "before" } });
+  const reverted = await session.request("session/revert", { requestId: "revert", sessionId: "s", scope: "conversation", boundary: { turnId: second.requireTurnId(), relation: "before" } });
   expect(reverted.nativeRef!.value).not.toBe(oldRef); expect(session.binding.nativeRef).toEqual(reverted.nativeRef);
-  expect((await session.request("history/read", { requestId: "after-revert", sessionId: "s" })).items.some((entry) => entry.turnId === requireBoundTurnId(session,"t2"))).toBe(false);
+  expect((await session.request("history/read", { requestId: "after-revert", sessionId: "s" })).items.some((entry) => entry.turnId === second.requireTurnId())).toBe(false);
   const currentBinding = structuredClone(session.binding); await session.close();
   const resumed = await runtime.openSession({ ...OPEN, requestId: "resume", mode: "resume", binding: currentBinding });
   expect(queries.at(-1)!.options.resume).toBe(currentBinding.nativeRef!.value); await resumed.close(); await runtime.dispose();
@@ -392,7 +487,7 @@ test("history items reuse live streamed ids and the session settles to ready aft
     await stream.emit({ type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "hello" } } });
     await stream.text("hello", "msg_api"); await stream.result("hello");
   });
-  await submitAndYield(session, "t"); const events = await collect(session);
+  const { events } = await submitAndCollect(session);
   const live = events.flatMap((event) => event.type === "item/started" ? [event.payload.item.id] : []);
   expect(live).toEqual(["msg_api:0", "msg_api:1"]);
   expect(session.snapshot.status).toBe('ready');
@@ -406,7 +501,7 @@ test("effort is a session option passed at start and applied live", async () => 
   const init = { capabilities: adapter.capabilities };
   expect(init.capabilities.config?.options.find((option) => option.id === "effort")).toMatchObject({ scope: "session", schema: { enum: ["low", "medium", "high", "xhigh", "max"], default: "high" } });
   const session = await runtime.openSession({ ...OPEN, config: { effort: "low" } });
-  await submitAndYield(session, "t"); await collect(session);
+  await submitAndCollect(session);
   expect(fake.queries[0]!.options.effort).toBe("low");
   await session.request("session/config/set", { requestId: "effort", sessionId: "s", patch: { effort: "max" } });
   expect(fake.queries[0]!.calls).toContainEqual({ method: "flags", value: { effortLevel: "max" } });
@@ -423,7 +518,7 @@ test("fast mode is a session option sent as flag settings, switched live, and re
   const init = { capabilities: adapter.capabilities };
   expect(init.capabilities.config?.options.find((option) => option.id === "fastMode")).toMatchObject({ scope: "session", schema: { type: "boolean", default: false } });
   const session = await runtime.openSession({ ...OPEN, config: { fastMode: true } });
-  await submitAndYield(session, "t"); const events = await collect(session);
+  await submitAndCollect(session);
   expect(fake.queries[0]!.options.settings).toEqual({ fastMode: true });
   expect(session.snapshot.fastMode).toEqual({ state: "off", reason: "extra_usage_disabled" });
   await session.request("session/config/set", { requestId: "fast", sessionId: "s", patch: { fastMode: false } });
@@ -434,13 +529,14 @@ test("fast mode is a session option sent as flag settings, switched live, and re
 
 test("file rollback requires a checkpoint and scope=both reports partial effects on native fork failure", async () => {
   const history = historyApi();
-  const fixture = await setup({ sessionStore: new InMemorySessionStore(), enableFileCheckpointing: true, getSessionMessages: history.getSessionMessages, forkSession: async () => { throw new Error("Native fork failed"); } }, async (input, stream) => { history.append(input); await stream.text("conformance"); await stream.result(); });
-  await submitAndYield(fixture.session, "t1"); await collect(fixture.session); await submitAndYield(fixture.session, "t2"); await collect(fixture.session);
+  const fixture = await setup({ sessionStore: new InMemorySessionStore(), enableFileCheckpointing: true, getSessionMessages: history.getSessionMessages, forkSession: async () => { throw new Error("Native fork failed"); } }, history.reply);
+  await submitAndCollect(fixture.session);
+  const second = await submitAndCollect(fixture.session);
   fixture.queries[0]!.rewindAllowed = false;
-  await expect(fixture.session.request("session/revert", { requestId: "no-checkpoint", sessionId: "s", scope: "files", boundary: { turnId: requireBoundTurnId(fixture.session,"t2"), relation: "before" } })).rejects.toMatchObject({ code: "CHECKPOINT_UNAVAILABLE" });
+  await expect(fixture.session.request("session/revert", { requestId: "no-checkpoint", sessionId: "s", scope: "files", boundary: { turnId: second.requireTurnId(), relation: "before" } })).rejects.toMatchObject({ code: "CHECKPOINT_UNAVAILABLE" });
   expect(fixture.queries[0]!.calls.filter((call) => call.method === "rewind")).toHaveLength(0);
   fixture.queries[0]!.rewindAllowed = true;
-  await expect(fixture.session.request("session/revert", { requestId: "partial", sessionId: "s", scope: "both", boundary: { turnId: requireBoundTurnId(fixture.session,"t2"), relation: "before" } })).rejects.toMatchObject({ code: "REVERT_PARTIAL", outcomeUnknown: true, details: { appliedScope: "files" } });
+  await expect(fixture.session.request("session/revert", { requestId: "partial", sessionId: "s", scope: "both", boundary: { turnId: second.requireTurnId(), relation: "before" } })).rejects.toMatchObject({ code: "REVERT_PARTIAL", outcomeUnknown: true, details: { appliedScope: "files" } });
   expect(fixture.queries[0]!.calls.filter((call) => call.method === "rewind")).toHaveLength(1); await fixture.runtime.dispose();
 });
 
@@ -465,7 +561,7 @@ test("the real pinned SDK drives an external fake executable through the native 
   const directory = await mkdtemp(join(tmpdir(), "claude sdk actual "));
   const runtime = await createClient({identity:OPEN.binding,adapter:createClaudeAdapter({ command: fileURLToPath(new URL("../tests/fixtures/fake-claude.mjs", import.meta.url)), executableRuntime: "node", stateDir: join(directory, "state") })});
   try {
-    const session = await runtime.openSession({ ...OPEN, cwd: directory }); await submitAndYield(session, "t"); const events = await collect(session);
+    const session = await runtime.openSession({ ...OPEN, cwd: directory }); const { events } = await submitAndCollect(session);
     expect(events.find((event) => event.type === "item/completed" && event.payload.item.type === "agentMessage")?.payload).toMatchObject({ item: { text: "external executable probe passed", phase: "final" } });
     expect(events.at(-1)?.payload).toMatchObject({ status: "completed" });
   } finally { await runtime.dispose(); await rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); }
@@ -503,7 +599,7 @@ test("streamed edit inputs become full source snapshots and typed native results
     await stream.emit({ type: "user", tool_use_result: { filePath: "index.ts", structuredPatch: [{ oldStart: 57, oldLines: 1, newStart: 57, newLines: 1, lines: ["-old", "+new"] }] }, message: { content: [{ type: "tool_result", tool_use_id: "edit", content: "File updated" }] } });
     await stream.result();
   });
-  await submitAndYield(session, "t"); const events = await collect(session);
+  const { events } = await submitAndCollect(session);
   expect(events.find(event => event.type === "item/delta" && event.payload.itemId === "edit")).toMatchObject({ payload: { kind: "patch", value: { fileChanges: [{ materials: [{ scope: "fragment" }] }] } } });
   expect(events.find(event => event.type === "item/completed" && event.payload.item.id === "edit")).toMatchObject({ payload: { item: { status: "completed", fileChanges: [{ completeness: "complete", materials: [{ format: "unified", patch: "@@ -57,1 +57,1 @@\n-old\n+new\n" }] }] } } });
   await runtime.dispose();
@@ -514,7 +610,7 @@ test("an interrupted turn cannot leave an unresolved file edit running or count 
     await stream.emit({ type: "assistant", parent_tool_use_id: null, message: { id: "message", content: [{ type: "tool_use", id: "edit", name: "Write", input: { file_path: "index.ts", content: "attempt" } }] } });
     await stream.emit({ type: "result", subtype: "success", result: "", stop_reason: "interrupted", usage: {} });
   });
-  await submitAndYield(session, "t"); const events = await collect(session);
+  const { events } = await submitAndCollect(session);
   expect(events.find(event => event.type === "item/completed" && event.payload.item.id === "edit")).toMatchObject({ payload: { item: { status: "interrupted", fileChanges: [{ operation: "unknown" }] } } });
   await runtime.dispose();
 });
@@ -527,7 +623,7 @@ test("explicit edit approval denial remains declined after an error tool result"
     await stream.emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "edit", content: "Denied", is_error: true }] } });
     await stream.result();
   });
-  await submitAndYield(session, "t"); const events = await collect(session, () => ({ kind: "approval", optionId: "deny" }));
+  const { events } = await submitAndCollect(session, () => ({ kind: "approval", optionId: "deny" }));
   expect(events.find(event => event.type === "item/completed" && event.payload.item.id === "edit")).toMatchObject({ payload: { item: { status: "declined" } } });
   await runtime.dispose();
 });

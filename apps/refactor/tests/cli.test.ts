@@ -1,4 +1,4 @@
-// Verifies CLI exit codes, client ownership and process boundaries; it must not require live models or credentials.
+// Verifies CLI exit codes, client ownership and subprocess boundaries with scripted harnesses.
 import { expect, spyOn, test } from 'bun:test'
 import { cp, mkdir, readFile, realpath, symlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -21,7 +21,7 @@ test('help and invalid arguments do not construct a backend', async () => {
   expect(await runCli(['--help'], dependencies)).toBe(0)
   expect(await runCli(['--help', 'a', 'b', '--check', ' '], dependencies)).toBe(0)
   for (const args of [
-    ['--unknown'], ['--concurrency', '2'], ['a', 'b'], ['--check', ' '],
+    ['--unknown'], ['--concurrency', '0'], ['--concurrency', '1.5'], ['a', 'b'], ['--check', ' '],
     ['--check-argv', '[]'], ['--check-argv', '["git", 1]'], ['--no-graph', '--repograph', 'other.ts'],
     ['--harness', 'unknown'], ['--harness', 'acp'], ['--harness-url', 'ws://localhost:3000'],
     ['--harness', 'ahp', '--harness-command', 'peer', '--harness-url', 'ws://localhost:3000'],
@@ -29,7 +29,38 @@ test('help and invalid arguments do not construct a backend', async () => {
     expect(await runCli(args, dependencies)).toBe(2)
   }
   expect(created).toBe(0)
+  expect(errors).toContain('anureo-refactor: --concurrency must be a positive integer\n')
   expect(errors).toContain('anureo-refactor: --check commands must be nonempty\n')
+})
+
+test('CLI limits concurrent module sessions while running every planned module', async () => {
+  let active = 0
+  let peak = 0
+  const modules = Array.from({ length: 10 }, (_, index) => ({
+    id: `module-${index}`, name: `Module ${index}`, description: 'Fixture module',
+    files: [`module-${index}.ts`],
+  }))
+  const firstWorkersReady = Promise.withResolvers<void>()
+  const context = await fixture(async prompt => {
+    if (prompt.startsWith('PLAN')) return { summary: plan.summary, modules }
+    if (!moduleOf(prompt)) return unchanged
+    peak = Math.max(peak, ++active)
+    if (active === 8) firstWorkersReady.resolve()
+    await firstWorkersReady.promise
+    active--
+    return unchanged
+  })
+  await Promise.all(modules.map(module => writeFile(join(context.cwd, module.files[0]!), 'export {}\n')))
+  let output = ''
+  const code = await runCli([
+    context.cwd, '--include', 'module-*.ts', '--concurrency', '8', '--review-only', '--no-graph', '--json',
+  ], {
+    stdout: text => { output += text }, stderr: () => {}, createClient: async () => context.client,
+  })
+  expect({ code, errors: JSON.parse(output).errors }).toEqual({ code: 0, errors: [] })
+  expect(peak).toBe(8)
+  expect(JSON.parse(output).modules.map((result: { module: { id: string } }) => result.module.id))
+    .toEqual(modules.map(module => module.id))
 })
 
 test.each([...refactorHarnesses])('CLI dispatches %s with the matching permission and model settings', async id => {
@@ -61,10 +92,10 @@ test.each(['acp', 'ahp'])('installed CLI completes a run over a scripted %s stdi
   await exec('git', ['init', '-q', target])
   await writeFile(join(target, 'task.custom'), 'do work\n')
   const peer = fileURLToPath(new URL(`./fixtures/${id}.mjs`, import.meta.url))
-  const { stdout } = await exec(process.execPath, [
-    installedEntry(), target, '--harness', id, '--harness-command', process.execPath, '--harness-arg', peer,
+  const { stdout } = await runInstalledCli([
+    target, '--harness', id, '--harness-command', process.execPath, '--harness-arg', peer,
     '--no-graph', '--review-only', '--json',
-  ], { timeout: 20_000 })
+  ])
   expect(JSON.parse(stdout)).toMatchObject({
     status: 'completed', plan: { modules: [{ files: ['task.custom'] }] },
     modules: [{ step: { status: 'unchanged' } }],
@@ -78,9 +109,9 @@ test('installed CLI completes a run through the Claude SDK with native structure
   await writeFile(join(target, 'script.rb'), 'puts "hello"\n')
   const claude = fileURLToPath(new URL('../../../packages/adapter/claude/tests/fixtures/fake-claude.mjs', import.meta.url))
   const answer = fileURLToPath(new URL('./fixtures/answer.mjs', import.meta.url))
-  const { stdout } = await exec(process.execPath, [
-    installedEntry(), target, '--harness', 'claude', '--no-graph', '--review-only', '--json',
-  ], { env: { ...process.env, CLAUDE_BIN: claude, CLAUDE_CONFIG_DIR: state, FAKE_STRUCTURED_ANSWER: answer }, timeout: 20_000 })
+  const { stdout } = await runInstalledCli([
+    target, '--harness', 'claude', '--no-graph', '--review-only', '--json',
+  ], { env: { ...process.env, CLAUDE_BIN: claude, CLAUDE_CONFIG_DIR: state, FAKE_STRUCTURED_ANSWER: answer } })
   expect(JSON.parse(stdout)).toMatchObject({
     status: 'completed', plan: { modules: [{ files: ['script.rb'] }] },
   })
@@ -104,6 +135,7 @@ test('CLI reports completion and owns client cleanup', async () => {
 test.each([
   { failure: 'none', cleanupError: null },
   { failure: 'none', cleanupError: 'Disposal unavailable' },
+  { failure: 'incomplete', cleanupError: 'Disposal unavailable' },
   { failure: 'output', cleanupError: null },
   { failure: 'output', cleanupError: 'Disposal unavailable' },
   { failure: 'preflight', cleanupError: null },
@@ -124,6 +156,7 @@ test.each([
     const cwd = failure === 'preflight' ? join(context.cwd, 'missing') : context.cwd
     const code = await runCli([cwd, '--json'], {
       ...context, createClient: async () => context.client,
+      graphLoader: failure === 'incomplete' ? async () => { throw new Error('Graph unavailable') } : context.graphLoader,
       /** Record report delivery before optionally failing the sink to exercise post-run cleanup. */
       stdout: text => {
         output += text
@@ -141,13 +174,15 @@ test.each([
       expect(errors).toContain('missing')
       expect(errors).toContain('anureo-refactor: ')
     } else {
-      expect(JSON.parse(output).status).toBe('completed')
+      expect(JSON.parse(output).status).toBe(failure === 'incomplete' ? 'incomplete' : 'completed')
       if (failure === 'output') expect(errors).toContain('anureo-refactor: Output unavailable\n')
     }
     if (cleanupError) {
-      const diagnostic = failure === 'none' ? `anureo-refactor: ${cleanupError}\n` : `anureo-refactor: cleanup failed: ${cleanupError}\n`
+      const executionThrew = failure === 'output' || failure === 'preflight'
+      const diagnostic = `anureo-refactor: ${executionThrew ? 'cleanup failed: ' : ''}${cleanupError}\n`
       expect(errors).toContain(diagnostic)
-      expect(errors.endsWith(diagnostic)).toBe(failure === 'none')
+      expect(errors.endsWith(diagnostic)).toBe(!executionThrew)
+      if (!executionThrew) expect(errors).not.toContain('cleanup failed:')
     } else {
       expect(errors).not.toContain('cleanup failed:')
       if (failure === 'none') expect(errors).not.toContain('anureo-refactor:')
@@ -189,10 +224,9 @@ test('installed CLI entry runs from an unrelated cwd through real Codex and grap
   await writeFile(join(target, 'main.ts'), 'export function main() { return 1 }\n')
   await writeFile(join(target, 'task.dsl'), 'do work\n')
   await exec('git', ['init', '-q', target])
-  const binary = installedEntry()
   const repograph = fileURLToPath(new URL('./fixtures/repograph.ts', import.meta.url))
-  const { stdout, stderr } = await exec(process.execPath, [binary, target, '--review-only', '--repograph', repograph, '--json'], {
-    cwd: outside, env: { ...process.env, CODEX_BIN: codexFixture }, timeout: 20_000, maxBuffer: 1 << 20,
+  const { stdout, stderr } = await runInstalledCli([target, '--review-only', '--repograph', repograph, '--json'], {
+    cwd: outside, env: { ...process.env, CODEX_BIN: codexFixture }, maxBuffer: 1 << 20,
   })
   const report = JSON.parse(stdout)
   expect(report).toMatchObject({ status: 'completed', reviewOnly: true })
@@ -219,13 +253,13 @@ test('installed CLI edits a mixed-language repository and runs ordered checks wi
     'if (process.argv[1] !== "label with spaces & symbols %! ${value}") process.exit(7); console.log("verified")',
     literal,
   ]
-  const { stdout } = await exec(process.execPath, [
-    installedEntry(), target, '--no-graph', '--json', '--include', '**/*.{py,zig,custom}',
+  const { stdout } = await runInstalledCli([
+    target, '--no-graph', '--json', '--include', '**/*.{py,zig,custom}',
     '--include', 'start', '--exclude', 'excluded.*', '--check-argv', JSON.stringify(check),
     '--check', 'git rev-parse --is-inside-work-tree',
   ], {
     cwd: outside, env: { ...process.env, CODEX_BIN: codexFixture, REFACTOR_FIXTURE_EDIT: 'job 配置.custom' },
-    timeout: 20_000, maxBuffer: 1 << 20,
+    maxBuffer: 1 << 20,
   })
   const report = JSON.parse(stdout)
   const files = ['job 配置.custom', 'main.py', 'start', 'worker.zig']
@@ -265,6 +299,14 @@ test('CLI automatically falls back when the optional graph package is absent', a
 
 const codexFixture = fileURLToPath(new URL('./fixtures/codex.mjs', import.meta.url))
 
+/** Run the package-resolved CLI in a child with a 20-second timeout. Return its buffered streams
+ * on success. Failed resolution, launch, exit, timeout or buffer errors reject the test. */
+async function runInstalledCli(args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv; maxBuffer?: number } = {}) {
+  return exec(process.execPath, [installedEntry(), ...args], { ...options, timeout: 20_000 })
+}
+
+/** Locate the executable relative to the resolved package root entry, independent of test cwd.
+ * A missing package throws here. The optional-dependency test also uses this to locate copy inputs. */
 function installedEntry(): string {
   const require = createRequire(import.meta.url)
   return join(dirname(require.resolve('@anureo/refactor')), '../bin/anureo-refactor.ts')

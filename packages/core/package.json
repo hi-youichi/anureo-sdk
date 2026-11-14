@@ -1,7 +1,7 @@
 {
   "name": "@anureo/sdk",
   "description": "Runtime core of the Anureo SDK: unified HarnessRuntime and HarnessSession over any adapter, enforcing AHP semantics",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "Apache-2.0",
   "keywords": [
     "anureo",

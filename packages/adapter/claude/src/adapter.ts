@@ -1,4 +1,4 @@
-// Owns native Claude adapters and sessions; the package entry point only assembles exports.
+// Owns Claude query launch, session command dispatch and native execution observation.
 import type { ClaudeAdapterOptions, ClaudeQuery } from "./options";
 import { claudeFileChanges, completeClaudeTool } from './file-changes';
 import { randomUUID } from "node:crypto";
@@ -12,12 +12,12 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   BoundedEventQueue, HarnessSdkError, sdkError,
-  type BackendSession, type HarnessAdapter, type SessionEventSink, type SessionMethod,
+  type BackendSession, type HarnessAdapter, type NativeInteractionResponder, type SessionEventSink, type SessionMethod,
 } from "@anureo/sdk";
 import {
   AHP_PROTOCOL_CONTRACT, assertRequest, negotiateVersion, publicValue, validateJsonSchema,
-  type Capabilities, type AhpRequestMap, type AhpResultMap, type HistoryItem, type HistoryPage,
-  type InitializeParams, type InitializeResult, type InputBlock, type InteractionRequested, type InteractionResponse,
+  type Capabilities, type AhpRequestMap, type AhpResultMap, type HarnessError, type HistoryItem, type HistoryPage,
+  type InitializeParams, type InitializeResult, type InputBlock, type InteractionRequested,
   type Item, type JsonObject, type JsonValue, type SessionBinding, type SessionOpenParams, type SessionState, type Boundary,
 } from "@anureo/protocol";
 import { FileSessionStore } from "./store";
@@ -26,12 +26,11 @@ import { claudeTurnError } from './turn-error';
 
 /** Connect a client to Claude queries and retain ownership of opened backend sessions.
  * createClient initializes and disposes this adapter through its output wrapper; direct consumers
- * initialize before opening sessions and await disposal when finished.
- * Constructor setup reads host configuration without starting Claude. */
+ * initialize before opening sessions and await disposal when finished. */
 export class ClaudeNativeAdapter implements HarnessAdapter {
-  /** Retain launch/extension options and select an optional state store without native I/O.
-   * Explicit stateDir wins for adapter storage; defaultHome suppresses its CLAUDE_CONFIG_DIR
-   * override while retaining any explicitly supplied environment. */
+  /** Select the launch environment and store without starting Claude. stateDir takes precedence
+   * for adapter storage. With defaultHome enabled, an explicitly supplied CLAUDE_CONFIG_DIR is
+   * forwarded as supplied. */
   constructor(options: ClaudeAdapterOptions = {}) {
     this.options = options;
     const stateDir = options.stateDir ?? options.env?.CLAUDE_CONFIG_DIR;
@@ -41,8 +40,9 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
   }
   /** Report store/checkpoint-dependent support without native discovery or resource acquisition. */
   get capabilities(): Capabilities { return capabilities({ store: !!this.sessionStore, checkpoints: !!this.options.enableFileCheckpointing }); }
-  /** Validate protocol negotiation and explicit home policy for Client.initialize. Reject invalid
-   * negotiation, disposed adapters or missing home configuration; no native query is opened here. */
+  /** Negotiate protocol support for Client.initialize through withStructuredOutput. Reject invalid
+   * negotiation, a disposed adapter, or an absent Claude home unless defaultHome or a query
+   * factory is supplied. Native launch is deferred to discovery or a session open. */
   async initialize(params: InitializeParams): Promise<InitializeResult> {
     assertRequest("initialize", params);
     negotiateVersion(params.protocolVersions);
@@ -50,41 +50,57 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
     if (!this.env.CLAUDE_CONFIG_DIR && !this.options.defaultHome && !this.options.queryFactory) throw new HarnessSdkError("HARNESS_CONFIG_INVALID", "Claude requires an explicit isolated CLAUDE_CONFIG_DIR");
     return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: "claude", version: "0.3.265", adapter: "claude-native/0.1.0" }, capabilities: this.capabilities };
   }
-  /** Open and retain a backend for OutputSession.open, awaiting resume/fork setup and query
-   * construction. Native handshake/execution events arrive through the sink; this is not a readiness
-   * or terminal wait. Setup failures reject; the client owns successful backend disposal. */
+  /** Open and retain a backend for OutputSession.open to attach. Await resume/fork setup, query
+   * construction and any resumed-title refresh. Native handshake and execution events arrive
+   * independently through the sink. Setup errors reject the open. The client disposes the backend
+   * it attaches, and adapter disposal also releases retained sessions. */
   async openSession(params: SessionOpenParams, sink: SessionEventSink): Promise<BackendSession> {
     if (this.disposed) throw new HarnessSdkError("RUNTIME_DISPOSED");
     if (params.binding.adapterId !== "claude" && params.binding.adapterId !== "claude-native") throw new HarnessSdkError("SESSION_BINDING_MISMATCH");
     const session = new ClaudeBackendSession(this, params, sink, this.defaultStore);
-    await session.open(); this.sessions.add(session); return session;
+    await session.open();
+    this.sessions.add(session);
+    return session;
   }
-  /** Query model metadata once for directory hosts, defaulting cwd to process.cwd().
-   * End input and close the query after discovery; startup/query/close failures reject. */
+  /** Read model metadata with a one-shot query using cwd, which defaults to process.cwd().
+   * The adapter supplies an empty input stream and closes the query after discovery. Startup,
+   * discovery and close failures reject, with a close failure taking precedence over discovery. */
   async listModels(cwd = process.cwd()): Promise<Awaited<ReturnType<Query["supportedModels"]>>> {
     const input = new BoundedEventQueue<SDKUserMessage>();
     const stream = (this.options.queryFactory ?? query)({ prompt: input, options: this.queryOptions(cwd) });
     try { return await stream.supportedModels(); } finally { input.end(); stream.close(); }
   }
-  /** Internal launch projection shared by ClaudeBackendSession.startQuery, listModels and
-   * createClaudeCatalogSession. Returns native options without launching; callers apply operation
-   * overrides and own every query started with these options. */
+  /** Build native launch options for internal use without starting a query. listModels uses them
+   * directly. ClaudeBackendSession.sessionQueryOptions and createClaudeCatalogSession's openConnection
+   * add their own options. The operation that starts the query owns its cleanup. */
   queryOptions(cwd: string): Options {
     return {
       cwd, env: this.env, settingSources: [], persistSession: true,
       includePartialMessages: true, includeHookEvents: true,
       ...(this.options.command ?? this.options.executable ? { pathToClaudeCodeExecutable: this.options.command ?? this.options.executable } : {}),
       ...(this.options.executableRuntime ? { executable: this.options.executableRuntime } : {}),
-      ...(this.options.args?.length ? { spawnClaudeCodeProcess: (options) => spawn(options.command, [...options.args, ...this.options.args!], { cwd: options.cwd, env: options.env, signal: options.signal, stdio: ["pipe", "pipe", "pipe"], shell: false, windowsHide: true }) } : {}),
+      ...(this.options.args?.length ? {
+        // Read host arguments at spawn time, when the native SDK supplies its own launch arguments.
+        spawnClaudeCodeProcess: (options) => spawn(options.command, [...options.args, ...this.options.args!], {
+          cwd: options.cwd,
+          env: options.env,
+          signal: options.signal,
+          stdio: ["pipe", "pipe", "pipe"],
+          shell: false,
+          windowsHide: true,
+        }),
+      } : {}),
       ...(this.sessionStore ? { sessionStore: this.sessionStore, sessionStoreFlush: "eager" as const } : {}),
       enableFileCheckpointing: this.options.enableFileCheckpointing ?? false,
     };
   }
-  /** Await all retained sessions before releasing the adapter registry; reject the first cleanup
-   * failure after all attempts settle. Later calls return without retrying failed cleanup. */
+  /** Release retained sessions. Await all attempts and reject with the first cleanup failure in
+   * registry order. Once disposal starts, subsequent calls resolve independently of that cleanup. */
   async dispose(): Promise<void> {
-    if (this.disposed) return; this.disposed = true;
-    const results = await Promise.allSettled([...this.sessions].map(session => session.dispose())); this.sessions.clear();
+    if (this.disposed) return;
+    this.disposed = true;
+    const results = await Promise.allSettled([...this.sessions].map(session => session.dispose()));
+    this.sessions.clear();
     const failed = results.find((value): value is PromiseRejectedResult => value.status === 'rejected');
     if (failed) throw failed.reason;
   }
@@ -95,7 +111,8 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
   /** Native launch environment; may contain credentials and is not a safe diagnostic projection. */
   readonly env: Record<string, string | undefined>;
   private readonly sessions = new Set<ClaudeBackendSession>();
-  /** Internal native-input UUID to SDK turn mappings retained across in-memory resume/fork. */
+  /** Internal map from native session ID to the input UUIDs verified against SDK turns.
+   * Backend sessions reuse it across in-memory resume and copy it for forks. */
   readonly turnMaps = new Map<string, Record<string, string>>();
   private readonly defaultStore?: FileSessionStore;
   private disposed = false;
@@ -116,60 +133,64 @@ export class ClaudeBackendSession implements BackendSession {
       if (!validateJsonSchema(option.schema, value)) throw new HarnessSdkError("INVALID_PARAMS", "Invalid Claude config value");
     }
   }
-  /** Resolve resume/fork state and start a query for ClaudeNativeAdapter.openSession.
-   * Store, boundary and native setup failures reject. Successful opens transfer backend cleanup
-   * to the adapter/client; native setup is not a terminal execution wait. */
+  /** Resolve resume/fork state and start a query for ClaudeNativeAdapter.openSession. Store,
+   * boundary and query-setup failures reject before the adapter registers the backend. */
   async open(): Promise<void> {
     if (this.params.mode === "resume" && !this.params.binding.nativeRef) throw new HarnessSdkError("SESSION_NOT_FOUND");
     if (this.params.mode === "fork") {
       if (!this.params.fork?.nativeRef) throw new HarnessSdkError("SESSION_NOT_FOUND");
       const source = this.params.fork.nativeRef.value;
       const point = await this.boundaryPoint(source, this.params.fork.boundary);
-      const forked = point.uuid ? await (this.adapter.options.forkSession ?? forkSession)(source, { dir: this.params.cwd, sessionStore: this.adapter.sessionStore, upToMessageId: point.uuid }) : { sessionId: randomUUID() };
+      const forked = point.uuid ? await this.forkTranscript(source, point.uuid) : { sessionId: randomUUID() };
       this.binding = { ...this.binding, nativeRef: { provider: "claude", value: forked.sessionId } };
       this.turns = this.fileStore ? await this.fileStore.loadTurnMap(source) : structuredClone(this.adapter.turnMaps.get(source) ?? {});
     } else this.turns = this.fileStore ? await this.fileStore.loadTurnMap(this.nativeId) : this.adapter.turnMaps.get(this.nativeId) ?? {};
-    this.adapter.turnMaps.set(this.nativeId, this.turns);
-    await this.fileStore?.saveTurnMap(this.nativeId, this.turns);
+    await this.rememberTurnMap();
     const fresh = this.params.mode === "new" || (this.params.mode === "fork" && !await this.hasHistory(this.nativeId));
     await this.startQuery({ mode: fresh ? "fresh" : "resume" });
   }
-  /** Dispatch the SDK's backend port requests. Input resolves on native dispatch, independently of
-   * association/terminal events; configuration applies in order without rollback. Busy/unsupported
-   * operations and native failures reject. Closing releases observation with execution unconfirmed. */
+  /** Dispatch requests forwarded by OutputSession.execute. Submission returns after enqueueing
+   * native input. Association and terminal results arrive through the sink. Busy or unsupported
+   * operations and native failures reject. Close awaits query cleanup with execution stop unconfirmed. */
   async execute<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
     if (this.closed) throw new HarnessSdkError("SESSION_CLOSED");
-    if (this.switchingOutput && method !== 'session/close' && method !== 'history/read') throw new HarnessSdkError('SESSION_BUSY', 'Claude output format is changing');
-    if (method !== 'session/close' && method !== 'history/read') {
-      if (this.queryFailure) throw this.queryFailure;
-      if (!this.query) throw new HarnessSdkError('SESSION_CLOSED');
+    if (method === "history/read") return await this.readHistory(params as AhpRequestMap["history/read"]) as AhpResultMap[M];
+    if (method === "session/close") {
+      await this.dispose();
+      return { closed: true, observationClosed: true, executionStopped: "unconfirmed" } as AhpResultMap[M];
     }
-    if (this.reverting && method === 'session/config/set') throw new HarnessSdkError('SESSION_BUSY', 'Claude configuration cannot change during revert');
+    const query = this.requireQuery();
     let result: AhpResultMap[SessionMethod];
     switch (method) {
-      case 'input/submit': return await this.submitInput(params as AhpRequestMap['input/submit']) as AhpResultMap[M];
+      case 'input/submit': return await this.submitInput(params as AhpRequestMap['input/submit'], query) as AhpResultMap[M];
       case 'session/interrupt': {
-        const receipt = await this.query!.interrupt();
-        const stillQueued = receipt?.still_queued?.flatMap(id => { const pending = this.nativeInputs.get(id); return pending ? [pending.submissionId] : []; });
-        result = { accepted: true, ...(stillQueued ? { stillQueued } : {}) }; break;
+        const receipt = await query.interrupt();
+        const stillQueued = receipt?.still_queued?.flatMap(id => {
+          const pending = this.nativeInputs.get(id);
+          return pending ? [pending.submissionId] : [];
+        });
+        result = { accepted: true, ...(stillQueued ? { stillQueued } : {}) };
+        break;
       }
       case 'turn/interrupt': case 'turn/steer': throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Claude controls target the session, not an atomically matched Turn');
-      case "session/config/set": result = await this.setConfig((params as AhpRequestMap["session/config/set"]).patch); break;
-      case "history/read": {
-        const request = params as AhpRequestMap["history/read"]; result = await this.readHistory(request); break;
-      }
+      case "session/config/set":
+        if (this.reverting) throw new HarnessSdkError('SESSION_BUSY', 'Claude configuration cannot change during revert');
+        result = await this.setConfig((params as AhpRequestMap["session/config/set"]).patch);
+        break;
       case "session/revert": result = await this.revert(params as AhpRequestMap['session/revert']); break;
-      case "session/close": await this.dispose(); result = { closed: true, observationClosed: true, executionStopped: "unconfirmed" }; break;
       default: throw new HarnessSdkError("CAPABILITY_UNSUPPORTED");
     }
     return result as AhpResultMap[M];
   }
-  /** Share cleanup completion with execute's close path and OutputSession.dispose. Stop input admission, invalidate the
-   * pump generation and await query close/return; this does not prove native execution stopped. */
+  /** Share query close/return completion between the close request and OutputSession.dispose.
+   * Stop input admission, clear pending associations and invalidate message observation immediately.
+   * Cleanup rejects on release failure and leaves native execution stop unconfirmed. */
   async dispose(): Promise<void> {
     return this.release ??= (async () => {
-      this.closed = true; this.generation++;
-      this.nativeInputs.clear(); this.input?.end();
+      this.closed = true;
+      this.generation++;
+      this.nativeInputs.clear();
+      this.input?.end();
       if (this.query) await this.releaseQuery(this.query);
     })();
   }
@@ -177,11 +198,17 @@ export class ClaudeBackendSession implements BackendSession {
   binding: SessionBinding;
   /** Store/checkpoint capability projection captured from the adapter at construction. */
   readonly capabilities: Capabilities;
-  /** Apply execute's configuration controls in order and publish a snapshot only after all succeed.
-   * Earlier native effects (including model changes) survive rejection; the admission counter prevents
-   * an output-format replacement from racing an in-flight patch and is released on every outcome.
-   * Preserve SDK error metadata; unclassified failures become unknown outcomes, which Session's
-   * request-failure handler uses to require recovery before further configuration/input. */
+  /** Enforce execute's query admission policy for operations other than history and close. */
+  private requireQuery(): ClaudeQuery {
+    if (this.switchingOutput) throw new HarnessSdkError('SESSION_BUSY', 'Claude output format is changing');
+    if (this.queryFailure) throw this.queryFailure;
+    if (!this.query) throw new HarnessSdkError('SESSION_CLOSED');
+    return this.query;
+  }
+  /** Apply execute's configuration controls in order and publish state after all controls succeed.
+   * Earlier native effects, including model changes, survive a rejected patch. Keep output-format
+   * replacement blocked until the patch settles. Session.onRequestFailed enters recovery when
+   * the returned SDK error carries an unknown outcome. */
   private async setConfig(patch: JsonObject): Promise<SessionState> {
     this.configOperations++;
     try {
@@ -259,8 +286,9 @@ export class ClaudeBackendSession implements BackendSession {
       ...(store.listSessionSummaries ? { listSessionSummaries: store.listSessionSummaries.bind(store) } : {}),
     };
   }
-  /** Coalesce store-append/open/terminal refreshes in generation order. Publish changed titles
-   * through the sink; read failures publish a best-effort notice and never fail a committed append. */
+  /** Coalesce title reads for observedStore, startQuery and completeTurn. startQuery awaits the
+   * refresh on resume, while append and terminal publication proceed independently. Ignore stale
+   * reads after replacement or close and report read failures with a best-effort warning. */
   private refreshMetadata(): Promise<void> {
     const generation = this.generation, nativeId = this.nativeId;
     if (this.metadataPending?.generation === generation) {
@@ -291,9 +319,23 @@ export class ClaudeBackendSession implements BackendSession {
     return pending.promise;
   }
   private get nativeId(): string { return this.binding.nativeRef!.value; }
-  /** Let open distinguish an empty fork (new native query) from a transcript that must be resumed.
-   * Store/history read failures reject open before query construction. */
-  private async hasHistory(id: string): Promise<boolean> { return (await this.messages(id)).length > 0; }
+  /** Let open choose a fresh query for an empty fork. A history read failure rejects open. */
+  private async hasHistory(id: string): Promise<boolean> {
+    return (await this.messages(id)).length > 0;
+  }
+  /** Copy the source transcript through a verified cutoff for open or restoreConversation.
+   * The caller installs the returned session ID. Native copy failures reject that phase. */
+  private forkTranscript(nativeId: string, cutoff: string): ReturnType<typeof forkSession> {
+    return (this.adapter.options.forkSession ?? forkSession)(nativeId, {
+      dir: this.params.cwd, sessionStore: this.adapter.sessionStore, upToMessageId: cutoff,
+    });
+  }
+  /** Open, association, init and conversation restore update the in-memory map before awaiting
+   * its optional disk copy. Save failure rejects the caller without undoing the map update. */
+  private rememberTurnMap(): Promise<void> | undefined {
+    this.adapter.turnMaps.set(this.nativeId, this.turns);
+    return this.fileStore?.saveTurnMap(this.nativeId, this.turns);
+  }
   /** Accept native init/result fast-mode states and report whether the public snapshot changed. */
   private trackFastMode(value: Record<string, unknown>): boolean {
     const state = str(value.fast_mode_state);
@@ -304,21 +346,31 @@ export class ClaudeBackendSession implements BackendSession {
     this.fastMode = next;
     return changed;
   }
-  /** Build state for open/config/message publications without exposing mutable binding/config objects. */
+  /** Clone binding and config for state publications during initialization, configuration,
+   * completion and conversation restore. Report running while an execution occupies the active slot. */
   private snapshot(): SessionState { return { ...(this.sessionTitle !== undefined ? { metadata: { title: this.sessionTitle } } : {}), binding: structuredClone(this.binding), status: this.active ? "running" : "ready", config: structuredClone(this.config), capabilities: this.capabilities, capabilityRevision: this.capabilityRevision, ...(this.model ? { model: this.model } : {}), ...(this.fastMode ? { fastMode: this.fastMode } : {}), activeTurnIds: this.active ? [this.active.id] : [] }; }
   /** Construct a generation-specific query for open, restoreConversation or replaceOutputFormat,
    * then start background pumping and await resumed-title refresh. Fresh mode opens the current native
    * ID as a new session; resume mode reopens its transcript, optionally at resumeAt. Factory/setup
    * failures reject here; subsequent source failures are reported to the sink by pump. */
-  private async startQuery({ mode, resumeAt }: QueryStart): Promise<void> {
+  private async startQuery(start: QueryStart): Promise<void> {
+    const { mode, resumeAt } = start;
     if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
     const generation = ++this.generation;
     this.queryMode = mode;
     this.queryResumeAt = resumeAt;
     this.input = new BoundedEventQueue<SDKUserMessage>({ maxEvents: 64 });
+    const options = this.sessionQueryOptions(start, generation);
+    this.query = (this.adapter.options.queryFactory ?? query)({ prompt: this.input, options });
+    this.pumping = this.pump(this.query, generation);
+    if (mode === "resume") await this.refreshMetadata();
+  }
+  /** Project the session and generation into launch options for startQuery. Native tool callbacks
+   * are invoked by the SDK. The observed store schedules title refreshes only for this generation. */
+  private sessionQueryOptions({ mode, resumeAt }: QueryStart, generation: number): Options {
     const mcpServers: NonNullable<Options["mcpServers"]> = {};
     for (const server of this.params.mcpServers ?? []) mcpServers[server.name] = server.type === "stdio" ? { type: "stdio", command: server.command, args: server.args, env: server.env } : { type: "http", url: server.url, headers: server.headers };
-    const options: Options = {
+    return {
       ...this.adapter.queryOptions(this.params.cwd),
       ...(this.adapter.sessionStore ? { sessionStore: this.observedStore(this.adapter.sessionStore, generation) } : {}),
       ...(mode === "fresh" ? { sessionId: this.nativeId } : { resume: this.nativeId }),
@@ -336,9 +388,6 @@ export class ClaudeBackendSession implements BackendSession {
       canUseTool: async (toolName, input, details) => this.permissionRequest(toolName, input, details),
       onElicitation: async (request, details) => this.elicitationRequest(request, details),
     };
-    this.query = (this.adapter.options.queryFactory ?? query)({ prompt: this.input, options });
-    this.pumping = this.pump(this.query, generation);
-    if (mode === "resume") await this.refreshMetadata();
   }
   /** Consume the query started by startQuery until closure/generation replacement. Fail SDK
    * observation on source errors or early EOF with pending work; never replay native input. */
@@ -348,8 +397,9 @@ export class ClaudeBackendSession implements BackendSession {
       if (!this.closed && generation === this.generation && (this.active || this.nativeInputs.size)) await this.sink.fail(new HarnessSdkError("CONNECTION_CLOSED", "Claude query ended before a result", false, true));
     } catch (cause) { if (!this.closed && generation === this.generation) await this.sink.fail(sdkError(cause, "CLAUDE_QUERY_FAILED", true)); }
   }
-  /** Publish one active execution for native message or permission evidence; subsequent input
-   * associations reuse it until a native terminal result clears the active slot. */
+  /** Return the active execution to associateInputs. Allocate and publish it on the first native
+   * execution evidence from associateInputs or permissionRequest. Starting work also makes later
+   * schema replacements resume the native transcript. Publication failure rejects to the caller. */
   private async beginExecution(userUuid: string = randomUUID()): Promise<ActiveTurn> {
     if (!this.active) {
       this.queryMode = "resume";
@@ -359,8 +409,8 @@ export class ClaudeBackendSession implements BackendSession {
     }
     return this.active;
   }
-  /** Project pump messages into ordered sink events and native-input associations. Persist verified
-   * turn mappings before terminal publication; sink/store failures reject into pump observation failure. */
+  /** Route pump messages after processing native input refusal or association evidence. Bind
+   * inputs before projecting the associated reply. Sink and store failures reject back to pump. */
   private async mapMessage(message: SDKMessage): Promise<void> {
     const value = record(message);
     const refused = str(value.refused_user_message_uuid);
@@ -387,54 +437,89 @@ export class ClaudeBackendSession implements BackendSession {
       this.trackFastMode(value);
       if (message.session_id !== this.nativeId) {
         this.binding = { ...this.binding, nativeRef: { provider: "claude", value: message.session_id } };
-        this.adapter.turnMaps.set(this.nativeId, this.turns); await this.fileStore?.saveTurnMap(this.nativeId, this.turns);
+        await this.rememberTurnMap();
       }
       await this.sink.emit({ type: "session/state", payload: this.snapshot() }); return;
     }
     if (!active) { await this.notice(value); return; }
     if (message.type === "assistant") {
       if (!message.parent_tool_use_id) active.apiError = message.error;
-      for (const block of message.message.content) await this.completeBlock(record(block), message.message.id, message.parent_tool_use_id !== null ? "subagent" : "main");
+      for (const block of message.message.content) await this.completeBlock({ block: record(block), messageId: message.message.id, context: message.parent_tool_use_id !== null ? "subagent" : "main", active });
       return;
     }
-    if (message.type === "stream_event") { await this.streamEvent(record(message.event)); return; }
+    if (message.type === "stream_event") { await this.streamEvent(record(message.event), active); return; }
     if (message.type === "user") {
-      const body = record(message.message).content;
-      if (Array.isArray(body)) for (const part of body) {
-        const block = record(part); if (block.type !== "tool_result") continue;
-        const toolId = str(block.tool_use_id); if (!toolId) continue;
-        const previous = active.output.get(toolId);
-        if (previous?.type === "toolCall") { const item = completeClaudeTool(previous, toolResult(block, value.tool_use_result)); active.output.set(toolId, item); await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id }); }
-      }
-      return;
+      return this.publishToolResults(value, active);
     }
     if (message.type === "result") return this.completeTurn(message, active);
     if (message.type === "system" && typeof value.subtype === "string") {
       const subtype = value.subtype;
-      if (subtype.startsWith("task_")) {
-        const id = str(value.task_id); if (!id) return this.notice(value);
-        const previous = active.output.get(`task:${id}`); const patch = record(value.patch);
-        const status = str(value.status) ?? str(patch.status) ?? "running";
-        const final = ["completed", "failed", "stopped", "killed"].includes(status);
-        const item: Item = { id: `task:${id}`, type: "subagent", subagentId: id, state: status === "completed" ? "completed" : status === "failed" ? "failed" : final ? "interrupted" : "running", status: final ? status === "completed" ? "completed" : "failed" : "running", task: str(value.description) ?? str(patch.description) ?? str(value.summary), ...(str(value.tool_use_id) ? { parentItemId: str(value.tool_use_id) } : {}) };
-        active.output.set(item.id, item);
-        if (final) await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
-        else if (!previous) await this.sink.emit({ type: "item/started", payload: { item } }, { turnId: active.id });
-        else await this.sink.emit({ type: "item/delta", payload: { itemId: item.id, kind: "patch", value: safe(item) } }, { turnId: active.id });
-        return;
-      }
-      if (subtype.startsWith("hook_")) {
-        const id = str(value.hook_id); if (!id) return this.notice(value);
-        const previous = active.output.get(`hook:${id}`);
-        const item: Item = { id: `hook:${id}`, type: "hook", name: str(value.hook_name) ?? "hook", status: subtype === "hook_response" ? value.outcome === "success" ? "completed" : "failed" : "running", ...(value.output !== undefined ? { output: safe(value.output) } : {}) };
-        active.output.set(item.id, item);
-        if (subtype === "hook_progress") { if (!previous) await this.sink.emit({ type: "item/started", payload: { item } }, { turnId: active.id }); await this.sink.emit({ type: "item/delta", payload: { itemId: item.id, kind: "output", text: str(value.output) ?? "" } }, { turnId: active.id }); }
-        else await this.sink.emit({ type: previous || subtype === "hook_response" ? "item/completed" : "item/started", payload: { item } }, { turnId: active.id });
-        return;
-      }
+      if (subtype.startsWith("task_")) return this.publishTask(value, active);
+      if (subtype.startsWith("hook_")) return this.publishHook(subtype, value, active);
       if (subtype === "compact_boundary") { await this.sink.emit({ type: "item/completed", payload: { item: { id: str(value.uuid) ?? randomUUID(), type: "compaction", status: "completed", summary: str(value.summary), trigger: str(record(value.compact_metadata).trigger) } } }, { turnId: active.id }); return; }
     }
     await this.notice(value);
+  }
+  /** Complete live tool calls from matching native user-message results. mapMessage awaits
+   * publication to keep these effects ordered before later native messages. */
+  private async publishToolResults(value: Record<string, unknown>, active: ActiveTurn): Promise<void> {
+    const body = record(value.message).content;
+    if (!Array.isArray(body)) return;
+    for (const part of body) {
+      const block = record(part);
+      if (block.type !== "tool_result") continue;
+      const toolId = str(block.tool_use_id);
+      if (!toolId) continue;
+      const previous = active.output.get(toolId);
+      if (previous?.type !== "toolCall") continue;
+      const item = completeClaudeTool(previous, toolResult(block, value.tool_use_result));
+      active.output.set(toolId, item);
+      await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
+    }
+  }
+  /** Map native task updates to an item's start, patch or terminal event. mapMessage awaits
+   * publication, falling back to a notice when the native task identity is missing. */
+  private async publishTask(value: Record<string, unknown>, active: ActiveTurn): Promise<void> {
+    const id = str(value.task_id);
+    if (!id) return this.notice(value);
+    const previous = active.output.get(`task:${id}`);
+    const patch = record(value.patch);
+    const status = str(value.status) ?? str(patch.status) ?? "running";
+    const final = ["completed", "failed", "stopped", "killed"].includes(status);
+    const item: Item = {
+      id: `task:${id}`,
+      type: "subagent",
+      subagentId: id,
+      state: status === "completed" || status === "failed" ? status : final ? "interrupted" : "running",
+      status: status === "completed" ? "completed" : final ? "failed" : "running",
+      task: str(value.description) ?? str(patch.description) ?? str(value.summary),
+      ...(str(value.tool_use_id) ? { parentItemId: str(value.tool_use_id) } : {}),
+    };
+    active.output.set(item.id, item);
+    if (final) await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
+    else if (!previous) await this.sink.emit({ type: "item/started", payload: { item } }, { turnId: active.id });
+    else await this.sink.emit({ type: "item/delta", payload: { itemId: item.id, kind: "patch", value: safe(item) } }, { turnId: active.id });
+  }
+  /** Give hook progress a start event when the hook was previously unseen. mapMessage awaits
+   * publication before consuming another message, including when a missing hook ID emits a notice. */
+  private async publishHook(subtype: string, value: Record<string, unknown>, active: ActiveTurn): Promise<void> {
+    const id = str(value.hook_id);
+    if (!id) return this.notice(value);
+    const previous = active.output.get(`hook:${id}`);
+    const item: Item = {
+      id: `hook:${id}`,
+      type: "hook",
+      name: str(value.hook_name) ?? "hook",
+      status: subtype === "hook_response" ? value.outcome === "success" ? "completed" : "failed" : "running",
+      ...(value.output !== undefined ? { output: safe(value.output) } : {}),
+    };
+    active.output.set(item.id, item);
+    if (subtype === "hook_progress") {
+      if (!previous) await this.sink.emit({ type: "item/started", payload: { item } }, { turnId: active.id });
+      await this.sink.emit({ type: "item/delta", payload: { itemId: item.id, kind: "output", text: str(value.output) ?? "" } }, { turnId: active.id });
+    } else {
+      await this.sink.emit({ type: previous || subtype === "hook_response" ? "item/completed" : "item/started", payload: { item } }, { turnId: active.id });
+    }
   }
   /** Publish mapMessage's native refusal/no-execution evidence before removing a pending input.
    * Unknown UUIDs are ignored; publication failure leaves the input retained and rejects into pump. */
@@ -457,24 +542,14 @@ export class ClaudeBackendSession implements BackendSession {
         await this.sink.bindSubmission(pending.submissionId, execution.id);
       }
     }
-    this.adapter.turnMaps.set(this.nativeId, this.turns); await this.fileStore?.saveTurnMap(this.nativeId, this.turns);
+    await this.rememberTurnMap();
   }
-  /** Finish mapMessage's captured execution: validate final output, publish items and usage,
-   * then clear only consumed input IDs before the terminal and ready-state events. A sink failure
-   * rejects into pump; inputs omitted by native correlation remain pending rather than guessed. */
+  /** Finish mapMessage's captured execution. Validate final output, publish items and usage, then
+   * clear consumed input IDs before the terminal and ready-state events. Uncorrelated inputs stay
+   * pending. A sink failure rejects into pump. */
   private async completeTurn(message: Extract<SDKMessage, { type: "result" }>, active: ActiveTurn): Promise<void> {
     const value = record(message);
-    const interrupted = str(message.stop_reason) === "interrupted" || str(value.terminal_reason) === "interrupted";
-    let error = claudeTurnError(message, active.apiError);
-    let structuredText: string | undefined;
-    if (this.outputSchema && !error && !interrupted) {
-      if (value.structured_output === undefined) {
-        error = { code: 'CLAUDE_STRUCTURED_OUTPUT_MISSING', message: 'Claude completed without the requested structured output', retryable: false, outcomeUnknown: false };
-      } else if (!this.outputSchema.validate(value.structured_output)) {
-        error = { code: 'CLAUDE_STRUCTURED_OUTPUT_INVALID', message: 'Claude structured output does not match outputSchema', retryable: false, outcomeUnknown: false };
-      } else structuredText = JSON.stringify(value.structured_output);
-    }
-    const resultText = !this.outputSchema && message.subtype === "success" ? message.result : undefined;
+    const { interrupted, error, resultText, structuredText } = this.terminalOutput(message, active, value);
     const textItems = [...active.output.values()].filter((item) => item.type === "agentMessage" && item.status !== "completed");
     for (let index = 0; index < textItems.length; index++) {
       const item = textItems[index]!; if (item.type !== "agentMessage") continue;
@@ -507,17 +582,38 @@ export class ClaudeBackendSession implements BackendSession {
     // The init snapshot was taken mid-turn ("running"); publish the settled state.
     await this.sink.emit({ type: "session/state", payload: this.snapshot() });
   }
+  /** Classify native termination and validate structured output before completeTurn publishes
+   * any final item. Missing or invalid output becomes a terminal error. An interruption bypasses
+   * schema validation and retains precedence in the terminal event. */
+  private terminalOutput(message: Extract<SDKMessage, { type: "result" }>, active: ActiveTurn, value: Record<string, unknown>): {
+    interrupted: boolean; error: HarnessError | undefined; resultText: string | undefined; structuredText: string | undefined;
+  } {
+    const interrupted = str(message.stop_reason) === "interrupted" || str(value.terminal_reason) === "interrupted";
+    let error = claudeTurnError(message, active.apiError);
+    let structuredText: string | undefined;
+    if (this.outputSchema && !error && !interrupted) {
+      if (value.structured_output === undefined) {
+        error = { code: 'CLAUDE_STRUCTURED_OUTPUT_MISSING', message: 'Claude completed without the requested structured output', retryable: false, outcomeUnknown: false };
+      } else if (!this.outputSchema.validate(value.structured_output)) {
+        error = { code: 'CLAUDE_STRUCTURED_OUTPUT_INVALID', message: 'Claude structured output does not match outputSchema', retryable: false, outcomeUnknown: false };
+      } else {
+        structuredText = JSON.stringify(value.structured_output);
+      }
+    }
+    const resultText = !this.outputSchema && message.subtype === "success" ? message.result : undefined;
+    return { interrupted, error, resultText, structuredText };
+  }
   /** Update the active turn from streamed content, publishing starts/deltas before final blocks.
    * mapMessage calls only with an active turn; sink rejection propagates to the query pump. */
-  private async streamEvent(event: Record<string, unknown>): Promise<void> {
-    const active = this.active!; const type = event.type;
+  private async streamEvent(event: Record<string, unknown>, active: ActiveTurn): Promise<void> {
+    const type = event.type;
     if (type === "message_start") { active.streamMessageId = str(record(event.message).id); return; }
     const index = typeof event.index === "number" ? event.index : 0;
     const id = `${active.streamMessageId ?? active.userUuid}:${index}`;
     if (type === "content_block_start") {
       const block = record(event.content_block);
       const blockId = str(block.id) ?? id;
-      const status = this.active?.stoppedTools.get(blockId) ?? "running";
+      const status = active.stoppedTools.get(blockId) ?? "running";
       const item = this.blockItem(block, blockId, status);
       active.output.set(item.id, item); await this.sink.emit({ type: "item/started", payload: { item } }, { turnId: active.id });
     } else if (type === "content_block_delta") {
@@ -558,12 +654,13 @@ export class ClaudeBackendSession implements BackendSession {
   }
   /** Merge a complete assistant block into active output and publish its start/patch/completion.
    * Text and tool calls stay pending until native result/tool evidence; sink failures reach pump. */
-  private async completeBlock(block: Record<string, unknown>, messageId: string, context: "main" | "subagent"): Promise<void> {
-    const active = this.active!;
+  private async completeBlock({ block, messageId, context, active }: {
+    block: Record<string, unknown>; messageId: string; context: "main" | "subagent"; active: ActiveTurn;
+  }): Promise<void> {
     const id = this.resolveCompleteBlockId(block, messageId, active);
     const previous = active.output.get(id);
     const running = block.type === "text" || block.type === "tool_use";
-    const status = this.active?.stoppedTools.get(id) ?? (running ? "running" : "completed");
+    const status = active.stoppedTools.get(id) ?? (running ? "running" : "completed");
     const item = this.blockItem(block, id, status);
     if (context === "subagent") item.extensions = { ...(item.extensions ?? {}), nativeParentTool: "subagent" };
     active.output.set(id, item);
@@ -576,9 +673,9 @@ export class ClaudeBackendSession implements BackendSession {
     const subtype = str(value.subtype) ?? str(value.type) ?? "unknown";
     await this.sink.emit({ type: "notice", payload: { severity: /error|denied|retry|rate_limit/.test(subtype) ? "warning" : "info", code: `CLAUDE_${subtype.toUpperCase().replace(/[^A-Z0-9_]/g, "_")}`, message: str(value.content) ?? str(value.message) ?? subtype, raw: safe(value) } }, this.active ? { turnId: this.active.id } : {});
   }
-  /** Native canUseTool callback registered by startQuery. Await SDK approval/user answers or
+  /** Native canUseTool callback supplied by sessionQueryOptions. Await SDK approval/user answers or
    * native cancellation, translating unavailable interactions to denial and removing the abort listener.
-   * The sink registers the responder; Session/InteractionRegistry invokes it for answers or teardown.
+   * Session and InteractionRegistry invoke the registered responder for answers or cancellation.
    * Execution-start publication failures reject this native callback before interaction registration. */
   private async permissionRequest(toolName: string, input: Record<string, unknown>, details: Parameters<NonNullable<Options["canUseTool"]>>[2]): Promise<PermissionResult> {
     // A native tool permission request is execution evidence even when the SDK
@@ -586,17 +683,17 @@ export class ClaudeBackendSession implements BackendSession {
     if (!this.active && this.nativeInputs.size) await this.beginExecution();
     const turnId = this.active?.id;
     if (!turnId) return { behavior: "deny", message: "No active AHP turn" };
-    const interactionId = details.toolUseID;
     const rawQuestions = Array.isArray(input.questions) ? input.questions.map(record) : [];
-    const isUserQuestionRequest = toolName === "AskUserQuestion" && rawQuestions.length > 0 && rawQuestions.every((question) => typeof question.question === "string");
+    const isUserQuestionRequest = toolName === "AskUserQuestion" && rawQuestions.length > 0 && rawQuestions.every((question): question is Record<string, unknown> & { question: string } => typeof question.question === "string");
     const request = isUserQuestionRequest
-      ? this.createUserQuestionRequest(interactionId, turnId, details.toolUseID, rawQuestions)
-      : this.createToolApprovalRequest({ interactionId, turnId, toolName, input, details });
-    return new Promise<PermissionResult>((resolve) => {
-      let answered = false; const finish = (result: PermissionResult) => { if (!answered) { answered = true; details.signal.removeEventListener("abort", abort); resolve(result); } };
-      const abort = () => { void this.sink.resolveInteraction({ interactionId, outcome: "expired", reason: "native_cancelled" }); finish({ behavior: "deny", message: "Request cancelled" }); };
-      details.signal.addEventListener("abort", abort, { once: true });
-      void this.sink.requestInteraction(request, async (answer) => {
+      ? this.createUserQuestionRequest(turnId, details.toolUseID, rawQuestions)
+      : this.createToolApprovalRequest({ turnId, toolName, input, details });
+    return this.awaitInteraction<PermissionResult>({
+      request,
+      signal: details.signal,
+      cancelled: { behavior: "deny", message: "Request cancelled" },
+      unavailable: { behavior: "deny", message: "Interaction unavailable" },
+      respond: async (answer, finish) => {
         const stopped = !answer ? "interrupted" : answer.kind === "approval" && answer.optionId === "deny" ? "declined" : undefined;
         if (stopped && this.active?.id === turnId) {
           this.active.stoppedTools.set(details.toolUseID, stopped);
@@ -613,25 +710,25 @@ export class ClaudeBackendSession implements BackendSession {
           updatedInput: {
             ...input,
             answers: Object.fromEntries(rawQuestions.map((question, index) => [
-              str(question.question)!, answer.answers[`q${index}`],
+              str(question.question), answer.answers[`q${index}`],
             ])),
           },
         });
         else finish({ behavior: "deny", message: "Invalid response" });
-      }).catch(() => finish({ behavior: "deny", message: "Interaction unavailable" }));
+      },
     });
   }
   /** Build stable qN question identities for permissionRequest so answers map back to native text. */
-  private createUserQuestionRequest(interactionId: string, turnId: string, itemId: string, rawQuestions: Record<string, unknown>[]): InteractionRequested {
+  private createUserQuestionRequest(turnId: string, toolUseId: string, rawQuestions: Array<Record<string, unknown> & { question: string }>): InteractionRequested {
     return {
-      interactionId,
+      interactionId: toolUseId,
       kind: "userInput",
       turnId,
-      itemId,
+      itemId: toolUseId,
       questions: rawQuestions.map((question, index) => ({
         // Answers above use the same zero-based qN IDs to recover the native question text.
         id: `q${index}`,
-        prompt: str(question.question)!,
+        prompt: question.question,
         ...(Array.isArray(question.options) ? {
           options: question.options.map((option) => ({
             id: str(record(option).label) ?? String(option),
@@ -642,15 +739,16 @@ export class ClaudeBackendSession implements BackendSession {
       })),
     };
   }
-  /** Offer only native-supported allow scopes to permissionRequest; session grants require suggestions. */
+  /** Offer session approval to permissionRequest only when the native callback supplied a
+   * session-scoped permission update it can return. */
   private createToolApprovalRequest(
-    { interactionId, turnId, toolName, input, details }: {
-      interactionId: string; turnId: string; toolName: string; input: Record<string, unknown>;
+    { turnId, toolName, input, details }: {
+      turnId: string; toolName: string; input: Record<string, unknown>;
       details: Parameters<NonNullable<Options["canUseTool"]>>[2];
     },
   ): InteractionRequested {
     return {
-      interactionId,
+      interactionId: details.toolUseID,
       kind: "approval",
       turnId,
       itemId: details.toolUseID,
@@ -665,19 +763,58 @@ export class ClaudeBackendSession implements BackendSession {
       ],
     };
   }
-  /** Native onElicitation callback registered by startQuery. Await a sink-delivered answer or native
-   * abort; map abort/unavailable interactions to cancellation and remove the abort listener on completion.
-   * The native answer can finish before the sink publishes interaction/resolved.
-   * Session/InteractionRegistry invokes the registered responder; unrepresentable form content rejects
-   * responder delivery while the failed interaction wait cancels the native callback. */
-  private async elicitationRequest(request: Parameters<NonNullable<Options["onElicitation"]>>[0], details: Parameters<NonNullable<Options["onElicitation"]>>[1]): Promise<Awaited<ReturnType<NonNullable<Options["onElicitation"]>>>> {
-    const interactionId = details.requestId;
-    const ahp: InteractionRequested = { interactionId, kind: "elicitation", mode: request.mode ?? "form", ...(this.active ? { turnId: this.active.id } : {}), message: request.message, ...(request.requestedSchema ? { schema: json(request.requestedSchema) as JsonObject } : {}), ...(request.url ? { privatePayload: { url: request.url }, privatePayloadAvailable: true } : {}) };
+  /** Native onElicitation callback supplied by sessionQueryOptions. Await a sink-delivered answer
+   * or native abort. The answer can reach Claude before the sink publishes interaction/resolved.
+   * Unrepresentable form content rejects responder delivery. Native abort or a rejected sink wait
+   * returns cancellation. */
+  private async elicitationRequest(
+    request: Parameters<NativeElicitation>[0],
+    details: Parameters<NativeElicitation>[1],
+  ): Promise<Awaited<ReturnType<NativeElicitation>>> {
+    const ahp: InteractionRequested = {
+      interactionId: details.requestId,
+      kind: "elicitation",
+      mode: request.mode ?? "form",
+      ...(this.active ? { turnId: this.active.id } : {}),
+      message: request.message,
+      ...(request.requestedSchema ? { schema: json(request.requestedSchema) as JsonObject } : {}),
+      ...(request.url ? { privatePayload: { url: request.url }, privatePayloadAvailable: true } : {}),
+    };
+    return this.awaitInteraction<NonNullable<Awaited<ReturnType<NativeElicitation>>>>({
+      request: ahp,
+      signal: details.signal,
+      cancelled: { action: "cancel" },
+      unavailable: { action: "cancel" },
+      respond: async (answer, finish) => finish(answer?.kind === "elicitation"
+        ? { action: answer.action, ...(answer.content ? { content: elicitationContent(answer.content) } : {}) }
+        : { action: "cancel" }),
+    });
+  }
+  /** Register the responder for permissionRequest and elicitationRequest. Resolve the native
+   * wait once and remove its abort listener. Native abort reports expiry to the sink without
+   * awaiting publication. A rejected sink wait supplies the operation's fallback response. */
+  private awaitInteraction<T>({ request, signal, cancelled, unavailable, respond }: {
+    request: InteractionRequested;
+    signal: AbortSignal;
+    cancelled: T;
+    unavailable: T;
+    respond: (answer: Parameters<NativeInteractionResponder>[0], finish: (result: T) => void) => Promise<void>;
+  }): Promise<T> {
+    const interactionId = request.interactionId;
     return new Promise((resolve) => {
-      let answered = false; const finish = (value: NonNullable<Awaited<ReturnType<NonNullable<Options["onElicitation"]>>>>) => { if (!answered) { answered = true; details.signal.removeEventListener("abort", abort); resolve(value); } };
-      const abort = () => { void this.sink.resolveInteraction({ interactionId, outcome: "expired", reason: "native_cancelled" }); finish({ action: "cancel" }); };
-      details.signal.addEventListener("abort", abort, { once: true });
-      void this.sink.requestInteraction(ahp, async (answer) => finish(answer?.kind === "elicitation" ? { action: answer.action, ...(answer.content ? { content: elicitationContent(answer.content) } : {}) } : { action: "cancel" })).catch(() => finish({ action: "cancel" }));
+      let answered = false;
+      const finish = (result: T) => {
+        if (answered) return;
+        answered = true;
+        signal.removeEventListener("abort", abort);
+        resolve(result);
+      };
+      const abort = () => {
+        void this.sink.resolveInteraction({ interactionId, outcome: "expired", reason: "native_cancelled" });
+        finish(cancelled);
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      void this.sink.requestInteraction(request, answer => respond(answer, finish)).catch(() => finish(unavailable));
     });
   }
   /** Read native history for boundary/history callers through the supplied public store. Capture
@@ -694,10 +831,13 @@ export class ClaudeBackendSession implements BackendSession {
     };
     return (this.adapter.options.getSessionMessages ?? getSessionMessages)(nativeId, { dir: this.params.cwd, sessionStore: scoped, includeSystemMessages: true });
   }
-  /** Resolve open/revert boundaries from verified prompt identities and opaque store entries.
-   * Reject missing turns; retain transcript-only trailing entries when selecting a through boundary. */
+  /** Resolve the checkpoint and transcript cutoff for open and revert. Without a store, use
+   * native prompt IDs or known associations for file checkpoints. With a store, verify the prompt
+   * in history and include opaque trailing entries for through boundaries when available.
+   * Unknown boundaries and store failures reject the caller. */
   private async boundaryPoint(nativeId: string, boundary: Boundary): Promise<BoundaryPoint> {
-    if (!this.adapter.sessionStore) {
+    const store = this.adapter.sessionStore;
+    if (!store) {
       const promptUuid = boundary.nativeTurnId ?? Object.entries(this.turns).find(([, turn]) => turn === boundary.turnId)?.[0];
       if (!promptUuid) throw new HarnessSdkError("TURN_NOT_FOUND");
       const prompts = Object.keys(this.turns); const index = prompts.indexOf(promptUuid);
@@ -713,7 +853,7 @@ export class ClaudeBackendSession implements BackendSession {
     let uuid = boundary.relation === "before" ? index > 0 ? messages[index - 1]!.uuid : undefined : messages[(next >= 0 ? next : messages.length) - 1]!.uuid;
     const key = this.storeKeys.get(nativeId);
     if (boundary.relation === "through" && key) {
-      const entries = await this.adapter.sessionStore!.load(key);
+      const entries = await store.load(key);
       if (entries) {
         const start = entries.findIndex((entry) => entry.uuid === promptUuid);
         const end = next >= 0 ? entries.findIndex((entry) => entry.uuid === messages[next]!.uuid) : entries.length;
@@ -727,8 +867,8 @@ export class ClaudeBackendSession implements BackendSession {
     return { promptUuid, ...(next >= 0 ? { nextPromptUuid: messages[next]!.uuid } : {}), ...(uuid ? { uuid } : {}) };
   }
   /** Restore execute's requested file/conversation scope only while idle. Drain the old query
-   * before replacement; reject partial restoration with applied-scope metadata without undoing an
-   * already-applied restoration phase on failure. */
+   * before replacement. Hold admission across lookup and cleanup, releasing it on any outcome.
+   * Failed conversation restoration after file rewind rejects with REVERT_PARTIAL and appliedScope. */
   private async revert(request: AhpRequestMap['session/revert']): Promise<AhpResultMap['session/revert']> {
     const query = this.query;
     if (this.closed || !query) throw new HarnessSdkError('SESSION_CLOSED');
@@ -737,16 +877,15 @@ export class ClaudeBackendSession implements BackendSession {
     try {
       const point = await this.boundaryPoint(this.nativeId, request.boundary);
       if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
-      let appliedFiles = false;
-      if (request.scope === 'files' || request.scope === 'both') {
+      const rewindFiles = request.scope === 'files' || request.scope === 'both';
+      if (rewindFiles) {
         await this.restoreFiles(query, request.boundary, point);
-        appliedFiles = true;
       }
       if (request.scope !== 'files') {
         try {
           await this.restoreConversation(query, point);
         } catch (cause) {
-          if (appliedFiles) throw new HarnessSdkError('REVERT_PARTIAL', 'Files were restored but conversation restore could not be confirmed', false, true, { appliedScope: 'files' });
+          if (rewindFiles) throw new HarnessSdkError('REVERT_PARTIAL', 'Files were restored but conversation restore could not be confirmed', false, true, { appliedScope: 'files' });
           throw sdkError(cause, 'CLAUDE_REVERT_FAILED', true);
         }
       }
@@ -767,21 +906,22 @@ export class ClaudeBackendSession implements BackendSession {
   }
   /** Revert's conversation phase forks at the verified cutoff, drains the old query, then publishes
    * the replacement binding/state. Recheck close after native waits so disposal cannot reopen work;
-   * revert translates failure to a partial result when its file phase already applied. */
+   * revert translates failure to a REVERT_PARTIAL rejection when its file phase already applied. */
   private async restoreConversation(query: ClaudeQuery, point: BoundaryPoint): Promise<void> {
     if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
-    const native = point.uuid ? await (this.adapter.options.forkSession ?? forkSession)(this.nativeId, { dir: this.params.cwd, sessionStore: this.adapter.sessionStore, upToMessageId: point.uuid }) : { sessionId: randomUUID() };
+    const native = point.uuid ? await this.forkTranscript(this.nativeId, point.uuid) : { sessionId: randomUUID() };
     if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
-    this.generation++; this.input?.end();
-    await this.releaseQuery(query); await this.pumping;
+    this.endQueryInput();
+    await this.releaseQuery(query);
+    await this.pumping;
     if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
     this.binding = { ...this.binding, nativeRef: { provider: 'claude', value: native.sessionId } };
-    this.adapter.turnMaps.set(this.nativeId, this.turns); await this.fileStore?.saveTurnMap(this.nativeId, this.turns);
+    await this.rememberTurnMap();
     await this.startQuery({ mode: point.uuid ? "resume" : "fresh" }); await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
   }
   /** Admit execute's bounded input and enqueue native content, returning a dispatch receipt.
    * Changed schemas replace an idle query first; rejection never retries or replays the new input. */
-  private async submitInput(start: AhpRequestMap['input/submit']): Promise<AhpResultMap['input/submit']> {
+  private async submitInput(start: AhpRequestMap['input/submit'], query: ClaudeQuery): Promise<AhpResultMap['input/submit']> {
     if (this.closed || !this.input) throw new HarnessSdkError('SESSION_CLOSED');
     if (this.reverting) throw new HarnessSdkError('SESSION_BUSY', 'Claude input cannot be submitted during revert');
     // Native association echoes are bounded to 64 UUIDs. Do not admit more
@@ -795,7 +935,7 @@ export class ClaudeBackendSession implements BackendSession {
     try {
       // Do not yield admission for an unchanged format: another submission could
       // otherwise start a switch before this input is recorded as pending.
-      if (changing) await this.replaceOutputFormat(outputSchema);
+      if (changing) await this.replaceOutputFormat(query, outputSchema);
       if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
       const userUuid = randomUUID();
       this.nativeInputs.set(userUuid, { submissionId: start.submissionId });
@@ -807,14 +947,13 @@ export class ClaudeBackendSession implements BackendSession {
       } catch (cause) { this.nativeInputs.delete(userUuid); throw cause; }
     } finally { if (changing) this.switchingOutput = false; }
   }
-  /** Drain and replace the query for submitInput before enqueueing its input. Latch startup/cleanup
-   * failure for later operations; input remains undispatched and caller-owned retry policy stays explicit. */
-  private async replaceOutputFormat(outputSchema?: OutputSchema): Promise<void> {
-    const query = this.query!, pumping = this.pumping;
-    this.generation++;
-    this.input?.end();
+  /** Drain and replace the query for submitInput before enqueueing its input. Reject startup or
+   * cleanup failure as a definite dispatch failure and latch it for later query operations while open. */
+  private async replaceOutputFormat(query: ClaudeQuery, outputSchema: OutputSchema | undefined): Promise<void> {
+    const pumping = this.pumping;
+    this.endQueryInput();
     try {
-      // Query.return() awaits the official SDK's mirror flush and cleanup.
+      // The optional native return() also waits for the SDK's mirror flush.
       await this.releaseQuery(query);
       await pumping;
       if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
@@ -828,6 +967,12 @@ export class ClaudeBackendSession implements BackendSession {
       if (!this.closed) this.queryFailure = failure;
       throw failure;
     }
+  }
+  /** Invalidate the retired query's observation and end its input before release. Conversation
+   * restore and output replacement each await close/return and their own pump before reopening. */
+  private endQueryInput(): void {
+    this.generation++;
+    this.input?.end();
   }
   /** Share query close/return completion across replacement, revert and disposal. Attempt both
    * stages and reject RESOURCE_RELEASE_FAILED with safe codes when either fails. */
@@ -988,5 +1133,7 @@ interface BoundaryPoint { uuid?: string; promptUuid: string; nextPromptUuid?: st
 /** Query startup identity retained by schema replacement until beginExecution observes native work. */
 type QueryStart = { mode: "fresh" | "resume"; resumeAt?: string };
 
-/** Per-execution output/correlation state, released only after native terminal evidence. */
+type NativeElicitation = NonNullable<Options["onElicitation"]>;
+
+/** Execution output and input associations that completeTurn reads before clearing the active slot. */
 interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageId?: string; blockIndex: number; apiError?: Extract<SDKMessage, { type: 'assistant' }>['error'] }

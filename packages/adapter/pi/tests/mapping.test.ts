@@ -3,7 +3,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent'
 import { toHostEvent, toHostMessage, type PiHostEntry } from '../src/host'
-import { createRedactor, historyItems, nativeInput, permissionTools, piFileChanges, piTurnError, toolKind, toolOutputText, turnStarts, usageOf } from '../src/mapping'
+import { completeTool, createRedactor, historyItems, nativeInput, permissionTools, piFileChanges, piTurnError, toolItem, toolKind, toolOutputText, turnStarts, usageOf } from '../src/mapping'
 import { createPiCatalogSession, resolvePiProfile } from '../src/index'
 import { fakeFactory, MODELS } from './fake-host'
 
@@ -22,14 +22,30 @@ test('tool kinds and file changes follow Pi tool names and argument shapes', () 
     { path: 'a', operation: 'modify', completeness: 'complete', materials: [
       { format: 'text', scope: 'fragment', oldText: 'x', newText: 'y' }, { format: 'text', scope: 'fragment', oldText: 'p', newText: 'q' }] }])
   expect(piFileChanges('edit', { path: 'a', edits: [{ oldText: 'x' }] })![0]).toMatchObject({ completeness: 'partial', materials: [{ format: 'unavailable' }] })
-  expect(piFileChanges('write', { path: 'n', content: 'hi' })![0]).toMatchObject({ operation: 'unknown', completeness: 'partial' })
+  expect(piFileChanges('edit', { path: 'a', edits: [{ oldText: 'x' }, { oldText: 'p', newText: 'q' }] })).toEqual([
+    { path: 'a', operation: 'modify', completeness: 'partial', materials: [
+      { format: 'text', scope: 'fragment', oldText: 'p', newText: 'q' },
+    ] },
+  ])
+  expect(piFileChanges('write', { path: 'n', content: 'hi' })).toEqual([
+    { path: 'n', operation: 'unknown', completeness: 'partial', materials: [
+      { format: 'text', scope: 'file', oldText: null, newText: 'hi' },
+    ] },
+  ])
   expect(piFileChanges('edit', {})).toEqual([])
 })
 
 test('tool results keep text and drop structured details', () => {
   expect(toolOutputText({ content: [{ type: 'text', text: 'a' }, { type: 'image' }, { type: 'text', text: 'b' }], details: { secret: 1 } })).toBe('ab')
-  expect(toolOutputText('plain')).toBeDefined()
+  expect(toolOutputText('plain')).toBe('')
   expect(toolOutputText(undefined)).toBe('')
+
+  const redact = createRedactor(['secret'])
+  const running = toolItem(redact, 'tool', 'read', {}, 'running')
+  const completed = completeTool(redact, running, { content: 'secret' }, true, 'interrupted')
+  expect(completed).toEqual({ ...running, status: 'interrupted', output: '[REDACTED]' })
+  expect(running.status).toBe('running')
+  expect(running).not.toHaveProperty('output')
 })
 
 test('usage sums assistant messages and turn errors use native categories only', () => {

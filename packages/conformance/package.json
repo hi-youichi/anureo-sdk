@@ -1,7 +1,7 @@
 {
   "name": "@anureo/conformance",
   "description": "Shared conformance suite and scripted fixtures for Anureo SDK adapters and AHP implementations",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "Apache-2.0",
   "keywords": [
     "anureo",

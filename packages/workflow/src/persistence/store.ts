@@ -1,59 +1,55 @@
-import type { WorkflowOptions } from '../workflow-types'
 import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
 import { lstat, mkdir, open, readdir, realpath, unlink, type FileHandle } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
+import type { WorkflowOptions } from '../workflow-types'
 import { atomicPublish, syncDirectory } from './atomic'
 import { canonicalJson, digest, jsonCopy, type JsonValue } from './json'
 import { AgentJournal } from './journal'
-import { invalidCheckpoint, record, runIdSchema, type Manifest } from './records'
+import { invalidCheckpoint, record, runIdSchema, type Manifest, type StoredFailure } from './records'
 import { loadSourceJournal } from './replay'
 
 /** Internal identity saved before workflow enters its body. */
 export interface RunIdentity {
+  /** Validated basename of the run within directory. */
   runId: string
-  /** Canonical parent directory, not the run's own subdirectory. */
+  /** Canonical parent containing the run's subdirectory. */
   directory: string
   name: string
   revision: string
-  /** Isolated JSON snapshot; workflow separately freezes the copy exposed to its body. */
+  /** Isolated persistence snapshot. The body receives its own frozen copy from prepareRun. */
   input: JsonValue
 }
 
-/** Safe failure metadata supplied by storedFailure when workflow aborts; excludes diagnostics. */
-export interface StoredFailure {
-  code: string
-  retryable: boolean
-  /** The failure left execution's outcome uncertain. */
-  outcomeUnknown: boolean
-  /** Resource release failed even if execution itself had a known outcome. */
-  cleanupFailed: boolean
-}
-
-/** Internal storage ownership returned to workflow. Drain agent work before finish/abort and
- * always await close in finally; manifest operations serialize but journal draining is caller-owned. */
+/** Internal storage ownership returned to workflow. Drain agent work before finish or abort,
+ * and always await close in finally. Only manifest operations are serialized by this handle. */
 export interface RunHandle {
+  /** Provides the canonical storage directory for workflow's error details. */
   readonly identity: RunIdentity
+  /** Installed by completeRun as the journal for agent calls in the body. */
   readonly journal: AgentJournal
-  /** Publish result.json before the terminal manifest; resolves after both publications.
-   * Publication failures reject and may leave a result or manifest already replaced. */
+  /** Publish result.json before the terminal manifest and resolve after both publications.
+   * A rejection may leave a result or manifest already replaced. A queued call that starts
+   * after closure rejects with WORKFLOW_CLOSED. */
   finish(status: 'completed' | 'incomplete', result: JsonValue): Promise<void>
-  /** Publish a failed manifest without deleting any previously written result; does not release the lock. */
+  /** Publish a failed manifest and keep any earlier result file and the writer lock.
+   * Publication failures reject, as does a queued call that starts after closure. */
   abort(failure: StoredFailure): Promise<void>
   /** Wait for queued manifests, then release the owned writer lock and close its descriptor.
-   * Sequential repeats are no-ops, including after rejection; callers must not race closure with work. */
+   * Lock-release failures reject. Sequential repeats are no-ops, including after rejection.
+   * Callers must finish scheduling work before closure. */
   close(): Promise<void>
 }
 
 /** Create a fresh file-backed run for workflow, publishing its journal and running manifest
  * before returning. An optional inactive source supplies replay events, never the final result.
  * The returned handle owns the writer lock and must be closed after registered agent work drains.
- * Invalid options, overlapping/reused runs and invalid/active/incompatible sources reject with
- * their SDK errors; other I/O failures become WORKFLOW_STORAGE_FAILED. Initialization failures
- * attempt to release any acquired lock; partially published run files remain and must not be reused. */
+ * SDK errors propagate unless lock rollback fails. Rollback failures and otherwise unclassified
+ * I/O failures reject as WORKFLOW_STORAGE_FAILED. If publication left run files behind,
+ * a later attempt on the same target rejects with WORKFLOW_RUN_EXISTS. */
 export async function openFileRun(
-  options: WorkflowOptions<JsonValue> & { runId: string },
+  options: FileRunOptions,
 ): Promise<RunHandle> {
   validateRunOptions(options)
   try {
@@ -75,9 +71,6 @@ interface PreparedRun {
 
 /** Own the open lock descriptor and serialize manifest transitions until workflow releases it. */
 class FileRunHandle implements RunHandle {
-  readonly identity: RunIdentity
-  readonly journal: AgentJournal
-
   /** Take ownership only after initial publication; initialization retains rollback responsibility. */
   constructor({ identity, path, lock, manifest, journal }: {
     identity: RunIdentity
@@ -93,7 +86,8 @@ class FileRunHandle implements RunHandle {
     this.journal = journal
   }
 
-  /** completeRun calls after draining agents; commit the result before its manifest digest. */
+  /** completeRun awaits both publications before returning the body result to workflow.
+   * The manifest comes last so it refers to an already published result. */
   async finish(status: 'completed' | 'incomplete', result: JsonValue): Promise<void> {
     await this.updateManifest(async () => {
       await atomicPublish(join(this.path, 'result.json'), result)
@@ -101,21 +95,30 @@ class FileRunHandle implements RunHandle {
     })
   }
 
-  /** abortRun records failure after draining; an earlier result file is ignored by failed-run replay. */
+  /** abortRun awaits this after draining. Replay treats the failed manifest as authoritative
+   * even if finish left an earlier result file. */
   async abort(failure: StoredFailure): Promise<void> {
     await this.updateManifest(async () => {
       await this.publishManifest({ status: 'failed', resultDigest: null, failure })
     })
   }
 
-  /** workflow's finally releases ownership even after failed publication; earlier queue rejections
-   * have already reached their callers and do not prevent the lock-release attempt. */
+  /** workflow awaits this in finally and records any rejection as a storage failure.
+   * A failed publication already reached finish or abort, so proceed with lock release. */
   async close(): Promise<void> {
     if (this.closed) return
-    try { await this.manifestQueue.catch(() => {}); await releaseLock(join(this.path, 'writer.lock'), this.lock) }
-    catch (cause) { throw storageError(cause) }
-    finally { this.closed = true }
+    try {
+      await this.manifestQueue.catch(() => {})
+      await releaseLock(join(this.path, 'writer.lock'), this.lock)
+    } catch (cause) {
+      throw storageError(cause)
+    } finally {
+      this.closed = true
+    }
   }
+
+  readonly identity: RunIdentity
+  readonly journal: AgentJournal
 
   private closed = false
   private manifestQueue: Promise<void> = Promise.resolve()
@@ -143,7 +146,7 @@ class FileRunHandle implements RunHandle {
   }
 }
 
-/** Reject malformed target identity before copying input or touching storage. */
+/** Throw INVALID_PARAMS for malformed target identity before copying input or touching storage. */
 function validateRunOptions(options: FileRunOptions): void {
   if (!runIdSchema.safeParse(options.runId).success || typeof options.name !== 'string' || !options.name
     || typeof options.revision !== 'string' || !options.revision || typeof options.directory !== 'string' || !options.directory) {
@@ -152,21 +155,26 @@ function validateRunOptions(options: FileRunOptions): void {
 }
 
 /** Snapshot input, resolve parent/source paths, and create a real target directory before locking.
- * Only a newly created target needs a parent flush; an existing target is checked under its lock. */
+ * Flush the parent when creating the target. Initialization checks existing contents under the lock. */
 async function prepareRunStorage(options: FileRunOptions): Promise<PreparedRun> {
   const input = jsonCopy(options.input)
   await mkdir(resolve(options.directory), { recursive: true, mode: 0o700 })
   const directory = await realpath(resolve(options.directory))
   const path = join(directory, options.runId)
   const source = await resolveSourceRun({ options, directory, path })
-  try { await mkdir(path, { mode: 0o700 }); await syncDirectory(directory) }
-  catch (cause) { if ((cause as NodeJS.ErrnoException).code !== 'EEXIST') throw cause }
+  try {
+    await mkdir(path, { mode: 0o700 })
+    await syncDirectory(directory)
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code !== 'EEXIST') throw cause
+  }
   if (!(await lstat(path)).isDirectory()) invalidCheckpoint()
   return { directory, path, input, source }
 }
 
 /** Resolve optional replay coordinates before target creation so overlapping source/target trees
- * reject before a writer claim. A string uses the target's canonical parent directory. */
+ * reject before a writer claim. Omission selects fresh execution. A string uses the target's
+ * canonical parent, while an object supplies its own parent to resolve. */
 async function resolveSourceRun({ options, directory, path }: {
   options: FileRunOptions
   directory: string
@@ -196,16 +204,30 @@ async function initializeLockedRun({ options, prepared }: {
     throw cause
   })
   try {
-    await lock.writeFile(`${canonicalJson(record({ checkpointFormatVersion: 2, token: randomUUID(),
-      hostname: hostname(), pid: process.pid, createdAt: new Date().toISOString() }))}\n`)
-    await lock.sync()
-    if ((await readdir(prepared.path)).some(name => name !== 'writer.lock')) throw new HarnessSdkError('WORKFLOW_RUN_EXISTS')
+    await writeWriterClaim(lock)
+    if ((await readdir(prepared.path)).some(name => name !== 'writer.lock')) {
+      throw new HarnessSdkError('WORKFLOW_RUN_EXISTS')
+    }
     return await publishInitialRun({ options, prepared, lock })
   } catch (cause) {
     try { await releaseLock(lockPath, lock) }
     catch { throw new HarnessSdkError('WORKFLOW_STORAGE_FAILED') }
     throw cause
   }
+}
+
+/** Write and flush the claim on the exclusively opened descriptor. Replay validates this
+ * record before probing its writer, and initializeLockedRun owns rollback on rejection. */
+async function writeWriterClaim(lock: FileHandle): Promise<void> {
+  const claim = record({
+    checkpointFormatVersion: 2,
+    token: randomUUID(),
+    hostname: hostname(),
+    pid: process.pid,
+    createdAt: new Date().toISOString(),
+  })
+  await lock.writeFile(`${canonicalJson(claim)}\n`)
+  await lock.sync()
 }
 
 /** Validate replay under the target lock, publish a self-contained journal before its manifest,
@@ -221,12 +243,19 @@ async function publishInitialRun({ options, prepared, lock }: {
       name: options.name, revision: options.revision, runId: source.runId,
     })
     : []
-  const journal = new AgentJournal(join(path, 'journal.json'), inherited)
-  await atomicPublish(join(path, 'journal.json'), [...inherited])
+  const journalPath = join(path, 'journal.json')
+  const journal = new AgentJournal(journalPath, inherited)
+  await atomicPublish(journalPath, [...inherited])
   const identity = { runId: options.runId, directory, name: options.name, revision: options.revision, input }
-  const manifest: Manifest = record({ checkpointFormatVersion: 2,
-    identity, createdAt: new Date().toISOString(), resumedFrom: source,
-    status: 'running', resultDigest: null, failure: null })
+  const manifest: Manifest = record({
+    checkpointFormatVersion: 2,
+    identity,
+    createdAt: new Date().toISOString(),
+    resumedFrom: source,
+    status: 'running',
+    resultDigest: null,
+    failure: null,
+  })
   await atomicPublish(join(path, 'run.json'), manifest)
   return new FileRunHandle({ identity, path, lock, manifest, journal })
 }
@@ -237,7 +266,8 @@ function storageError(cause: unknown): HarnessSdkError {
   return new HarnessSdkError('WORKFLOW_STORAGE_FAILED')
 }
 
-/** Reject equal or nested run trees in either direction so target writes cannot overlap replay input. */
+/** Detect equal or nested run trees in either direction. resolveSourceRun uses canonical
+ * parent directories so writes cannot overlap the selected source tree. */
 function overlaps(a: string, b: string): boolean {
   const inside = (parent: string, child: string) => {
     const path = relative(parent, child)
@@ -246,9 +276,10 @@ function overlaps(a: string, b: string): boolean {
   return inside(a, b) || inside(b, a)
 }
 
-/** Unlink only the inode held by this instance, including partial initialization, then flush the
- * parent and always close the descriptor. Ownership loss rejects without removing another lock. */
-async function releaseLock(path: string, handle: FileHandle) {
+/** Compare the on-disk entry with the held descriptor before unlinking, so rollback also works
+ * for a partially written lock. Flush the parent after unlinking and always close the descriptor.
+ * An observed inode or file kind mismatch rejects as WORKFLOW_LOCK_OWNERSHIP_LOST. */
+async function releaseLock(path: string, handle: FileHandle): Promise<void> {
   try {
     const held = await handle.stat()
     const actual = await lstat(path)

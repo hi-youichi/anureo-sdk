@@ -1,4 +1,4 @@
-// Exercises schema dialect, definition and value contracts. Production admission and publication stay in the output session.
+// Exercises schema dialect, definition and value contracts.
 import { expect, test } from 'bun:test'
 import { compileOutputSchema } from './schema'
 import type { JsonSchema } from '@anureo/protocol'
@@ -15,6 +15,9 @@ test('schema compilation distinguishes invalid contracts from invalid values wit
 
 test('draft-07 and explicit 2020-12 use their own array semantics and ignore schema-like example data', () => {
   expect(compileOutputSchema({ type: 'object', examples: [{ $ref: 'https://example.com/data', $async: true }] }).parse('{}')).toEqual({})
+  const draft07 = compileOutputSchema({ $schema: 'http://json-schema.org/draft-07/schema#', type: 'array', items: [{ type: 'integer' }], additionalItems: false })
+  expect(draft07.parse('[42]')).toEqual([42])
+  expect(() => draft07.parse('[42,43]')).toThrow()
   const tuple = compileOutputSchema({ $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'array', prefixItems: [{ type: 'integer' }], items: false })
   expect(tuple.parse('[42]')).toEqual([42])
   expect(() => tuple.parse('[42,43]')).toThrow()

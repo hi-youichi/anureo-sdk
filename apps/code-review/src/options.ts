@@ -6,33 +6,35 @@ import type { ReviewProgress } from './progress'
 /** Internal default shared by library preflight and CLI flag parsing for review and fix capacity. */
 export const DEFAULT_REVIEW_CONCURRENCY = 8
 
-/** Configure reviewCode with a borrowed initialized client. The caller disposes the client after
- * completion; reviewCode owns per-agent sessions, durable workflow records and temporary worktrees. */
+/** Configure reviewCode with an initialized client. Keep the client available until the call
+ * resolves or rejects and await its disposal when finished using it. */
 export interface ReviewOptions {
-  /** Initialized client borrowed for the run; await completion or rejection before disposing it. */
+  /** Initialized client used to open the run's analysis, review and optional fix sessions. */
   client: Client
   /** Existing source directory, resolved from the process working directory and canonicalized. */
   cwd: string
-  /** Model override for analysis, reviews and fixes; omission leaves selection to the client. */
+  /** Model override for all agent sessions. Omission uses the harness's default model selection. */
   model?: string
-  /** Additional instructions appended to module analysis and review/verification prompts. */
+  /** Additional instructions for analysis, review and final verification. An empty string is omitted. */
   focus?: string
   /** Angles in result order; defaults to correctness, code quality and design. Requires a nonempty
    * list with unique nonblank IDs (at most 256 UTF-8 bytes) and nonblank titles/instructions. Copied at preflight. */
   angles?: readonly ReviewAngle[]
-  /** Review only these exact IDs from the analyzed plan; omission selects all. Supplied lists must
-   * be nonempty and contain unique nonblank IDs of at most 256 UTF-8 bytes. Unknown IDs reject after analysis. */
+  /** Select exact IDs from the analyzed plan. Omission selects all modules before maxModules is
+   * applied. A supplied list must contain at least one ID, with unique nonblank IDs of at most
+   * 256 UTF-8 bytes. An unknown ID rejects the run after analysis, even if maxModules is set. */
   moduleIds?: readonly string[]
   /** Positive safe integer limiting selected modules in plan order; omission leaves them unlimited. */
   maxModules?: number
-  /** Fix each module's findings as soon as its review completes, then re-review
-   * the selected scope if any fix was applied, after all fixes settle. Defaults to false.
-   * Requires a usable Git work tree. Each agent receives a separate temporary checkout.
-   * Validated fixes are applied to the original work tree and remain if a later step fails. */
+  /** Queue fixes in review-completion order and apply validated edits to the original work tree.
+   * If any fix changes files, the selected scope is reviewed again after the fix queue settles.
+   * Defaults to false. Fix mode requires a usable Git work tree and gives each agent a separate
+   * temporary checkout. Applied edits remain if a later step fails. */
   fix?: boolean
   /** Harness-specific session permission mode for fix edits and checks; omission uses the session default. */
   fixPermissionMode?: string
-  /** Positive safe integer limiting simultaneous review and fix agents across modules; defaults to 8. */
+  /** Shared maximum for simultaneous review, fix and verification agents. Must be a positive safe
+   * integer and defaults to 8. Module analysis runs first. */
   concurrency?: number
   /** Durable run storage, retained after completion. Defaults to <canonical cwd>/.anureo/workflows;
    * an explicit relative path resolves from the process working directory. */
@@ -42,9 +44,9 @@ export interface ReviewOptions {
   onProgress?: (event: ReviewProgress) => void
 }
 
-/** Internal preflight used by prepareReview before resolving paths or opening sessions.
- * Throws synchronously for invalid limits, IDs or angles; returns defaults and copied selections.
- * Module existence is checked against the plan after analysis. */
+/** Validate limits, IDs and angles, throwing synchronously on invalid input. prepareReview uses
+ * the returned defaults and copied selections for dispatch and durable run input. Module existence
+ * is checked after analysis produces the plan. */
 export function validateReviewOptions(options: ReviewOptions) {
   const fixRequested = options.fix ?? false
   const concurrency = options.concurrency ?? DEFAULT_REVIEW_CONCURRENCY
@@ -53,7 +55,7 @@ export function validateReviewOptions(options: ReviewOptions) {
   if (maxModules !== undefined) validatePositiveInteger(maxModules, 'maxModules')
   const moduleIds = options.moduleIds ? [...options.moduleIds] : undefined
   validateModuleIds(moduleIds, 'moduleIds must contain unique nonempty module ids')
-  if (moduleIds) validateWorkflowStepIds(moduleIds, 'moduleIds must be at most 256 bytes each (workflow step-key limit)')
+  if (moduleIds) validateIdByteLength(moduleIds, 'moduleIds must be at most 256 bytes each (workflow step-key limit)')
   const angles = copyReviewAngles(options.angles ?? defaultAngles)
   return { fixRequested, concurrency, maxModules, moduleIds, angles }
 }
@@ -65,7 +67,8 @@ export function validatePositiveInteger(value: number, label: string): void {
 }
 
 /** Internal selection guard for validateReviewOptions and CLI parseCommand. Allows omission;
- * throws for empty lists, blank IDs or exact duplicates using the caller's diagnostic. Does not trim IDs. */
+ * throws for empty lists, blank IDs or exact duplicates using the caller's diagnostic. Whitespace
+ * is significant for matching IDs. */
 export function validateModuleIds(ids: readonly string[] | undefined, message: string): void {
   if (ids && (ids.length === 0 || ids.some(id => !id.trim()) || hasDuplicateIds(ids))) {
     throw new Error(message)
@@ -77,18 +80,21 @@ export function hasDuplicateIds(ids: readonly string[]): boolean {
   return new Set(ids).size !== ids.length
 }
 
-/** Copy angle records in caller order, rejecting unusable prompts or ambiguous workflow identities. */
+/** Snapshot angle records in caller order for validateReviewOptions before execution can yield.
+ * Throw for blank prompts, empty selections, duplicate or blank IDs, or IDs over the byte limit. */
 function copyReviewAngles(input: readonly ReviewAngle[]): ReviewAngle[] {
   const angles = input.map(angle => ({ ...angle }))
+  const ids = angles.map(angle => angle.id)
   if (angles.length === 0 || angles.some(angle => !angle.id.trim() || !angle.title.trim() || !angle.instructions.trim())
-    || hasDuplicateIds(angles.map(angle => angle.id))) {
+    || hasDuplicateIds(ids)) {
     throw new Error('Review angles must have unique nonempty ids and nonempty titles and instructions')
   }
-  validateWorkflowStepIds(angles.map(angle => angle.id), 'Review angle ids must be at most 256 bytes (workflow step-key limit)')
+  validateIdByteLength(ids, 'Review angle ids must be at most 256 bytes (workflow step-key limit)')
   return angles
 }
 
-/** Enforce the review API's 256-byte UTF-8 ID cap before dispatch, retaining the caller's diagnostic. */
-function validateWorkflowStepIds(ids: readonly string[], message: string): void {
+/** Enforce the review API's 256-byte UTF-8 ID cap for module and angle selections, throwing with
+ * the caller's diagnostic. */
+function validateIdByteLength(ids: readonly string[], message: string): void {
   if (ids.some(id => Buffer.byteLength(id) > 256)) throw new Error(message)
 }

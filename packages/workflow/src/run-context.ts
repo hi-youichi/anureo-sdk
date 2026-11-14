@@ -2,21 +2,23 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import type { AgentJournal } from './persistence/journal'
 import type { RunState } from './workflow-state'
 
-/** Internal context supplied by workflow and read by agent to share a journal and dispatch state. */
+/** Internal run context installed for the workflow body and inherited by agent calls. */
 export interface RunContext {
+  /** Source replay and target journal used by memoizedAgent. */
   readonly journal: AgentJournal
+  /** Admission, pending work and failure state shared with workflow. */
   readonly state: RunState
 }
 
-/** Run the body supplied by workflow's completeRun phase with context inherited by asynchronous descendants.
- * Returns the body's promise without draining or closing the run; workflow owns that lifecycle.
- * Nested calls restore the enclosing context when their synchronous invocation returns. */
+/** Invoke completeRun's body callback with context inherited by asynchronous descendants.
+ * Return the callback's promise or propagate a synchronous throw. The calling context is
+ * restored when the callback returns or throws, while completeRun owns the subsequent drain. */
 export function runWith<T>(context: RunContext, body: () => Promise<T>): Promise<T> {
   return storage.run(context, body)
 }
 
-/** Let agent select journaled execution in an inherited run context, or ordinary execution
- * when absent. A retained context may already be closed; RunState enforces dispatch admission. */
+/** Read the current async context so agent can choose journaled or ordinary execution.
+ * Async descendants can retain a closed context. RunState.track then rejects admission. */
 export function currentRun(): RunContext | undefined {
   return storage.getStore()
 }

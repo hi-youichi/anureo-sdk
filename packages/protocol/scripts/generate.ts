@@ -38,8 +38,12 @@ function renderTypes(document: ProtocolSchema, version: 'v1'): string {
   const lines = [
     `// Generated from schema/${version}/ahp.schema.json. Run bun run generate; do not edit.`,
     ...aliases,
-    'export interface AhpRequestMap {', ...methods.map(([method, [params]]) => `  ${literal(method)}: ${params};`), '}',
-    'export interface AhpResultMap {', ...methods.map(([method, [, result]]) => `  ${literal(method)}: ${result};`), '}',
+    'export interface AhpRequestMap {',
+    ...methods.map(([method, [params]]) => `  ${JSON.stringify(method)}: ${params};`),
+    '}',
+    'export interface AhpResultMap {',
+    ...methods.map(([method, [, result]]) => `  ${JSON.stringify(method)}: ${result};`),
+    '}',
     'export type AhpMethod = keyof AhpRequestMap;',
     `export const AHP_METHODS = ${JSON.stringify(methods.map(([name]) => name), null, 2)} as const;`,
     `export const AHP_METHOD_DEFINITIONS = ${JSON.stringify(document['x-methods'], null, 2)} as const;`,
@@ -57,25 +61,22 @@ async function saveTypes(output: string, mode: GenerationOptions['mode']): Promi
   }
 }
 
-function literal(value: unknown): string { return JSON.stringify(value) }
-
-/** Emit the supported type vocabulary; unsupported references and unrecognized type cases throw. */
+/** Emit a TypeScript type from the schema vocabulary. Throw for unsupported references or type cases. */
 function emit(value: Schema, context: EmissionContext): string {
-  const { definitions, indentation } = context
   if (value === true) return 'unknown'
   if (value === false) return 'never'
   if (typeof value.$ref === 'string') {
-    const match = /^#\/\$defs\/([\w]+)$/.exec(value.$ref)
-    if (!match || !definitions[match[1]!]) throw new Error(`Unsupported reference ${value.$ref}`)
-    return match[1]!
+    const name = /^#\/\$defs\/(\w+)$/.exec(value.$ref)?.[1]
+    if (name === undefined || !context.definitions[name]) throw new Error(`Unsupported reference ${value.$ref}`)
+    return name
   }
-  if ('const' in value) return literal(value.const)
-  if (Array.isArray(value.enum)) return value.enum.map(literal).join(' | ')
-  const unionSeparator = indentation === undefined ? ' | ' : `\n${indentation}| `
-  const intersectionSeparator = indentation === undefined ? ' & ' : `\n${indentation}& `
-  if (!value.type && Array.isArray(value.oneOf)) return value.oneOf.map(v => `(${emit(v as Schema, context)})`).join(unionSeparator)
-  if (!value.type && Array.isArray(value.anyOf)) return value.anyOf.map(v => `(${emit(v as Schema, context)})`).join(unionSeparator)
-  if (!value.type && Array.isArray(value.allOf)) return value.allOf.map(v => `(${emit(v as Schema, context)})`).join(intersectionSeparator)
+  if ('const' in value) return JSON.stringify(value.const)
+  if (Array.isArray(value.enum)) return value.enum.map(entry => JSON.stringify(entry)).join(' | ')
+  if (!value.type) {
+    if (Array.isArray(value.oneOf)) return emitComposition(value.oneOf, '|', context)
+    if (Array.isArray(value.anyOf)) return emitComposition(value.anyOf, '|', context)
+    if (Array.isArray(value.allOf)) return emitComposition(value.allOf, '&', context)
+  }
   switch (value.type) {
     case 'string': return 'string'
     case 'integer': case 'number': return 'number'
@@ -87,12 +88,22 @@ function emit(value: Schema, context: EmissionContext): string {
   }
 }
 
+/** Parenthesize composed types so nesting preserves grouping and inherit the enclosing indentation. */
+function emitComposition(members: readonly Schema[], operator: '|' | '&', context: EmissionContext): string {
+  const { indentation } = context
+  const separator = indentation === undefined ? ` ${operator} ` : `\n${indentation}${operator} `
+  return members.map(member => `(${emit(member, context)})`).join(separator)
+}
+
 /** Own object-field optionality, index signatures and nested indentation for recursive emission. */
 function emitObject(value: Exclude<Schema, boolean>, { definitions, indentation }: EmissionContext): string {
   const required = new Set((value.required ?? []) as string[])
   const properties = (value.properties ?? {}) as Record<string, Schema>
   const nestedContext = { definitions, indentation: indentation === undefined ? undefined : `${indentation}    ` }
-  const fields = Object.entries(properties).map(([key, prop]) => `${literal(key)}${required.has(key) ? '' : '?'}: ${emit(prop, nestedContext)}`)
+  const fields = Object.entries(properties).map(([key, prop]) => {
+    const optional = required.has(key) ? '' : '?'
+    return `${JSON.stringify(key)}${optional}: ${emit(prop, nestedContext)}`
+  })
   if (typeof value.additionalProperties === 'object') fields.push(`[key: string]: ${emit(value.additionalProperties as Schema, nestedContext)}`)
   if (indentation !== undefined) return `{\n${indentation}  ${fields.join(`;\n${indentation}  `)}\n${indentation}}`
   return `{ ${fields.join('; ')} }`

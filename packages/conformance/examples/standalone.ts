@@ -1,5 +1,5 @@
 import { createClient } from '@anureo/sdk'
-import { createScriptedAdapter } from '../src/fake'
+import { createScriptedAdapter } from '@anureo/conformance/fake'
 
 // Runs a scripted backend without an account or model service.
 const client = await createClient({

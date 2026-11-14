@@ -1,8 +1,13 @@
-/** Checks pinned protocol schema provenance and version mappings; it must not regenerate or modify schemas. */
+/** Runs the read-only pinned schema checks for the package and CI. */
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+
+const legacyPin = { version: '0.148.0', revertDefinition: 'ThreadRollbackParams' } as const
+const modernPin = { version: '0.164.0', revertDefinition: 'ThreadRevertParams' } as const
+type SchemaPin = typeof legacyPin | typeof modernPin
+type SchemaDefinitions = Record<string, unknown>
 
 /** Minimum native request/item vocabulary needed by both supported profiles. */
 const requiredDefinitionNames = [
@@ -18,43 +23,66 @@ const requiredDefinitionNames = [
 const protocolRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'protocol')
 
 /**
- * For the sequential CLI checks, read one pinned version, verify provenance before interpreting its
- * definitions, and log success only after required vocabulary and revert mapping pass. Reject file/JSON
- * errors or the first invariant violation; never write protocol assets.
+ * Check one pin for the CLI. Verify its byte hash before parsing its definitions and print success
+ * after validation. A read, parse or validation failure rejects and halts the CLI before comparison.
  */
-async function checkPinnedSchema(version: string): Promise<void> {
-  const bytes = await readFile(path.join(protocolRoot, version, 'native.schema.json'))
-  const provenance = JSON.parse(await readFile(path.join(protocolRoot, version, 'provenance.json'), 'utf8')) as { subsetSha256: string }
-  if (createHash('sha256').update(bytes).digest('hex') !== provenance.subsetSha256) throw new Error(`${version}: fixed schema changed without updating provenance`)
+async function checkPinnedSchema(pin: SchemaPin): Promise<void> {
+  const { version } = pin
+  const bytes = await readSchemaBytes(pin)
+  const provenancePath = path.join(protocolRoot, version, 'provenance.json')
+  const provenance = JSON.parse(await readFile(provenancePath, 'utf8')) as { subsetSha256: string }
   // Hash the original bytes before parsing: equivalent JSON is still a change to a pinned asset.
-  const schema = JSON.parse(bytes.toString()) as { definitions: Record<string, unknown> }
-  for (const definitionName of requiredDefinitionNames) {
-    if (!schema.definitions[definitionName]) {
-      throw new Error(`${version}: missing ${definitionName}`)
-    }
+  const digest = createHash('sha256').update(bytes).digest('hex')
+  if (digest !== provenance.subsetSha256) {
+    throw new Error(`${version}: fixed schema changed without updating provenance`)
   }
-  const hasRevertParams = !!schema.definitions.ThreadRevertParams
-  const hasRollbackParams = !!schema.definitions.ThreadRollbackParams
-  // Each native line must expose exactly one boundary contract; the methods are not interchangeable.
-  const matchesExpectedVersion = hasRevertParams === (version === '0.164.0')
-  const hasExclusiveMapping = hasRevertParams !== hasRollbackParams
-  if (!matchesExpectedVersion || !hasExclusiveMapping) throw new Error(`${version}: unsafe revert/rollback mapping`)
+  validateDefinitions(pin, parseDefinitions(bytes))
   console.log(`${version}: schema hash and native mapping verified`)
 }
 
-/** For the post-validation comparison, read and parse one version's definitions without writes; filesystem/JSON errors reject. This read deliberately follows the provenance checks. */
-async function readSchemaDefinitions(version: string): Promise<Record<string, unknown>> {
-  const schema = JSON.parse(await readFile(path.join(protocolRoot, version, 'native.schema.json'), 'utf8'))
+/** Load raw bytes for verification and the later comparison, propagating filesystem errors. */
+function readSchemaBytes({ version }: SchemaPin): Promise<Buffer> {
+  return readFile(path.join(protocolRoot, version, 'native.schema.json'))
+}
+
+/** Decode one pinned UTF-8 schema and return its definitions for the checks or report. Invalid JSON throws. */
+function parseDefinitions(bytes: Buffer): SchemaDefinitions {
+  const schema = JSON.parse(bytes.toString('utf8')) as { definitions: SchemaDefinitions }
   return schema.definitions
 }
 
-/** After both checks succeed, reread pinned schemas in version order and print the watched method changes for CLI consumers. Reject read/JSON errors; no files are modified. */
-async function reportSchemaChanges(): Promise<void> {
-  const legacy = await readSchemaDefinitions('0.148.0')
-  const modern = await readSchemaDefinitions('0.164.0')
-  const watched = ['ThreadRollbackParams','ThreadRevertParams','ThreadSettingsUpdateParams','ThreadTurnsListParams','ThreadItemsListParams']
-  console.log(JSON.stringify({ addedIn0164: watched.filter(name => !legacy[name] && modern[name]), removedIn0164: watched.filter(name => legacy[name] && !modern[name]) }))
+/**
+ * For checkPinnedSchema, require the shared vocabulary before checking the pin's exclusive revert
+ * contract. Throw on the first violation.
+ */
+function validateDefinitions({ version, revertDefinition }: SchemaPin, definitions: SchemaDefinitions): void {
+  for (const definitionName of requiredDefinitionNames) {
+    if (!definitions[definitionName]) {
+      throw new Error(`${version}: missing ${definitionName}`)
+    }
+  }
+  const otherDefinition = revertDefinition === 'ThreadRevertParams' ? 'ThreadRollbackParams' : 'ThreadRevertParams'
+  if (!definitions[revertDefinition] || definitions[otherDefinition]) {
+    throw new Error(`${version}: unsafe revert/rollback mapping`)
+  }
 }
 
-for (const version of ['0.148.0', '0.164.0']) await checkPinnedSchema(version)
+/** Reread both schemas in version order after verification and print the watched method changes. Read and parse failures reject the CLI before the diff is printed. */
+async function reportSchemaChanges(): Promise<void> {
+  const legacy = parseDefinitions(await readSchemaBytes(legacyPin))
+  const modern = parseDefinitions(await readSchemaBytes(modernPin))
+  const watched = [
+    'ThreadRollbackParams',
+    'ThreadRevertParams',
+    'ThreadSettingsUpdateParams',
+    'ThreadTurnsListParams',
+    'ThreadItemsListParams',
+  ]
+  console.log(JSON.stringify({
+    addedIn0164: watched.filter(name => !legacy[name] && modern[name]),
+    removedIn0164: watched.filter(name => legacy[name] && !modern[name]),
+  }))
+}
+
+for (const pin of [legacyPin, modernPin]) await checkPinnedSchema(pin)
 await reportSchemaChanges()

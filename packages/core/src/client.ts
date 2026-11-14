@@ -1,4 +1,4 @@
-// Owns negotiation, open admission and client-wide resource release; must not process session events.
+// Owns adapter negotiation, session open admission and client-wide resource release.
 import { randomUUID } from 'node:crypto';
 import { AHP_PROTOCOL_CONTRACT, assertRequest, assertResult, supportsCapability,
   type AhpRequestMap, type Capabilities, type InteractionRequested, type SessionBinding, type SessionOpenParams } from '@anureo/protocol';
@@ -12,21 +12,18 @@ import { positive } from './lifecycle/limits';
 import { combined } from './lifecycle/errors';
 import { withStructuredOutput } from './structured-output/adapter';
 
-/** Preserve the client-module Session export for hosts consuming sessions returned by open methods. */
 export { Session } from './session';
-/** Preserve host configuration exports alongside the Client entry point; implementations live in client-options. */
 export type { ClientOptions, InteractionHandlers, SubmitOptions } from './client-options';
 
 /**
- * Host entry point owning an adapter and every admitted Session. createClient returns an initialized
- * instance; direct constructors require initialize before opens. Hosts must await dispose for
- * session-before-adapter release; native execution/observation policy remains with Session.
+ * Open and manage sessions through one adapter. Use createClient for an initialized client, or
+ * construct and initialize it explicitly. Await dispose to release owned sessions and the adapter.
  */
 export class Client {
   /**
-   * createClient and hosts constructing directly supply the owned adapter and host policy. Install
-   * structured-output wrapping without native I/O, then validate options; invalid identity, handlers
-   * or limits throw INVALID_PARAMS. Direct callers must initialize before opening and dispose later.
+   * Take ownership of the adapter without starting native I/O. Invalid identity, interaction
+   * registrations or retention limits throw INVALID_PARAMS. Direct callers must await initialize
+   * before opening sessions and later await dispose, including after failed initialization.
    */
   constructor(private readonly options: ClientOptions) {
     this.options = {
@@ -41,16 +38,16 @@ export class Client {
     this.createId = options.runtime?.createId ?? randomUUID;
     assertClientOptions(options);
   }
-  /** Give host consumers a fresh adapter/configuration identity; mutating this copy cannot change open-admission checks. */
+  /** Read a fresh copy of the adapter and runtime configuration IDs used to check session bindings. */
   get identity(): ClientOptions['identity'] {
     return { adapterId: this.options.identity.adapterId, runtimeConfigId: this.options.identity.runtimeConfigId };
   }
   /**
-   * createClient awaits this negotiation before returning; direct users await it before opens.
-   * Each call negotiates anew; callers must order initialization before opening sessions.
-   * Validate and store a detached frozen capability snapshot only if the caller wait succeeds.
-   * Protocol, adapter, abort and timeout failures reject; late initialization remains observed but
-   * does not store capabilities after a failed wait. Direct users retain disposal responsibility.
+   * Negotiate adapter capabilities before opening sessions. Each call invokes adapter negotiation
+   * once if admitted and stores the validated capability snapshot on success. The wait defaults to
+   * 30 seconds unless configured by runtime.requestTimeoutMs. Invalid waits, adapter or protocol
+   * failures, abort and timeout reject. A negotiation that finishes after a failed wait cannot update
+   * the client's capabilities. createClient awaits this method and handles cleanup on failure.
    */
   async initialize(wait?: RequestOptions): Promise<void> {
     if (invalidWait(wait)) throw new HarnessSdkError('INVALID_PARAMS');
@@ -65,54 +62,72 @@ export class Client {
     this.initialized = immutable(result.capabilities);
   }
   /**
-   * Hosts supplying their own request/binding IDs enter the same open path as sessions.create,
-   * resume and fork. Resolve only after native attachment and initial state publication; reject
-   * admission, wait or setup/cleanup failure. The returned Session remains owned by this client.
+   * Open with explicit request and binding IDs. Resolve with the client-owned Session after backend
+   * attachment and initial state publication. Invalid input, unsupported mode, setup or wait failure
+   * rejects. The attachment wait defaults to 120 seconds unless configured by runtime.openTimeoutMs.
+   * If the wait ends early, the SDK closes local observation and still releases a late backend.
    */
   openSession(params: SessionOpenParams, wait?: RequestOptions): Promise<Session> { return this.open(params, wait); }
   /**
-   * Hosts await this to release the client; createClient also awaits it after initialization failure.
-   * Close open admission immediately and share one promise across calls. Attempt every owned session
-   * disposal before adapter disposal, then clear ownership and reject aggregated release failures.
-   * Disposal ends local observation; it does not confirm native execution stopped.
+   * Release the client and its sessions. Stop admitting opens immediately and share the disposal
+   * promise across calls. Await all owned session disposal attempts before releasing the adapter.
+   * Reject with RESOURCE_RELEASE_FAILED if release fails. Disposal ends local observation and leaves
+   * native execution stop unconfirmed. An open that delivers a backend after teardown releases it
+   * on its own attachment path.
    */
   dispose(): Promise<void> {
-    return this.disposing ??= (async () => {
-      this.closed = true;
-      const results = await Promise.allSettled([...this.owned].map(session => session.dispose()));
-      // Adapter resources can underpin every session, so release them only after all session attempts settle.
-      results.push(...await Promise.allSettled([this.options.adapter.dispose()]));
-      this.owned.clear();
-      const failures = results.filter((value): value is PromiseRejectedResult => value.status === 'rejected');
-      if (failures.length) throw combined(failures.map(value => value.reason));
-    })();
+    return this.disposing ??= this.disposeOwnedResources();
   }
 
-  // Preserve state-field initialization before the sessions convenience object.
+  // TypeScript emits these as own fields. Keep their initialization order relative to sessions.
   private initialized?: Capabilities;
   private closed = false;
   private disposing?: Promise<void>;
   private readonly owned = new Set<Session>();
   private readonly createId: () => string;
-  /** Host convenience operations return the Session owned by open, or its admission/setup rejection; callers still dispose the client. */
+
+  /** Open sessions using generated request IDs and the same attachment wait and ownership as openSession. */
   readonly sessions = {
-    /** Generate request/session IDs for a new host session, then return open's attachment result or rejection; ID-source throws propagate synchronously. */
+    /** Open a new session with a fresh binding. A throwing ID generator fails the call synchronously. */
     create: (options: Omit<SessionOpenParams, 'requestId' | 'binding' | 'mode'>, wait?: RequestOptions) => this.open({
       ...options, mode: 'new', requestId: this.createId(),
-      binding: { ...this.options.identity, sessionId: this.createId() },
+      binding: this.newBinding(),
     }, wait),
-    /** Reopen a host resume reference with a fresh request ID; open rejects foreign/unsupported references or setup/wait failure. ID-source throws are synchronous. */
+    /** Reopen a saved session reference when supported. Foreign bindings reject and ID-generator throws propagate synchronously. */
     resume: (reference: { binding: SessionBinding; cwd: string }, wait?: RequestOptions) => this.open({ ...reference, mode: 'resume', requestId: this.createId() }, wait),
-    /** Reject a foreign source before generating IDs, then return open's fresh fork at the supplied boundary; ID-source throws are synchronous. */
+    /** Open a fresh session at a supported boundary in the referenced session. Foreign bindings reject before ID generation, which can throw synchronously. */
     fork: (reference: { binding: SessionBinding; cwd: string }, options: { boundary: AhpRequestMap['session/revert']['boundary'] }, wait?: RequestOptions) => {
       if (!matchesIdentity(reference.binding, this.options.identity)) return Promise.reject(new HarnessSdkError('SESSION_BINDING_MISMATCH'));
       return this.open({
         cwd: reference.cwd, mode: 'fork', requestId: this.createId(),
-        binding: { ...this.options.identity, sessionId: this.createId() },
+        binding: this.newBinding(),
         fork: { sourceSessionId: reference.binding.sessionId, nativeRef: reference.binding.nativeRef, boundary: options.boundary },
       }, wait);
     },
   };
+
+  /**
+   * sessions.create and sessions.fork use this for a fresh destination after generating the request
+   * ID. Snapshot the configured identity before invoking the host's session ID generator.
+   */
+  private newBinding(): SessionBinding {
+    return { ...this.options.identity, sessionId: this.createId() };
+  }
+
+  /**
+   * dispose caches this release attempt. Close admission before taking the session snapshot and
+   * keep the adapter alive until all session disposals settle. Report failures in session order,
+   * followed by the adapter failure, through the shared disposal promise.
+   */
+  private async disposeOwnedResources(): Promise<void> {
+    this.closed = true;
+    const sessions = await Promise.allSettled([...this.owned].map(session => session.dispose()));
+    const [adapter] = await Promise.allSettled([this.options.adapter.dispose()]);
+    this.owned.clear();
+    const failures = [...sessions, adapter].filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failures.length) throw combined(failures.map(failure => failure.reason));
+  }
+
   /**
    * openSession and sessions.create/resume/fork return this promise to hosts. Validate before
    * allocating a Session, then own it before native callbacks or disposal can race attachment.
@@ -162,10 +177,12 @@ export class Client {
   }
 }
 /**
- * Host factory returning a Client ready for session opens. Copy the option containers, construct and
- * await initialize; on initialization/wait failure, await disposal before rejecting the cause or
- * combined cleanup failure. Pre-aborted waits reject before construction. Successful callers own
- * the returned client and must await dispose; supplied callbacks keep their host-owned effects.
+ * Create and initialize a client before opening sessions. A pre-aborted wait rejects before the
+ * client takes ownership of the adapter. Once construction succeeds, initialization failure triggers
+ * disposal before rejection. The original cause is preserved unless disposal also fails, in which
+ * case both failures are reported as RESOURCE_RELEASE_FAILED. Await dispose on the returned client.
+ * createRefactorClient and createReviewClient return this promise to their CLI commands, which
+ * await disposal after the run and report output.
  */
 export async function createClient(options: ClientOptions, wait?: RequestOptions): Promise<Client> {
   if (wait?.signal?.aborted) throw new HarnessSdkError('REQUEST_ABORTED');

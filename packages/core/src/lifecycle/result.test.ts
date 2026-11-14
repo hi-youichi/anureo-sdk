@@ -1,4 +1,4 @@
-// Verifies retained-result accounting, ordering and isolation; must not implement Session admission or native execution.
+// Verifies retained-result accounting, ordering and isolation.
 import { expect, test } from 'bun:test';
 import type { AhpEvent, AhpEventPayload, Item, Usage } from '@anureo/protocol';
 import { ResultAccumulator } from './result';
@@ -123,13 +123,28 @@ test('terminal text follows first-seen final-message order and preserves empty s
   expect(Object.isFrozen(result.items)).toBe(true);
 });
 
-/** Exceed replacement bytes and new-item capacity separately; failed retention must preserve the existing snapshot. */
+/** Reject replacement bytes and new-item capacity separately, then verify the item still accepts deltas. */
 test('rejected authoritative snapshots leave retention and byte accounting unchanged', () => {
   const item: Item = { id: 'answer', type: 'agentMessage', phase: 'final', text: 'fits' };
-  const accumulator = new ResultAccumulator(bytes(item), 1);
+  const updated = { ...item, text: 'fits!' };
+  const second: Item = { id: 'r', type: 'reasoning' };
+  const accumulator = new ResultAccumulator(bytes(updated) + bytes(second), 1);
   accumulator.accept(event({ type: 'item/started', payload: { item } }));
-  expect(() => accumulator.accept(event({ type: 'item/completed', payload: { item: { ...item, text: 'too large' } } }))).toThrow('RESULT_BUDGET_EXCEEDED');
-  expect(() => accumulator.accept(event({ type: 'item/started', payload: { item: { id: 'r', type: 'reasoning' } } }))).toThrow('RESULT_BUDGET_EXCEEDED');
+  expect(() => accumulator.accept(event({ type: 'item/completed', payload: { item: { ...item, text: 'too large'.repeat(10) } } }))).toThrow('RESULT_BUDGET_EXCEEDED');
+  expect(() => accumulator.accept(event({ type: 'item/started', payload: { item: second } }))).toThrow('RESULT_BUDGET_EXCEEDED');
+  expect(accumulator.size).toBe(bytes(item));
+  expect(accumulator.finish(terminal).items).toEqual([item]);
+  accumulator.accept(event({ type: 'item/delta', payload: { itemId: item.id, kind: 'text', text: '!' } }));
+  expect(accumulator.size).toBe(bytes(updated));
+  expect(accumulator.finish(terminal).items).toEqual([updated]);
+});
+
+test('extension patches and text deltas for another item family leave retained content unchanged', () => {
+  const item: Item = { id: 'answer', type: 'agentMessage', phase: 'final', text: 'initial' };
+  const accumulator = new ResultAccumulator(1024, 10);
+  accumulator.accept(event({ type: 'item/started', payload: { item } }));
+  accumulator.accept(event({ type: 'item/delta', payload: { itemId: item.id, kind: 'patch', value: { custom: true }, text: 'ignored' } }));
+  accumulator.accept(event({ type: 'item/delta', payload: { itemId: item.id, kind: 'output', text: 'ignored' } }));
   expect(accumulator.size).toBe(bytes(item));
   expect(accumulator.finish(terminal).items).toEqual([item]);
 });

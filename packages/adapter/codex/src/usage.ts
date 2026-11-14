@@ -1,13 +1,13 @@
-/** Projects native token counters into public usage; session retention and aggregation belong to callers. */
+/** Projects native token counters into public usage snapshots. */
 import type { Usage } from '@anureo/protocol'
 import { record, type NativeRecord } from './native-values'
 
 /**
- * Copy finite nonnegative native token counters into AHP usage with the requested scope (turn by
- * default). Zero and fractional counters survive; missing/invalid counters remain absent and
- * totals are never inferred. CodexBackendSession.notification retains the last-turn projection
- * for turn/completed and publishes the session projection as usage/updated. Callers own retention
- * and aggregation; this performs neither mutation of the input nor I/O.
+ * Copy finite, nonnegative token counters into AHP usage for the supplied scope, defaulting to
+ * turn. Zero and fractions are valid. Missing or invalid counters stay absent, and the total
+ * is copied only when supplied and valid. The scope labels the sample without aggregating it.
+ * CodexBackendSession.notification retains last-turn usage for turn/completed when a turn is
+ * in scope and publishes cumulative usage as usage/updated.
  */
 export function mapUsage(value: unknown, scope: 'turn' | 'session' = 'turn'): Usage {
   const raw = record(value)
@@ -25,7 +25,7 @@ export function mapUsage(value: unknown, scope: 'turn' | 'session' = 'turn'): Us
   return usage
 }
 
-/** Read one counter for mapUsage without coercion or mutation; invalid counters stay absent rather than becoming invented zero totals. */
+/** Accept a numeric counter only when finite and nonnegative so measured zero stays distinct from absent data. */
 function nativeCounter(raw: NativeRecord, field: string): number | undefined {
   return typeof raw[field] === 'number' && Number.isFinite(raw[field]) && (raw[field] as number) >= 0
     ? raw[field] as number

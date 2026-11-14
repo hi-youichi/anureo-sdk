@@ -58,8 +58,9 @@ test('help and argument errors never initialize a backend', async () => {
   const dependencies = { ...io, createClient: async () => { opened++; throw new Error('Must not open') } }
   expect(await runCli(['--help'], dependencies)).toBe(0)
   expect(io.read().stdout).toContain('Usage: anureo-review')
+  expect(await runCli(['--help', '--harness', 'missing'], dependencies)).toBe(0)
   for (const args of [
-    ['--unknown'], ['--concurrency', '0'], ['--concurrency', '1.5'], ['a', 'b'],
+    ['--unknown'], ['--help', '--unknown'], ['--concurrency', '0'], ['--concurrency', '1.5'], ['a', 'b'],
     ['--max-modules', '0'], ['--max-modules', '1.5'], ['--module', ' '],
     ['--module', 'a', '--module', 'a'], ['--angle', 'missing'],
     ['--angle', 'correctness', '--angle', 'correctness'],
@@ -67,6 +68,9 @@ test('help and argument errors never initialize a backend', async () => {
   ]) {
     expect(await runCli(args, dependencies)).toBe(2)
   }
+  const duplicateAngle = output()
+  expect(await runCli(['--angle', 'missing', '--angle', 'missing'], { ...dependencies, ...duplicateAngle })).toBe(2)
+  expect(duplicateAngle.read().stderr).toContain('--angle requires unique angle ids')
   expect(opened).toBe(0)
 })
 
@@ -138,9 +142,10 @@ test.each([false, true])('CLI prints JSON separately from progress, disposes cli
   const io = output()
   const code = await runCli([cwd, '--json', '--model', 'test-model', '--focus', 'Test focus', '--concurrency', '1'], { ...io, createClient: async () => client })
   expect(code).toBe(hasFindings ? 1 : 0)
-  expect(JSON.parse(io.read().stdout).status).toBe('completed')
+  const report = JSON.parse(io.read().stdout)
+  expect(report.status).toBe('completed')
   expect(io.read().stderr).toContain('[analysis] started')
-  expect(io.read().stderr).toContain(`[workflow] ${JSON.parse(io.read().stdout).runId}`)
+  expect(io.read().stderr).toContain(`[workflow] ${report.runId}`)
   expect(io.read().stderr).toContain('[a/correctness] completed')
   expect(adapter.opened.every(session => session.model === 'test-model')).toBe(true)
   expect(adapter.disposeCount).toBe(1)

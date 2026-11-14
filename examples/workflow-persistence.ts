@@ -13,19 +13,25 @@ const schema = z.strictObject({ answer: z.string() })
 const adapter = createScriptedAdapter()
 const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: 'example' } })
 try {
+  /**
+   * The pipeline invokes this stage for each question. The scripted adapter echoes the prompt,
+   * so encode a schema-valid answer as that prompt. Return the answer or null on a drop.
+   * Pipeline keeps a null slot on rejection, while workflow still observes fatal agent failures.
+   */
+  const answerQuestion = async (question: string) => {
+    const prompt = JSON.stringify({ answer: `answered: ${question}` })
+    const output = await agent(prompt, { client, cwd: process.cwd(), schema })
+    return output === null ? null : output.answer
+  }
+
+  // Resume runs this body again so the journal can match each agent call in invocation order.
   const result = await workflow({
     name: 'agent-journal', revision: '1', directory: resolve('.anureo/workflows'),
     input: { questions: ['Map the modules.', 'List risky files.'] },
     resumeFrom: process.argv[2],
-  }, /** Rerun on resume to match calls in order; fatal journal failures still reject workflow. */ async run => {
+  }, async run => {
     console.log(`Run: ${run.runId}`)
-    return pipeline(run.input.questions, /** Decode scripted answers; pipeline retains null slots for rejected or dropped stages. */ async question => {
-      // The scripted backend echoes the prompt as its final message, so the
-      // prompt text doubles as the schema-valid JSON answer.
-      const prompt = JSON.stringify({ answer: `answered: ${question}` })
-      const output = await agent(prompt, { client, cwd: process.cwd(), schema })
-      return output === null ? null : output.answer
-    })
+    return pipeline(run.input.questions, answerQuestion)
   })
   console.log(JSON.stringify(result))
   console.log(`Sessions opened: ${adapter.opened.length}`)

@@ -3,22 +3,20 @@ import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createClient, HarnessSdkError, type Client } from '@anureo/sdk'
+import { createClient, HarnessSdkError, type Client, type SessionEventSink } from '@anureo/sdk'
 import { createScriptedAdapter, type FakeAdapterOptions } from '@anureo/conformance'
 import type { JsonObject } from '@anureo/protocol'
 import type { ModulePlan } from '../src/schema'
 
-/** Routing convention for scripted responses: `respond` receives the full prompt
- * text; route on the stage prefixes below (stages.analyze / stages.fix /
- * stages.verify) and on the module's compact JSON marker via isModule(id).
- * Prompt-building changes in src must update these keys. */
+/** Prefixes for routing fixture responses by stage in analysis and fix tests. */
 export const stages = { analyze: 'Analyze', fix: 'Fix these review findings', verify: 'Verify' } as const
 /** Recognize analysis submissions when routing fixture responses. */
 export const isAnalysis = (prompt: string) => prompt.startsWith(stages.analyze)
 /** Build a predicate for the compact module JSON embedded in review/verification prompts. */
 export const isModule = (id: string) => (prompt: string) => prompt.includes(`"id":"${id}"`)
 
-/** Captured-IO recorder matching the CliDependencies stdout/stderr seam. */
+/** Capture CLI output in separate streams. Pass the callbacks to runCli and read the joined text
+ * after it settles. Reading leaves the recorded writes available for later assertions. */
 export function output() {
   const stdout: string[] = []
   const stderr: string[] = []
@@ -42,12 +40,13 @@ export const finding = {
   file: 'a.ts', lineStart: 1, lineEnd: 1,
 }
 
-/** Create two temporary source files and an initialized scripted client for review, fix and CLI tests.
- * The adapter invokes respond with captured full prompts when turns are submitted after setup, so
- * the callback may reference this fixture's returned context. Defaults to plan plus empty reviews;
- * returning HarnessSdkError emits a failed turn, while other values become JSON agent messages.
- * Setup failures reject. This module's afterEach disposes clients and removes directories; tests must
- * settle their runs first. Hooks customize adapter capabilities/session opening, not turn execution. */
+/** Create a temporary two-file source tree and an initialized scripted client for review, fix and
+ * CLI tests. The submission hook awaits respond with the captured prompt and session directory.
+ * By default it returns the fixture plan for analysis and empty findings for other submissions.
+ * A returned HarnessSdkError emits a failed turn. Other values are serialized as final JSON text.
+ * A thrown or rejected response fails submission. The optional hooks configure capabilities and
+ * session opening. Setup failures reject. Settle all runs before the test cleanup hook disposes
+ * fixture clients and removes their source directories. */
 export async function fixture(
   respond: (prompt: string, sessionCwd: string) => unknown | Promise<unknown> = prompt => isAnalysis(prompt) ? plan : { findings: [] },
   hooks: Omit<FakeAdapterOptions, 'execute'> = {},
@@ -65,18 +64,8 @@ export async function fixture(
     await sink.emit({ type: 'turn/started', payload: { turnId } })
     const session = adapter.opened.find(open => open.binding.sessionId === sessionId)
     if (!session) throw new Error('Fixture submission has no session')
-    const output = await respond(prompt, session.cwd)
-    if (output instanceof HarnessSdkError) {
-      await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: {
-        code: output.code, message: output.message, retryable: output.retryable, outcomeUnknown: output.outcomeUnknown,
-        ...(output.details === undefined ? {} : { details: output.details as JsonObject }),
-      } } })
-    } else {
-      await sink.emit({ type: 'item/completed', payload: { item: {
-        id: randomUUID(), type: 'agentMessage', phase: 'final', text: JSON.stringify(output),
-      } } }, { turnId })
-      await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'completed' } })
-    }
+    const response = await respond(prompt, session.cwd)
+    await publishFixtureResult(sink, turnId, response)
     return { submissionId, accepted: true, disposition: 'started', turnId }
   } })
   const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: randomUUID() } })
@@ -84,13 +73,33 @@ export async function fixture(
   return { client, cwd, adapter, prompts }
 }
 
+/** Publish the scripted turn outcome before the submission hook returns its acceptance receipt.
+ * Preserve SDK error metadata for workflow failure tests. Serialization and sink failures reject
+ * the submission hook. */
+async function publishFixtureResult(sink: SessionEventSink, turnId: string, response: unknown): Promise<void> {
+  if (response instanceof HarnessSdkError) {
+    await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: {
+      code: response.code, message: response.message, retryable: response.retryable, outcomeUnknown: response.outcomeUnknown,
+      ...(response.details === undefined ? {} : { details: response.details as JsonObject }),
+    } } })
+    return
+  }
+  await sink.emit({ type: 'item/completed', payload: { item: {
+    id: randomUUID(), type: 'agentMessage', phase: 'final', text: JSON.stringify(response),
+  } } }, { turnId })
+  await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'completed' } })
+}
+
 const clients: Client[] = []
 const directories: string[] = []
 
-afterEach(async () => {
-  // Dispose failures must neither skip directory cleanup nor mask the test's result.
+afterEach(cleanupFixtures)
+
+/** Release tracked clients before removing source directories, even when a client's disposal
+ * rejects. Bun invokes this after each test. Disposal rejections are logged after both settle. */
+async function cleanupFixtures(): Promise<void> {
   const disposed = await Promise.allSettled(clients.splice(0).map(client => client.dispose()))
   await Promise.allSettled(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true })))
   const failed = disposed.filter(result => result.status === 'rejected')
   if (failed.length > 0) console.error('cleanup dispose failures:', failed.map(result => String(result.reason)))
-})
+}

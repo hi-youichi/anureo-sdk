@@ -18,13 +18,13 @@ import type { SessionMethod } from "../ports";
 export function guardRequest<M extends SessionMethod>(method: M, params: AhpRequestMap[M], sessionId: string, capabilities: Capabilities): void {
   assertRequest(method, params);
   if (params.sessionId !== sessionId) throw new HarnessSdkError("SESSION_BINDING_MISMATCH");
-  guardOperationCapability(method, params, capabilities);
-  guardSubmissionCapability(method, params, capabilities);
-  guardSessionConfigCapability(method, params, capabilities);
+  if (!supportsOperation(method, params, capabilities)) throwCapabilityUnsupported();
+  if (method === "input/submit") guardSubmissionCapability(params as AhpRequestMap["input/submit"], capabilities);
+  if (method === "session/config/set") guardSessionConfigCapability((params as AhpRequestMap["session/config/set"]).patch, capabilities);
 }
 
 /**
- * guardOperationCapability, guardSubmissionCapability and guardSessionConfigCapability throw through
+ * guardRequest, guardSubmissionCapability and guardSessionConfigCapability throw through
  * this shared policy to guardRequest. Always throw a code-only SDK failure without exposing rejected
  * capability details; the calling admission path owns propagation and any prior resource cleanup.
  */
@@ -33,49 +33,40 @@ function throwCapabilityUnsupported(): never {
 }
 
 /**
- * guardRequest calls this after shape/binding checks and before submission/config policy. Return void
- * for supported or unrestricted methods; throw CAPABILITY_UNSUPPORTED for missing method support,
- * including session interruption's optional queued-work cancellation. Never dispatch or mutate state.
+ * guardRequest checks operation support after shape and binding, before submission or config policy.
+ * Unrestricted methods pass. Session interruption also requires opt-in support for cancelling queued
+ * inputs when the caller requests it. A false result becomes CAPABILITY_UNSUPPORTED in guardRequest.
  */
-function guardOperationCapability<M extends SessionMethod>(method: M, params: AhpRequestMap[M], capabilities: Capabilities): void {
+function supportsOperation<M extends SessionMethod>(method: M, params: AhpRequestMap[M], capabilities: Capabilities): boolean {
   switch (method) {
     case "turn/steer":
-      if (!capabilities.input?.steer?.atomicMatch) throwCapabilityUnsupported();
-      return;
+      return Boolean(capabilities.input?.steer?.atomicMatch);
     case "turn/interrupt":
-      if (!capabilities.input?.interrupt?.targets.includes("turn")) throwCapabilityUnsupported();
-      return;
+      return capabilities.input?.interrupt?.targets.includes("turn") ?? false;
     case "session/revert":
-      if (!supportsCapability(capabilities, "session.revert", (params as AhpRequestMap["session/revert"]).scope)) throwCapabilityUnsupported();
-      return;
+      return supportsCapability(capabilities, "session.revert", (params as AhpRequestMap["session/revert"]).scope);
     case "history/read":
-      if (!supportsCapability(capabilities, "session.history")) throwCapabilityUnsupported();
-      return;
+      return supportsCapability(capabilities, "session.history");
     case "goal/set":
     case "goal/clear":
-      if (!supportsCapability(capabilities, "goal.actions", method.split("/")[1])) throwCapabilityUnsupported();
-      return;
+      return supportsCapability(capabilities, "goal.actions", method.split("/")[1]);
     case "compact/start":
-      if (!capabilities.compact) throwCapabilityUnsupported();
-      return;
+      return Boolean(capabilities.compact);
     case "review/start":
-      if (!capabilities.review) throwCapabilityUnsupported();
-      return;
+      return Boolean(capabilities.review);
     case "session/interrupt":
-      if (!capabilities.input?.interrupt?.targets.includes("session")) throwCapabilityUnsupported();
-      if ((params as AhpRequestMap["session/interrupt"]).cancelQueued && !capabilities.input?.interrupt?.cancelQueued) throwCapabilityUnsupported();
-      return;
+      return Boolean(capabilities.input?.interrupt?.targets.includes("session")
+        && (!(params as AhpRequestMap["session/interrupt"]).cancelQueued || capabilities.input?.interrupt?.cancelQueued));
+    default:
+      return true;
   }
 }
 
 /**
- * guardRequest calls this after operation policy. For input/submit, check delivery, output schema,
- * modalities (defaulting to text) and override names in that order; other methods need no check here.
- * Return void or throw CAPABILITY_UNSUPPORTED before dispatch, without changing params or capabilities.
+ * guardRequest checks input/submit delivery, output schema, modalities and override names in that
+ * order. Omitted input modalities allow text only. An unsupported option throws CAPABILITY_UNSUPPORTED.
  */
-function guardSubmissionCapability<M extends SessionMethod>(method: M, params: AhpRequestMap[M], capabilities: Capabilities): void {
-  if (method !== "input/submit") return;
-  const submission = params as AhpRequestMap["input/submit"];
+function guardSubmissionCapability(submission: AhpRequestMap["input/submit"], capabilities: Capabilities): void {
   if (!capabilities.input?.delivery.includes(submission.delivery)) throwCapabilityUnsupported();
   if (submission.outputSchema !== undefined && !capabilities.turn?.outputSchema) throwCapabilityUnsupported();
   const modalities = capabilities.turn?.inputModalities ?? ["text"];
@@ -87,11 +78,9 @@ function guardSubmissionCapability<M extends SessionMethod>(method: M, params: A
  * guardRequest calls this last. For session/config/set, visit patch entries in property order and
  * require a session-scoped advertised option before validating its value. Throw CAPABILITY_UNSUPPORTED
  * for an unknown/non-session option or INVALID_PARAMS for a schema mismatch; the first failing entry
- * wins. Return void for valid patches/other methods, without applying config or dispatching work.
+ * wins. Applying the validated patch remains the responsibility of the request implementation.
  */
-function guardSessionConfigCapability<M extends SessionMethod>(method: M, params: AhpRequestMap[M], capabilities: Capabilities): void {
-  if (method !== "session/config/set") return;
-  const patch = (params as AhpRequestMap["session/config/set"]).patch;
+function guardSessionConfigCapability(patch: AhpRequestMap["session/config/set"]["patch"], capabilities: Capabilities): void {
   for (const [key, value] of Object.entries(patch)) {
     const option = capabilities.config?.options.find((entry) => entry.id === key && entry.scope === "session");
     if (!option) throwCapabilityUnsupported();

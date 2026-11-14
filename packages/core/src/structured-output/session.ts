@@ -1,4 +1,4 @@
-// Owns per-session output admission, association and commitment. Adapter initialization and the shared bridge listener belong to other layers.
+// Owns per-session output admission, execution association, publication and revocation.
 import { randomBytes } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { assertEvent, type AhpEventPayload, type AhpRequestMap, type AhpResultMap, type Capabilities, type HarnessError, type Item, type JsonSchema, type SessionOpenParams, type SessionState } from '@anureo/protocol'
@@ -31,7 +31,7 @@ export class OutputSession implements BackendSession {
     this.limits = input.limits
     this.forget = input.forget
   }
-  /** Session.attach reads the native binding after open. validateEnvelope uses the requested identity during early native callbacks before attachment. */
+  /** Session.attach reads the native binding after open. validateEnvelope uses the requested identity until the native backend is available. */
   get binding() { return this.backend?.binding ?? this.params.binding }
   /** Session.attach adopts this capability projection. The native tool or MCP lease can supply schema support without mutating backend capabilities. */
   get capabilities(): Capabilities { return this.projectCapabilities(this.backend?.capabilities ?? {}) }
@@ -40,8 +40,9 @@ export class OutputSession implements BackendSession {
   /**
    * withStructuredOutput's openSession port awaits this before Client.attachSession receives the
    * wrapper. Prepare an optional bridge before native open, then adopt the backend and its active
-   * turns. Bridge preparation failures normally publish a warning and continue; cleanup or warning
-   * failures reject. A backend arriving after disposal is released before SESSION_CLOSED rejection.
+   * turns. A reserved bridge name, lease cleanup failure or warning publication failure rejects
+   * setup. Other bridge preparation failures warn and continue. If disposal wins the open race,
+   * await native release and reject with its failure or SESSION_CLOSED.
    * nativeOutput is the initialization negotiation result, used only to decide bridge preparation;
    * per-session capabilities decide submission mode. Native-open and release failures reject to the
    * adapter wrapper, which owns setup cleanup.
@@ -59,25 +60,22 @@ export class OutputSession implements BackendSession {
   }
   /**
    * Session.invokeRequest invokes this BackendSession port; Session.executeRequest validates and
-   * projects its result without retry. Prepare output policy, dispatch once with native validation and
-   * late receipt binding, then project the result or release output resources on close. Failures
+   * projects its result. Prepare output policy, check the transformed request against native
+   * capabilities, and dispatch once. Bind any receipt turn before returning. A native close
+   * receipt revokes output admission before the wrapper returns to Session. Failures
    * reclaim only definitely rejected, unbound submissions and preserve safe cleanup diagnostics.
    * Session owns request replay, caller wait cancellation and native-result validation. These waits
    * never release a live output lane.
    */
   async execute<M extends SessionMethod>(method: M, original: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
     if (this.disposed || !this.backend) throw new HarnessSdkError('SESSION_CLOSED')
-    let params = structuredClone(original)
+    const params = structuredClone(original)
     if (this.locked && ['input/submit', 'review/start', 'compact/start', 'session/config/set', 'session/revert'].includes(method)) throw new HarnessSdkError('STRUCTURED_OUTPUT_BUSY')
     let submissionId: string | undefined
     try {
       submissionId = requestSubmissionId(method, params)
-      const prepared = await this.prepareSubmission(method, params)
-      params = prepared.params
-      submissionId = prepared.submissionId ?? submissionId
-      if (Buffer.byteLength(JSON.stringify(params)) > (this.limits.queue?.maxFrameBytes ?? 8 * 1024 * 1024)) throw new HarnessSdkError('FRAME_TOO_LARGE')
-      guardRequest(method, params, this.binding.sessionId, this.backend.capabilities)
-      const result = await this.backend.execute(method, params)
+      const prepared = await this.prepareSubmission(method, params, submissionId)
+      const result = await this.dispatch(method, prepared, this.backend)
       if (submissionId && result && typeof result === 'object' && 'turnId' in result && typeof result.turnId === 'string') {
         const boundSubmissionId = submissionId
         await this.enqueue(() => this.bind(boundSubmissionId, result.turnId as string))
@@ -127,6 +125,18 @@ export class OutputSession implements BackendSession {
   private readonly manager: OutputBridgeManager
   private readonly limits: OutputLimits
   private readonly forget: () => void
+
+  /**
+   * execute calls this after preparing the request. Validate its frame size, protocol shape and
+   * native binding and capabilities before dispatch. Return the native promise directly so the close
+   * continuation can revoke output admission as soon as its receipt arrives.
+   */
+  private dispatch<M extends SessionMethod>(method: M, params: AhpRequestMap[M], backend: BackendSession): Promise<AhpResultMap[M]> {
+    if (Buffer.byteLength(JSON.stringify(params)) > (this.limits.queue?.maxFrameBytes ?? 8 * 1024 * 1024)) throw new HarnessSdkError('FRAME_TOO_LARGE')
+    guardRequest(method, params, this.binding.sessionId, backend.capabilities)
+    return backend.execute(method, params)
+  }
+
   /**
    * open awaits this only for an attested MCP transport. Retain a lease and its private credentials
    * before returning augmented native-open params. A reserved name rejects before allocation; other
@@ -152,8 +162,9 @@ export class OutputSession implements BackendSession {
   }
   /**
    * open supplies these callbacks to the native adapter, which may invoke them before attachment.
-   * Route events/bindings through serialized output policy and forward interactions directly to
-   * Session. tryEmit reports only synchronous admission; later rejection is reported through fail.
+   * Route events and bindings through serialized output policy. Session handles interactions and
+   * direct failure reports. tryEmit returns false when admission throws and forwards both immediate
+   * and asynchronous failures to Session.fail.
    */
   private nativeSink(): SessionEventSink {
     return {
@@ -221,11 +232,22 @@ export class OutputSession implements BackendSession {
    */
   private emit(event: AhpEventPayload, scope: EventScope = {}): Promise<void> {
     const bytes = Buffer.byteLength(JSON.stringify(event))
-    if (bytes > (this.limits.queue?.maxFrameBytes ?? 8 * 1024 * 1024) || this.queuedBytes + this.heldBytes + bytes > (this.limits.queue?.maxBytes ?? 16 * 1024 * 1024) || this.queuedEvents + this.heldCount >= (this.limits.queue?.maxEvents ?? 2048)) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED')
+    if (
+      bytes > (this.limits.queue?.maxFrameBytes ?? 8 * 1024 * 1024)
+      || this.queuedBytes + this.heldBytes + bytes > (this.limits.queue?.maxBytes ?? 16 * 1024 * 1024)
+      || this.queuedEvents + this.heldCount >= (this.limits.queue?.maxEvents ?? 2048)
+    ) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED')
     const copy = structuredClone({ event, scope })
-    this.queuedBytes += bytes; this.queuedEvents++
+    this.queuedBytes += bytes
+    this.queuedEvents++
     const operation = this.enqueue(() => this.accept(copy))
-    return operation.catch(async cause => { await this.sink.fail(cause); throw cause }).finally(() => { this.queuedBytes -= bytes; this.queuedEvents-- })
+    return operation.catch(async cause => {
+      await this.sink.fail(cause)
+      throw cause
+    }).finally(() => {
+      this.queuedBytes -= bytes
+      this.queuedEvents--
+    })
   }
   /**
    * routeEarlyEvent awaits this after publishing submission/bound, while execute queues it
@@ -236,29 +258,36 @@ export class OutputSession implements BackendSession {
   private async bind(submissionId: string, turnId: string): Promise<void> {
     this.unresolved.delete(submissionId)
     const output = this.outputs.get(submissionId)
-    if (output) {
-      if (output.turnId && output.turnId !== turnId) throw new HarnessSdkError('PROTOCOL_ERROR', 'Conflicting structured output binding')
-      const endedAt = this.terminalVersions.get(turnId)
-      if (endedAt !== undefined) {
-        if (output.admittedVersion >= endedAt) throw new HarnessSdkError('PROTOCOL_ERROR', 'Structured submission bound to an earlier execution')
-        // Equal-schema native inputs can acquire their shared binding after that execution ended.
-        this.drop(submissionId)
-        return
-      }
-      output.turnId = turnId
-      const previous = this.byTurn.get(turnId)
-      if (previous && !isDeepStrictEqual(previous.schema.schema, output.schema.schema)) previous.error = failure('STRUCTURED_OUTPUT_BINDING_CONFLICT')
-      else this.byTurn.set(turnId, previous ?? output)
-    }
+    if (output && this.associateOutput(output, turnId) === 'already-ended') return
     // Receipt-only backends can bind after emitting all their execution events.
     const held = this.pending.get(turnId)
-    if (held) {
-      this.pending.delete(turnId)
-      for (const envelope of held) {
-        this.heldCount--; this.heldBytes -= Buffer.byteLength(JSON.stringify(envelope.event))
-        await this.accept(envelope)
-      }
+    if (!held) return
+    this.pending.delete(turnId)
+    for (const envelope of held) {
+      this.heldCount--
+      this.heldBytes -= Buffer.byteLength(JSON.stringify(envelope.event))
+      await this.accept(envelope)
     }
+  }
+  /**
+   * bind uses this decision before replaying held events. A late binding from an input admitted
+   * before the terminal can share that ended execution and is reclaimed immediately. Binding a
+   * newer input to an ended execution or changing an existing binding throws PROTOCOL_ERROR.
+   * Record competing schemas on the first output so a native success reports the conflict.
+   */
+  private associateOutput(output: Output, turnId: string): 'associated' | 'already-ended' {
+    if (output.turnId && output.turnId !== turnId) throw new HarnessSdkError('PROTOCOL_ERROR', 'Conflicting structured output binding')
+    const endedAt = this.terminalVersions.get(turnId)
+    if (endedAt !== undefined) {
+      if (output.admittedVersion >= endedAt) throw new HarnessSdkError('PROTOCOL_ERROR', 'Structured submission bound to an earlier execution')
+      this.drop(output.submissionId)
+      return 'already-ended'
+    }
+    output.turnId = turnId
+    const previous = this.byTurn.get(turnId)
+    if (previous && !isDeepStrictEqual(previous.schema.schema, output.schema.schema)) previous.error = failure('STRUCTURED_OUTPUT_BINDING_CONFLICT')
+    else this.byTurn.set(turnId, previous ?? output)
+    return 'associated'
   }
   /**
    * The state getter, accept, routeEarlyEvent, publishOutput and execute project values
@@ -267,7 +296,7 @@ export class OutputSession implements BackendSession {
    * still owns projection of marked user secrets and any host history policy.
    */
   private redact<T>(value: T): T {
-    /** Recursively project bridge secrets from string values while preserving non-string values and object keys. */
+    /** Rebuild JSON-shaped values so bridge redaction leaves retained source data untouched. */
     const visit = (node: unknown): unknown => {
       if (typeof node === 'string') {
         let text = node.replace(/anureo_output_[a-f0-9]{48}/g, '[redacted]')
@@ -381,8 +410,11 @@ export class OutputSession implements BackendSession {
   private holdForBinding(event: AhpEventPayload, scope: EventScope, turnId: string | undefined, output: Output | undefined): boolean {
     const needsBinding = !output && [...this.outputs.values()].some(value => !value.turnId)
     if (turnId && needsBinding && (event.type.startsWith('item/') || event.type === 'turn/completed')) {
-      const held = this.pending.get(turnId) ?? []; held.push({ event, scope }); this.pending.set(turnId, held)
-      this.heldCount++; this.heldBytes += Buffer.byteLength(JSON.stringify(event))
+      const held = this.pending.get(turnId) ?? []
+      held.push({ event, scope })
+      this.pending.set(turnId, held)
+      this.heldCount++
+      this.heldBytes += Buffer.byteLength(JSON.stringify(event))
       return true
     }
     return false
@@ -448,15 +480,28 @@ export class OutputSession implements BackendSession {
     }
     if (output && event.payload.status === 'completed') event = await this.publishOutput(event, output, turnId)
     if (output && event.payload.status !== 'completed') await this.publishCommentaryFinals(output, turnId)
-    this.active.delete(event.payload.turnId)
-    this.terminalVersions.set(event.payload.turnId, ++this.terminalVersion)
-    if (this.terminalVersions.size > (this.limits.maxSubmissions ?? 1024)) this.terminalVersions.delete(this.terminalVersions.keys().next().value!)
-    if (output) {
-      for (const [id, value] of this.outputs) if (value.turnId === turnId) this.drop(id)
-      this.byTurn.delete(event.payload.turnId)
-      if (this.locked?.turnId === turnId) this.locked = undefined
-    }
+    this.recordTerminal({ terminalTurnId: event.payload.turnId, associatedTurnId: turnId, output })
     return event
+  }
+  /**
+   * completeTurn records the native terminal after tool cleanup and item publication succeed.
+   * Bound the terminal markers used by late binding and reclaim the associated submissions and lane.
+   * Use the payload ID for active, terminal and turn-index records. Match retained candidates and
+   * the lane using the envelope's resolved association ID.
+   */
+  private recordTerminal({ terminalTurnId, associatedTurnId, output }: {
+    terminalTurnId: string; associatedTurnId: string | undefined; output: Output | undefined
+  }): void {
+    this.active.delete(terminalTurnId)
+    this.terminalVersions.set(terminalTurnId, ++this.terminalVersion)
+    if (this.terminalVersions.size > (this.limits.maxSubmissions ?? 1024)) {
+      const oldest = this.terminalVersions.keys().next()
+      if (!oldest.done) this.terminalVersions.delete(oldest.value)
+    }
+    if (!output) return
+    for (const [id, value] of this.outputs) if (value.turnId === associatedTurnId) this.drop(id)
+    this.byTurn.delete(terminalTurnId)
+    if (this.locked?.turnId === associatedTurnId) this.locked = undefined
   }
   /**
    * completeTurn awaits this only for native success with output state. Convert validation failures
@@ -479,7 +524,10 @@ export class OutputSession implements BackendSession {
     }
     if (text !== undefined) {
       const original = output.mode === 'native' && output.finalItems.size === 1 ? [...output.finalItems.values()][0] : undefined
-      for (const item of output.finalItems.values()) if (item.id !== original?.id) await this.sink.emit({ type: 'item/completed', payload: { item: { ...item, phase: 'commentary' } } }, { turnId })
+      // Skip an await when there is no commentary to publish before the final.
+      for (const item of output.finalItems.values()) {
+        if (item.id !== original?.id) await this.emitCommentaryFinal(item, turnId)
+      }
       const item: Item = { ...(original ?? { id: `anureo-result:${randomBytes(24).toString('hex')}`, type: 'agentMessage' }), phase: 'final', text, status: 'completed' }
       await this.sink.emit({ type: 'item/completed', payload: { item } }, { turnId })
     }
@@ -496,13 +544,19 @@ export class OutputSession implements BackendSession {
     throw new HarnessSdkError(output.attempts ? 'STRUCTURED_OUTPUT_INVALID' : 'STRUCTURED_OUTPUT_MISSING')
   }
   /**
-   * completeTurn awaits this for failed/interrupted terminals. Emit retained native items as
-   * commentary in insertion order. publishOutput keeps its successful publication loop inline so
-   * an empty commentary set adds no promise turn. Publication failures reject the
-   * calling terminal path, which still owns association and lock cleanup.
+   * completeTurn awaits this for non-success terminals, including failures from final validation.
+   * Emit retained native items as commentary in insertion order. Publication failures reject before
+   * completeTurn records the terminal and reclaims its associations.
    */
   private async publishCommentaryFinals(output: Output, turnId: string | undefined): Promise<void> {
-    for (const item of output.finalItems.values()) await this.sink.emit({ type: 'item/completed', payload: { item: { ...item, phase: 'commentary' } } }, { turnId })
+    for (const item of output.finalItems.values()) await this.emitCommentaryFinal(item, turnId)
+  }
+  /**
+   * publishOutput and publishCommentaryFinals await Session.emit directly. Preserve the native
+   * item identity while emitting commentary, and let publication failure halt the terminal path.
+   */
+  private emitCommentaryFinal(item: Extract<Item, { type: 'agentMessage' }>, turnId: string | undefined): Promise<void> {
+    return this.sink.emit({ type: 'item/completed', payload: { item: { ...item, phase: 'commentary' } } }, { turnId })
   }
   /**
    * prepareBridge registers a queued handler with OutputBridgeManager.create. The manager's MCP
@@ -525,10 +579,11 @@ export class OutputSession implements BackendSession {
   }
   /**
    * submitValue formats this decision for MCP. prepareOutput supplies the native tool port with a
-   * queued callback capturing the exact Output, which the adapter invokes for candidate calls. Check
-   * lifecycle, deduplication, size and schema in order, retaining a clone only on first acceptance.
-   * Return safe rejection decisions for policy failures. Cloning/infrastructure failures can throw
-   * through the callback. Acceptance remains provisional until completeTurn's privacy revalidation.
+   * queued callback capturing the exact Output. Pi's createOutputTool awaits it and translates
+   * acceptance into a termination request or returns an error for correction. A structurally equal
+   * retry is accepted without storing a second value. The third schema mismatch before acceptance
+   * exhausts retries. Return policy failures as decisions, while clone failure rejects the callback.
+   * Acceptance remains provisional until publishOutput revalidates the projected result.
    */
   private submitCandidate(output: Output, value: unknown): StructuredOutputToolResult {
     const rejected = (code: string, details?: Record<string, unknown>): StructuredOutputToolResult => ({ accepted: false, error: failure(code, details) })
@@ -537,14 +592,20 @@ export class OutputSession implements BackendSession {
     if (output.hasValue) return isDeepStrictEqual(output.value, value) ? { accepted: true } : rejected('STRUCTURED_OUTPUT_ALREADY_SUBMITTED')
     let bytes: number
     try { bytes = Buffer.byteLength(JSON.stringify(value)) } catch { return rejected('STRUCTURED_OUTPUT_INVALID') }
-    if (bytes > (this.limits.maxResultBytes ?? 16 * 1024 * 1024)) { output.error = failure('RESULT_BUDGET_EXCEEDED'); return { accepted: false, error: output.error } }
+    if (bytes > (this.limits.maxResultBytes ?? 16 * 1024 * 1024)) return this.rejectCandidateBudget(output)
     try { output.schema.check(value) } catch (cause) {
       if (++output.attempts >= 3) output.error = failure('STRUCTURED_OUTPUT_RETRIES_EXCEEDED')
       return rejected(output.error?.code ?? 'STRUCTURED_OUTPUT_INVALID', sdkError(cause).details)
     }
-    try { this.retain(output, bytes) } catch { output.error = failure('RESULT_BUDGET_EXCEEDED'); return { accepted: false, error: output.error } }
-    output.value = structuredClone(value); output.hasValue = true
+    try { this.retain(output, bytes) } catch { return this.rejectCandidateBudget(output) }
+    output.value = structuredClone(value)
+    output.hasValue = true
     return { accepted: true }
+  }
+  /** submitCandidate reports either byte-budget failure immediately and retains it for later calls and terminal validation. */
+  private rejectCandidateBudget(output: Output): StructuredOutputToolResult {
+    output.error = failure('RESULT_BUDGET_EXCEEDED')
+    return { accepted: false, error: output.error }
   }
   /**
    * routeEarlyEvent calls this for rejected status, and rejectDispatch calls after a definite request
@@ -563,18 +624,17 @@ export class OutputSession implements BackendSession {
   }
   /**
    * execute awaits this after checking backend attachment and before native frame/capability checks.
-   * Transform schema-bearing input and record input/review IDs as unresolved only after preparation
-   * succeeds. Return params and submission identity for execute's receipt binding. Setup
+   * Transform schema-bearing input and record the captured input/review ID as unresolved only
+   * after preparation succeeds. Return params for native validation and dispatch. Setup
    * failures reject execute, which still knows the original submission ID for definite-failure cleanup.
    */
-  private async prepareSubmission<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<{ params: AhpRequestMap[M]; submissionId?: string }> {
-    const submissionId = requestSubmissionId(method, params)
+  private async prepareSubmission<M extends SessionMethod>(method: M, params: AhpRequestMap[M], submissionId: string | undefined): Promise<AhpRequestMap[M]> {
     if (method === 'input/submit') {
       const input = params as AhpRequestMap['input/submit']
       if (input.outputSchema !== undefined) params = await this.prepareOutput(input, input.outputSchema) as AhpRequestMap[M]
     }
     if (submissionId !== undefined) this.unresolved.add(submissionId)
-    return { params, submissionId }
+    return params
   }
   /**
    * prepareSubmission awaits this for schema-bearing input using the attached backend. Compile the
@@ -611,7 +671,19 @@ export class OutputSession implements BackendSession {
     if (mode === 'mcp' && !this.lease) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
     if (mode !== 'native' && (this.active.size || this.unresolved.size)) throw new HarnessSdkError('STRUCTURED_OUTPUT_BUSY')
     if (mode === 'native' && [...this.outputs.values()].some(output => !isDeepStrictEqual(output.schema.schema, schema.schema))) throw new HarnessSdkError('SESSION_BUSY')
-    const output: Output = { submissionId, outputId: `anureo_output_${randomBytes(24).toString('hex')}`, mode, schema, attempts: 0, hasValue: false, text: new Map(), finalIds: new Set(), finalItems: new Map(), retainedBytes: 0, admittedVersion: this.terminalVersion }
+    const output: Output = {
+      submissionId,
+      outputId: `anureo_output_${randomBytes(24).toString('hex')}`,
+      mode,
+      schema,
+      attempts: 0,
+      hasValue: false,
+      text: new Map(),
+      finalIds: new Set(),
+      finalItems: new Map(),
+      retainedBytes: 0,
+      admittedVersion: this.terminalVersion,
+    }
     this.retain(output, Buffer.byteLength(JSON.stringify(schema.schema)))
     this.outputs.set(submissionId, output)
     return output
@@ -619,14 +691,23 @@ export class OutputSession implements BackendSession {
   /**
    * execute awaits this after a native close receipt and dispose awaits it before backend
    * disposal. Clear retention, associations and held-event accounting, detach the lease, then attempt
-   * lease disposal and native tool disabling together. checkRelease rejects after both promises settle.
-   * The caller still owns backend disposal and observation closure.
+   * lease disposal and native tool disabling together. Clear the lane before invoking either so
+   * queued candidates expire at receipt time. Classify promise rejections after both settle.
+   * Session still owns observation closure, and OutputSession.dispose owns backend release.
    */
   private async release(): Promise<void> {
-    this.outputs.clear(); this.byTurn.clear(); this.pending.clear(); this.unresolved.clear(); this.active.clear(); this.locked = undefined
+    this.outputs.clear()
+    this.byTurn.clear()
+    this.pending.clear()
+    this.unresolved.clear()
+    this.active.clear()
+    this.locked = undefined
     this.terminalVersions.clear()
-    this.outputBytes = 0; this.heldBytes = 0; this.heldCount = 0
-    const lease = this.lease; this.lease = undefined
+    this.outputBytes = 0
+    this.heldBytes = 0
+    this.heldCount = 0
+    const lease = this.lease
+    this.lease = undefined
     checkRelease(await Promise.allSettled([lease?.dispose(), this.backend?.structuredOutputTool?.configure()]))
   }
 }
@@ -675,8 +756,8 @@ interface Output {
 interface Envelope { event: AhpEventPayload; scope: EventScope }
 
 /**
- * execute captures identity before output preparation can fail; prepareSubmission uses the same
- * lookup to track unresolved input/review admission. Other requests have no submission to reclaim.
+ * execute captures input/review identity once for unresolved admission, receipt binding and
+ * definite-failure cleanup. Other methods have no submission tracked by the output wrapper.
  */
 function requestSubmissionId<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): string | undefined {
   if (method === 'input/submit' || method === 'review/start') return (params as AhpRequestMap['input/submit'] | AhpRequestMap['review/start']).submissionId

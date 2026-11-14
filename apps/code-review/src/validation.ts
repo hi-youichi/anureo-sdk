@@ -4,42 +4,41 @@ import { HarnessSdkError } from '@anureo/sdk'
 import { assertReviewablePath, isInsideDirectory } from './paths'
 import type { Finding, ModulePlan, ReviewModule } from './schema'
 
-/** Validate a schema-parsed plan against the filesystem and return a copy with canonical,
- * slash-separated paths relative to the canonical absolute cwd. Requires an absolute workflow
- * directory to exclude storage. Rejects duplicate/oversized IDs, duplicate file ownership,
- * invalid source paths and filesystem failures, in plan order. analyzeModules awaits this via
- * validateOutput before dispatch; this checks listed files, not exhaustive source coverage. */
-export async function validatePlan(cwd: string, plan: ModulePlan, directory: string): Promise<ModulePlan> {
-  const ids = new Set<string>()
-  const files = new Set<string>()
+/** Check the listed assignments in a schema-parsed plan and return a copy with canonical,
+ * slash-separated paths relative to cwd. Pass the canonical absolute review directory and
+ * absolute workflow storage path for the source view being checked. Duplicate or oversized IDs,
+ * duplicate file ownership, invalid paths and filesystem failures reject in traversal order.
+ *
+ * analyzeModules checks the agent's source view first and, in fix mode, checks the resulting
+ * assignments against the original tree before selecting modules. A rejection prevents dispatch. */
+export async function validatePlan(cwd: string, plan: ModulePlan, workflowDirectory: string): Promise<ModulePlan> {
+  const claimedIds = new Set<string>()
+  const claimedFiles = new Set<string>()
   const modules: ReviewModule[] = []
   for (const module of plan.modules) {
-    if (ids.has(module.id)) throw new Error(`Duplicate module id: ${module.id}`)
-    // Keep analyzed IDs within the same byte limit as caller-selected module and angle IDs.
-    if (Buffer.byteLength(module.id) > 256) throw new Error(`Module id is too long (max 256 bytes): ${module.id.slice(0, 64)}`)
-    ids.add(module.id)
-    const owned: string[] = []
+    claimModuleId(module.id, claimedIds)
+    const files: string[] = []
     for (const file of module.files) {
-      const local = await resolveReviewableSourcePath(cwd, file, directory)
-      if (files.has(local)) throw new Error(`Source file assigned more than once: ${local}`)
-      files.add(local)
-      owned.push(local)
+      const canonicalFile = await resolveReviewableSourcePath(cwd, file, workflowDirectory)
+      claimSourceFile(canonicalFile, claimedFiles)
+      files.push(canonicalFile)
     }
-    modules.push({ ...module, files: owned })
+    modules.push({ ...module, files })
   }
   return { ...plan, modules }
 }
 
 /** Return copies of schema-parsed findings with canonical source paths, preserving order.
  * Requires canonical absolute cwd, absolute workflow storage and a module from validatePlan.
- * Reads current source files, rejecting invalid paths, ownership, line ranges or filesystem
- * failures. reviewAngle awaits this via validateOutput; rejection becomes failed angle coverage.
- * Line counts are cached only for this call; validation neither locks nor freezes the sources. */
-export async function validateFindings(cwd: string, module: ReviewModule, findings: Finding[], directory: string): Promise<Finding[]> {
+ * Checks ownership and inclusive ranges using one UTF-8 read per canonical file in this call,
+ * with no source lock.
+ * Invalid paths, ownership, ranges or filesystem failures reject. reviewAngle awaits the check
+ * inside withAgentWorktree before returning completed findings or recording failed coverage. */
+export async function validateFindings(cwd: string, module: ReviewModule, findings: Finding[], workflowDirectory: string): Promise<Finding[]> {
   const lineCounts = new Map<string, number>()
   const validated: Finding[] = []
   for (const finding of findings) {
-    const file = await resolveReviewableSourcePath(cwd, finding.file, directory)
+    const file = await resolveReviewableSourcePath(cwd, finding.file, workflowDirectory)
     if (!module.files.includes(file)) throw new Error(`Finding is outside module ${module.id}: ${file}`)
     let lines = lineCounts.get(file)
     if (lines === undefined) {
@@ -53,10 +52,10 @@ export async function validateFindings(cwd: string, module: ReviewModule, findin
   return validated
 }
 
-/** Invoke and await a local output validator, returning its value or rejecting with
- * REVIEW_VALIDATION_FAILED. Replaces failure metadata with a known-outcome error, retaining
- * Error messages or a generic message for other causes. analyzeModules lets this reject analysis;
- * reviewAngle catches it as failed coverage. Supply local validation, not agent execution. */
+/** Invoke the supplied local validator once and await its value. A synchronous throw or rejection
+ * becomes REVIEW_VALIDATION_FAILED, with the original Error message or a generic message.
+ * analyzeModules and reviewAngle supply callbacks after the agent returns. Analysis propagates
+ * this failure, while reviewAngle records it as failed coverage. */
 export async function validateOutput<T>(validate: () => Promise<T>): Promise<T> {
   try { return await validate() }
   catch (cause) {
@@ -64,19 +63,32 @@ export async function validateOutput<T>(validate: () => Promise<T>): Promise<T> 
   }
 }
 
+/** Reserve the exact ID after checking uniqueness and the same 256-byte UTF-8 cap
+ * applied to caller-selected module IDs. */
+function claimModuleId(id: string, claimedIds: Set<string>): void {
+  if (claimedIds.has(id)) throw new Error(`Duplicate module id: ${id}`)
+  if (Buffer.byteLength(id) > 256) throw new Error(`Module id is too long (max 256 bytes): ${id.slice(0, 64)}`)
+  claimedIds.add(id)
+}
+
+/** Claim a canonical relative path in the plan-wide ownership set. Reject repeated claims
+ * within a module or across modules, including paths that resolved from different aliases. */
+function claimSourceFile(file: string, claimedFiles: Set<string>): void {
+  if (claimedFiles.has(file)) throw new Error(`Source file assigned more than once: ${file}`)
+  claimedFiles.add(file)
+}
+
 /** Resolve one relative source path for both validators, rejecting storage, metadata, escapes,
  * non-files and filesystem failures. Resolve symlinks before scope checks so aliases cannot
  * disguise excluded targets; return the canonical path relative to cwd with '/' separators. */
-async function resolveReviewableSourcePath(cwd: string, file: string, directory: string): Promise<string> {
+async function resolveReviewableSourcePath(cwd: string, file: string, workflowDirectory: string): Promise<string> {
   if (isAbsolute(file)) throw new Error(`Expected a relative source path: ${file}`)
   const absolute = await realpath(resolve(cwd, file))
-  await assertReviewablePath(cwd, absolute, directory)
-  const local = relative(cwd, absolute)
-  // Check containment after resolving symlinks, then require a regular source file.
+  await assertReviewablePath(cwd, absolute, workflowDirectory)
   if (!isInsideDirectory(cwd, absolute) || !(await stat(absolute)).isFile()) {
     throw new Error(`Source file is outside the review directory or is not a file: ${file}`)
   }
-  return local.split(sep).join('/')
+  return relative(cwd, absolute).split(sep).join('/')
 }
 
 /** Count addressable source lines across CRLF and single-character line terminators.

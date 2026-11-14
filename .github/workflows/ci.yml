@@ -30,6 +30,7 @@ jobs:
       - run: bun run typecheck
       - run: bun run typecheck:tooling
       - run: bun run test
+      # The default suite skips the native repograph backend. Opt in on every matrix runner.
       - name: Verify native refactor graph exports
         env:
           REPOGRAPH_INTEGRATION: '1'

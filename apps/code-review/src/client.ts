@@ -10,13 +10,14 @@ export const reviewHarnesses = ['codex', 'claude', 'hermes', 'pi'] as const
 /** CLI backend selection shared by client construction and fix-session permissions. */
 export type ReviewHarness = (typeof reviewHarnesses)[number]
 
-/** Create an initialized CLI client with unattended approval of the narrowest advertised allow option.
- * executeReviewCommand uses this internal factory by default and awaits disposal after report output;
- * direct source callers must also await disposal. Initialization failures reject.
- * Defaults to Codex; cwd configures its process launch. Overrides skip built-in adapter construction.
- * `harness` must describe the adapter actually installed (including `override`):
- * identity.adapterId becomes the session binding, so a mismatched pair fails or
- * mislabels every session open far from the construction site. */
+/** Initialize the CLI client. executeReviewCommand awaits it before running the review and owns
+ * disposal. Direct source callers must also await disposal. Adapter construction and initialization
+ * failures reject.
+ *
+ * Defaults to Codex, which uses cwd for its initial process launch. An override replaces the
+ * built-in adapter. Keep harness aligned with that adapter because the SDK uses it in session bindings.
+ * The SDK handles approval requests using the narrowest advertised allow option and attempts
+ * cancellation when none is offered. */
 export async function createReviewClient(cwd: string, harness: ReviewHarness = 'codex', override?: HarnessAdapter): Promise<Client> {
   return createClient({
     adapter: override ?? harnessConfig[harness].adapter(cwd),
@@ -34,9 +35,10 @@ export function fixPermissionMode(harness: ReviewHarness): string | undefined {
   return harnessConfig[harness].fix
 }
 
-/** Read and trim an executable override; missing or blank values use the supplied default. */
-function binaryOverride(name: string, fallback: string): string {
-  return process.env[name]?.trim() || fallback
+/** Include a configured executable for Claude or Hermes. Trim only for the presence check so the
+ * adapter receives the exact configured path. An absent or blank override leaves adapter defaults in effect. */
+function optionalCommand(name: 'CLAUDE_BIN' | 'HERMES_BIN'): { command?: string } {
+  return process.env[name]?.trim() ? { command: process.env[name] } : {}
 }
 
 /** Pair each backend's adapter factory and fix permissions so additions must supply both.
@@ -44,16 +46,15 @@ function binaryOverride(name: string, fallback: string): string {
  * Claude/Hermes use their raw override only when nonblank, otherwise their adapter defaults. */
 const harnessConfig = {
   codex: {
-    adapter: (cwd: string) => createCodexAdapter({ command: binaryOverride('CODEX_BIN', 'codex'), cwd }),
+    adapter: (cwd: string) => createCodexAdapter({ command: process.env.CODEX_BIN?.trim() || 'codex', cwd }),
     fix: 'agent',
   },
   claude: {
-    adapter: () => createClaudeAdapter({ defaultHome: true, env: process.env,
-      ...(process.env.CLAUDE_BIN?.trim() ? { command: process.env.CLAUDE_BIN } : {}) }),
+    adapter: () => createClaudeAdapter({ defaultHome: true, env: process.env, ...optionalCommand('CLAUDE_BIN') }),
     fix: 'bypassPermissions',
   },
   hermes: {
-    adapter: () => createHermesAdapter(process.env.HERMES_BIN?.trim() ? { command: process.env.HERMES_BIN } : {}),
+    adapter: () => createHermesAdapter(optionalCommand('HERMES_BIN')),
     fix: undefined,
   },
   pi: { adapter: () => createPiAdapter(), fix: undefined },

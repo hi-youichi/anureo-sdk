@@ -12,8 +12,12 @@ test.each(['ws://example.com/api/ws', 'ws://127.0.0.1:12345/api/ws?ticket=fake',
   expect(() => validateGrant({ ...grant(), url })).toThrow()
 })
 test('attach checks both the negotiated wire and the ticket protocols without exposing credentials in errors', () => {
-  expect(() => validateGrant({ ...grant(), protocols: ['wrong', 'hermes-gateway-ticket.fake'] })).toThrow()
-  expect(() => validateGrant({ ...grant(), ticket: 'another' })).toThrow()
+  const safeMessage = /^Invalid Hermes gateway message$/
+  expect(() => validateGrant({ ...grant(), protocols: ['wrong', 'hermes-gateway-ticket.fake'] })).toThrow(safeMessage)
+  expect(() => validateGrant({ ...grant(), ticket: 'another' })).toThrow(safeMessage)
+})
+
+test('invalid numeric limits fail before opening a native connection', () => {
   expect(() => createHermesAdapter({ reconnectAttempts: -1 })).toThrow()
   expect(() => createHermesAdapter({ maxPending: 0 })).toThrow()
 })

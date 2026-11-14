@@ -17,12 +17,14 @@ try {
     ...(process.env.HERMES_MODEL ? { model: process.env.HERMES_MODEL } : {}),
   })
   const turn = await session.submit({ input: 'What is 17 + 25? Answer in one sentence.' })
+  // The result wait can reject independently of a failed or interrupted terminal outcome.
   const result = await turn.result({ timeoutMs: 180_000 })
   if (result.status === 'failed') throw new Error(result.error.message)
   if (result.status !== 'completed') throw new Error(`Turn ${result.status}`)
   console.log(result.text)
+  // Ask Hermes to detach this session from the shared gateway.
   await session.close()
 } finally {
-  // Release the SDK-owned session and adapter even when the result wait or native close fails.
+  // Dispose the client to release local session and adapter resources on either outcome.
   await client.dispose()
 }

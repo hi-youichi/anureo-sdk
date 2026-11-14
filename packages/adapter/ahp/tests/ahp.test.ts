@@ -1,6 +1,6 @@
 import { expect,test } from "bun:test";
 import path from "node:path";
-import { createClient,BoundedEventQueue,type Client,type Session } from "@anureo/sdk";
+import { createClient,BoundedEventQueue,type Session } from "@anureo/sdk";
 import type { AhpEvent } from "@anureo/protocol";
 import { createAhpAdapter,createWebSocketTransport,AhpWire,createStdioTransport,type AhpTransport } from "../src/index";
 import { createReferenceHarness } from "../examples/reference";
@@ -35,14 +35,37 @@ async function fixture(options:{dropSeq?:number;replay?:boolean;duplicate?:boole
   const session=await runtime.openSession({requestId:"open",mode:"new",binding:{sessionId:"session",adapterId:"ahp",runtimeConfigId:"ref"},cwd:process.cwd()});
   return {runtime,session,queue,forwardedFrames};
 }
-/** Read through the first terminal, optionally deny approvals, and always release the reader and timer. */
-async function collect(session:Session,{respondToApproval=false}:{respondToApproval?:boolean}={}):Promise<AhpEvent[]>{
-  const events:AhpEvent[]=[],reader=session.events()[Symbol.asyncIterator]();
-  const timer=setTimeout(()=>{void reader.return?.();},1500);
-  try{for(;;){const next=await reader.next();if(next.done)throw new Error("Missing terminal");events.push(next.value);
-    if(respondToApproval&&next.value.type==="interaction/requested")await session.request("interaction/respond",{requestId:"respond",sessionId:session.binding.sessionId,interactionId:next.value.payload.interactionId,response:{kind:"approval",optionId:"deny"}});
-    if(next.value.type==="turn/completed")return events;
-  }}finally{clearTimeout(timer);await reader.return?.();}
+/** Collect through the first terminal, optionally answer requests, and release the reader and timer. */
+async function collect(
+  session: Session,
+  onInteraction?: (session: Session, request: Extract<AhpEvent, { type: "interaction/requested" }>["payload"]) => Promise<unknown>,
+): Promise<AhpEvent[]> {
+  const events: AhpEvent[] = [];
+  const reader = session.events()[Symbol.asyncIterator]();
+  const timer = setTimeout(() => { void reader.return?.(); }, 1500);
+  try {
+    for (;;) {
+      const next = await reader.next();
+      if (next.done) throw new Error("Missing terminal");
+      const event = next.value;
+      events.push(event);
+      if (onInteraction && event.type === "interaction/requested") await onInteraction(session, event.payload);
+      if (event.type === "turn/completed") return events;
+    }
+  } finally {
+    clearTimeout(timer);
+    await reader.return?.();
+  }
+}
+
+/** Settle the scripted peer's approval manually before collect resumes reading. */
+function denyApproval(session: Session, { interactionId }: { interactionId: string }) {
+  return session.request("interaction/respond", {
+    requestId: "respond",
+    sessionId: session.binding.sessionId,
+    interactionId,
+    response: { kind: "approval", optionId: "deny" },
+  });
 }
 test("external AHP preserves immediate lifecycle over stdio",async()=>{
   const runtime=await createClient({identity:{adapterId:"ahp",runtimeConfigId:"ref"},interactions:{approval:undefined},adapter:createAhpAdapter({command:process.execPath,args:[path.resolve(import.meta.dir,"../examples/reference.ts")],timeoutMs:1500})});
@@ -54,7 +77,7 @@ test("external AHP preserves immediate lifecycle over stdio",async()=>{
 });
 test("remote interaction responds once, with no duplicate local resolution",async()=>{
   const f=await fixture();try{
-    const reading=collect(f.session,{respondToApproval:true});await f.session.submit({ input:[{type:"text",text:"/approval"}] });
+    const reading=collect(f.session,denyApproval);await f.session.submit({ input:[{type:"text",text:"/approval"}] });
     const events=await reading;expect(events.filter(e=>e.type==="interaction/resolved")).toHaveLength(1);expect(events.filter(e=>e.type==="interaction/requested")).toHaveLength(1);
   }finally{await f.runtime.dispose();}
 });
@@ -104,7 +127,7 @@ test("WebSocket factory uses identical lifecycle and closes only its connection"
   try{
     const session=await runtime.openSession({requestId:"open",mode:"new",binding:{sessionId:"ws",adapterId:"ahp",runtimeConfigId:"ref"},cwd:process.cwd()});
     const text=collect(session);await session.submit({ input:[{type:"text",text:"stdio"}] });expect((await text).some(e=>e.type==="item/completed"&&e.payload.item.type==="agentMessage"&&e.payload.item.text==="stdio")).toBe(true);
-    const approval=collect(session,{respondToApproval:true});await session.submit({ input:[{type:"text",text:"/approval"}] });expect((await approval).filter(e=>e.type==="interaction/resolved")).toHaveLength(1);
+    const approval=collect(session,denyApproval);await session.submit({ input:[{type:"text",text:"/approval"}] });expect((await approval).filter(e=>e.type==="interaction/resolved")).toHaveLength(1);
     const reading=collect(session);const active=await session.submit({ input:"/wait" });await active.interrupt();expect((await reading).at(-1)).toMatchObject({payload:{status:"interrupted"}});
     await runtime.dispose();expect(server.port).toBeGreaterThan(0);
   }finally{await runtime.dispose();await server.stop(true);}

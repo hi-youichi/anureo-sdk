@@ -2,27 +2,23 @@
 import { HarnessSdkError } from "../errors";
 
 /**
- * Translate native turn/item IDs to SDK IDs when implementing an adapter.
- * Identifiers are opaque strings; this map does not validate or normalize them.
- * All state is in memory and scoped to this instance. Adapters own event ordering,
- * failure handling and clearing the map after no later event needs its identities.
+ * Translate opaque native turn and item IDs when implementing an adapter. Keep one
+ * map per native session and use it for events that share those identities. The
+ * adapter owns event ordering, failure handling and clearing the map once its
+ * identities are no longer needed.
  */
 export class NativeIdentityMap {
   /**
-   * Adapters supply a synchronous SDK item ID allocator when creating a session-local
-   * map. Construction does not invoke it; item() invokes it on a cache miss and
-   * propagates its failures. Supply nonempty IDs to make subsequent lookups reuse them.
-   * The allocator owns ID uniqueness; its results are not checked for collisions.
+   * Supply an allocator that returns unique, nonempty SDK item IDs. item() invokes it
+   * synchronously on a cache miss and propagates failures. The allocator owns uniqueness.
    */
   constructor(private readonly createId: () => string) {}
 
   /**
-   * Adapters record an SDK/native turn pair before translating it through turn()
-   * or nativeTurn(). Rebinding the same pair is harmless. A conflicting nonempty
-   * stored ID throws HarnessSdkError with code PROTOCOL_ERROR before either map
-   * changes; existing empty values do not reject rebinding. Rebinding writes only
-   * the supplied pair and does not remove older entries involving empty IDs.
-   * The adapter decides how to handle a conflict.
+   * Record a turn pair before translating it through turn() or nativeTurn(). Rebinding
+   * the same pair is harmless. A conflicting nonempty stored ID throws HarnessSdkError
+   * with code PROTOCOL_ERROR before either lookup changes. Empty stored values permit
+   * rebinding, which writes only the supplied pair. The adapter handles conflicts.
    */
   bindTurn(turnId: string, nativeTurnId: string): void {
     const existingTurnId = this.turnIdsByNativeTurnId.get(nativeTurnId);
@@ -48,12 +44,10 @@ export class NativeIdentityMap {
   }
 
   /**
-   * Adapters obtain a stable SDK item ID for repeated native item events within an
-   * SDK turn. No turn binding is required. Return the cached nonempty ID, or invoke
-   * the supplied allocator synchronously and cache its result for this pair.
-   * Allocator failures propagate unchanged without caching a result, so a later
-   * call tries again; the adapter owns retry policy. Empty results are returned
-   * but cause another allocation on the next lookup. clear() forgets these IDs.
+   * Reuse the SDK item ID for a native item within an SDK turn. The turn can be unbound.
+   * The allocator runs synchronously when the pair has no nonempty cached ID. An empty
+   * result is returned and triggers another allocation on the next lookup. Allocator
+   * failures propagate unchanged and leave the adapter free to retry.
    */
   item(turnId: string, nativeItemId: string): string {
     // Encode the pair so delimiter characters inside opaque IDs cannot alias another pair.
@@ -67,10 +61,9 @@ export class NativeIdentityMap {
   }
 
   /**
-   * Adapters call this after no remaining events need the old identities. Forget
-   * both turn directions and all cached item IDs; later calls can bind and allocate
-   * again using the same allocator. Repeated clears are harmless and return no value.
-   * Native work is not cancelled or released: the adapter retains cleanup ownership.
+   * Forget both turn directions and all cached item IDs once pending events no longer
+   * need them. Later calls can bind and allocate again with the same allocator.
+   * Repeated clears are harmless. The adapter remains responsible for native cleanup.
    */
   clear(): void {
     this.turnIdsByNativeTurnId.clear();

@@ -1,22 +1,23 @@
-// Constructs phase prompts from host context; it must not dispatch agents, read artifacts or enforce permissions.
+// Renders the instructions for the planning, design and module agents.
 import type { CheckCommand } from './checks'
 import type { RefactorModule } from './schema'
 
-/** Internal input from runDesign before planning; the builder only renders the supplied context. */
+/** Context runDesign supplies before the planner partitions the inventory. */
 export interface DesignPromptInput extends PromptContext {
-  /** Complete eligible source inventory, rather than an individual module's file assignment. */
+  /** Complete eligible source inventory at the design snapshot. */
   files: string[]
 }
 
-/** Internal input from runModules after design and plan validation; the builder does not validate it. */
+/** Context runModules supplies after design and plan validation. */
 export interface ModulePromptInput extends PromptContext {
   /** Assignment already checked against the host inventory by validatePlan. */
   module: RefactorModule
-  /** Prior design summary that keeps module work consistent with the completed boundary review. */
+  /** Completed design step's summary, included so the module agent can preserve boundary decisions. */
   design: string
 }
 
-/** Build partition instructions for plan in refactor.ts, which dispatches a read-only schema-backed agent.
+/** Build read-only partition instructions for the post-design snapshot. plan in refactor.ts submits
+ * the text to a schema-backed agent in a separate worktree.
  * The caller must validate its response against the same inventory before dispatching module work.
  * Construction only serializes the supplied inventory; serialization errors throw synchronously. */
 export function planPrompt(files: string[], version: string): string {
@@ -32,13 +33,12 @@ ${rules}`
 }
 
 /** Build cross-file design instructions for runDesign to pass to runAgentWork before planning.
- * The caller supplies the graph artifact and snapshot; mode only changes instructions, not permissions.
- * Construction performs no I/O; JSON serialization errors throw synchronously. */
+ * Supply the snapshot inventory and its graph path, or null to request direct source inspection.
+ * runAgentWork configures session permissions separately. JSON serialization errors throw synchronously. */
 export function designPrompt(input: DesignPromptInput): string
-/** Preserve positional calls for existing consumers; true requests read-only agent instructions.
- * Returns the same pure prompt as the named form, including its JSON serialization errors. */
+/** Build the same design instructions from positional arguments. Passing true for readOnly requests
+ * read-only instructions. JSON serialization errors throw synchronously. */
 export function designPrompt(files: string[], graphFile: string, version: string, checks: readonly CheckCommand[], readOnly: boolean): string
-/** Build the same design prompt for either call form without opening artifacts or executing checks. */
 export function designPrompt(...args: [DesignPromptInput] | [string[], string, string, readonly CheckCommand[], boolean]): string {
   const input: DesignPromptInput = args.length === 1 ? args[0] : {
     files: args[0], graphFile: args[1], version: args[2], checks: args[3],
@@ -77,20 +77,16 @@ links, ownership and references affected by boundary changes. Explain new or spl
 Do not perform a repository-wide comment rewrite; module agents own the detailed documentation pass.
 Apply declaration ordering to files affected by boundary changes; module agents handle the remaining files.
 ${declarationOrderGuide}
-${commentGuide}
-${documentationGuide}
-${validationInstructions(input)}${output}
-${rules}`
+${workResponseInstructions(input)}`
 }
 
-/** Build instructions for runModules to pass to runAgentWork for one validated module assignment.
- * The caller supplies the graph, snapshot and completed design summary; mode does not enforce permissions.
- * Construction performs no I/O; JSON serialization errors throw synchronously. */
+/** Build instructions for runModules to pass to runAgentWork for one validated assignment.
+ * Supply the module snapshot, its graph path or null, and the completed design summary.
+ * runAgentWork configures session permissions separately. JSON serialization errors throw synchronously. */
 export function modulePrompt(input: ModulePromptInput): string
-/** Preserve positional calls for existing consumers; true requests read-only agent instructions.
- * Returns the same pure prompt as the named form, including its JSON serialization errors. */
+/** Build the same module instructions from positional arguments. Passing true for readOnly requests
+ * read-only instructions. JSON serialization errors throw synchronously. */
 export function modulePrompt(module: RefactorModule, graphFile: string, version: string, checks: readonly CheckCommand[], readOnly: boolean, design: string): string
-/** Build the same module prompt for either call form without opening artifacts or executing checks. */
 export function modulePrompt(...args: [ModulePromptInput] | [RefactorModule, string, string, readonly CheckCommand[], boolean, string]): string {
   const input: ModulePromptInput = args.length === 1 ? args[0] : {
     module: args[0], graphFile: args[1], version: args[2], checks: args[3],
@@ -128,28 +124,39 @@ ${declarationOrderGuide}
 Module documentation scope: review contracts throughout the assigned module, including declarations
 whose implementation stays unchanged. Write or revise comments where contracts are missing,
 misleading or hard to discover; keep accurate concise comments without cosmetic rewrites.
-${commentGuide}
-${documentationGuide}
-Make behavior-preserving changes only. Update callers and tests; reuse existing test helpers and
-types. Do not weaken tests. Do not move code between files here unless this module's own
-structure needs it; cross-file design was handled earlier.
-${validationInstructions(input)}${output}
-${rules}`
+${workResponseInstructions(input, moduleEditInstructions)}`
 }
 
 /** Host-supplied execution context for pure design/module prompt construction; no artifacts are opened. */
 interface PromptContext {
-  /** Path to the host-exported graph for the current phase. */
+  /** Host-exported graph for this snapshot, or null to use direct source inspection. */
   graphFile: string | null
   /** Snapshot identifier used to tie instructions to the current source tree. */
   version: string
-  /** Host-selected commands to request in edit mode; this builder never executes them. */
+  /** Commands to include in edit instructions. An empty list omits the validation section. */
   checks: readonly CheckCommand[]
-  /** Agent instruction only; read-only filesystem access must be enforced by the caller. */
+  /** Instruction mode. The caller configures the agent session's permissions. */
   mode: 'read-only' | 'edit'
-  /** The host integrates work from a private checkout and runs the configured checks thereupon. */
+  /** True tells module agents to edit only assigned existing files and leaves edit checks to the host. */
   isolated?: boolean
 }
+
+/**
+ * Append the shared documentation and response guidance after the phase-specific scope. Insert any
+ * phase-specific editing rules before validation so both prompts use the same workSchema fields and
+ * check instructions. Serializing the supplied checks can throw synchronously.
+ */
+function workResponseInstructions(context: PromptContext, editInstructions = ''): string {
+  return `${commentGuide}
+${documentationGuide}
+${editInstructions}${validationInstructions(context)}${output}
+${rules}`
+}
+
+const moduleEditInstructions = `Make behavior-preserving changes only. Update callers and tests; reuse existing test helpers and
+types. Do not weaken tests. Do not move code between files here unless this module's own
+structure needs it; cross-file design was handled earlier.
+`
 
 /** Appended to every phase so planning and editing share the same scope and behavior constraints. */
 const rules = `Follow applicable AGENTS.md instructions. Preserve public APIs and observable behavior,
@@ -267,7 +274,7 @@ const declarationOrderGuide = `Declaration order:
 Before returning, check the actual file and class declarations against this order, not only barrels
 or export lists. In read-only mode, propose the reordering without editing files.`
 
-/** Explains graph limitations to design and module agents so edge absence is not treated as proof. */
+/** Direct design and module agents to the serialized graph path, or to source alone when it is null. */
 function graphInstructions(file: string | null): string {
   if (file === null) return 'Static graph unavailable. Read source directly to trace declarations, imports and callers.'
   return `Graph artifact: ${JSON.stringify(file)}\n${graphGuide}`
@@ -281,7 +288,7 @@ the corresponding files in your own checkout. Use available tools to resolve nod
 per caller/callee pair, so read the source to see repetition. Inspect source directly for files
 without indexed symbols and for relationships with insufficient graph evidence.`
 
-/** Render the requested mode for design/module agents without enforcing access or changing state. */
+/** Render the requested edit or review-only instructions for design and module agents. */
 const modeInstructions = (mode: PromptContext['mode']) => mode === 'read-only'
   ? `MODE: READ ONLY. Do not modify, create, move or delete any file and do not run commands that write.
 Describe every change you would make in "changes", each starting with "proposed:".`
@@ -292,8 +299,10 @@ const output = `Return a summary of what you examined and decided, "changes" (wh
 "deferred" (problems you found but did not change, each with a concrete reason). Keep structure that
 is already well organized and say why. Do not split or move code merely because it is long.`
 
-/** Render checks for editing agents only; suppressing them in review mode avoids requesting writes.
- * designPrompt and modulePrompt append this text; neither runs commands or mutates input. */
+/** Omit checks for review-only runs and empty command lists. For isolated edits, announce host
+ * checks after integration. Otherwise ask the agent to run the checks before returning. A rendered
+ * section ends with a newline so the response guidance starts on its own line. Serializing
+ * commands can throw synchronously. */
 function validationInstructions({ checks, mode, isolated }: PromptContext): string {
   if (mode === 'read-only' || checks.length === 0) return ''
   if (isolated) return `Validation commands: ${JSON.stringify(checks)}. The host runs them in the target checkout after integrating your edits.\n`

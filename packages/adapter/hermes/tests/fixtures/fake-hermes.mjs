@@ -60,8 +60,9 @@ function disconnect(session) {
   disconnects++
   for (const socket of session.viewers) socket.close()
 }
-/** Select deterministic progress/failure behavior for a claimed row; start schedules this after admission unless immediate is requested. */
+/** Run the selected scenario after start assigns the generation and publishes message.start. */
 function progress(row) {
+  if (row.status !== 'started') return
   const s = row.session
   if (scenario === 'mcp') {
     void structuredOutput(row).catch(() => finish(row, 'error', 'MCP failed'))
@@ -84,14 +85,9 @@ function progress(row) {
   if (scenario === 'delta-conflict') {
     publish(s, 'message.delta', { text: 'conflicting prefix', segment: 0, offset: 0 }); return
   }
-  if (scenario === 'reconnect' || scenario === 'gap' || scenario === 'ack-lost' || scenario === 'unknown') {
-    if (!row.disconnected) {
-      row.disconnected = true; disconnect(s)
-      if (scenario === 'unknown') {
-        epoch++; instance = 'owner-2'; s.replay = 'replay-2'; s.seq = 0; s.events = []; row.status = 'unknown'
-      } else setTimeout(() => finish(row), 10)
-      return
-    }
+  if (['reconnect', 'gap', 'ack-lost', 'unknown'].includes(scenario) && !row.disconnected) {
+    disconnectDuringProgress(row)
+    return
   }
   if (scenario === 'disconnect') { disconnect(s); return }
   if (scenario === 'backpressure') { publish(s, 'message.delta', { text: 'x'.repeat(8192) }); return }
@@ -106,12 +102,7 @@ function progress(row) {
     s.prompts.set(prompt.prompt_id, prompt); publish(s, 'clarify.request', prompt); return
   }
   if (['batch', 'batch-reconnect', 'secret', 'secret-response-lost', 'unsupported-request'].includes(scenario)) {
-    const method = scenario.startsWith('batch') ? 'clarify' : scenario.startsWith('secret') ? 'secret' : 'desktop.act'
-    const params = { session_id: s.id, ...(method === 'clarify' ? { questions: [{ qid: 'q1', question: 'First?', choices: ['yes', 'no'] }, { qid: 'q2', question: 'Second?' }] }
-      : { env_var: 'FAKE_VALUE', prompt: 'Enter the fake secret' }) }
-    const request = { id: 'srq-1', method, params }; s.requests.set(request.id, request)
-    for (const socket of s.viewers) send(socket, { jsonrpc: '2.0', ...request })
-    if (scenario === 'batch-reconnect') disconnect(s)
+    issueServerRequest(s)
     return
   }
   if (['hold', 'overlap', 'interrupt', 'close-active', 'observer-cancel', 'queued-cancel'].includes(scenario)) return
@@ -123,6 +114,41 @@ function progress(row) {
   publish(s, 'message.delta', { text: 'not the final snapshot', segment: 1, offset: 0 })
   finish(row, scenario === 'failed' ? 'error' : 'complete')
 }
+
+/** Drop observation once, then either invalidate owner and replay identity or finish while disconnected. */
+function disconnectDuringProgress(row) {
+  const session = row.session
+  row.disconnected = true
+  disconnect(session)
+  if (scenario === 'unknown') {
+    epoch++
+    instance = 'owner-2'
+    session.replay = 'replay-2'
+    session.seq = 0
+    session.events = []
+    row.status = 'unknown'
+  } else {
+    setTimeout(() => finish(row), 10)
+  }
+}
+
+/** Record the request for resume snapshots before sending it to viewers. Batch reconnect then drops the socket. */
+function issueServerRequest(session) {
+  const method = scenario.startsWith('batch') ? 'clarify' : scenario.startsWith('secret') ? 'secret' : 'desktop.act'
+  const params = method === 'clarify' ? {
+    session_id: session.id,
+    questions: [
+      { qid: 'q1', question: 'First?', choices: ['yes', 'no'] },
+      // The second question exercises free-text answers.
+      { qid: 'q2', question: 'Second?' },
+    ],
+  } : { session_id: session.id, env_var: 'FAKE_VALUE', prompt: 'Enter the fake secret' }
+  const request = { id: 'srq-1', method, params }
+  session.requests.set(request.id, request)
+  for (const socket of session.viewers) send(socket, { jsonrpc: '2.0', ...request })
+  if (scenario === 'batch-reconnect') disconnect(session)
+}
+
 /** Exercise the session's actual HTTP MCP bridge before terminal publication; progress maps any failure to a native failed turn. */
 async function structuredOutput(row) {
   const server = row.session.mcpServers?.find(server => server.name === 'anureo_output')
@@ -152,23 +178,13 @@ function start(row) {
 }
 const NO_REPLY = Symbol()
 /** Dispatch native RPCs, retaining mutation evidence even in scenarios that deliberately withhold the reply. */
-async function request(socket, method, params) {
+async function dispatchRequest(socket, method, params) {
   methods.push(method)
   if (method === 'runtime.describe' && scenario === 'describe-hang') return NO_REPLY
   if (method === 'runtime.describe') return { instance_id: instance, profile_id: 'fake-profile', authority_epoch: epoch,
     capabilities: scenario === 'old-contract' ? [] : ['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1', ...(scenario === 'mcp' ? ['acp-session-mcp-v1'] : [])],
     session_create: { sources: ['tool', ...(scenario === 'mcp' ? ['acp'] : [])], parameters: ['request_id', 'source', 'cwd', 'model', 'client', ...(scenario === 'mcp' ? ['editor'] : []), ...(scenario === 'no-toolsets' ? [] : ['toolsets'])] } }
-  if (method === 'session.create') {
-    createParams.push(params)
-    if ((params.source !== 'tool' && !(scenario === 'mcp' && params.source === 'acp' && params.editor?.edit_approval_policy === 'ask')) || !params.cwd || !params.request_id) throw 'invalid_params'
-    let session = createIds.get(params.request_id)
-    if (!session) {
-      session = { id: `session-${++creates}`, seq: 0, replay: 'replay-1', generation: 0, queue: [], active: null, events: [], rows: new Map(), viewers: new Set(), prompts: new Map(), requests: new Map() }
-      sessions.set(session.id, session); createIds.set(params.request_id, session)
-      session.mcpServers = params.editor?.mcp_servers
-    }
-    session.viewers.add(socket); socket.data.session = session; return snapshot(session, socket)
-  }
+  if (method === 'session.create') return createSession(socket, params)
   const session = sessions.get(params.session_id)
   if (!session) throw 'not_found'
   if (method === 'session.resume') {
@@ -176,23 +192,9 @@ async function request(socket, method, params) {
     if (socket.data.replay) for (const event of session.events.filter(e => e.seq > socket.data.replay.sequence)) send(socket, { jsonrpc: '2.0', method: 'event', params: event })
     return snapshot(session, socket)
   }
-  if (method === 'session.events.since') {
-    const gap = scenario === 'gap' || params.replay_epoch !== session.replay
-    const events = gap ? [] : session.events.filter(e => e.seq > params.last_sequence)
-    socket.data.replay = { sequence: events.at(-1)?.seq ?? params.last_sequence }
-    return { events, latest_seq: session.seq, last_sequence: session.seq, epoch: session.replay, replay_epoch: session.replay, truncated: gap, snapshot_required: gap, count: events.length, open_requests: [...session.requests.values()] }
-  }
+  if (method === 'session.events.since') return replayEvents(session, socket, params)
   if (method === 'session.detach') { session.viewers.delete(socket); return { session_id: session.id, subscription_id: params.subscription_id, detached: true } }
-  if (method === 'prompt.submit') {
-    const existing = [...session.rows.values()].find(row => row.inputId === params.submission_id)
-    if (existing) { if (existing.text !== params.text) throw 'admission_conflict'; return admission(existing) }
-    inputs.push({ inputId: params.submission_id, text: params.text })
-    const row = { id: randomUUID(), session, inputId: params.submission_id, text: params.text, sequence: inputs.length, status: 'queued' }
-    session.rows.set(row.id, row)
-    if (session.active) { session.queue.push(row); info(session) } else start(row)
-    if (scenario === 'ack-lost') return NO_REPLY
-    return admission(row)
-  }
+  if (method === 'prompt.submit') return submitPrompt(session, params)
   if (method === 'prompt.receipt') {
     const row = session.rows.get(params.admission_id)
     if (!row) throw 'not_found'
@@ -204,18 +206,55 @@ async function request(socket, method, params) {
     if (session.active) finish(session.active, 'interrupted', '')
     return response
   }
-  if (method === 'approval.respond' || method === 'clarify.respond') {
-    const prompt = session.prompts.get(params.prompt_id)
-    if (!prompt) return { status: 'already_resolved', prompt_id: params.prompt_id }
-    if (params.execution_generation !== prompt.execution_generation) throw 'stale_generation'
-    if (method === 'approval.respond' && !prompt.choices.includes(params.choice)) throw 'invalid_params'
-    responses.push({ method, params }); session.prompts.delete(params.prompt_id)
-    publish(session, prompt.kind + '.settled', { prompt_id: params.prompt_id, execution_generation: prompt.execution_generation })
-    finish(session.active)
-    return { status: 'resolved', prompt_id: params.prompt_id }
-  }
+  if (method === 'approval.respond' || method === 'clarify.respond') return respondToPrompt(session, method, params)
   throw 'unsupported_control'
 }
+
+/** Create once per request ID, then subscribe the socket before taking the snapshot HermesSession.open consumes. */
+function createSession(socket, params) {
+  createParams.push(params)
+  if ((params.source !== 'tool' && !(scenario === 'mcp' && params.source === 'acp' && params.editor?.edit_approval_policy === 'ask')) || !params.cwd || !params.request_id) throw 'invalid_params'
+  let session = createIds.get(params.request_id)
+  if (!session) {
+    session = { id: `session-${++creates}`, seq: 0, replay: 'replay-1', generation: 0, queue: [], active: null, events: [], rows: new Map(), viewers: new Set(), prompts: new Map(), requests: new Map() }
+    sessions.set(session.id, session); createIds.set(params.request_id, session)
+    session.mcpServers = params.editor?.mcp_servers
+  }
+  session.viewers.add(socket); socket.data.session = session; return snapshot(session, socket)
+}
+
+/** Return replay after the requested watermark and remember the cutoff for live delivery on resume. */
+function replayEvents(session, socket, params) {
+  const gap = scenario === 'gap' || params.replay_epoch !== session.replay
+  const events = gap ? [] : session.events.filter(e => e.seq > params.last_sequence)
+  socket.data.replay = { sequence: events.at(-1)?.seq ?? params.last_sequence }
+  return { events, latest_seq: session.seq, last_sequence: session.seq, epoch: session.replay, replay_epoch: session.replay, truncated: gap, snapshot_required: gap, count: events.length, open_requests: [...session.requests.values()] }
+}
+
+/** Record a submission before dispatch. A lost ACK retains admission evidence for recovery without a resend. */
+function submitPrompt(session, params) {
+  const existing = [...session.rows.values()].find(row => row.inputId === params.submission_id)
+  if (existing) { if (existing.text !== params.text) throw 'admission_conflict'; return admission(existing) }
+  inputs.push({ inputId: params.submission_id, text: params.text })
+  const row = { id: randomUUID(), session, inputId: params.submission_id, text: params.text, sequence: inputs.length, status: 'queued' }
+  session.rows.set(row.id, row)
+  if (session.active) { session.queue.push(row); info(session) } else start(row)
+  if (scenario === 'ack-lost') return NO_REPLY
+  return admission(row)
+}
+
+/** Validate prompt identity and authority, then publish settlement and completion before acknowledging the response. */
+function respondToPrompt(session, method, params) {
+  const prompt = session.prompts.get(params.prompt_id)
+  if (!prompt) return { status: 'already_resolved', prompt_id: params.prompt_id }
+  if (params.execution_generation !== prompt.execution_generation) throw 'stale_generation'
+  if (method === 'approval.respond' && !prompt.choices.includes(params.choice)) throw 'invalid_params'
+  responses.push({ method, params }); session.prompts.delete(params.prompt_id)
+  publish(session, prompt.kind + '.settled', { prompt_id: params.prompt_id, execution_generation: prompt.execution_generation })
+  finish(session.active)
+  return { status: 'resolved', prompt_id: params.prompt_id }
+}
+
 const server = Bun.serve({ hostname: '127.0.0.1', port: 0,
   /** Serve ticket attachment, authenticated upgrades and fixture inspection/control without mutating SDK observations directly. */
   async fetch(req, server) {
@@ -252,7 +291,7 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0,
       const frame = JSON.parse(String(raw))
       if (frame.method) {
         try {
-          const result = await request(socket, frame.method, frame.params ?? {})
+          const result = await dispatchRequest(socket, frame.method, frame.params ?? {})
           if (result !== NO_REPLY) reply(socket, frame.id, result)
         } catch (cause) { refuse(socket, frame.id, typeof cause === 'string' ? cause : 'invalid_params') }
       } else {

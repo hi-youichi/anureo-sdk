@@ -1,11 +1,11 @@
-/** Binds shared capability conformance to native fixture scenarios; it must not define conformance rules or contact a real account. */
+/** Runs shared capability conformance against the scripted Codex app server. */
 import { fileURLToPath } from 'node:url'
 import { expect, test } from 'bun:test'
 import { runConformance } from '@anureo/conformance'
 import { createCodexAdapter } from '../src'
 import { tmpdir } from 'node:os'
 
-/** Map shared case names to native fixture behavior without I/O; the binding callback uses unchanged names for all cases without a native alias. */
+/** Translate shared runner case names to fixture aliases, falling back to the shared name. */
 function fakeServerScenarioFor(scenario: string): string {
   switch (scenario) {
     case 'steer': return 'timing'
@@ -16,9 +16,9 @@ function fakeServerScenarioFor(scenario: string): string {
   }
 }
 
-/** Ask the shared runner to exercise isolated fake processes and assert its complete verdict; runner-owned disposal releases each adapter, while setup or assertion failures reject the test. */
+/** Assert the runner's verdict across isolated fake processes. The runner reports case failures and owns client disposal. */
 test('Codex native adapter satisfies shared capability conformance', async () => {
-  /** Supply one unstarted adapter/open contract per shared scenario; the runner owns launch and disposal. Lower only the backpressure frame limit so that fixture must exercise transport overflow. */
+  // The backpressure case lowers the frame limit so the fake process can trigger transport overflow.
   const report = await runConformance(scenario => {
     return {
       adapter: createCodexAdapter({

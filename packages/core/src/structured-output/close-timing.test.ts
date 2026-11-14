@@ -1,4 +1,3 @@
-// Verifies output-tool revocation at native close receipt; native execution and cleanup remain in production modules.
 import { expect, test } from 'bun:test'
 import { AHP_PROTOCOL_CONTRACT, type AhpRequestMap, type AhpResultMap, type Capabilities } from '@anureo/protocol'
 import { createClient, type HarnessAdapter, type StructuredOutputToolDefinition } from '../index'
@@ -6,6 +5,7 @@ import { deferred } from '../lifecycle/deferred'
 
 test('native close receipt revokes the output tool before a queued candidate runs', async () => {
   const receipt = deferred<AhpResultMap['session/close']>()
+  const closed: AhpResultMap['session/close'] = { closed: true, observationClosed: true, executionStopped: 'unconfirmed' }
   const closing = deferred<void>()
   let tool!: StructuredOutputToolDefinition
   const capabilities: Capabilities = { turn: { outputSchema: false, inputModalities: ['text'] }, input: { delivery: ['native'] } }
@@ -40,11 +40,11 @@ test('native close receipt revokes the output tool before a queued candidate run
     const candidate = receipt.promise.then(() => tool.execute({ value: 1 }))
     const close = session.close()
     await closing.promise
-    receipt.resolve({ closed: true, observationClosed: true, executionStopped: 'unconfirmed' })
+    receipt.resolve(closed)
     await expect(candidate).resolves.toMatchObject({ accepted: false, error: { code: 'STRUCTURED_OUTPUT_EXPIRED' } })
     await close
   } finally {
-    receipt.resolve({ closed: true, observationClosed: true, executionStopped: 'unconfirmed' })
+    receipt.resolve(closed)
     await client.dispose()
   }
 })

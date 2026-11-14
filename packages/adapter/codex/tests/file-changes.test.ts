@@ -1,35 +1,47 @@
-/** Guards file-change provenance and history compatibility; filesystem reads and patch application belong outside these tests. */
+/** Guards native file-change provenance and history status. */
 import { expect, test } from 'bun:test'
 import { codexFileChanges } from '../src/file-changes'
 import { mapItems } from '../src/mapping'
 
 /** Native offsets and source/destination spelling must survive projection even when the enclosing tool fails. */
 test('native operation objects and move_path retain source and destination with raw unified offsets', () => {
+  const patch = '@@ -56,3 +56,3 @@\n context\n-old\n+new\n end\n'
   const changes = [{
     path: '/project/old.ts',
     kind: {
       type: 'update',
       move_path: '/project/new.ts'
     },
-    diff: '@@ -56,3 +56,3 @@\n context\n-old\n+new\n end\n'
+    diff: patch
   }]
-  expect(codexFileChanges(changes)).toEqual([{
+  const projected = codexFileChanges(changes)
+  expect(projected).toEqual([{
     path: '/project/new.ts',
     oldPath: '/project/old.ts',
     operation: 'rename',
     materials: [{
       format: 'unified',
-      patch: changes[0]!.diff
+      patch
     }],
     completeness: 'complete'
   }])
-  for (const completed of [false, true]) expect(mapItems({ id: 'change', type: 'fileChange', status: 'failed', changes }, completed)[0]).toMatchObject({ status: 'failed', kind: 'fileChange', fileChanges: codexFileChanges(changes) })
+  const native = { id: 'change', type: 'fileChange', status: 'failed', changes }
+  for (const completed of [false, true]) {
+    expect(mapItems(native, completed)[0]).toMatchObject({
+      status: 'failed', kind: 'fileChange', fileChanges: projected,
+    })
+  }
 })
 
 /** Missing native material must stay distinguishable from a supplied empty patch without inspecting workspace files. */
 test('missing text has an explicit unavailable material and no fabricated source', () => {
-  expect(codexFileChanges([{ path: 'empty', kind: { type: 'add' } }, { path: 'old', kind: { type: 'delete' } }])).toMatchObject([{ operation: 'add', completeness: 'partial', materials: [{ format: 'unavailable' }] }, { operation: 'delete' }])
+  const changes = [{ path: 'empty', kind: { type: 'add' } }, { path: 'old', kind: { type: 'delete' } }]
+  expect(codexFileChanges(changes)).toMatchObject([
+    { operation: 'add', completeness: 'partial', materials: [{ format: 'unavailable' }] },
+    { operation: 'delete', completeness: 'partial', materials: [{ format: 'unavailable' }] },
+  ])
 })
+
 /** A completed history envelope cannot prove an item's status when the native snapshot omits that field. */
 test('missing native history status remains unknown while live completed envelopes prove completion', () => {
   const native = { id: 'change', type: 'fileChange', changes: [] }
@@ -58,5 +70,29 @@ test('file changes retain empty patches, unknown operations and native destinati
   ])
   expect(mapItems({ id: 'f', type: 'fileChange', changes }, true)[0]).toMatchObject({
     locations: [{ path: 'empty' }, { path: 'source' }, { path: 'unknown' }, { path: 'source' }],
+  })
+})
+
+test('file evidence precedes JSON hooks and source locations follow them', () => {
+  const change = { path: 'before', kind: 'update' }
+  const changes = Object.assign([change], {
+    toJSON() {
+      change.path = 'after-input'
+      return [{ ...change }]
+    },
+  })
+  const output = {
+    toJSON() {
+      change.path = 'after-output'
+      return null
+    },
+  }
+
+  const [item] = mapItems({ id: 'change', type: 'fileChange', changes, output }, true)
+  expect(item).toMatchObject({
+    fileChanges: [{ path: 'before' }],
+    input: [{ path: 'after-input', kind: 'update' }],
+    output: null,
+    locations: [{ path: 'after-output' }],
   })
 })

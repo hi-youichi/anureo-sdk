@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { InMemorySessionStore, type Options, type SDKMessage, type SDKUserMessage, type SessionStore, type SessionStoreEntry } from '@anthropic-ai/claude-agent-sdk'
+import { InMemorySessionStore, type Options, type SDKMessage, type SessionStore, type SessionStoreEntry } from '@anthropic-ai/claude-agent-sdk'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,40 +7,90 @@ import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { BoundedEventQueue, createClient } from '@anureo/sdk'
 import type { AhpEvent, JsonSchema, SessionOpenParams } from '@anureo/protocol'
-import { createClaudeAdapter, type ClaudeAdapterOptions, type ClaudeQuery } from './index'
+import { createClaudeAdapter, type ClaudeAdapterOptions, type ClaudeQuery, type ClaudeQueryFactory } from './index'
 
 const ANSWER = { type: 'object', properties: { answer: { type: 'integer' } }, required: ['answer'], additionalProperties: false }
 const LABEL = { type: 'object', properties: { label: { type: 'string' } }, required: ['label'] }
 /** Observe expected admission failures immediately while retaining the original promise for assertions. */
-const observe = <T>(promise: Promise<T>) => { void promise.catch(() => {}); return promise }
-/** Hold native cleanup/configuration at an explicit boundary until the test releases it. */
-function deferred() {
-  let resolve!: () => void
-  const promise = new Promise<void>(done => { resolve = done })
-  return { promise, resolve }
+function observe<T>(promise: Promise<T>): Promise<T> {
+  void promise.catch(() => {})
+  return promise
 }
 
-/** Drive real adapter/client lifecycles through a scripted streaming query factory.
- * Query creation order is observable independently of turns; tests control native input consumption
- * and terminal results. The caller must await dispose to release the event reader and client. */
+/**
+ * Build the state for one scripted native query. The adapter calls the fixture's factory
+ * with its input stream, which tests consume to obtain the UUIDs needed for replies.
+ * close ends message iteration, while return tracks the adapter's separate cleanup step.
+ */
+function scriptedQuery({ prompt, options }: Parameters<ClaudeQueryFactory>[0]) {
+  if (typeof prompt === 'string') throw new Error('Expected streaming input')
+  const queryOptions: Options = options ?? {}
+  const state = {
+    output: new BoundedEventQueue<SDKMessage>(),
+    input: prompt[Symbol.asyncIterator](),
+    options: queryOptions,
+    closes: 0,
+    returns: 0,
+  }
+  const query: ClaudeQuery = {
+    [Symbol.asyncIterator]: () => state.output[Symbol.asyncIterator](),
+    close() {
+      state.closes++
+      state.output.end()
+    },
+    async interrupt() { return undefined },
+    async setModel() {},
+    async setPermissionMode() {},
+    async setMaxThinkingTokens() {},
+    async applyFlagSettings() {},
+    async rewindFiles() { return { canRewind: true } },
+    async supportedModels() { return [] },
+  }
+  Object.assign(query, {
+    async return() {
+      state.returns++
+      return { done: true, value: undefined }
+    },
+  })
+  return Object.assign(state, { query })
+}
+
+/**
+ * Pause the adapter's native return step after recording entry. Tests await entered to make
+ * assertions during cleanup and call release in finally so disposal can finish.
+ */
+function pauseQueryReturn(state: ReturnType<typeof scriptedQuery>) {
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  Object.assign(state.query, {
+    async return() {
+      state.returns++
+      entered.resolve()
+      await release.promise
+      return { done: true, value: undefined }
+    },
+  })
+  return { entered: entered.promise, release: release.resolve }
+}
+
+/**
+ * Drive real adapter/client lifecycles through a scripted streaming query factory.
+ * Tests observe query creation order independently of turns and control native input consumption
+ * and terminal results. The test must await dispose to release the event reader and client.
+ */
 async function fixture(options: ClaudeAdapterOptions = {}, open?: Partial<SessionOpenParams>) {
   // Query indices follow creation order from zero, not execution count; equal schemas reuse a Query.
-  const queries: Array<{ query: ClaudeQuery; output: BoundedEventQueue<SDKMessage>; input: AsyncIterator<SDKUserMessage>; options: Options; closes: number; returns: number }> = []
+  const queries: ReturnType<typeof scriptedQuery>[] = []
   const created: Array<() => void> = []
-  const adapter = createClaudeAdapter({ ...options, queryFactory: ({ prompt, options }) => {
-      if (typeof prompt === 'string') throw new Error('Expected streaming input')
-      const state = { output: new BoundedEventQueue<SDKMessage>(), input: prompt[Symbol.asyncIterator](), options: options ?? {}, closes: 0, returns: 0 }
-      const query: ClaudeQuery = {
-        [Symbol.asyncIterator]: () => state.output[Symbol.asyncIterator](),
-        close() { state.closes++; state.output.end() },
-        async interrupt() { return undefined }, async setModel() {}, async setPermissionMode() {}, async setMaxThinkingTokens() {}, async applyFlagSettings() {},
-        async rewindFiles() { return { canRewind: true } }, async supportedModels() { return [] },
-      }
-      Object.assign(query, { async return() { state.returns++; return { done: true, value: undefined } } })
-      queries.push(Object.assign(state, { query }))
+  const adapter = createClaudeAdapter({
+    ...options,
+    queryFactory: params => {
+      const state = scriptedQuery(params)
+      queries.push(state)
       for (const done of created.splice(0)) done()
-      return query
-    } })
+      return state.query
+    },
+  })
   const client = await createClient({
     adapter,
     identity: { adapterId: 'claude', runtimeConfigId: 'schema' },
@@ -49,11 +99,23 @@ async function fixture(options: ClaudeAdapterOptions = {}, open?: Partial<Sessio
   const events: AhpEvent[] = []
   const reader = session.events()[Symbol.asyncIterator]()
   // Event failures belong to operation assertions; keep the collector awaitable during disposal.
-  const reading = (async () => { try { for (;;) { const next = await reader.next(); if (next.done) break; events.push(next.value) } } catch {} })()
+  const reading = (async () => {
+    try {
+      for (;;) {
+        const next = await reader.next()
+        if (next.done) return
+        events.push(next.value)
+      }
+    } catch {}
+  })()
   /** Wait for native query creation, including replacements admitted after asynchronous cleanup. */
   async function waitForQuery(queryIndex: number) {
-    while (!queries[queryIndex]) await new Promise<void>(resolve => created.push(resolve))
-    return queries[queryIndex]!
+    let state = queries[queryIndex]
+    while (!state) {
+      await new Promise<void>(resolve => created.push(resolve))
+      state = queries[queryIndex]
+    }
+    return state
   }
   /** Consume one dispatched native input, failing if the scripted query has already ended. */
   async function input(queryIndex: number) {
@@ -61,14 +123,15 @@ async function fixture(options: ClaudeAdapterOptions = {}, open?: Partial<Sessio
     if (next.done) throw new Error('Expected an input')
     return next.value
   }
+  /** Enqueue a native message for the adapter's pump. Awaiting send confirms queue admission. */
   const send = (queryIndex: number, value: Record<string, unknown>) => queries[queryIndex]!.output.write(value as unknown as SDKMessage)
-  /** Echo consumed input UUIDs so the real adapter can associate and finish their execution. */
+  /** Echo consumed input UUIDs so the adapter can finish their execution. extra overrides the default result fields. */
   const result = (queryIndex: number, ids: string[], extra: Record<string, unknown> = {}) => send(queryIndex, {
     type: 'result', subtype: 'success', is_error: false, result: 'Do not parse this prose', num_turns: 1, stop_reason: 'end_turn',
     user_message_uuids: ids, user_message_uuid: ids.at(-1), usage: { input_tokens: 7, output_tokens: 9 }, ...extra,
   })
   return {
-    client, adapter, session, queries, events, waitForQuery, input, send, result,
+    client, adapter, session, queries, events, input, send, result,
     /** Submit, consume and finish one execution, awaiting both dispatch association and terminal output. */
     async execute(schema: JsonSchema | undefined, queryIndex: number, extra: Record<string, unknown> = {}) {
       const pending = observe(session.submit({ input: 'task', ...(schema !== undefined ? { outputSchema: schema } : {}) }))
@@ -78,7 +141,11 @@ async function fixture(options: ClaudeAdapterOptions = {}, open?: Partial<Sessio
       return { turn, result: await turn.result(), user }
     },
     /** Stop collection before disposing the client; propagate resource-release failures to the test. */
-    async dispose() { await reader.return?.(); await reading; await client.dispose() },
+    async dispose() {
+      await reader.return?.()
+      await reading
+      await client.dispose()
+    },
   }
 }
 
@@ -219,24 +286,26 @@ test('missing output, invalid output, retry exhaustion and interruption preserve
 })
 
 test('switch admission spans asynchronous Query cleanup and rejects competing input, config and revert', async () => {
-  const entered = deferred(), release = deferred(), f = await fixture({ sessionStore: new InMemorySessionStore() })
+  const f = await fixture({ sessionStore: new InMemorySessionStore() })
   const initialQueryIndex = 0, answerQueryIndex = 1
+  const cleanup = pauseQueryReturn(f.queries[initialQueryIndex]!)
   try {
-    Object.assign(f.queries[initialQueryIndex]!.query, { async return() { f.queries[initialQueryIndex]!.returns++; entered.resolve(); await release.promise; return { done: true, value: undefined } } })
     const pending = observe(f.session.submit({ input: 'switch', outputSchema: ANSWER }))
-    await entered.promise
+    await cleanup.entered
     await expect(f.session.submit({ input: 'competing', outputSchema: LABEL })).rejects.toMatchObject({ code: 'SESSION_BUSY' })
     await expect(f.session.request('session/config/set', { requestId: 'config', sessionId: f.session.id, patch: { model: 'other' } })).rejects.toMatchObject({ code: 'SESSION_BUSY' })
     await expect(f.session.request('session/revert', { requestId: 'revert', sessionId: f.session.id, scope: 'conversation', boundary: { turnId: 'old', relation: 'before' } })).rejects.toMatchObject({ code: 'SESSION_BUSY' })
-    release.resolve()
+    cleanup.release()
     const user = await f.input(answerQueryIndex)
     await f.result(answerQueryIndex, [user.uuid!], { structured_output: { answer: 9 } })
     expect((await (await pending).result()).text).toBe('{"answer":9}')
-  } finally { release.resolve(); await f.dispose() }
+  } finally { cleanup.release(); await f.dispose() }
 })
 
 test('configuration in progress prevents switching and completed settings survive the replacement', async () => {
-  const entered = deferred(), release = deferred(), f = await fixture()
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const f = await fixture()
   const initialQueryIndex = 0, answerQueryIndex = 1
   try {
     f.queries[initialQueryIndex]!.query.setModel = async () => { entered.resolve(); await release.promise }
@@ -251,19 +320,20 @@ test('configuration in progress prevents switching and completed settings surviv
 })
 
 test('close during cleanup never starts a replacement Query or dispatches input', async () => {
-  const entered = deferred(), release = deferred(), f = await fixture()
+  const f = await fixture()
   const initialQueryIndex = 0
+  const cleanup = pauseQueryReturn(f.queries[initialQueryIndex]!)
   try {
-    Object.assign(f.queries[initialQueryIndex]!.query, { async return() { f.queries[initialQueryIndex]!.returns++; entered.resolve(); await release.promise; return { done: true, value: undefined } } })
     const pending = observe(f.session.submit({ input: 'switch', outputSchema: ANSWER }))
-    await entered.promise
+    await cleanup.entered
     const closing = f.session.close()
-    release.resolve(); await closing
+    cleanup.release()
+    await closing
     await expect(pending).rejects.toMatchObject({ code: 'SESSION_CLOSED' })
     expect(f.queries).toHaveLength(1)
     expect([f.queries[initialQueryIndex]!.closes, f.queries[initialQueryIndex]!.returns]).toEqual([1, 1])
     expect(f.events.some(event => event.type === 'turn/started')).toBe(false)
-  } finally { release.resolve(); await f.dispose() }
+  } finally { cleanup.release(); await f.dispose() }
 })
 
 test('cleanup failure does not dispatch, repeat cleanup or silently recover by replay', async () => {

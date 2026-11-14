@@ -55,12 +55,26 @@ async function completed(sink: SessionEventSink, turnId: string, text = 'answer'
 /** Submission-specific Run callbacks recover their known request type here; this test assertion neither validates params nor changes native admission. */
 const asSubmitParams = (p: AhpRequestMap[SessionMethod]) => p as AhpRequestMap['input/submit'];
 
+/** Publish the start, then explicitly bind the submission. Run callbacks can still gate or omit a native acceptance receipt. */
+async function startAndBind(sink: SessionEventSink, { submissionId, turnId }: { submissionId: string; turnId: string }) {
+  await started(sink, turnId);
+  await sink.bindSubmission(submissionId, turnId);
+}
+
+/** Publish the start and return a receipt so OutputSession.execute can bind the submission from it. */
+async function startWithReceipt(sink: SessionEventSink, { submissionId, turnId }: { submissionId: string; turnId: string }): Promise<AhpResultMap['input/submit']> {
+  await started(sink, turnId);
+  return { submissionId, accepted: true, disposition: 'started', turnId };
+}
+
 /** Gate the native receipt after binding and require submit to return a Turn first; the public observer must reach completion without an acknowledgement dependency. Finally release both gate and client. */
 test('submit returns a Turn from binding before a delayed receipt; no public Submission stage', async () => {
   const ack = deferred<void>();
   const f = await fixture(async (_m, p, sink) => {
-    await started(sink, 'actual'); await sink.bindSubmission(asSubmitParams(p).submissionId, 'actual');
-    await ack.promise; return { submissionId: asSubmitParams(p).submissionId, disposition: 'dispatched' };
+    const { submissionId } = asSubmitParams(p);
+    await startAndBind(sink, { submissionId, turnId: 'actual' });
+    await ack.promise;
+    return { submissionId, disposition: 'dispatched' };
   });
   try {
     const turn = await f.session.submit({ input: 'x' }, { timeoutMs: 100 });
@@ -80,19 +94,44 @@ test('a backend without acceptance receipts binds a previously completed native 
   finally { await f.client.dispose(); }
 });
 
-/** Associate two inputs with one native execution and cancel/dispose only one Turn observer. Its sibling must retain the shared result with no extra dispatch; finally dispose the client. */
+/** Bind two inputs to one execution. Caller abort ends one result wait, then disposal cancels that handle's pending observations while its sibling still receives the terminal event and result. */
 test('two submissions share one actual result and independent observers', async () => {
   const f = await fixture(async (_m, p, sink) => {
-    await started(sink, 'shared'); await sink.bindSubmission(asSubmitParams(p).submissionId, 'shared');
-    return { submissionId: asSubmitParams(p).submissionId, accepted: true, disposition: 'joined', turnId: 'shared' };
+    const { submissionId } = asSubmitParams(p);
+    await startAndBind(sink, { submissionId, turnId: 'shared' });
+    return { submissionId, accepted: true, disposition: 'joined', turnId: 'shared' };
   });
   try {
-    const a = await f.session.submit({ input: 'a' }), b = await f.session.submit({ input: 'b' });
-    expect(a).not.toBe(b); expect(a.id).toBe(b.id);
-    const abort = new AbortController(); const wait = a.result({ signal: abort.signal }); abort.abort();
-    await expect(wait).rejects.toMatchObject({ code: 'REQUEST_ABORTED' });
-    await a.dispose(); await completed(f.sink, b.id, 'shared answer');
-    expect((await b.result()).text).toBe('shared answer'); expect(f.calls).toHaveLength(2);
+    const first = await f.session.submit({ input: 'a' });
+    const sibling = await f.session.submit({ input: 'b' });
+    expect(first).not.toBe(sibling);
+    expect(first.id).toBe(sibling.id);
+
+    const abort = new AbortController();
+    const callerWait = first.result({ signal: abort.signal });
+    abort.abort();
+    await expect(callerWait).rejects.toMatchObject({ code: 'REQUEST_ABORTED' });
+
+    const firstReader = first.events()[Symbol.asyncIterator]();
+    const pendingRead = firstReader.next();
+    const pendingResult = first.result().catch(cause => cause);
+    const siblingEvents = sibling.events();
+    try {
+      await first.dispose();
+      expect(await pendingResult).toMatchObject({ code: 'REQUEST_ABORTED' });
+      expect((await pendingRead).done).toBe(true);
+      await expect(first.result()).rejects.toMatchObject({ code: 'TURN_DISPOSED' });
+
+      await completed(f.sink, sibling.id, 'shared answer');
+      const eventTypes: AhpEvent['type'][] = [];
+      for await (const event of siblingEvents) eventTypes.push(event.type);
+      expect(eventTypes).toEqual(['item/completed', 'turn/completed']);
+      expect((await sibling.result()).text).toBe('shared answer');
+      expect(f.calls).toHaveLength(2);
+    } finally {
+      await firstReader.return?.();
+      await sibling.dispose();
+    }
   } finally { await f.client.dispose(); }
 });
 
@@ -106,7 +145,8 @@ test('cancelled submit waiting retains dispatch and later association without re
     const abort = new AbortController(); const waiting = f.session.submit({ input: 'x' }, { signal: abort.signal });
     await sent.promise; abort.abort(); await expect(waiting).rejects.toMatchObject({ code: 'REQUEST_ABORTED' });
     expect(f.session.snapshot.status).toBe('ready');
-    await started(f.sink, 'late'); await f.sink.bindSubmission(submitted, 'late'); await completed(f.sink, 'late');
+    await startAndBind(f.sink, { submissionId: submitted, turnId: 'late' });
+    await completed(f.sink, 'late');
     expect(events.some(e => e.type === 'submission/bound' && e.payload.submissionId === submitted)).toBe(true);
     expect(f.calls).toHaveLength(1);
   } finally { release.resolve(); await f.client.dispose(); await reading; }
@@ -116,8 +156,11 @@ test('cancelled submit waiting retains dispatch and later association without re
 test('completed snapshots rotate while newly pending submissions do not pin older executions', async () => {
   let n = 0;
   const f = await fixture(async (_m, p, sink) => {
-    const id = `turn-${++n}`; await started(sink, id); await sink.bindSubmission(asSubmitParams(p).submissionId, id); await completed(sink, id);
-    return { submissionId: asSubmitParams(p).submissionId, accepted: true, disposition: 'started', turnId: id };
+    const turnId = `turn-${++n}`;
+    const { submissionId } = asSubmitParams(p);
+    await startAndBind(sink, { submissionId, turnId });
+    await completed(sink, turnId);
+    return { submissionId, accepted: true, disposition: 'started', turnId };
   }, { limits: { maxExecutions: 1, maxSubmissions: 2 } });
   try {
     for (let i = 0; i < 6; i++) expect((await (await f.session.submit({ input: 'x' })).result()).status).toBe('completed');
@@ -145,7 +188,7 @@ test('definite input rejection leaves another execution usable', async () => {
   let n = 0;
   const f = await fixture(async (_m, p, sink) => {
     if (++n === 2) throw new HarnessSdkError('NATIVE_BUSY');
-    await started(sink, 'kept'); return { submissionId: asSubmitParams(p).submissionId, accepted: true, disposition: 'started', turnId: 'kept' };
+    return startWithReceipt(sink, { submissionId: asSubmitParams(p).submissionId, turnId: 'kept' });
   });
   try {
     const a = await f.session.submit({ input: 'a' }); await expect(f.session.submit({ input: 'b' })).rejects.toMatchObject({ code: 'NATIVE_BUSY' });
@@ -156,7 +199,9 @@ test('definite input rejection leaves another execution usable', async () => {
 /** Complete two active executions in reverse order with the same native item ID. Public activity and retained text must remain execution-local; finally dispose the fixture. */
 test('interleaved executions and reused item IDs remain isolated', async () => {
   let n = 0;
-  const f = await fixture(async (_m,p,sink) => { const turnId = `actual-${++n}`; await started(sink, turnId); return { submissionId: asSubmitParams(p).submissionId, accepted: true, disposition: 'started', turnId }; });
+  const f = await fixture((_m, p, sink) =>
+    startWithReceipt(sink, { submissionId: asSubmitParams(p).submissionId, turnId: `actual-${++n}` }),
+  );
   try {
     const a = await f.session.submit({ input: 'a' }), b = await f.session.submit({ input: 'b' });
     expect(f.session.snapshot.activeTurnIds).toEqual([a.id,b.id]);
@@ -169,7 +214,7 @@ test('interleaved executions and reused item IDs remain isolated', async () => {
 test('exact steer uses the actual target and keeps one execution', async () => {
   const f = await fixture(async (m,p,sink) => {
     if (m === 'turn/steer') { const v = p as AhpRequestMap['turn/steer']; return { accepted: true, submissionId: v.submissionId, turnId: v.expectedTurnId }; }
-    await started(sink,'actual'); return { submissionId: asSubmitParams(p).submissionId, accepted: true, disposition: 'started', turnId: 'actual' };
+    return startWithReceipt(sink, { submissionId: asSubmitParams(p).submissionId, turnId: 'actual' });
   });
   try {
     const turn = await f.session.submit({ input: 'a' }); await turn.steer({ input: 'change scope' });
@@ -182,7 +227,7 @@ test('exact steer uses the actual target and keeps one execution', async () => {
 test('mismatched native steer identity fails closed rather than reporting success', async () => {
   const f = await fixture(async (m,p,sink) => {
     if (m === 'turn/steer') { const v = p as AhpRequestMap['turn/steer']; return { accepted: true, submissionId: v.submissionId, turnId: 'wrong' }; }
-    await started(sink,'actual');return { submissionId: asSubmitParams(p).submissionId, accepted: true, disposition: 'started', turnId: 'actual' };
+    return startWithReceipt(sink, { submissionId: asSubmitParams(p).submissionId, turnId: 'actual' });
   });
   try { const turn=await f.session.submit({input:'a'}); await expect(turn.steer({input:'b'})).rejects.toMatchObject({code:'PROTOCOL_ERROR'}); }
   finally {await f.client.dispose();}
@@ -210,9 +255,7 @@ test('active close is shared, preserves retained terminals and leaves unfinished
       return closeResult;
     }
     if (m === 'turn/interrupt') return { accepted: true, turnId: (p as AhpRequestMap['turn/interrupt']).turnId };
-    const turnId = `turn-${++n}`;
-    await started(sink, turnId);
-    return { submissionId: asSubmitParams(p).submissionId, accepted: true, disposition: 'started', turnId };
+    return startWithReceipt(sink, { submissionId: asSubmitParams(p).submissionId, turnId: `turn-${++n}` });
   });
   try {
     const finished = await f.session.submit({ input: 'first' });
@@ -239,7 +282,10 @@ test('active close is shared, preserves retained terminals and leaves unfinished
 
 /** Reject native close definitively and then complete the active execution. The failed close must restore running status without losing the Turn; finally dispose the client. */
 test('definite close rejection restores an active session',async()=>{
-  const f=await fixture(async(m,p,sink)=>{if(m==='session/close')throw new HarnessSdkError('CLOSE_DENIED');await started(sink,'active');return {submissionId:asSubmitParams(p).submissionId,accepted:true,disposition:'started',turnId:'active'};});
+  const f = await fixture(async (method, params, sink) => {
+    if (method === 'session/close') throw new HarnessSdkError('CLOSE_DENIED');
+    return startWithReceipt(sink, { submissionId: asSubmitParams(params).submissionId, turnId: 'active' });
+  });
   try{const turn=await f.session.submit({input:'x'});await expect(f.session.close()).rejects.toMatchObject({code:'CLOSE_DENIED'});expect(f.session.snapshot.status).toBe('running');await completed(f.sink,turn.id);expect((await turn.result()).status).toBe('completed');}
   finally{await f.client.dispose();}
 });
@@ -284,9 +330,10 @@ test('timing out or aborting a close observer preserves the shared close and its
 /** Reject oversized inputs before native dispatch at a one-submission limit. A later valid input must still complete with exactly one native attempt; finally dispose the client. */
 test('inputs rejected before native dispatch do not exhaust submission capacity', async () => {
   const f = await fixture(async (_method, params, sink) => {
-    await started(sink, 'valid'); await sink.bindSubmission(asSubmitParams(params).submissionId, 'valid');
+    const { submissionId } = asSubmitParams(params);
+    await startAndBind(sink, { submissionId, turnId: 'valid' });
     await completed(sink, 'valid');
-    return { submissionId: asSubmitParams(params).submissionId, disposition: 'dispatched' };
+    return { submissionId, disposition: 'dispatched' };
   }, { limits: { maxSubmissions: 1 }, runtime: { queue: { maxFrameBytes: 2048 } } });
   try {
     for (let i = 0; i < 3; i++) await expect(f.session.submit({ input: 'x'.repeat(3000) })).rejects.toMatchObject({ code: 'FRAME_TOO_LARGE' });
@@ -300,9 +347,10 @@ test('request-cache backpressure before dispatch also releases submission capaci
   const release = deferred<void>();
   const f = await fixture(async (method, params, sink) => {
     if (method === 'compact/start') { await release.promise; return { maintenanceId: 'compact', status: 'completed' }; }
-    await started(sink, 'valid'); await sink.bindSubmission(asSubmitParams(params).submissionId, 'valid');
+    const { submissionId } = asSubmitParams(params);
+    await startAndBind(sink, { submissionId, turnId: 'valid' });
     await completed(sink, 'valid');
-    return { submissionId: asSubmitParams(params).submissionId, disposition: 'dispatched' };
+    return { submissionId, disposition: 'dispatched' };
   }, { limits: { maxSubmissions: 1 }, runtime: { requestCacheSize: 1 } });
   try {
     const compact = f.session.request('compact/start', { sessionId: f.session.id, requestId: 'compact' });
@@ -326,7 +374,9 @@ test('invalid timeout parameters and mismatched session bindings never dispatch 
 
 /** Replay the same raw request concurrently, then vary payload and submission reservation independently. Require one native attempt plus distinct request/submission conflict errors; finally dispose the fixture. */
 test('raw requests dedupe and reject conflicting submission identity',async()=>{
-  const f=await fixture(async(_m,p,sink)=>{await started(sink,'actual');return {submissionId:asSubmitParams(p).submissionId,accepted:true,disposition:'started',turnId:'actual'};});
+  const f = await fixture((_m, p, sink) =>
+    startWithReceipt(sink, { submissionId: asSubmitParams(p).submissionId, turnId: 'actual' }),
+  );
   try{
     const p:AhpRequestMap['input/submit']={sessionId:f.session.id,requestId:'request',submissionId:'input',delivery:'native',input:[{type:'text',text:'a'}]};
     const [a,b]=await Promise.all([f.session.request('input/submit',p),f.session.request('input/submit',p)]);expect(a).toEqual(b);expect(f.calls).toHaveLength(1);
@@ -414,8 +464,7 @@ test('confirmed native close reports stop confirmation without inventing an unfi
   const receipt = { ...closeResult, executionStopped: 'confirmed' } as const;
   const f = await fixture(async (method, params, sink) => {
     if (method === 'session/close') return receipt;
-    await started(sink, 'active');
-    return { submissionId: asSubmitParams(params).submissionId, accepted: true, disposition: 'started', turnId: 'active' };
+    return startWithReceipt(sink, { submissionId: asSubmitParams(params).submissionId, turnId: 'active' });
   });
   try {
     const turn = await f.session.submit({ input: 'work' });
@@ -431,8 +480,9 @@ test('confirmed native close reports stop confirmation without inventing an unfi
 /** Patch a retained tool snapshot before interrupted completion. Turn.result must expose the replacement content under the original item identity; finally dispose the client. */
 test('item-shaped patch snapshots update retained results without changing item identity', async () => {
   const f = await fixture(async (_method, params, sink) => {
-    await started(sink, 'actual'); await sink.bindSubmission(asSubmitParams(params).submissionId, 'actual');
-    return { submissionId: asSubmitParams(params).submissionId, disposition: 'dispatched' };
+    const { submissionId } = asSubmitParams(params);
+    await startAndBind(sink, { submissionId, turnId: 'actual' });
+    return { submissionId, disposition: 'dispatched' };
   });
   try {
     const turn = await f.session.submit({ input: 'work' });
@@ -447,9 +497,9 @@ test('item-shaped patch snapshots update retained results without changing item 
 test('a patch cannot move an item into another identity or content family', async () => {
   const patches: import('@anureo/protocol').JsonObject[] = [ { id: 'other', type: 'agentMessage', text: 'bad' }, { id: 'item', type: 'notice', severity: 'info', text: 'bad' } ];
   for (const value of patches) {
-    const f = await fixture(async (_method, params, sink) => {
-      await started(sink, 'actual'); return { submissionId: asSubmitParams(params).submissionId, accepted: true, disposition: 'started', turnId: 'actual' };
-    });
+    const f = await fixture((_method, params, sink) =>
+      startWithReceipt(sink, { submissionId: asSubmitParams(params).submissionId, turnId: 'actual' }),
+    );
     try {
       const turn = await f.session.submit({ input: 'work' });
       await f.sink.emit({ type: 'item/started', payload: { item: { id: 'item', type: 'agentMessage', text: '' } } }, { turnId: turn.id });
@@ -461,14 +511,18 @@ test('a patch cannot move an item into another identity or content family', asyn
 
 /** Overflow one Turn reader while draining a sibling. The sibling and retained result must complete without native interruption; return the slow reader and finally dispose the fixture. */
 test('one overflowing observer does not interrupt a sibling or discard the retained native result', async () => {
-  const f = await fixture(async (_method, params, sink) => {
-    await started(sink, 'actual'); return { submissionId: asSubmitParams(params).submissionId, accepted: true, disposition: 'started', turnId: 'actual' };
-  });
+  const f = await fixture((_method, params, sink) =>
+    startWithReceipt(sink, { submissionId: asSubmitParams(params).submissionId, turnId: 'actual' }),
+  );
   try {
     const turn = await f.session.submit({ input: 'work' });
     const slow = turn.events({ queue: { maxEvents: 1 } })[Symbol.asyncIterator]();
-    const sibling = turn.observe(), reader = sibling.events()[Symbol.asyncIterator]();
-    const fast = (async () => { const events: AhpEvent[] = []; for (;;) { const next = await reader.next(); if (next.done) return events; events.push(next.value); } })();
+    const sibling = turn.observe();
+    const fast = (async () => {
+      const events: AhpEvent[] = [];
+      for await (const event of sibling.events()) events.push(event);
+      return events;
+    })();
     await f.sink.emit({ type: 'item/started', payload: { item: { id: 'message', type: 'agentMessage', text: '' } } }, { turnId: turn.id });
     await completed(f.sink, turn.id);
     await slow.next(); await expect(slow.next()).rejects.toMatchObject({ code: 'BACKPRESSURE_EXCEEDED' });

@@ -1,14 +1,13 @@
-/** Owns Codex permission and service-tier policy; it must not dispatch requests or mutate sessions. */
+/** Translates SDK configuration values into Codex request settings. */
 import type { JsonObject } from '@anureo/protocol'
 import { HarnessSdkError } from '@anureo/sdk'
 
-/** Host-facing permission vocabulary shared by capability advertisement and request translation; consumers must not mutate it. */
+/** Permission modes advertised by codexCapabilities and recognized by CodexBackendSession.threadOptions. Treat the list as read-only. */
 export const PERMISSION_MODES = ['read-only', 'agent', 'agent-full-access'] as const
 /**
- * For thread/turn/settings request builders, translate a host permission mode into fresh native approval
- * and sandbox settings without I/O. Undefined stays absent; every other unsupported value throws
- * INVALID_PARAMS. Both sandbox forms are returned because thread creation and turn/settings requests
- * use different native fields.
+ * Translate a configured mode before native dispatch. threadOptions uses the string sandbox, while
+ * startInput and setConfig use the fresh sandbox policy object. Omitted mode returns undefined.
+ * Unsupported values throw INVALID_PARAMS before the caller dispatches its thread, turn or settings request.
  */
 export function permissionSettings(value: unknown): { approvalPolicy: string; sandbox: string; sandboxPolicy: JsonObject } | undefined {
   if (value === undefined) return undefined
@@ -21,11 +20,8 @@ export function permissionSettings(value: unknown): { approvalPolicy: string; sa
 }
 
 /**
- * For native request builders, return the priority tier only for true and null otherwise so disabling
- * fast mode restores the thread default. No I/O or errors. CodexBackendSession.setConfig validates
- * booleans before translating; threadOptions and startInput decide whether to omit an absent option.
+ * Translate true to priority and other values to null, the native instruction to use the thread
+ * default. threadOptions and startInput omit the field when fastMode is absent. setConfig checks
+ * the patch is boolean before translating a provided value.
  */
-export const serviceTierFor = (fast: unknown) => fast === true ? FAST_TIER : null
-
-/** Anureo's fastMode boolean maps to Codex's priority service tier; standard speed is the thread default (null). */
-const FAST_TIER = 'priority'
+export const serviceTierFor = (fast: unknown): 'priority' | null => fast === true ? 'priority' : null

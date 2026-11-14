@@ -1,22 +1,35 @@
 import { test, expect } from 'bun:test';
 import { resolve } from 'node:path';
-import { createClient, type Session } from '@anureo/sdk';
+import { createClient } from '@anureo/sdk';
 import type { AhpEvent, Capabilities } from '@anureo/protocol';
 import { createAcpAdapter, createDshAcpAdapter, type AcpAdapterOptions } from '../src/index';
 import { resolveConfigValue } from '../src/mapping';
 import { rejectionOf } from './test-helpers';
 
 const executable = resolve(import.meta.dirname, './fixtures/dsh-acp.mjs');
-// `turnId` lives on the source envelope; turn events also repeat it inside the payload.
-const turnIdOf = (event: AhpEvent): string | undefined => event.turnId ?? (('turnId' in event.payload) ? (event.payload as { turnId?: string }).turnId : undefined);
+/** Prefer the envelope's turn ID, with a payload fallback for assertions on turn events. */
+function turnIdOf(event: AhpEvent): string | undefined {
+  if (event.turnId != null) return event.turnId;
+  if ('turnId' in event.payload) return (event.payload as { turnId?: string }).turnId;
+  return undefined;
+}
 
-/** Collect DSH-shaped peer events and poll for terminal publication; callers must close the fixture to join its pump. */
-async function fixture(args: string[] = [], options: Partial<AcpAdapterOptions> = {}) {
+/** Initialize the scripted peer with explicit interaction responses enabled. The caller owns client disposal. */
+async function openFixtureClient(args: string[] = [], options: AcpAdapterOptions = {}) {
   const adapter = createAcpAdapter({ command: process.execPath, args: [executable, ...args], ...options });
-  // Declaring the approval channel opts into explicit `interaction/respond`; the adapter
-  // never needs it when a policy answers, but the fallback path does.
-  const runtime = await createClient({ adapter, identity: { adapterId: 'dsh-acp', runtimeConfigId: 'fixture' }, interactions: { approval: undefined, userInput: undefined, elicitation: undefined, dynamicTool: undefined } });
-  const session: Session = await runtime.sessions.create({ cwd: process.cwd() });
+  const runtime = await createClient({
+    adapter,
+    identity: { adapterId: 'dsh-acp', runtimeConfigId: 'fixture' },
+    // The fallback approval test sends interaction/respond itself.
+    interactions: { approval: undefined, userInput: undefined, elicitation: undefined, dynamicTool: undefined },
+  });
+  return { adapter, runtime };
+}
+
+/** Open a session and subscribe before submitting turns. Await close to dispose the client and join the event pump. */
+async function fixture(args: string[] = [], options: AcpAdapterOptions = {}) {
+  const { adapter, runtime } = await openFixtureClient(args, options);
+  const session = await runtime.sessions.create({ cwd: process.cwd() });
   const events: AhpEvent[] = [];
   const pump = (async () => {
     try {
@@ -24,26 +37,35 @@ async function fixture(args: string[] = [], options: Partial<AcpAdapterOptions> 
         events.push(event);
       }
     } catch {
-      // Disposal is expected to close the observation, but this fixture
-      // unconditionally ignores all event-stream errors.
+      // The assertions use captured events. Missing events surface through the polling timeout.
     }
   })();
   /** Poll an observed event condition for up to roughly one second; timeout rejects the test. */
   const until = async (predicate: () => boolean) => {
-    for (let index = 0; index < 500; index++) { if (predicate()) return; await new Promise((done) => setTimeout(done, 2)); }
+    for (let index = 0; index < 500; index++) {
+      if (predicate()) return;
+      await new Promise((done) => setTimeout(done, 2));
+    }
     throw new Error('Timed out awaiting the DSH fixture');
   };
+  /** Wait for terminal event publication for the submitted turn, including failed outcomes. */
+  const untilTurnCompletes = (id: string) =>
+    until(() => events.some((event) => event.type === 'turn/completed' && turnIdOf(event) === id));
   return {
-    adapter, runtime, session, events, until,
-    /** Observe terminal events even for failed TurnResults, whose rejection is explicitly consumed. */
+    adapter, session, events, until, untilTurnCompletes,
+    /** Submit input and return that turn's captured events once its terminal event is published. */
     async turn(text: string) {
-      const value = await session.submit({ input: text });
-      // A failed turn rejects its TurnResult; observe it so the test never leaks a rejection.
-      void value.result().catch(() => {});
-      await until(() => events.some((event) => event.type === 'turn/completed' && turnIdOf(event) === value.id));
-      return events.filter((event) => turnIdOf(event) === value.id);
+      const turn = await session.submit({ input: text });
+      // These assertions observe terminal publication through the event stream.
+      void turn.result().catch(() => {});
+      await untilTurnCompletes(turn.id);
+      return events.filter((event) => turnIdOf(event) === turn.id);
     },
-    async close() { await runtime.dispose(); await pump; },
+    /** Dispose the client and join event collection after successful disposal. */
+    async close() {
+      await runtime.dispose();
+      await pump;
+    },
   };
 }
 
@@ -101,7 +123,7 @@ test('a policy that declines to decide keeps the interactive approval path', asy
     if (request?.type === 'interaction/requested') {
       await f.session.request('interaction/respond', { requestId: 'answer', sessionId: f.session.binding.sessionId, interactionId: request.payload.interactionId, response: { kind: 'approval', optionId: 'reject-once' } });
     }
-    await f.until(() => f.events.some((event) => event.type === 'turn/completed' && turnIdOf(event) === turn.id));
+    await f.untilTurnCompletes(turn.id);
     expect(f.events.some((event) => event.type === 'interaction/resolved')).toBe(true);
   } finally { await f.close(); }
 });
@@ -129,7 +151,15 @@ test('stop reasons never turn an unclassified stop into success', async () => {
 
 test('model aliases resolve to the advertised wire value and unknown ones fail early', () => {
   const capabilities = { config: { options: [{ id: 'model', title: 'Model', scope: 'session', schema: { type: 'string', enum: ['deepseek-official/deepseek-v4-flash', 'deepseek-official/deepseek-v4-pro'] } }] } } as unknown as Capabilities;
-  const capture = (run: () => unknown) => { try { run(); return undefined; } catch (error) { return error; } };
+  /** Return the synchronous failure for code assertions, or undefined if validation succeeds. */
+  const capture = (run: () => unknown) => {
+    try {
+      run();
+      return undefined;
+    } catch (error) {
+      return error;
+    }
+  };
   expect(resolveConfigValue(capabilities, 'model', 'deepseek-v4-flash')).toBe('deepseek-official/deepseek-v4-flash');
   expect(resolveConfigValue(capabilities, 'model', 'deepseek-official/deepseek-v4-pro')).toBe('deepseek-official/deepseek-v4-pro');
   expect(capture(() => resolveConfigValue(capabilities, 'model', 'gpt-9'))).toMatchObject({ code: 'INVALID_PARAMS' });
@@ -137,10 +167,7 @@ test('model aliases resolve to the advertised wire value and unknown ones fail e
 });
 
 test('the open path resolves a bare model before it reaches the backend', async () => {
-  const adapter = createAcpAdapter({ command: process.execPath, args: [executable] });
-  // Declaring the approval channel opts into explicit `interaction/respond`; the adapter
-  // never needs it when a policy answers, but the fallback path does.
-  const runtime = await createClient({ adapter, identity: { adapterId: 'dsh-acp', runtimeConfigId: 'fixture' }, interactions: { approval: undefined, userInput: undefined, elicitation: undefined, dynamicTool: undefined } });
+  const { runtime } = await openFixtureClient();
   try {
     const session = await runtime.sessions.create({ cwd: process.cwd(), model: 'deepseek-v4-flash' });
     expect(session.binding.adapterId).toBe('dsh-acp');

@@ -1,27 +1,31 @@
-/** Projects read-only native model pages for discovery callers; it must not own connections or create threads. */
 import { HarnessSdkError } from '@anureo/sdk'
 import type { CodexJsonlClient } from './jsonl'
 import { record, string } from './native-values'
 
-/** Metadata returned to catalog and adapter discovery callers, including hidden models; optional fields follow native metadata and carry no connection ownership. */
+/** Model metadata returned by catalog and adapter discovery, including entries hidden from the usual picker. */
 export type CodexModel = {
-  /** Native id, falling back to the native model field when id is not a string. */
+  /** Nonempty native id, or the native model field if id is absent or non-string. */
   id: string
-  /** Native display label, falling back to the model identity. */
+  /** First string among the native displayName, name and resolved id fields, including an empty label. */
   name: string
   /** Present only when the native response marks this model as the default. */
   isDefault?: boolean
   /** Present only when the native response hides this model from the usual picker. */
   hidden?: boolean
-  /** Supported reasoning effort IDs and optional picker descriptions. */
+  /** Nonempty reasoning effort IDs with optional picker descriptions. An empty list is retained. */
   efforts?: Array<{ id: string; description?: string }>
   /** Nonempty native default reasoning effort ID, when provided. */
   defaultEffort?: string
-  /** Service tiers the model accepts; 'priority' is Codex's fast tier. */
+  /** Native service-tier IDs in response order, including empty strings. Codex uses priority for fast mode. */
   serviceTiers?: string[]
 }
 
-/** For catalog listModels and CodexNativeAdapter.listModels, read model pages sequentially on an initialized client, retaining native order and hidden entries. Reject malformed entries, repeated cursors, more than 10,000 models or transport errors; never create threads or dispose the caller's client. */
+/**
+ * Read model pages sequentially on an initialized client, retaining native order and hidden
+ * entries. Catalog listModels and CodexNativeAdapter.listModels return this array to hosts.
+ * A missing, empty or non-string next cursor ends pagination. Reject malformed pages or model
+ * identities, repeated cursors, more than 10,000 models and RPC failures. The caller owns the client.
+ */
 export async function readCodexModels(client: CodexJsonlClient): Promise<CodexModel[]> {
   const models: CodexModel[] = []
   let cursor: string | undefined
@@ -39,7 +43,11 @@ export async function readCodexModels(client: CodexJsonlClient): Promise<CodexMo
   return models
 }
 
-/** Project one native page entry for the pagination reader without mutation or I/O. Reject missing/empty identities; omit invalid optional entries and empty effort IDs, retaining tier strings and native ordering. */
+/**
+ * Project a native page entry for readCodexModels. An empty native id is invalid even when model
+ * is present. Throw PROTOCOL_ERROR for an invalid identity and omit malformed optional fields
+ * or list entries while preserving valid entries in native order.
+ */
 function decodeModel(entry: unknown): CodexModel {
   const model = record(entry)
   const id = string(model.id) ?? string(model.model)

@@ -39,7 +39,7 @@ test('analysis finishes before nested module/angle reviews, which run concurrent
   let peak = 0
   let reviews = 0
   const { client, cwd, adapter, prompts } = await fixture(async prompt => {
-    if (prompt.startsWith('Analyze')) { analysisStarted.resolve(); await analysisGate.promise; return plan }
+    if (isAnalysis(prompt)) { analysisStarted.resolve(); await analysisGate.promise; return plan }
     active++
     peak = Math.max(peak, active)
     if (++reviews === 4) reviewsReady.resolve()
@@ -79,7 +79,7 @@ test('one shared concurrency limit bounds agents across both levels', async () =
   let peak = 0
   let reviews = 0
   const { client, cwd } = await fixture(async prompt => {
-    if (prompt.startsWith('Analyze')) return plan
+    if (isAnalysis(prompt)) return plan
     active++
     peak = Math.max(peak, active)
     reviews++
@@ -119,8 +119,8 @@ test('module coverage stays in plan order when lifecycles finish in reverse orde
 })
 
 test('defaults to correctness, code quality, and design angles and passes their full instructions', async () => {
-  const { client, cwd, prompts } = await fixture(prompt => prompt.startsWith('Analyze') ? plan : {
-    findings: prompt.includes('"id":"a"') && prompt.includes('Angle: Correctness') ? [finding] : [],
+  const { client, cwd, prompts } = await fixture(prompt => isAnalysis(prompt) ? plan : {
+    findings: isModule('a')(prompt) && prompt.includes('Angle: Correctness') ? [finding] : [],
   })
   const report = await reviewCode({ client, cwd })
   expect(defaultAngles.map(angle => angle.id)).toEqual(['correctness', 'code-quality', 'design'])
@@ -140,8 +140,8 @@ test('defaults to correctness, code quality, and design angles and passes their 
 
 test.each(['RATE_LIMITED', 'NATIVE_FAILED'])('failed angle %s preserves coverage and releases its scheduler slot', async code => {
   const { client, cwd, adapter } = await fixture(prompt => {
-    if (prompt.startsWith('Analyze')) return plan
-    if (prompt.includes('"id":"a"') && prompt.includes('Angle: Correctness')) {
+    if (isAnalysis(prompt)) return plan
+    if (isModule('a')(prompt) && prompt.includes('Angle: Correctness')) {
       return new HarnessSdkError(code, 'Review unavailable')
     }
     return { findings: [] }
@@ -203,7 +203,7 @@ test('failure normalization retains only valid issue paths and codes', () => {
 })
 
 test('schema-invalid findings retain diagnostics in text and persisted JSON reports', async () => {
-  const { client, cwd } = await fixture(prompt => prompt.startsWith('Analyze') ? plan : {
+  const { client, cwd } = await fixture(prompt => isAnalysis(prompt) ? plan : {
     findings: [{ ...finding, severity: 'invalid' }],
   })
   const report = await reviewCode({ client, cwd, maxModules: 1, angles: [correctnessAngle] })
@@ -216,14 +216,14 @@ test('schema-invalid findings retain diagnostics in text and persisted JSON repo
 })
 
 test('scripted startup-blocked terminal details produce a dropped agent result', async () => {
-  const { client, cwd } = await fixture(prompt => prompt.startsWith('Analyze') ? plan
+  const { client, cwd } = await fixture(prompt => isAnalysis(prompt) ? plan
     : new HarnessSdkError('AGENT_STARTUP_BLOCKED', 'Blocked', false, false, { workflowDisposition: 'startup_blocked' }))
   const report = await reviewCode({ client, cwd, maxModules: 1, angles: [correctnessAngle] })
   expect(report.modules[0]?.review.angles[0]).toMatchObject({ status: 'failed', error: { code: 'REVIEW_AGENT_INCOMPLETE' } })
 })
 
 test('scripted native cleanup metadata stops further agent dispatch', async () => {
-  const { client, cwd, adapter } = await fixture(prompt => prompt.startsWith('Analyze') ? plan
+  const { client, cwd, adapter } = await fixture(prompt => isAnalysis(prompt) ? plan
     : new HarnessSdkError('NATIVE_FAILED', 'Cleanup failed', false, false, { cleanupFailed: true }))
   await expect(reviewCode({ client, cwd, angles, concurrency: 1 })).rejects.toMatchObject({
     code: 'NATIVE_FAILED', outcomeUnknown: false, details: { cleanupFailed: true },
@@ -253,7 +253,7 @@ test('persists the run, validated analysis, every angle result, and the final re
 })
 
 test.each(['RECEIPT_LOST', 'RESOURCE_RELEASE_FAILED'])('fatal %s stops new agent dispatch and saves a failed run', async code => {
-  const { client, cwd, adapter } = await fixture(prompt => prompt.startsWith('Analyze')
+  const { client, cwd, adapter } = await fixture(prompt => isAnalysis(prompt)
     ? plan : new HarnessSdkError(code, 'Execution failed', false, code === 'RECEIPT_LOST'))
   let cause: unknown
   try { await reviewCode({ client, cwd, angles, concurrency: 1 }) }
@@ -343,7 +343,7 @@ test('null module analysis cannot become an empty successful report', async () =
 
 test.each(['\n', '\r\n', '\r', '\u2028', '\u2029'])('finding locations recognize source line terminator %j', async ending => {
   const expected = { ...finding, lineStart: 2, lineEnd: 2 }
-  const { client, cwd } = await fixture(prompt => prompt.startsWith('Analyze') ? plan : { findings: [expected] })
+  const { client, cwd } = await fixture(prompt => isAnalysis(prompt) ? plan : { findings: [expected] })
   await writeFile(join(cwd, 'a.ts'), `export const first = 1${ending}export const second = 2${ending}`)
   const report = await reviewCode({ client, cwd, maxModules: 1, angles: [correctnessAngle] })
   expect(report.status).toBe('completed')
@@ -356,8 +356,8 @@ test.each([
   { ...finding, lineEnd: 2 },
   { ...finding, file: 'missing.ts' },
 ])('unsupported finding locations fail the angle while siblings finish: %j', async invalidFinding => {
-  const { client, cwd } = await fixture(prompt => prompt.startsWith('Analyze') ? plan : {
-    findings: prompt.includes('"id":"a"') ? [invalidFinding] : [],
+  const { client, cwd } = await fixture(prompt => isAnalysis(prompt) ? plan : {
+    findings: isModule('a')(prompt) ? [invalidFinding] : [],
   })
   const report = await reviewCode({ client, cwd })
   expect(report.status).toBe('incomplete')

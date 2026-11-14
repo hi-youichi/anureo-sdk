@@ -21,6 +21,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     case 'session/prompt': {
       const server = servers.get(params.sessionId).find(server => server.name === 'anureo_output')
+      // The bridge must accept the result before the prompt reply ends the turn.
       await submitOutput(server, params.prompt, answer)
       result = { stopReason: 'end_turn' }
       break

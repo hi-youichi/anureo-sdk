@@ -5,7 +5,11 @@ import { createAcpAdapter } from '../src/index';
 
 test('vanilla ACP and negotiated ACP extensions pass the same public SDK conformance suite', async () => {
   const executable = resolve(import.meta.dirname, './fixtures/fake-acp.mjs');
-  for (const extended of [false, true]) {
+  const modes = [
+    { name: 'standard', args: [] },
+    { name: 'extensions', args: ['--extensions'] },
+  ] as const;
+  for (const { name, args } of modes) {
     const report = await runConformance((scenario) => ({
       adapter: createAcpAdapter({
         command: process.execPath,
@@ -13,7 +17,7 @@ test('vanilla ACP and negotiated ACP extensions pass the same public SDK conform
           executable,
           '--scenario',
           scenario,
-          ...(extended ? ['--extensions'] : []),
+          ...args,
         ],
         ...(scenario === 'backpressure' ? { maxFrameBytes: 1024 } : {}),
       }),
@@ -22,7 +26,7 @@ test('vanilla ACP and negotiated ACP extensions pass the same public SDK conform
     }), { timeoutMs: 3000 });
     expect(report.cases.filter((result) => result.status === 'failed')).toEqual([]);
     expect(report.passed).toBe(true);
-    if (!extended) expect(report.cases.find((result) => result.scenario === 'fork')?.status).toBe('not-applicable');
+    if (name === 'standard') expect(report.cases.find((result) => result.scenario === 'fork')?.status).toBe('not-applicable');
     else expect(report.cases.filter(result => result.status === 'not-applicable').map(result => result.scenario)).toEqual(['steer']);
   }
 }, 25_000);

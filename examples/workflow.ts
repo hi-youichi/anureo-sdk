@@ -5,8 +5,9 @@ import { agent, parallel, pipeline } from '@anureo/workflow'
 
 /**
  * Double then square each input independently, then request both summaries concurrently.
- * Print each settled agent response; pipeline/parallel failures or dropped calls become null
- * and are reported here as calculation errors. The caller keeps the client alive and disposes it.
+ * Pipeline and parallel turn callback failures and dropped calls into null slots. Reject on
+ * those slots, before requesting summaries if any input failed. The CLI awaits this function,
+ * checks the numeric results and disposes the client.
  */
 async function calculate(client: Client, inputs: readonly number[]) {
   const options = {
@@ -14,7 +15,11 @@ async function calculate(client: Client, inputs: readonly number[]) {
     cwd: process.cwd(),
     instructions: 'Perform only the requested arithmetic. Do not use tools. Return only the numeric result.',
   }
-  /** Composition callbacks use a fresh agent session per prompt and log its text or null after cleanup. */
+  /**
+   * The pipeline stages and parallel callbacks use this to run a prompt in a fresh session.
+   * Log its text or null after agent's cleanup. Agent rejections reach the invoking primitive
+   * without an input/output log.
+   */
   const ask = async (input: string) => {
     const output = await agent(input, options)
     console.log(JSON.stringify({ input, output }))
@@ -31,9 +36,10 @@ async function calculate(client: Client, inputs: readonly number[]) {
     if (value === null) throw new Error(`Calculation failed for input ${inputs[index]}`)
     return value
   })
+  const summaryInput = squaredDoubles.join(',')
   const [sum, max] = await parallel([
-    () => ask(`sum ${squaredDoubles.join(',')}`),
-    () => ask(`max ${squaredDoubles.join(',')}`),
+    () => ask(`sum ${summaryInput}`),
+    () => ask(`max ${summaryInput}`),
   ])
   if (sum === null || max === null) throw new Error('Summary calculation failed')
   return { squares: squaredDoubles, sum: Number(sum), max: Number(max) }

@@ -25,11 +25,14 @@ for await (const line of createInterface({ input: process.stdin })) {
       if (outputSchema || !text.includes('matches this JSON Schema')) throw new Error('Expected JSON text fallback')
       const session = sessions.get(sessionId)
       const turnId = `turn-${id}`
+      /** Publish one notification in this session's observation sequence. Only item events carry
+       * the optional envelope turn ID here. Serialization and write failures fail the fixture. */
       const event = (type, payload, itemTurnId) => send({ method: type, params: {
         sessionId, streamId: 'fixture', seq: ++session.seq, timestamp: new Date().toISOString(), turnId: itemTurnId, type, payload,
       } })
       event('turn/started', { turnId })
       event('submission/bound', { submissionId, turnId })
+      // Put fallback JSON in final text before completion so the SDK can validate the full result.
       event('item/completed', { item: { id: 'result', type: 'agentMessage', phase: 'final', text: JSON.stringify(answer(text)) } }, turnId)
       event('turn/completed', { turnId, status: 'completed' })
       result = { accepted: true, submissionId, disposition: 'started', turnId }

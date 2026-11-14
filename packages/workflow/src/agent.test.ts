@@ -1,19 +1,37 @@
-import { createFixture } from './test-helpers'
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
+import type { FakeAdapterOptions } from '@anureo/conformance'
+import type { HarnessError } from '@anureo/protocol'
 import { HarnessSdkError, type Client, type SessionEventSink } from '@anureo/sdk'
 import { z } from 'zod'
 import { agent, parallel, pipeline, type AgentOptions } from './index'
-import type { HarnessError } from '@anureo/protocol'
+import { createFixture } from './test-helpers'
 
 const clients: Client[] = []
 const fixture = createFixture(clients)
 afterEach(async () => { await Promise.all(clients.splice(0).map(client => client.dispose())) })
 
-/** Publish final text before completion so the retained terminal includes it. */
+/** Publish final text before the test terminal so Turn.result retains it. */
 async function complete(sink: SessionEventSink, turnId: string, text: string) {
   await sink.emit({ type: 'item/completed', payload: { item: { id: randomUUID(), type: 'agentMessage', phase: 'final', text } } }, { turnId })
   await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'completed' } })
+}
+
+/**
+ * Supply a scripted adapter execute hook. For a submit, publish the start and await the test's
+ * events before replying with the same turn ID. Other calls fall through to the default adapter.
+ */
+function scriptSubmission(
+  publish: (submission: { sink: SessionEventSink; turnId: string; submissionId: string }) => Promise<void>,
+): NonNullable<FakeAdapterOptions['execute']> {
+  return async (call, sink) => {
+    if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
+    const { submissionId } = call.params
+    const turnId = randomUUID()
+    await sink.emit({ type: 'turn/started', payload: { turnId } })
+    await publish({ sink, turnId, submissionId })
+    return { submissionId, accepted: true, disposition: 'started', turnId }
+  }
 }
 
 test('returns text from independent sessions and leaves the borrowed client usable', async () => {
@@ -60,15 +78,11 @@ test('native association and acceptance do not replace terminal evidence', async
 })
 
 test('preserves native failure details and releases the session', async () => {
-  const { client, adapter } = await fixture({ execute: async (call, sink) => {
-    if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
-    const turnId = randomUUID()
-    await sink.emit({ type: 'turn/started', payload: { turnId } })
+  const { client, adapter } = await fixture({ execute: scriptSubmission(async ({ sink, turnId }) => {
     await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: {
       code: 'NATIVE_FAILED', message: 'native failure', retryable: true, outcomeUnknown: false, details: { reason: 'test' },
     } } })
-    return { submissionId: call.params.submissionId, accepted: true, disposition: 'started', turnId }
-  } })
+  }) })
   await expect(agent('fail', { client, cwd: process.cwd() })).rejects.toMatchObject({
     code: 'NATIVE_FAILED', retryable: true, outcomeUnknown: false, details: { reason: 'test' },
   })
@@ -77,13 +91,9 @@ test('preserves native failure details and releases the session', async () => {
 })
 
 test('an interrupted execution cannot return successful text', async () => {
-  const { client, adapter } = await fixture({ execute: async (call, sink) => {
-    if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
-    const turnId = randomUUID()
-    await sink.emit({ type: 'turn/started', payload: { turnId } })
+  const { client, adapter } = await fixture({ execute: scriptSubmission(async ({ sink, turnId }) => {
     await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'interrupted' } })
-    return { submissionId: call.params.submissionId, accepted: true, disposition: 'started', turnId }
-  } })
+  }) })
   await expect(agent('interrupted', { client, cwd: process.cwd() })).rejects.toMatchObject({ code: 'AGENT_INTERRUPTED' })
   expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
 })
@@ -101,14 +111,10 @@ test('unknown submission outcomes are preserved without retries or implicit inte
 })
 
 test('source failure remains uncertain and is not converted into successful cleanup', async () => {
-  const { client, adapter } = await fixture({ execute: async (call, sink) => {
-    if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
-    const turnId = randomUUID()
-    await sink.emit({ type: 'turn/started', payload: { turnId } })
-    await sink.bindSubmission(call.params.submissionId, turnId)
+  const { client, adapter } = await fixture({ execute: scriptSubmission(async ({ sink, turnId, submissionId }) => {
+    await sink.bindSubmission(submissionId, turnId)
     await sink.fail(new HarnessSdkError('CONNECTION_LOST', 'lost', false, true))
-    return { submissionId: call.params.submissionId, accepted: true, disposition: 'started', turnId }
-  } })
+  }) })
   await expect(agent('source disappears', { client, cwd: process.cwd() })).rejects.toMatchObject({ code: 'CONNECTION_LOST', outcomeUnknown: true })
   expect(adapter.calls.filter(call => call.method === 'input/submit')).toHaveLength(1)
 })
@@ -145,20 +151,21 @@ test('cleanup failure cannot hide the primary uncertain execution failure', asyn
   expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
 })
 
-/** Script a retained terminal before submit's reply, including partial text on failed/interrupted turns. */
-async function terminalFixture(
+/** Use the scripted adapter to publish final text and a terminal before the submit receipt. */
+function terminalFixture(
   status: 'failed' | 'interrupted' | 'completed',
   { error, text = 'partial', outputSchema = true }: { error?: HarnessError; text?: string; outputSchema?: boolean } = {},
 ) {
-  return fixture({ ...(outputSchema ? {} : { capabilities: { input: { delivery: ['native'] }, turn: { inputModalities: ['text'], outputSchema: false } } }), execute: async (call, sink) => {
-    if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
-    const turnId = randomUUID()
-    await sink.emit({ type: 'turn/started', payload: { turnId } })
-    await sink.emit({ type: 'item/completed', payload: { item: { id: 'output', type: 'agentMessage', phase: 'final', text } } }, { turnId })
-    // Deliberately terminal before submit's reply: no event subscription can recover this later.
-    await sink.emit({ type: 'turn/completed', payload: { turnId, status, ...(error ? { error } : {}) } })
-    return { submissionId: call.params.submissionId, accepted: true, disposition: 'started', turnId }
-  } })
+  return fixture({
+    ...(outputSchema ? {} : {
+      capabilities: { input: { delivery: ['native'] }, turn: { inputModalities: ['text'], outputSchema: false } },
+    }),
+    execute: scriptSubmission(async ({ sink, turnId }) => {
+      await sink.emit({ type: 'item/completed', payload: { item: { id: 'output', type: 'agentMessage', phase: 'final', text } } }, { turnId })
+      // A live subscription opened after submit cannot recover a retained terminal.
+      await sink.emit({ type: 'turn/completed', payload: { turnId, status, ...(error ? { error } : {}) } })
+    }),
+  })
 }
 
 test('Zod schema is converted for submission and returns typed data through composition', async () => {
@@ -260,13 +267,12 @@ test('explicit skip metadata survives terminal-before-reply and startup denial r
 })
 
 test('a null candidate cannot hide cleanup failure', async () => {
+  const submit = scriptSubmission(async ({ sink, turnId }) => {
+    await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: { code: 'RATE_LIMITED', message: 'rate limit', retryable: true, outcomeUnknown: false } } })
+  })
   const { client, adapter } = await fixture({ execute: async (call, sink) => {
     if (call.method === 'session/close') throw new HarnessSdkError('CLOSE_FAILED')
-    if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
-    const turnId = randomUUID()
-    await sink.emit({ type: 'turn/started', payload: { turnId } })
-    await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: { code: 'RATE_LIMITED', message: 'rate limit', retryable: true, outcomeUnknown: false } } })
-    return { submissionId: call.params.submissionId, accepted: true, disposition: 'started', turnId }
+    return submit(call, sink)
   } })
   await expect(agent('rate limited', { client, cwd: '.' })).rejects.toMatchObject({ code: 'RESOURCE_RELEASE_FAILED', details: { droppedError: { code: 'RATE_LIMITED' } } })
   expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
@@ -283,14 +289,10 @@ test.each(['', 'bad JSON', '{}', '{"count":"3"}'])('invalid structured terminal 
 test('empty text and multiple final text items retain SDK aggregation', async () => {
   const empty = await terminalFixture('completed', { text: '' })
   expect(await agent('empty', { client: empty.client, cwd: '.' })).toBe('')
-  const { client } = await fixture({ execute: async (call, sink) => {
-    if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
-    const turnId = randomUUID()
-    await sink.emit({ type: 'turn/started', payload: { turnId } })
+  const { client } = await fixture({ execute: scriptSubmission(async ({ sink, turnId }) => {
     for (const text of ['first', 'last']) await sink.emit({ type: 'item/completed', payload: { item: { id: text, type: 'agentMessage', phase: 'final', text } } }, { turnId })
     await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'completed' } })
-    return { submissionId: call.params.submissionId, accepted: true, disposition: 'started', turnId }
-  } })
+  }) })
   expect(await agent('two', { client, cwd: '.' })).toBe('first\nlast')
 })
 

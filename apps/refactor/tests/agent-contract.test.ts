@@ -1,4 +1,3 @@
-// Verifies prompt compatibility and plan safety contracts; it must not dispatch agents or touch repositories.
 import { expect, test } from 'bun:test'
 import { validatePlan } from '../src/plan-validation'
 import { designPrompt, modulePrompt, planPrompt } from '../src/prompts'
@@ -25,7 +24,9 @@ test.each([
   for (const prompt of prompts) {
     expect(prompt).toContain(readOnly ? 'MODE: READ ONLY' : 'MODE: EDIT')
     expect(prompt.includes('Validation commands:')).toBe(!readOnly && checks.length > 0)
-    if (!readOnly && checks.length > 0) expect(prompt).toContain(`Validation commands: ${JSON.stringify(checks)}`)
+    if (!readOnly && checks.length > 0) {
+      expect(prompt).toContain(`Validation commands: ${JSON.stringify(checks)}. Run them before returning and fix failures.`)
+    }
   }
 })
 
@@ -95,10 +96,13 @@ test.each(['read-only', 'edit'] as const)('declaration ordering reaches both pha
   expect(prompts[1]).toContain('public class methods hidden below internal implementation helpers')
 })
 
-/** Boundary work preserves affected contracts; module work owns completion without forcing cosmetic churn. */
+/** Verify that phase-specific scope survives shared guidance and that isolated checks stay with the host. */
 test('documentation scope is phase-specific and planning remains inventory-only', () => {
   const files = ['api.ts']
-  const context = { graphFile: 'graph.json', version: 'snapshot', checks: [], mode: 'edit' as const }
+  const context = {
+    graphFile: 'graph.json', version: 'snapshot', mode: 'edit' as const, isolated: true,
+    checks: [{ executable: 'bun', args: ['run', 'typecheck'] }],
+  }
   const design = designPrompt({ ...context, files })
   const module = modulePrompt({ ...context, module: plan.modules[0]!, design: 'Reviewed boundaries' })
   expect(design).toContain('preserve contract comments on moved declarations')
@@ -108,15 +112,22 @@ test('documentation scope is phase-specific and planning remains inventory-only'
   expect(module).toContain('keep accurate concise comments without cosmetic rewrites')
   expect(module).not.toContain('Design documentation scope:')
   expect(planPrompt(files, 'snapshot')).not.toContain('Documentation conventions and tags:')
+  const hostChecks = `Validation commands: ${JSON.stringify(context.checks)}. The host runs them in the target checkout after integrating your edits.`
+  for (const prompt of [design, module]) {
+    expect(prompt).toContain(hostChecks)
+    expect(prompt).not.toContain('Run them before returning')
+  }
+  expect(module).toContain('Other modules run concurrently.')
+  expect(design).not.toContain('Other modules run concurrently.')
 })
 
-/** Artifact IDs keep the existing alphabet and length boundaries, including legacy uppercase/underscore IDs. */
+/** Module IDs keep the existing alphabet and length boundaries, including uppercase letters and underscores. */
 test.each(['a', 'A_0-module', 'a'.repeat(80)])('accepts safe module ID %s', id => {
   const candidate = { ...plan, modules: [{ ...plan.modules[0]!, id }] }
   expect(() => validatePlan(candidate, ['a.ts'])).not.toThrow()
 })
 
-/** Reject path components and out-of-policy IDs before their values can reach graph artifact filenames. */
+/** Reject path components and out-of-policy IDs before their values can reach patch filenames. */
 test.each(['', '../escape', 'a/b', 'a\\b', '_module', '-module', 'a.b', 'a b', 'a'.repeat(81)])('rejects unsafe module ID %s', id => {
   const candidate = { ...plan, modules: [{ ...plan.modules[0]!, id }] }
   expect(() => validatePlan(candidate, ['a.ts'])).toThrow(`Invalid or duplicate module id: ${id}`)
@@ -128,6 +139,8 @@ test('plan validation preserves error precedence and inventory ordering', () => 
   const second = plan.modules[1]!
   expect(() => validatePlan({ ...plan, modules: [first, { ...second, id: first.id, files: ['extra.ts'] }] }, ['a.ts', 'b.ts']))
     .toThrow('Invalid or duplicate module id: a')
+  expect(() => validatePlan({ ...plan, modules: [first, { ...second, id: first.id.toUpperCase(), files: ['extra.ts'] }] }, ['a.ts', 'b.ts']))
+    .toThrow('Invalid or duplicate module id: A')
   expect(() => validatePlan({ ...plan, modules: [{ ...first, files: ['extra.ts'] }, { ...second, id: '../unsafe' }] }, ['a.ts', 'b.ts']))
     .toThrow('Unlisted or duplicate module file: extra.ts')
   expect(() => validatePlan({ ...plan, modules: [first, { ...second, files: ['a.ts'] }] }, ['a.ts', 'b.ts']))

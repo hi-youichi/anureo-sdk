@@ -10,6 +10,7 @@ export interface Description {
   profileId: string
   /** Owner authority epoch; sessions bind executions and interaction answers to this authority. */
   epoch: number
+  /** Advertised session.create parameter names used to gate optional configuration. */
   createParameters: string[]
   /** True only when the ACP source, editor parameter and session MCP capability are all advertised. */
   editorMcp: boolean
@@ -18,12 +19,15 @@ export interface Description {
 /** Validated durable admission evidence; acceptance alone does not establish that execution has started or finished. */
 export interface Receipt {
   id: string
+  /** Native admission sequence, distinct from the replay event sequence. */
   sequence: number
   status: 'queued' | 'started' | 'unknown' | 'terminal'
+  /** Native outcome when supplied, passed to turn projection for terminal receipts. */
   outcome: string | null
   epoch: number
   /** Required for started receipts; absent terminal generations can describe cancellation before execution. */
   generation?: number
+  /** Native submission identity used to match local inputs during snapshot reconciliation. */
   inputId?: string
   /** A native transfer to steering rather than a locally queued execution. */
   steering?: boolean
@@ -37,6 +41,7 @@ export interface NativeEvent {
   /** Absent for global notifications, including an empty native session id. */
   session_id?: string
   payload: NativeObject
+  /** Position within the replay history named by replay_epoch. */
   seq?: number
   replay_epoch?: string
   authority_epoch?: number
@@ -44,7 +49,10 @@ export interface NativeEvent {
   admission_id?: string
 }
 
-/** Create the shared malformed-message error; attachGateway and HermesAdapter.initialize clear uncertainty for their read-only failures. */
+/** Wire identifier required in the CLI grant and in the WebSocket handshake. */
+export const GATEWAY_PROTOCOL = 'hermes-gateway-v1'
+
+/** Create a malformed-message error with unknown outcome. Attach and the adapter probe clear uncertainty for their read-only failures. */
 export const protocolError = () => new HarnessSdkError('PROTOCOL_ERROR', 'Invalid Hermes gateway message', false, true)
 /** Require a non-null, non-array object without validating fields; throw PROTOCOL_ERROR on other shapes. */
 export function object(value: unknown): NativeObject {
@@ -79,26 +87,31 @@ export function array(value: unknown): unknown[] {
 export function stableId(...parts: unknown[]): string {
   return createHash('sha256').update(JSON.stringify(parts)).digest('hex')
 }
-/** Detach native tool input/output through a JSON round trip for HermesTurn.apply; unsupported serialization throws. */
+/** Detach native tool input/output through a JSON round trip for HermesTurn.apply. Serialization or parse failures propagate. */
 export function json(value: unknown): JsonValue { return JSON.parse(JSON.stringify(value)) as JsonValue }
 
 /**
  * Validate runtime.describe against the fresh attach identity and required gateway capabilities.
- * HermesAdapter.initialize publishes capabilities only after this succeeds; HermesSession.connect
+ * HermesAdapter.probeRuntime publishes capabilities only after this succeeds; HermesSession.connect
  * stores the result for session creation and epoch checks. Throw SESSION_BINDING_MISMATCH for a
  * different owner/profile, HERMES_GATEWAY_UNSUPPORTED for missing capabilities, or PROTOCOL_ERROR
  * for malformed fields. Extra capabilities are accepted and creation parameters are retained.
  */
 export function describe(value: unknown, expected: { instanceId: string; profileId: string }): Description {
-  const data = object(value), creation = object(data.session_create)
+  const data = object(value)
+  const creation = object(data.session_create)
   if (data.instance_id !== expected.instanceId || data.profile_id !== expected.profileId) throw new HarnessSdkError('SESSION_BINDING_MISMATCH')
   const capabilities = array(data.capabilities).map(identity)
-  const sources = array(creation.sources).map(identity), parameters = array(creation.parameters).map(identity)
-  if (!['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1'].every(value => capabilities.includes(value)) || !sources.includes('tool') || !['request_id', 'source', 'cwd', 'model'].every(value => parameters.includes(value))) {
-    throw new HarnessSdkError('HERMES_GATEWAY_UNSUPPORTED', 'Hermes canonical gateway capabilities are required')
+  const sources = array(creation.sources).map(identity)
+  const parameters = array(creation.parameters).map(identity)
+  assertCanonicalCreation({ capabilities, sources, parameters })
+  return {
+    instanceId: expected.instanceId,
+    profileId: expected.profileId,
+    epoch: integer(data.authority_epoch),
+    createParameters: parameters,
+    editorMcp: capabilities.includes('acp-session-mcp-v1') && sources.includes('acp') && parameters.includes('editor'),
   }
-  return { instanceId: expected.instanceId, profileId: expected.profileId, epoch: integer(data.authority_epoch), createParameters: parameters,
-    editorMcp: capabilities.includes('acp-session-mcp-v1') && sources.includes('acp') && parameters.includes('editor') }
 }
 
 /**
@@ -127,7 +140,7 @@ export function publicReceipt(value: Receipt): JsonObject {
 }
 
 /**
- * Parse a gateway event envelope for live RPC delivery or HermesSession.recover replay, throwing
+ * Parse a gateway event envelope for live RPC delivery or HermesSession.replaySnapshot, throwing
  * PROTOCOL_ERROR for malformed fields. Missing/null payload becomes {}; session continuity and
  * event-specific payload validation remain with HermesSession.apply and HermesTurn.apply.
  */
@@ -145,7 +158,7 @@ export function event(value: unknown): NativeEvent {
   }
 }
 
-/** Internal SDK error mapping for a native RPC rejection; never retain native error messages or data. */
+/** Map a gateway rejection for HermesRpc.receiveResponse without retaining native error messages or data. */
 export class HermesRpcError extends HarnessSdkError {
   /** Map an explicit rejection to a known-outcome failure; only storage_unavailable is retryable. Array-shaped error data throws PROTOCOL_ERROR. */
   constructor(error: NativeObject) {
@@ -153,6 +166,19 @@ export class HermesRpcError extends HarnessSdkError {
     const code = typeof reason === 'string' ? REASONS[reason] : undefined
     super(code ?? (error.code === -32601 ? 'METHOD_NOT_FOUND' : error.code === -32602 ? 'INVALID_PARAMS' : 'NATIVE_RPC_ERROR'),
       'Hermes gateway refused the request', reason === 'storage_unavailable', false)
+  }
+}
+
+/** Reject owners that cannot create ordinary sessions and recover their durable admissions and event history. */
+function assertCanonicalCreation({ capabilities, sources, parameters }: {
+  capabilities: string[]
+  sources: string[]
+  parameters: string[]
+}): void {
+  if (!['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1'].every(value => capabilities.includes(value))
+    || !sources.includes('tool')
+    || !['request_id', 'source', 'cwd', 'model'].every(value => parameters.includes(value))) {
+    throw new HarnessSdkError('HERMES_GATEWAY_UNSUPPORTED', 'Hermes canonical gateway capabilities are required')
   }
 }
 

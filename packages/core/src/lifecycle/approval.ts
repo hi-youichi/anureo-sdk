@@ -2,13 +2,14 @@
 import type { InteractionRequested, InteractionResponse } from '@anureo/protocol';
 
 /**
- * Automatically answer an approval request using its narrowest advertised grant: allow once,
- * then allow for the session, then allow with a rule; ties use the first advertised option.
- * Register explicitly as ClientOptions.interactions.approval only when the host intends unattended
- * approval; the SDK never installs this policy by default. Reject with Error when no known allow
- * option exists. Session.startInteractionHandler delivers the returned answer through the registry
- * or attempts cancellation on rejection while the handler signal remains active. This policy neither
- * prompts a user nor acquires resources.
+ * Select an advertised grant for unattended approval. Prefer allow-once, then session, then
+ * rule grants. When several options have the same scope, return the first advertised option.
+ * Reject with Error when the request offers none of these grants.
+ *
+ * Opt in through ClientOptions.interactions.approval, as createReviewClient and
+ * createRefactorClient do. The returned promise completes when the answer is selected.
+ * Session.startInteractionHandler invokes the registered policy and awaits native delivery
+ * separately. If selection rejects while the signal is active, Session attempts cancellation.
  */
 export async function approveWithNarrowestScope(
   request: Extract<InteractionRequested, { kind: 'approval' }>,

@@ -53,21 +53,26 @@ async function fixture(args: string[] = [], options: Partial<AcpAdapterOptions> 
     async finished(turnId: string) {
       await until(() => events.some((event) => event.type === 'turn/completed' && event.payload.turnId === turnId));
 
-      const turnInteractionIds = new Set<string>();
-      for (const event of events) {
-        if (event.turnId === turnId && event.type === 'interaction/requested') {
-          turnInteractionIds.add(event.payload.interactionId);
-        }
-      }
-
-      // Resolved events are associated with the turn through their interactionId.
-      return events.filter((event) => event.turnId === turnId || (
-        event.type === 'interaction/resolved' && turnInteractionIds.has(event.payload.interactionId)
-      ));
+      return eventsForTurn(events, turnId);
     },
     async resume() { const binding = session.binding; await session.close(); session = await runtime.openSession({ requestId: 'resume', mode: 'resume', binding, cwd: process.cwd() }); pumps.push(consume(session)); },
     async close() { await runtime.dispose(); await Promise.all(pumps); },
   };
+}
+
+/** Retain turn events and their interaction resolutions in observation order. Resolutions carry the
+ * interaction ID even when the turn ID is absent. */
+function eventsForTurn(events: AhpEvent[], turnId: string): AhpEvent[] {
+  const turnInteractionIds = new Set<string>();
+  for (const event of events) {
+    if (event.turnId === turnId && event.type === 'interaction/requested') {
+      turnInteractionIds.add(event.payload.interactionId);
+    }
+  }
+
+  return events.filter((event) => event.turnId === turnId || (
+    event.type === 'interaction/resolved' && turnInteractionIds.has(event.payload.interactionId)
+  ));
 }
 
 test('vanilla native stdio maps structured updates, complete authority, reused ids and unknown messages', async () => {

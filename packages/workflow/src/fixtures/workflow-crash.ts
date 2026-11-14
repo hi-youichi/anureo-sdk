@@ -6,8 +6,8 @@ import { createScriptedAdapter } from '@anureo/conformance'
 const [directory, phase] = process.argv.slice(2) as [string, string]
 const originalRename = fs.rename
 let journalPublishes = 0
-// Install before importing workflow so atomic publication uses the injected rename.
-// workflow.test.ts restarts this process for each boundary and inspects recovery.
+// workflow.test.ts spawns a fresh process per crash point. Install the mock before
+// importing workflow so atomic publication uses the injected rename in this process.
 mock.module('node:fs/promises', () => ({ ...fs, rename: renameAtCrashBoundary }))
 const { workflow, agent } = await import('../index')
 
@@ -20,12 +20,13 @@ try {
   await client.dispose()
 }
 
-/** Installed as fs.rename by mock.module and invoked by atomicPublish before replacing a file.
- * Kill before the started record, result record or completed manifest reaches its target,
- * according to the test's phase; all earlier renames use the original filesystem operation. */
+/** Replace fs.rename for atomicPublish. Kill the process before the selected rename can
+ * publish the started marker, agent result or completed manifest. Unselected renames
+ * use the original operation and propagate its failures. */
 async function renameAtCrashBoundary(from: string, to: string): Promise<void> {
   const target = to.replaceAll('\\', '/')
   if (target.endsWith('/journal.json')) {
+    // The first publication creates the empty journal before any agent work can start.
     journalPublishes++
     if (phase === 'before-started' && journalPublishes === 2) process.kill(process.pid, 'SIGKILL')
     if (phase === 'after-execute' && journalPublishes === 3) process.kill(process.pid, 'SIGKILL')

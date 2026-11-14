@@ -1,14 +1,11 @@
-// Defines privacy-safe SDK errors and normalization; must not schedule waits or perform cleanup.
 /**
- * Public failure envelope for hosts and adapters. Session admission throws these errors and
- * sdkError preserves existing instances, including their details, for downstream failure handling.
- * Construction does not sanitize data: the producer must supply safe messages/details and mark
- * uncertain native outcomes so consumers can assess whether retrying might duplicate work.
+ * Inspect SDK or adapter failures by code and outcome. Producers must supply safe messages and
+ * details. Check outcomeUnknown before retrying an operation that may already have taken effect.
  */
 export class HarnessSdkError extends Error {
   /**
-   * Hosts, adapters and SDK policy checks supply a code and optional safe diagnostics. Store them
-   * without validation, cloning or I/O; creating an error neither retries work nor releases resources.
+   * Create a failure with an already-sanitized code, message and diagnostics. The message defaults
+   * to the code, both flags default to false, and details are retained by reference.
    */
   constructor(
     /** Safe machine-readable failure code selected by the owning subsystem. */
@@ -22,22 +19,23 @@ export class HarnessSdkError extends Error {
     /** Already-sanitized structured diagnostics supplied by the owning subsystem. */
     readonly details?: Record<string, unknown>,
   ) { super(message); }
-  /** Stable discriminator for consumers that cannot use instanceof across package boundaries. */
+  /** Error name used in diagnostics. */
   readonly name = "HarnessSdkError";
 }
 
 /**
- * Normalize failures for SDK and adapter boundaries without I/O or cleanup. Return SDK errors by
- * identity, preserving their messages and metadata. For other objects, copy only a bounded uppercase
- * code and literal-true flags; discard messages/details and use the code as the message. Unrecognized
- * causes use fallback with retryable=false and the supplied outcomeUnknown default. An explicit
- * outcomeUnknown property overrides that default, even when its value is not true. Property
- * getters/proxy traps can throw to the caller.
+ * Normalize a failure for SDK or adapter callers. Return existing HarnessSdkError instances by
+ * identity. For other objects with a code matching A-Z followed by up to 80 uppercase letters,
+ * digits or underscores, use the code as the message and copy only literal-true flags. A present
+ * outcomeUnknown property on such an object overrides the supplied default. Other causes use
+ * fallback (HARNESS_ERROR by default) as both code and message, with retryable false and the
+ * supplied outcomeUnknown default. Supply a safe fallback. Property access can throw if the
+ * cause has throwing getters or proxy traps.
  *
  * Called by:
  * - Session.onRequestFailed to choose recovery state and publish safe submission failure status.
- * - InteractionRegistry.deliverResponse to classify responder/publication failures before publishing an
- *   unknown outcome or rejecting waiters; the registry still owns publication and state transitions.
+ * - InteractionRegistry.deliverResponse to classify responder or publication failures for the
+ *   interaction waiter and, during delivery, for publication of an unknown outcome.
  * - checkRelease in structured-output/errors to throw safe failures after cleanup attempts settle.
  * Public consumers can apply the same normalization; callers own propagation, retries and cleanup.
  */

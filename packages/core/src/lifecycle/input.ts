@@ -1,13 +1,12 @@
-// Detaches host input as protocol blocks; must not admit requests, check capabilities or dispatch work.
 import type { InputBlock } from '@anureo/protocol';
 import { HarnessSdkError } from '../errors';
 import type { Input } from '../types';
 
 /**
- * Session.submit and the Turn.steer callback installed by Session.context call before request
- * admission. Return one text block for a string or a detached clone of an array; throw INVALID_PARAMS
- * for other values or clone failure. The callers pass the result to submission/control dispatch,
- * where protocol shape and capability checks still belong; normalization performs no native work.
+ * Normalize host input into one text block for a string or a detached copy of a block array.
+ * Throw INVALID_PARAMS for other values or clone failure. Session.submit and the callback installed
+ * by Session.context for Turn.steer pass the resulting blocks to request admission, which validates
+ * their contents and capabilities. Both expose normalization failures as promise rejections.
  */
 export function inputBlocks(input: Input): InputBlock[] {
   if (typeof input === 'string') return [{ type: 'text', text: input }];

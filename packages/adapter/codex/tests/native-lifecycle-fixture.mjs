@@ -1,4 +1,4 @@
-/** Scripts native receipt/evidence races over stdio for lifecycle tests; it must not run real turns or own SDK lifecycle policy. */
+/** Scripts receipt and execution-evidence races over stdio for the Codex lifecycle tests. */
 import { createInterface } from 'node:readline';
 const lines = createInterface({ input: process.stdin });
 let active = false;
@@ -8,12 +8,32 @@ let reviewAwaitingItemsList = false;
 const send = value => process.stdout.write(JSON.stringify(value) + '\n');
 /** Scope a scripted notification to the fixture thread and return send's write result; call order is wire order and write errors propagate. */
 const event = (method, params) => send({ method, params: { threadId: 'thread', ...params } });
-/** Complete the shared execution for a joining input: write final output before terminal evidence, then clear active state. Write errors escape before later state changes. */
-const terminal = () => {
+/** Publish final output before terminal evidence for a joining input, then clear active state. */
+function completeJoinedTurn() {
   event('item/completed', { turnId: 'actual', item: { id: 'answer', type: 'agentMessage', text: 'native result', phase: 'final' } });
   event('turn/completed', { turn: { id: 'actual', status: 'completed' } });
   active = false;
-};
+}
+
+/**
+ * Accept the next input and emit its execution evidence before returning the RPC receipt.
+ * Only the first accepted input in the process receives the actual ID as its receipt.
+ */
+function acceptInput({ params, text }) {
+  if (!active) {
+    active = true;
+    event('turn/started', { turn: { id: 'actual' } });
+  }
+  acceptedInputCount++;
+  event('item/completed', {
+    turnId: 'actual',
+    item: { id: `input-${acceptedInputCount}`, type: 'userMessage', clientId: params.clientUserMessageId, content: params.input },
+  });
+  const result = { turn: { id: acceptedInputCount === 1 ? 'actual' : params.clientUserMessageId } };
+  if (text === 'join') completeJoinedTurn();
+  return result;
+}
+
 for await (const line of lines) {
   const frame = JSON.parse(line);
   const p = frame.params ?? {};
@@ -40,16 +60,7 @@ for await (const line of lines) {
       send({ id: frame.id, error: { code: -32602, message: 'native rejection' } });
       continue;
     }
-    if (!active) {
-      active = true;
-      event('turn/started', { turn: { id: 'actual' } });
-    }
-    acceptedInputCount++;
-    event('item/completed', { turnId: 'actual', item: { id: `input-${acceptedInputCount}`, type: 'userMessage', clientId: p.clientUserMessageId, content: p.input } });
-    // Only the first accepted input in this fixture process returns 'actual';
-    // the count is not reset when an execution completes.
-    result = { turn: { id: acceptedInputCount === 1 ? 'actual' : p.clientUserMessageId } };
-    if (text === 'join') terminal();
+    result = acceptInput({ params: p, text });
   }
   if (frame.method === 'turn/interrupt') {
     send({ id: frame.id, result: {} });

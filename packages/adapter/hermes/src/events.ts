@@ -4,18 +4,37 @@ import { identity, integer, json, object, protocolError, stableId, text, type Na
 import type { HermesAdapterOptions } from './options'
 
 /**
+ * Publish cumulative session usage for HermesSession.apply and terminal turn projection.
+ * Omit nonfinite or negative counters and await sink publication.
+ */
+export async function sessionUsage(sink: SessionEventSink, payload: NativeObject): Promise<void> {
+  const usage: Usage = { provider: 'hermes', source: 'native', scope: 'session' }
+  const fields = { input: 'input', output: 'output', total: 'total', context_max: 'contextWindow', context_used: 'contextUsed' } as const
+  for (const [native, target] of Object.entries(fields)) {
+    const value = payload[native]
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) usage[target] = value
+  }
+  await sink.emit({ type: 'usage/updated', payload: usage })
+}
+
+/**
  * Internal execution projection created by HermesSession.turn. Publish ordered SDK items through
  * its sink, retaining bounded provisional state until native terminal evidence arrives. Native
  * snapshots complete items; deltas only describe provisional progress. Sink failures reject to the
  * session's receipt or event path; the session owns recovery and channel disposal.
  */
 export class HermesTurn {
+  /** SDK identity shared by submission bindings, events and interrupt targeting. */
   readonly id: string
+  /** Durable native admission used to reconcile this execution after reconnect. */
   readonly admissionId: string
   /** Native authority paired with generation; HermesSession checks both when reusing this execution. */
   readonly epoch: number
+  /** Native execution generation within this authority, used to fence interrupt requests. */
   readonly generation: number
+  /** Set before publishing turn/started to suppress duplicate starts during association and event delivery. */
   started = false
+  /** Set before turn/completed publication. HermesSession uses it to stop treating this turn as active. */
   terminal = false
   /** Set with terminal evidence before turn/completed publication, and retained after item content is released. */
   status?: TerminalStatus
@@ -28,8 +47,11 @@ export class HermesTurn {
     sink: SessionEventSink
     options: HermesAdapterOptions
   }) {
-    this.admissionId = admissionId; this.epoch = epoch; this.generation = generation
-    this.sink = sink; this.options = options
+    this.admissionId = admissionId
+    this.epoch = epoch
+    this.generation = generation
+    this.sink = sink
+    this.options = options
     this.id = `hermes-${stableId(sessionId, admissionId)}`
   }
   /** Publish turn/started at most once, before any binding or item publication. */
@@ -57,52 +79,17 @@ export class HermesTurn {
     await this.complete({ id: `${this.id}:gap`, type: 'notice', severity: 'warning', code: 'HERMES_PROGRESS_GAP',
       text: 'Some intermediate Hermes progress was unavailable; the final answer requires native terminal evidence.', status: 'completed' })
   }
-  /** Project HermesSession's already-associated event; ignore terminal replays and reject malformed payloads or sink failures. */
+  /** Project the event supplied by HermesSession.applyTurnEvent. Ignore terminal replays and reject malformed payloads or sink failures. */
   async apply(event: NativeEvent): Promise<void> {
     if (this.terminal) return
     await this.start()
-    const payload = event.payload
     switch (event.type) {
-      case 'message.delta': await this.messageDelta(payload); return
-      case 'message.interim': {
-        const body = text(payload.text)
-        if (payload.segment !== undefined && integer(payload.segment) < this.segment) return
-        if (!this.current) this.current = { item: { id: `${this.id}:message:${this.segment}`, type: 'agentMessage', text: body, phase: 'commentary' }, incomplete: false }
-        else this.current.item = { ...this.current.item, text: body }
-        await this.commentary(); return
-      }
-      case 'reasoning.delta': {
-        const chunk = text(payload.text); this.reasoning += chunk
-        const item: Item = { id: `${this.id}:reasoning`, type: 'reasoning', summary: this.reasoning }
-        if (!this.items.has(item.id)) await this.put({ ...item, summary: '' })
-        await this.put(item)
-        await this.sink.emit({ type: 'item/delta', payload: { itemId: item.id, kind: 'reasoningSummary', text: chunk } }, { turnId: this.id })
-        return
-      }
-      case 'tool.start': {
-        const id = `${this.id}:tool:${identity(payload.tool_id)}`
-        if (this.items.has(id)) return
-        const name = identity(payload.name)
-        await this.put({ id, type: 'toolCall', kind: 'other', title: name, toolName: name, nativeType: name,
-          ...(payload.args !== undefined ? { input: json(payload.args) } : {}) }); return
-      }
-      case 'tool.complete': {
-        const id = `${this.id}:tool:${identity(payload.tool_id)}`, name = identity(payload.name)
-        const prior = this.items.get(id)
-        await this.complete({ ...(prior?.type === 'toolCall' ? prior : {}), id, type: 'toolCall', kind: 'other', title: name,
-          toolName: name, nativeType: name, status: 'completed',
-          ...(payload.args !== undefined ? { input: json(payload.args) } : {}),
-          ...(payload.result !== undefined ? { output: json(payload.result) } : typeof payload.result_text === 'string' ? { output: payload.result_text } : {}),
-          ...(typeof payload.duration_s === 'number' && payload.duration_s >= 0 ? { durationMs: payload.duration_s * 1000 } : {}),
-        }); return
-      }
-      case 'message.complete': {
-        const status = payload.status === 'complete' ? 'completed' : payload.status === 'interrupted' ? 'interrupted' : payload.status === 'error' ? 'failed' : undefined
-        if (!status) throw protocolError()
-        const value = payload.text ?? payload.content
-        if (value != null && typeof value !== 'string') throw protocolError()
-        await this.finish(status, value == null ? this.current?.item.text ?? this.lastText : value, payload)
-      }
+      case 'message.delta': await this.messageDelta(event.payload); return
+      case 'message.interim': await this.messageInterim(event.payload); return
+      case 'reasoning.delta': await this.reasoningDelta(event.payload); return
+      case 'tool.start':
+      case 'tool.complete': await this.toolEvent(event.type, event.payload); return
+      case 'message.complete': await this.messageComplete(event.payload)
     }
   }
   /**
@@ -126,6 +113,53 @@ export class HermesTurn {
   private reasoning = ''
   private bytes = 0
   private gapReported = false
+
+  /** Replace streamed commentary with the native snapshot and seal the segment unless it is stale. */
+  private async messageInterim(payload: NativeObject): Promise<void> {
+    const body = text(payload.text)
+    if (payload.segment !== undefined && integer(payload.segment) < this.segment) return
+    if (!this.current) this.current = { item: { id: `${this.id}:message:${this.segment}`, type: 'agentMessage', text: body, phase: 'commentary' }, incomplete: false }
+    else this.current.item = { ...this.current.item, text: body }
+    await this.commentary()
+  }
+  /** Retain the accumulated reasoning summary while publishing only the new chunk as a delta. */
+  private async reasoningDelta(payload: NativeObject): Promise<void> {
+    const chunk = text(payload.text)
+    this.reasoning += chunk
+    const item: Item = { id: `${this.id}:reasoning`, type: 'reasoning', summary: this.reasoning }
+    if (!this.items.has(item.id)) await this.put({ ...item, summary: '' })
+    await this.put(item)
+    await this.sink.emit({ type: 'item/delta', payload: { itemId: item.id, kind: 'reasoningSummary', text: chunk } }, { turnId: this.id })
+  }
+  /**
+   * Project both tool phases under one native identity. Ignore duplicate starts, retain prior input
+   * when completion omits it, and convert native duration seconds to SDK milliseconds.
+   */
+  private async toolEvent(type: 'tool.start' | 'tool.complete', payload: NativeObject): Promise<void> {
+    const id = `${this.id}:tool:${identity(payload.tool_id)}`
+    if (type === 'tool.start' && this.items.has(id)) return
+    const name = identity(payload.name)
+    const prior = this.items.get(id)
+    const item: Item = { ...(prior?.type === 'toolCall' ? prior : {}), id, type: 'toolCall', kind: 'other',
+      title: name, toolName: name, nativeType: name,
+      ...(payload.args !== undefined ? { input: json(payload.args) } : {}) }
+    if (type === 'tool.start') {
+      await this.put(item)
+      return
+    }
+    await this.complete({ ...item, status: 'completed',
+      ...(payload.result !== undefined ? { output: json(payload.result) } : typeof payload.result_text === 'string' ? { output: payload.result_text } : {}),
+      ...(typeof payload.duration_s === 'number' && payload.duration_s >= 0 ? { durationMs: payload.duration_s * 1000 } : {}),
+    })
+  }
+  /** Require a recognized terminal status. Use retained text only when both native text fields are absent or null. */
+  private async messageComplete(payload: NativeObject): Promise<void> {
+    const status = payload.status === 'complete' ? 'completed' : payload.status === 'interrupted' ? 'interrupted' : payload.status === 'error' ? 'failed' : undefined
+    if (!status) throw protocolError()
+    const value = payload.text ?? payload.content
+    if (value != null && typeof value !== 'string') throw protocolError()
+    await this.finish(status, value == null ? this.current?.item.text ?? this.lastText : value, payload)
+  }
   /** Retain a detached item within count/byte budgets and publish item/started only on first appearance. */
   private async put(item: Item): Promise<void> {
     const previous = this.items.get(item.id)
@@ -196,17 +230,6 @@ export class HermesTurn {
 
   private readonly sink: SessionEventSink
   private readonly options: HermesAdapterOptions
-}
-
-/** Publish finite nonnegative native counters as cumulative session usage, even when received with a turn's terminal frame. */
-export async function sessionUsage(sink: SessionEventSink, payload: NativeObject): Promise<void> {
-  const usage: Usage = { provider: 'hermes', source: 'native', scope: 'session' }
-  const fields = { input: 'input', output: 'output', total: 'total', context_max: 'contextWindow', context_used: 'contextUsed' } as const
-  for (const [native, target] of Object.entries(fields)) {
-    const value = payload[native]
-    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) usage[target] = value
-  }
-  await sink.emit({ type: 'usage/updated', payload: usage })
 }
 
 type TerminalStatus = 'completed' | 'interrupted' | 'failed'

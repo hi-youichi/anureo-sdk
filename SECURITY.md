@@ -21,31 +21,36 @@ reports.
 The latest published 0.x minor line of each package is supported.
 Security fixes target that line only.
 
-## Redaction and secret handling (design guarantees)
+## Redaction and secret handling
 
-Secret safety is a core protocol guarantee, not an afterthought. The
-following invariants hold across `@anureo/protocol` and `@anureo/sdk`
-and are enforced by tests:
+- **Public interaction requests omit `privatePayload`.** The protocol's
+  `publicEvent`, `publicInteraction`, and `publicValue` helpers copy JSON
+  without modifying the input and replace `privatePayload` with
+  `privatePayloadAvailable: true`. When an adapter registers an interaction
+  through `requestInteraction`, the SDK uses `publicInteraction` before
+  publishing `interaction/requested`. It retains the native request in
+  memory for settlement and passes a copy to the configured host handler.
+  Hosts must keep that copy private.
+- **Public projections filter sensitive fields.** The protocol helpers
+  replace values under keys such as `password`, `token`, `apiKey`,
+  `authorization`, `headers`, and `env` with `[redacted]`. They redact
+  fields such as `answer` and `value` in objects marked `secret: true`
+  and strip queries and fragments from HTTP(S) URLs in projected strings.
+  If a native interaction supplies a full authorization URL in
+  `privatePayload`, the host handler can use it from its private request
+  copy. Callers must keep secrets out of arbitrary text sent to public
+  outputs.
+- **The SDK registers marked answers before native delivery.** It uses
+  them to redact supported public event, history, and output fields. The
+  in-memory registry can notify a host-provided `onMarkedSecret` hook.
+  Hosts own any storage that hook uses.
+- **Validation diagnostics omit rejected parameter values.** Protocol
+  validation issues retain the instance path, keyword, and message. SDK
+  structured-output schema diagnostics retain the path and keyword.
+- **Failure never grants approval.** Unsupported requests are rejected.
+  Interaction expiry and session teardown cancel pending requests without
+  sending an approval. The SDK does not automatically retry native
+  requests when their outcome is unknown. Hosts that retry must reconcile
+  an unknown outcome first to avoid duplicating work.
 
-- **`privatePayload` is memory-only.** It is never written to disk.
-  `publicEvent`/`publicInteraction` produce an immutable public
-  projection: the entire `privatePayload` is removed (replaced by
-  `privatePayloadAvailable`), and the original object is never modified
-  in place.
-- **Sensitive keys are redacted in public projections.** Keys such as
-  `password`, `token`, `apiKey`, `authorization`, `headers`, and `env`
-  are replaced with `[redacted]`; secret-marked answer values are
-  redacted.
-- **Authorization URLs are stripped.** Query and fragment never appear
-  in public text; the full address is only available through the host's
-  private authorization read.
-- **Logs carry no parameter values.** Only validation paths and error
-  keywords are retained.
-- **Failure never implies authorization.** Unknown requests return
-  method-not-found (never default-approve); timeouts, disconnects, and
-  turn termination never auto-approve an interaction; `outcomeUnknown`
-  errors never auto-retry.
-
-If you believe any of these invariants can be violated, that is a
-security report, not a regular bug — please use the private channel
-above.
+Report suspected violations through the private channel above.

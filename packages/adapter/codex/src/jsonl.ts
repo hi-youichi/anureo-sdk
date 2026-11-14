@@ -1,61 +1,102 @@
-/** Owns process-stream framing, RPC correlation and transport cleanup; it must not interpret session policy or native payloads. */
+/** Owns process-stream framing, RPC correlation and transport cleanup. */
 import { HarnessSdkError } from '@anureo/sdk'
 import type { HarnessProcess } from '@anureo/sdk/process'
 
 import { record, type NativeRecord } from './native-values'
-/** Keep value helpers available through the public JSONL entry point while their interpretation remains owned by native-values. */
+/** Value helpers re-exported through the JSONL entry point for native payload inspection. */
 export { record, string, type NativeRecord } from './native-values'
-/** Server interaction delivered to JsonlHandlers.request; the handler interprets params and answers through the supplied reply/reject callbacks. */
+
+/** Server interaction received by a low-level client's request handler. Answer through the supplied callbacks. */
 export interface NativeRequest {
   /** Native correlation identity echoed unchanged in replies. */
   id: number | string;
+  /** Native method name used to select a handler. */
   method: string;
   /** Unvalidated method-specific fields; session handlers own interpretation. */
   params: NativeRecord
 }
-/** Callbacks supplied at construction. CodexNativeAdapter.openSession forwards them to CodexBackendSession; probe/catalog owners supply non-interactive handlers. The client invokes them while reading, and its owner must dispose the client after closure. */
+/**
+ * Supply callbacks before constructing a client. CodexNativeAdapter.openSession registers
+ * CodexBackendSession callbacks to publish events and route interactions through the session sink.
+ * Adapter probes and the catalog supply non-interactive handlers. The client owner handles disposal.
+ */
 export interface JsonlHandlers {
   /** Consume a notification before the next frame is dispatched; throwing or rejecting fails the reader. Waiting for work that needs later stdout frames would block its own completion. */
   notification(method: string, params: NativeRecord): Promise<void>;
-  /** Handle an interaction concurrently and await its reply/reject write; capacity is held until this promise and any fallback settle. Both callbacks claim before I/O: duplicate reply rejects, duplicate reject is a no-op. Supply safe result/error payloads; no redaction occurs here. Async handler rejection sends a fallback only if unclaimed; synchronous throws fail the stream. Resolving without answering sends nothing. */
+  /**
+   * Handle an interaction while stdout continues to drain. Await the reply or reject write and
+   * supply payloads safe to send verbatim. Capacity is held until the handler and any fallback
+   * settle. Both callbacks claim the response before I/O. A duplicate reply rejects with
+   * INTERACTION_ALREADY_RESOLVED, and a duplicate reject resolves without writing. If the handler
+   * promise rejects before a response is claimed, the client attempts a fallback error reply.
+   * A synchronous throw fails the reader. Resolving without answering sends no response.
+   */
   request(request: NativeRequest, reply: (result: unknown) => Promise<void>, reject: (code: number, message: string) => Promise<void>): Promise<void>;
-  /** Observe reader failure or EOF after pending requests reject; explicit disposal does not call this. Rejection reaches finished on stream errors, but is absorbed at EOF by the already-closed guard. Always dispose afterward. */
+  /**
+   * Observe the same reader failure or EOF cause delivered to pending requests after admission
+   * closes. Explicit disposal skips this callback. Callback rejection reaches finished for reader
+   * errors and is absorbed at EOF. The owner still needs to dispose the client.
+   */
   failure(cause: HarnessSdkError): Promise<void>;
-  /** Diagnostic code only. Native stderr bytes and request params never reach this callback. */
+  /** Receive CODEX_STDERR for each nonempty stderr chunk. Throwing stops diagnostics without failing stdout. */
   diagnostic?(code: string): void;
 }
 /** Bounds configured by transport owners to limit pending RPCs, frame bytes and concurrent interactions; exceeding a bound fails admission or reading. */
 export interface JsonlOptions {
-  /** Per-request response deadline from admission, including queued write time; defaults to 30,000ms. Timeout reports an unknown outcome without cancelling native work. */
+  /** Per-request response deadline in milliseconds from admission, including queued write time. Defaults to 30,000. Timeout reports an unknown outcome without cancelling native work. */
   timeoutMs?: number;
-  /** Maximum UTF-8 bytes per frame, default 8MiB; outgoing includes the newline, incoming excludes the CRLF/LF delimiter. */
+  /**
+   * Maximum UTF-8 bytes per frame. Defaults to 8 MiB. Outgoing frames include the newline.
+   * Complete incoming lines exclude LF or CRLF. While waiting for LF, the buffered text is
+   * checked as-is, including any trailing CR.
+   */
   maxFrameBytes?: number;
   /** Maximum unresolved client requests, default 128. */
   maxPending?: number;
   /** Maximum concurrent server handlers until their full completion, default 32. */
   maxServerRequests?: number
 }
-/** Definite native rejection returned to RPC callers without the native message or payload. rpcCode -32601 lets session optional-method dispatch revoke capabilities and account reads return unknown; other codes remain NATIVE_RPC_ERROR. */
+/**
+ * Identify a definite native rejection without exposing its message or payload. For code -32601,
+ * CodexBackendSession.optional publishes revised capabilities before rejecting the SDK request,
+ * and readAccountStatus returns unknown.
+ */
 export class CodexRpcError extends HarnessSdkError {
-  /** For response decoding, map a numeric native code to a safe SDK error without I/O; method-not-found stays distinguishable from other definite failures. */
-  constructor(readonly rpcCode: number) { super(rpcCode === -32601 ? 'METHOD_NOT_FOUND' : 'NATIVE_RPC_ERROR', 'Native Codex request failed', false, false, { rpcCode }) }
+  /** Map -32601 to METHOD_NOT_FOUND and other codes to NATIVE_RPC_ERROR. Expose rpcCode for callers that handle specific native rejections. */
+  constructor(readonly rpcCode: number) {
+    super(rpcCode === -32601 ? 'METHOD_NOT_FOUND' : 'NATIVE_RPC_ERROR', 'Native Codex request failed', false, false, { rpcCode })
+  }
 }
-/** Exchange native Codex frames over a supplied process. Construction starts readers, writes are serialized and replies correlated; the owner must dispose even after reader failure or EOF. Native frames omit the public AHP JSON-RPC header. */
+/**
+ * Exchange native Codex frames over a supplied process. Writes are serialized and replies
+ * correlated. Frames use the Codex app-server format, which omits the JSON-RPC version field.
+ * The owner must dispose the client even after reader failure or EOF.
+ */
 export class CodexJsonlClient {
-  /** Reader/failure completion for owners observing stdout; excludes stderr, asynchronous interactions and process disposal. EOF absorbs failure-callback rejection; stream-error reporting propagates it. */
+  /**
+   * Wait for stdout reading and any failure callback. Stream-error reporting propagates callback
+   * rejection, while EOF absorbs it. The catalog observes completion to detach and dispose its
+   * connection. Stderr, concurrent interaction handlers and process disposal complete separately.
+   */
   readonly finished: Promise<void>
-  /** Start draining a supplied process with the owner's handlers before requests can be sent; no process is spawned here. The owner must dispose even if finished resolves or rejects. */
+
+  /** Start draining the supplied process with the owner's handlers. Call dispose on this client to release the process. */
   constructor(readonly process: HarnessProcess, private readonly handlers: JsonlHandlers, private readonly options: JsonlOptions = {}) {
     this.maxFrameBytes = options.maxFrameBytes ?? 8 * 1024 * 1024
-    // Read before initialize; stdout EOF, rather than process exit, preserves buffered final frames.
+    // Start before the handshake and drain to stdout EOF so buffered replies can settle.
     this.finished = this.read().catch(cause => this.fail(cause instanceof HarnessSdkError ? cause : new HarnessSdkError('PROTOCOL_ERROR', 'Invalid Codex stream', false, true)))
     void this.drainDiagnostics()
   }
-  /** Write a notification in outbound order, omitting params when not supplied. Completion means process.write completed, not native acceptance. Serialization can throw synchronously; closed/oversized frames and write failures reject. */
+  /**
+   * Write a notification in outbound order, omitting params when absent. Resolves when
+   * process.write completes. CodexNativeAdapter.initializeClient and the catalog await this
+   * write before sending domain requests. Serialization can throw synchronously. Closed
+   * transport, oversized frames and failed writes reject.
+   */
   notify(method: string, params?: NativeRecord): Promise<void> { return this.write({ method, ...(params ? { params } : {}) }) }
   /**
-   * Send an RPC (with empty params by default) and await its correlated result; T is a caller
-   * assertion, not payload validation.
+   * Send an RPC with empty params by default and await its correlated result. Callers must
+   * validate native fields before use. T lets callers specify the expected result type.
    * Closed/capacity admission failures are definite, as are CodexRpcError replies. Timeout, failed
    * writes (including frame-bound rejection) and disposal report unknown outcomes without replay or
    * native cancellation. Serialization exceptions reject unchanged but leave the pending slot until
@@ -75,11 +116,15 @@ export class CodexJsonlClient {
       void this.write({ id, method, params }).catch(() => {
         const waiting = this.takePendingRequest(id)
         if (!waiting) return
-        reject(new HarnessSdkError('CONNECTION_CLOSED', 'Native request outcome is unknown', false, true))
+        waiting.reject(new HarnessSdkError('CONNECTION_CLOSED', 'Native request outcome is unknown', false, true))
       })
     })
   }
-  /** Close admission and reject waiters before disposing the process. Repeated calls share success or rejection; queued writes keep their order, and neither finished nor interaction handlers are awaited. */
+  /**
+   * Close admission and reject waiters before disposing the process. Repeated calls share the
+   * process cleanup promise and its outcome. Queued writes retain their order and may fail during
+   * process teardown. Reader and interaction completion are independent of disposal.
+   */
   dispose(): Promise<void> {
     return this.disposing ??= (async () => {
       this.closeTransport(() => new HarnessSdkError('RUNTIME_DISPOSED', 'Codex client disposed', false, true))
@@ -116,7 +161,7 @@ export class CodexJsonlClient {
     this.writeTail = writeTask.catch(() => {})
     return writeTask
   }
-  /** Constructor-owned stdout reader: decode across chunk boundaries and await frames in wire order before EOF handling. Invalid/oversized/incomplete frames reject into failure reporting; process disposal stays explicit. */
+  /** Drain stdout in wire order before reporting EOF. Keep partial UTF-8 and lines across chunks. Invalid, oversized or nonblank unterminated frames reject into the constructor's failure handler. */
   private async read(): Promise<void> {
     let buffer = ''
     for await (const chunk of this.process.stdout) {
@@ -141,7 +186,7 @@ export class CodexJsonlClient {
       throw new HarnessSdkError('FRAME_TOO_LARGE', 'Codex frame exceeds limit', false, true)
     }
   }
-  /** Route read's decoded frame: await notifications, start concurrent interactions or settle a reply. Invalid IDs and interaction overflow reject; user answers must never block subsequent stdout frames. */
+  /** Route a decoded frame. Await notification delivery to preserve event order. Start server requests concurrently so later frames can arrive during user interaction. Invalid IDs and handler failures can reject the reader. */
   private async receive(message: NativeRecord): Promise<void> {
     const id = message.id
     const method = message.method
@@ -156,13 +201,20 @@ export class CodexJsonlClient {
     }
     this.settleResponse(id, message)
   }
-  /** Called by receive to reserve a handler slot and launch an interaction without blocking stdout. Throws on overflow or synchronous handler failure; asynchronous failure attempts a fallback only while unclaimed. The slot lasts through fallback completion. */
+  /** Reserve a slot before invoking the handler. The reader observes overflow and synchronous throws. For returned promises, release the slot after the handler and any fallback settle, even if the reply was written earlier. */
   private startServerRequest(request: NativeRequest): void {
     if (++this.activeServerRequestHandlers > (this.options.maxServerRequests ?? 32)) {
       throw new HarnessSdkError('BACKPRESSURE_EXCEEDED', 'Too many native interactions', false, true)
     }
-    const { id } = request
-    // Claim response ownership before writing, even if the write later fails.
+    const { reply, reject } = this.createServerResponder(request.id)
+    void this.handlers.request(request, reply, reject)
+      .catch(() => reject(-32603, 'Interaction unavailable'))
+      .catch(() => {})
+      .finally(() => { this.activeServerRequestHandlers-- })
+  }
+
+  /** Supply the callbacks for one native ID. The first callback claims the response before writing, so an ambiguous write failure cannot trigger a duplicate response. */
+  private createServerResponder(id: NativeRequest['id']) {
     let responseClaimed = false
     /** Claim this interaction once before queueing its result; duplicate replies reject INTERACTION_ALREADY_RESOLVED and write failures propagate without releasing response ownership. */
     const reply = async (result: unknown) => {
@@ -176,19 +228,12 @@ export class CodexJsonlClient {
       responseClaimed = true
       await this.write({ id, error: { code, message } })
     }
-    // Do not block stdout on a user answer: responses and interrupt notifications must still drain.
-    void this.handlers.request(request, reply, reject)
-      .catch(() => reject(-32603, 'Interaction unavailable'))
-      .catch(() => {})
-      .finally(() => {
-        // Release the slot after the handler and any fallback rejection settle, not on reply.
-        this.activeServerRequestHandlers--
-      })
+    return { reply, reject }
   }
   /** Settle receive's validated response ID after removing its waiter and deadline. Ignore late/duplicate replies; reject native errors safely, prefer error over result and reject missing payloads as protocol errors. */
   private settleResponse(id: number | string, message: NativeRecord): void {
     const waiting = this.takePendingRequest(id)
-    if (!waiting) return // timed-out/duplicate response is observed and not replayed
+    if (!waiting) return // A late or duplicate response has no waiter to settle.
     if (Object.hasOwn(message, 'error')) waiting.reject(new CodexRpcError(Number(record(message.error).code ?? -32603)))
     else if (Object.hasOwn(message, 'result')) waiting.resolve(message.result)
     else waiting.reject(new HarnessSdkError('PROTOCOL_ERROR'))

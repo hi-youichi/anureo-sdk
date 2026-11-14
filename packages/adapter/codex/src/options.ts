@@ -1,23 +1,26 @@
-/** Defines host launch and resource-limit inputs shared by adapter and catalog owners; it must not launch processes or negotiate capabilities. */
 import type { HarnessProcess, HarnessProcessOptions } from '@anureo/sdk/process'
 import type { JsonlOptions } from './jsonl'
 
-/** Host launch and resource settings for adapter and catalog construction. Each launched process belongs to its calling owner; changing these settings does not reset an adapter's cached initialization. In addition to limiting transport requests, maxPending bounds submissions still awaiting execution evidence (default 128). */
+/** Configure executable launch and resource limits for the adapter or read-only catalog. */
 export interface CodexAdapterOptions extends JsonlOptions {
-  /** Executable selected by the host; never inferred from account state. */
+  /** Executable path or command name passed to the process launcher. */
   command: string;
   /** Native server arguments; defaults to ['app-server'], while version probing always uses ['--version']. */
   args?: string[];
-  /** Default working directory for discovery processes; session opening supplies its own cwd. */
+  /** Default working directory for version probing, standalone reads and the catalog. Session opens supply their own cwd. */
   cwd?: string;
   /** Environment passed to the process factory, including any explicitly selected Codex home. */
   env?: Record<string, string | undefined>;
-  /** Nonempty trusted version override that skips --version; semantic-version suffixes normalize, otherwise text is preserved for profile selection. Empty text still probes. */
+  /** A nonempty override skips the adapter's --version launch. The first matching major.minor.patch is used, or the original text is preserved. Omission or empty text probes the executable. */
   version?: string;
-  /** Optional injected launcher; each returned process becomes the calling owner’s cleanup responsibility. */
+  /** Supply an alternate launcher. The adapter or catalog takes responsibility for disposing each returned process. Launch rejection propagates to the operation. */
   processFactory?: (options: HarnessProcessOptions) => Promise<HarnessProcess>;
-  /** Receives safe diagnostic codes only; raw native stderr and request data are excluded. */
+  /** Receive CODEX_STDERR on a nonempty stderr chunk from a session, catalog, model discovery or reconciliation connection. */
   diagnostic?: (code: string) => void;
-  /** Limit for mapped items from paged item history or turns from paged turn lists; defaults to 10,000. Legacy thread/read snapshots are not capped here. */
+  /** Maximum mapped items from paged item history or turns from paged turn lists, default 10,000. These reads reject with HISTORY_LIMIT_EXCEEDED above the limit. */
   maxHistoryItems?: number;
+  /** Deadline in milliseconds per adapter RPC or version read, default 30,000. The version deadline starts after process launch. The catalog uses its preparation context's deadline instead, default 10,000. */
+  timeoutMs?: number;
+  /** Maximum pending RPCs and, separately, maximum submissions awaiting native execution evidence in a session. Both limits default to 128 and reject new work at capacity. */
+  maxPending?: number;
 }

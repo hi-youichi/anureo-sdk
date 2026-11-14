@@ -5,11 +5,11 @@ import { mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createClient, HarnessSdkError, type Client, type SessionEventSink } from '@anureo/sdk'
-import { createScriptedAdapter, type FakeAdapterOptions, type FakeCall } from '@anureo/conformance'
+import { createClient, HarnessSdkError, type Client } from '@anureo/sdk'
+import { createScriptedAdapter, type FakeAdapterOptions } from '@anureo/conformance'
 import type { HarnessError } from '@anureo/protocol'
 import { z } from 'zod'
-import { workflow, pipeline, parallel, agent, type WorkflowOptions } from './index'
+import { workflow, parallel, agent, type WorkflowOptions } from './index'
 import { canonicalJson, digest } from './persistence/json'
 
 const clients: Client[] = []
@@ -26,14 +26,15 @@ async function setup() {
   return { directory, name: 'test', revision: '1', input: {} }
 }
 
-/** Emits a failed terminal turn outcome, mirroring native failures. */
+/** Supply a scripted input/submit handler that emits terminal failure before returning acceptance.
+ * Returning undefined for other calls lets the scripted adapter apply its default behavior. */
 function failingExecute(error: HarnessError): NonNullable<FakeAdapterOptions['execute']> {
   return async (call, sink) => {
     if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
     const turnId = randomUUID()
     await sink.emit({ type: 'turn/started', payload: { turnId } })
     await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error } }, { turnId })
-    return { submissionId: (call.params as { submissionId: string }).submissionId,
+    return { submissionId: call.params.submissionId,
       accepted: true, disposition: 'started', turnId }
   }
 }
@@ -66,18 +67,17 @@ test('run identity is durable before body, inputs are isolated, and results are 
 test('resumed runs replay identical agent calls from the journal without new sessions', async () => {
   const options = await setup()
   const { client, adapter } = await fixture()
-  const first = await workflow(options, async () =>
-    agent('{"value":1}', { client, cwd: options.directory, schema: z.strictObject({ value: z.number() }) }))
+  const body = async () =>
+    agent('{"value":1}', { client, cwd: options.directory, schema: z.strictObject({ value: z.number() }) })
+  const first = await workflow(options, body)
   expect(adapter.opened).toHaveLength(1)
   expect(first.result).toEqual({ value: 1 })
-  const second = await workflow({ ...options, resumeFrom: first.runId }, async () =>
-    agent('{"value":1}', { client, cwd: options.directory, schema: z.strictObject({ value: z.number() }) }))
+  const second = await workflow({ ...options, resumeFrom: first.runId }, body)
   expect(adapter.opened).toHaveLength(1)
   expect(second.result).toEqual({ value: 1 })
   // The resumed run carries its own journal copy; the source can be deleted.
   await rm(join(options.directory, first.runId), { recursive: true })
-  const third = await workflow({ ...options, resumeFrom: second.runId }, async () =>
-    agent('{"value":1}', { client, cwd: options.directory, schema: z.strictObject({ value: z.number() }) }))
+  const third = await workflow({ ...options, resumeFrom: second.runId }, body)
   expect(adapter.opened).toHaveLength(1)
   expect(third.result).toEqual({ value: 1 })
 })
@@ -162,13 +162,18 @@ test('unknown previous outcomes require reconciliation instead of silent re-exec
   const { client, adapter } = await fixture({
     execute: failingExecute({ code: 'NATIVE_FAILED', message: 'unknown', retryable: false, outcomeUnknown: true }),
   })
-  const failure = await workflow(options, () => agent('unknown', { client, cwd: options.directory }))
-    .then(value => { throw new Error(`expected rejection, completed with ${JSON.stringify(value)}`) })
-    .catch(cause => cause as HarnessSdkError & { details: { runId: string } })
+  const failure: unknown = await workflow(options, () => agent('unknown', { client, cwd: options.directory }))
+    .then(
+      value => { throw new Error(`expected rejection, completed with ${JSON.stringify(value)}`) },
+      cause => cause,
+    )
   expect(failure).toBeInstanceOf(HarnessSdkError)
+  if (!(failure instanceof HarnessSdkError)) throw failure
   expect(failure.outcomeUnknown).toBe(true)
   expect(adapter.opened).toHaveLength(1)
-  await expect(workflow({ ...options, resumeFrom: failure.details.runId }, () =>
+  const runId = failure.details?.runId
+  if (typeof runId !== 'string') throw new Error('expected the failed run ID')
+  await expect(workflow({ ...options, resumeFrom: runId }, () =>
     agent('unknown', { client, cwd: options.directory })))
     .rejects.toMatchObject({ code: 'WORKFLOW_RECONCILIATION_REQUIRED' })
   expect(adapter.opened).toHaveLength(1)
@@ -193,16 +198,14 @@ test('storage failure is sticky and blocks subsequent agent dispatch', async () 
 test('body completion waits for already registered unawaited agent work', async () => {
   const options = await setup()
   const { client } = await fixture()
-  let resolve!: () => void
-  const wait = new Promise<void>(done => { resolve = done })
+  const entered = Promise.withResolvers<void>()
   let ended = false
   const result = workflow(options, () => {
     void agent('slow', { client, cwd: options.directory }).then(() => { ended = true })
-    void wait.then(() => {})
-    resolve()
+    entered.resolve()
     return 'body'
   })
-  await wait
+  await entered.promise
   expect((await result).status).toBe('completed')
   expect(ended).toBe(true)
 })
@@ -223,21 +226,22 @@ test('agent calls detached from the run context execute as ordinary unjournaled 
 test('source activity, target competition, and reused explicit ids reject before body', async () => {
   const options = await setup()
   const { client } = await fixture()
-  let release!: () => void
-  let entered!: () => void
-  const ready = new Promise<void>(done => { entered = done })
-  const waiting = new Promise<void>(done => { release = done })
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
   const first = workflow({ ...options, runId: 'owned' }, async () => {
-    entered()
+    entered.resolve()
     await agent('held', { client, cwd: options.directory })
-    await waiting
+    await release.promise
     return 'done'
   })
-  await ready
+  await entered.promise
   try {
     await expect(workflow({ ...options, runId: 'owned' }, () => 'bad')).rejects.toMatchObject({ code: 'WORKFLOW_RUN_EXISTS' })
     await expect(workflow({ ...options, resumeFrom: 'owned' }, () => 'bad')).rejects.toMatchObject({ code: 'WORKFLOW_SOURCE_ACTIVE' })
-  } finally { release(); await first }
+  } finally {
+    release.resolve()
+    await first
+  }
   await expect(workflow({ ...options, runId: 'owned' }, () => 'bad')).rejects.toMatchObject({ code: 'WORKFLOW_RUN_EXISTS' })
 })
 

@@ -226,6 +226,6 @@ a related structural cause here only when it warrants a distinct design change.
 Return no findings when there is no supported structural improvement.`,
 }
 
-/** Default perspectives when ReviewOptions.angles is omitted, in report order.
- * Execution may overlap; reviewCode copies the angle records during preflight. */
+/** Default perspectives when ReviewOptions.angles is omitted, in report order. Preflight
+ * copies the angle records before dispatch. The CLI also uses these IDs for --angle selection. */
 export const defaultAngles: readonly ReviewAngle[] = [correctnessAngle, codeQualityAngle, designAngle]

@@ -45,12 +45,14 @@ test('concurrent AHP closes share cleanup and retain both release failures', asy
 test('a background protocol failure still cleans up and exposes release errors on close', async () => {
   const incoming = new BoundedEventQueue<string>();
   let closed = 0;
-  let signalCloseHandlerInvoked!: () => void;
-  const closeHandlerInvoked = new Promise<void>(resolve => { signalCloseHandlerInvoked = resolve; });
+  const closeHandler = Promise.withResolvers<void>();
   const wire = new AhpWire({ messages: incoming, send: async () => {}, close: async () => { closed++; incoming.end(); } });
-  wire.onClose = () => { signalCloseHandlerInvoked(); throw new Error('private callback failure'); };
+  wire.onClose = () => {
+    closeHandler.resolve();
+    throw new Error('private callback failure');
+  };
   incoming.push('invalid json');
-  await closeHandlerInvoked;
+  await closeHandler.promise;
   await expect(wire.close()).rejects.toMatchObject({ code: 'RESOURCE_RELEASE_FAILED', details: { errors: [{ code: 'AHP_CLOSE_HANDLER_FAILED' }] } });
   expect(closed).toBe(1);
 });
@@ -65,14 +67,13 @@ test('notification callbacks can await RPC replies without allowing later callba
   }, { timeoutMs: 1000 });
   const reader = outgoing[Symbol.asyncIterator]();
   const observed: string[] = [];
-  let finish = () => {};
-  const delivered = new Promise<void>(resolve => { finish = resolve; });
+  const delivered = Promise.withResolvers<void>();
   wire.onNotification = async method => {
     observed.push(method);
     if (method === 'first') {
       observed.push(String(await wire.request('replay', {})));
     } else {
-      finish();
+      delivered.resolve();
     }
   };
   try {
@@ -84,7 +85,7 @@ test('notification callbacks can await RPC replies without allowing later callba
     expect(request.method).toBe('replay');
     expect(observed).toEqual(['first']);
     incoming.push(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: 'replayed' }));
-    await delivered;
+    await delivered.promise;
     expect(observed).toEqual(['first', 'replayed', 'second']);
   } finally {
     await reader.return?.();
@@ -92,7 +93,7 @@ test('notification callbacks can await RPC replies without allowing later callba
   }
 });
 
-test('peer requests and late replies do not disturb correlated response failures', async () => {
+test('peer requests and unmatched replies do not disturb correlated response failures', async () => {
   const incoming = new BoundedEventQueue<string>();
   const sent: Array<Record<string, unknown>> = [];
   const wire = new AhpWire({
@@ -104,18 +105,23 @@ test('peer requests and late replies do not disturb correlated response failures
     const first = wire.request('first', {});
     const malformed = wire.request('malformed', {}).catch(cause => cause as unknown);
     const unsupported = wire.request('unsupported', {}).catch(cause => cause as unknown);
+    const [firstFrame, malformedFrame, unsupportedFrame] = sent;
+    if (!firstFrame || !malformedFrame || !unsupportedFrame) throw new Error('Missing outgoing requests');
     incoming.push(JSON.stringify({ jsonrpc: '2.0', id: 'peer-request', method: 'peer/call' }));
     incoming.push(JSON.stringify({ jsonrpc: '2.0', id: 999, result: 'unmatched' }));
-    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: sent[2]!.id, error: { code: -32601, message: 'private peer error' } }));
-    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: sent[1]!.id }));
-    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: sent[0]!.id, result: null }));
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: String(firstFrame.id), result: 'wrong ID type' }));
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: unsupportedFrame.id, error: { code: -32601, message: 'private peer error' } }));
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: malformedFrame.id }));
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: firstFrame.id, result: null }));
     expect(await first).toBeNull();
     expect(await malformed).toMatchObject({ code: 'PROTOCOL_ERROR' });
     expect(await unsupported).toMatchObject({ code: 'CAPABILITY_UNSUPPORTED', message: 'AHP_RPC_ERROR' });
     expect(sent[3]).toEqual({ jsonrpc: '2.0', id: 'peer-request', error: { code: -32601, message: 'Method not found' } });
     // A malformed correlated response fails its request rather than the whole connection.
     const next = wire.request('next', {});
-    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: sent[4]!.id, result: 'still open' }));
+    const nextFrame = sent[4];
+    if (!nextFrame) throw new Error('Missing follow-up request');
+    incoming.push(JSON.stringify({ jsonrpc: '2.0', id: nextFrame.id, result: 'still open' }));
     expect(await next).toBe('still open');
   } finally {
     await wire.close();

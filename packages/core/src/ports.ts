@@ -1,4 +1,3 @@
-// Defines adapter callbacks and host runtime hooks; must not implement transport, dispatch or resource lifecycles.
 import type { AhpEventPayload, AhpMethod, AhpRequestMap, AhpResultMap, Capabilities, HarnessError, InitializeParams, InitializeResult, InteractionRequested, InteractionResponse, JsonSchema, SessionBinding, SessionOpenParams } from '@anureo/protocol';
 import type { QueueLimits } from './queue';
 /**
@@ -6,13 +5,14 @@ import type { QueueLimits } from './queue';
  * the sink's requestInteraction. InteractionRegistry.deliverResponse invokes it with an answer;
  * cancelPending invokes it with null and a reason on expiry/cancellation/teardown.
  * Session.requestInteraction also calls it directly when rejecting closed, unsupported or handler
- * capacity admission. Resolve after native delivery/cancellation; reject delivery failures so registry
- * settlement can report an unknown outcome. The SDK does not retry potentially accepted responses.
+ * capacity admission. Resolve once native delivery or cancellation is confirmed by the adapter.
+ * Reject delivery failures and mark uncertain outcomes so the SDK can report them without retrying
+ * a response that might already have been accepted.
  */
 export type NativeInteractionResponder = (response: InteractionResponse | null, reason?: string) => Promise<void>;
 /** Session.request and BackendSession.execute use these methods; Client handles initialize/session-open separately through HarnessAdapter. */
 export type SessionMethod = Exclude<AhpMethod, 'initialize' | 'session/open'>;
-/** Adapters pass this envelope to sink emit/tryEmit; Session.validateEvent rejects conflicts with payload turn/item IDs before publication. */
+/** Supply the execution and item identities for a native event. IDs in scope and payload must agree. */
 export interface EventScope {
   /** Execution identity needed for item/usage events whose payload carries no turn ID. */
   turnId?: string;
@@ -20,40 +20,53 @@ export interface EventScope {
   itemId?: string;
 }
 /**
- * Publish native events and settle interactions through the sink supplied to HarnessAdapter.openSession.
- * Session implements this callback port and Client.attachSession supplies it to the output wrapper.
- * OutputSession.open registers forwarding callbacks with the native adapter, routing events through
- * output policy before Session publication. Adapters await publication methods for ordering and use
- * fail for observation failures; ownership of the Session and adapter stays with Client.
+ * Publish events and settle interactions through the sink received by HarnessAdapter.openSession.
+ * OutputSession.open supplies adapter callbacks that route events through structured-output policy
+ * before delivering them to Session. Await publication calls to preserve source order. Report
+ * observation failures through fail and release native resources through the adapter's disposal.
  */
 export interface SessionEventSink {
   /**
-   * OutputSession.publishOutput invokes this optional synchronous hook before final schema
-   * revalidation. Session returns privacy-projected text without mutating retained candidates;
-   * projection/validation failure becomes a failed terminal instead of publishing accepted JSON.
+   * Project final JSON synchronously for privacy. Session supplies this hook to
+   * OutputSession.publishOutput, which revalidates the returned text against the schema.
+   * Projection or validation failure turns the native success into a failed terminal result.
    */
   projectOutput?(text: string): string;
-  /** Await ordered submission/bound publication; invalid/conflicting bindings may throw or reject. Session.onRequestSucceeded also uses this for receipt-based association. */
+  /**
+   * Publish an association between a submission and its native execution. Successful publication
+   * can resolve Session.submit before the native receipt. Invalid or conflicting bindings fail
+   * publication. PiBackendSession.beginTurn awaits this before processing later turn events.
+   */
   bindSubmission(submissionId: string, turnId: string): Promise<void>;
-  /** Await detached event publication; admission may throw synchronously or reject. Processing failures reject and end Session observation. */
+  /**
+   * Admit a detached event for ordered processing. Await this call before sending a dependent event.
+   * Structured-output policy can hold events until a binding arrives. Admission can throw or reject.
+   * Queued processing failures reject and end observation.
+   */
   emit(event: AhpEventPayload, scope?: EventScope): Promise<void>;
-  /** Adapters unable to await attempt admission here; false reports immediate failure, while true still permits later publication failure to end observation. */
+  /** Attempt event admission without waiting. False reports immediate failure. True allows later processing failure to end observation. */
   tryEmit(event: AhpEventPayload, scope?: EventScope): boolean;
   /**
-   * Adapters register a native request and responder here. Session publishes interaction/requested
-   * before scheduling a configured host handler; manual answers enter Session.request instead.
-   * Resolve the answer after responder delivery and result publication; cancellation, expiry and
-   * settlement failures reject. Adapters retain their own native callback resources until settled.
+   * Register a native request and the callback that delivers its answer or cancellation. Session
+   * publishes interaction/requested before scheduling a configured host handler. Manual answers
+   * arrive through Session.request. Resolve with the answer after delivery and settlement
+   * publication. Admission failures, cancellation and expiry reject. If native delivery and
+   * publication of its unknown outcome both fail, the pending answer can remain unresolved.
+   * Keep native callback resources available through settlement or adapter teardown.
    */
   requestInteraction(request: InteractionRequested, responder: NativeInteractionResponder): Promise<InteractionResponse>;
   /**
-   * Adapters report settlement already completed by the native peer. Session.resolveInteraction
-   * delegates to InteractionRegistry.resolveExternally without calling responder; publish the result
-   * then reject the pending requestInteraction even for responded, because no answer value is supplied.
-   * Unknown/resolved IDs are ignored; result-publication failure rejects this call too.
+   * Report settlement already completed by the native peer. Session publishes the result without
+   * invoking the responder and rejects the pending requestInteraction, including for a responded
+   * outcome, because there is no answer value. Unknown or resolved IDs are ignored. A publication
+   * failure rejects this call.
    */
   resolveInteraction(result: AhpResultMap['interaction/respond']): Promise<void>;
-  /** Adapters report observation loss here; Session.fail ends observers and attempts interaction/backend cleanup, suppressing backend release failure. Native stop remains unconfirmed. */
+  /**
+   * Report observation loss. The first call on an open Session ends observation, cancels pending
+   * interactions and attempts backend cleanup. Session suppresses backend disposal rejection.
+   * Native execution stop remains unconfirmed.
+   */
   fail(cause: unknown): Promise<void>;
 }
 /**
@@ -80,10 +93,9 @@ export interface StructuredOutputToolDefinition {
   execute(value: unknown): Promise<StructuredOutputToolResult>;
 }
 /**
- * Implement session-scoped native tool registration on an optional BackendSession port. OutputSession.prepareOutput
- * awaits configure before input dispatch; completeTurn, reject and release call it without a tool to
- * disable registration. The adapter owns native registration effects and must finish them before
- * resolving so input dispatch cannot race setup.
+ * Implement session-scoped native tool registration on a BackendSession. OutputSession.prepareOutput
+ * awaits installation before dispatch. OutputSession.completeTurn, reject and release disable the
+ * tool on completion, definite rejection or teardown. Finish changes before resolving.
  */
 export interface StructuredOutputToolPort {
   /**
@@ -118,16 +130,16 @@ export interface BackendSession {
 }
 /**
  * Implement native negotiation, session acquisition and client-wide cleanup for ClientOptions.adapter.
- * Client installs withStructuredOutput, then delegates negotiation, opening and disposal through
- * that wrapper. Hosts initialize before
- * opening sessions and await Client.dispose; its session cleanup attempts precede adapter release.
- * Implementers own native setup effects and partially acquired resources on failure.
+ * Client invokes these operations through its structured-output wrapper. Release partially acquired
+ * native resources if setup fails. Be prepared to dispose after failed negotiation or while
+ * negotiation or a native open is still in flight, since a host can stop waiting first.
  */
 export interface HarnessAdapter {
   /**
-   * OutputSession.open synchronously queries this when initialization lacks native outputSchema
-   * support. Select a reachable bridge transport, or undefined to disable MCP fallback; opt in only
-   * when native open can consume session-scoped MCP configuration. Throws reject session setup.
+   * Select a bridge transport reachable by the native session, or return undefined to disable MCP
+   * fallback. OutputSession.open calls this synchronously when initialization lacks native
+   * outputSchema support. Opt in when native open can consume session-scoped MCP configuration.
+   * A throw rejects session setup.
    */
   outputBridgeTransport?(params: SessionOpenParams): 'http' | 'stdio' | undefined;
   /** Client.initialize awaits negotiation through its wrapper, validates the result and stores capabilities; reject incompatible contracts/native setup failure. */
@@ -155,13 +167,14 @@ export interface RuntimeOptions {
    */
   createId?: () => string;
   /**
-   * Supply public ISO timestamps for Session.publish; defaults to new Date().toISOString().
-   * Invalid timestamps/throws fail publication, while expiry checks use wall-clock time.
+   * Supply public ISO timestamps for Session.publish. Defaults to new Date().toISOString().
+   * An invalid timestamp or throw fails publication. Interaction expiry uses wall-clock time.
    */
   now?: () => string;
   /**
-   * Default Client.initialize/Session request wait and interaction responder deadline in milliseconds;
-   * defaults to 30_000. Per-call waits override request waits; Turn.result has its own default.
+   * Default wait for initialization, session requests, submission association and native interaction
+   * responders, in milliseconds. Defaults to 30_000. Per-call waits can override the operation
+   * wait. Turn.result has a separate 30-second default.
    */
   requestTimeoutMs?: number;
   /**
@@ -170,8 +183,8 @@ export interface RuntimeOptions {
    */
   openTimeoutMs?: number;
   /**
-   * Bound actionable interaction lifetime in milliseconds; defaults to 600_000.
-   * InteractionRegistry.begin also respects the native request's earlier expiry.
+   * Bound actionable interaction lifetime in milliseconds. Defaults to 600_000.
+   * An earlier native expiry takes precedence.
    */
   interactionTimeoutMs?: number;
   /**
@@ -185,15 +198,16 @@ export interface RuntimeOptions {
    */
   requestCacheSize?: number;
   /**
-   * Policy applied independently to Session event admission and output buffering; defaults to 2048
-   * events, 16 MiB buffered and 8 MiB per frame. Observer subscriptions use EventSubscriptionOptions.
+   * Set maxEvents, maxBytes and maxFrameBytes for session and structured-output event buffering.
+   * Their defaults are 2048 events, 16 MiB buffered and 8 MiB per frame. Observer queues use
+   * EventSubscriptionOptions.
    */
   queue?: QueueLimits;
   /**
    * Persist irreversible privacy metadata synchronously before accepting a new marked secret.
-   * Session registers a forwarding callback with SecretRedactor; remember invokes it before retaining
-   * a new marked value during InteractionRegistry.respond's pre-delivery check. Throws prevent native
-   * response delivery. Host persistence effects already completed for earlier values are not rolled back.
+   * Session registers this hook with SecretRedactor. SecretRedactor.rememberScalar invokes it before
+   * retaining a new marked value during InteractionRegistry.respond's pre-delivery check.
+   * A throw prevents native response delivery and leaves earlier persisted values in place.
    */
   onMarkedSecret?: (binding: Readonly<SessionBinding>, value: string) => void;
   /**

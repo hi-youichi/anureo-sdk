@@ -18,7 +18,7 @@ test('http and stdio MCP servers map to explicit native ACP entries', () => {
   expect(mcp()).toEqual([])
 })
 
-test('mapper reset forgets tracked state without breaking later updates', async () => {
+test('mapper reset leaves the session title available for later metadata updates', async () => {
   const binding = { sessionId: 's', adapterId: 'acp', runtimeConfigId: 'r' }
   const client=await createClient({adapter:createScriptedAdapter(),identity:binding})
   const sink=await client.openSession({requestId:'open',mode:'new',binding,cwd:process.cwd()})
@@ -37,6 +37,7 @@ test('mapper reset forgets tracked state without breaking later updates', async 
   )
   await mapper.update({ sessionUpdate: 'session_info_update', title: 'Before' })
   mapper.reset()
+  expect(state.metadata?.title).toBe('Before')
   await mapper.update({ sessionUpdate: 'session_info_update', title: 'After' })
   expect(state.metadata?.title).toBe('After')
   await client.dispose()
@@ -67,8 +68,9 @@ test('ACP idle metadata patches preserve absent titles and explicitly clear, wit
   await mapper.update({ sessionUpdate: 'session_info_update', title: 'Generated' })
   await mapper.update({ sessionUpdate: 'session_info_update', title: 'Generated' })
 
-  // A later patch without a title preserves the existing value.
+  // Missing and invalid titles preserve the existing value.
   await mapper.update({ sessionUpdate: 'session_info_update', updatedAt: 'later' })
+  await mapper.update({ sessionUpdate: 'session_info_update', title: 42 })
   expect(state.metadata?.title).toBe('Generated')
 
   // An explicit null clears the title and emits a metadata event.

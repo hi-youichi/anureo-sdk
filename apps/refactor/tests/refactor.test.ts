@@ -1,4 +1,4 @@
-// Verifies public sequencing, checkpoints and failure gates; it must not implement production orchestration.
+// Exercises public sequencing, checkpoints and failure gates through refactorCode.
 import { expect, test } from 'bun:test'
 import { mkdir, readFile, rename, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -7,7 +7,8 @@ import { createPiAdapter } from '@anureo/adapter-pi'
 import { fakeFactory } from '../../../packages/adapter/pi/tests/fake-host'
 import { startFake } from '../../../packages/adapter/hermes/tests/helpers'
 import { refactorCode, formatReport } from '../src'
-import { captureTree, git, treeVersion } from '../src/git-tree'
+import { captureTree, treeVersion } from '../src/git-tree'
+import { git } from '../src/git'
 import { edited, fixture, graph, kind, moduleOf, plan, temporary, unchanged } from './helpers'
 
 const DESIGN = 'DESIGN MODULE BOUNDARIES'
@@ -173,6 +174,7 @@ test('a failed design step stops before planning and records its partial edit', 
   const report = await refactorCode({ ...context, checks: [] })
   expect(report.status).toBe('incomplete')
   expect(report.design).toMatchObject({ status: 'failed', changedFiles: ['a.ts'], failure: { code: 'RECEIPT_LOST', outcomeUnknown: true } })
+  expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toBe('export const value = 2\n')
   expect(context.prompts).toHaveLength(1)
   expect(formatReport(report)).toContain('execution outcome is unknown')
 })
@@ -231,12 +233,14 @@ test('edits to another module and review-only writes stay out of the target chec
   }
 })
 
-/** Fail a shell gate after a real module edit; retain diagnostics and prevent later integration. */
+/** Fail a check after the first patch applies so the second patch exercises the integration gate. */
 test('failed validation retains its output and stops later integration', async () => {
   const context = await fixture(async (prompt, cwd) => {
     if (prompt.startsWith('PLAN')) return plan
-    if (moduleOf(prompt) === 'a') await writeFile(join(cwd, 'a.ts'), 'export const value = 2\n')
-    return moduleOf(prompt) === 'a' ? edited() : unchanged
+    const module = moduleOf(prompt)
+    if (!module) return unchanged
+    await writeFile(join(cwd, `${module}.ts`), 'export const value = 2\n')
+    return edited()
   })
   const report = await refactorCode({ ...context, checks: [
     { executable: process.execPath, args: ['-e', 'console.error("validation-broken"); process.exit(7)'] },
@@ -246,6 +250,14 @@ test('failed validation retains its output and stops later integration', async (
   expect(report.modules[0]?.step?.checks[0]).toMatchObject({ status: 'failed', output: expect.stringContaining('validation-broken') })
   expect(report.modules).toHaveLength(2)
   expect(report.modules[0]?.step?.checks).toHaveLength(1)
+  expect(report.modules[1]?.step).toMatchObject({
+    status: 'failed',
+    error: 'Integration blocked by failed module a',
+    changedFiles: ['b.ts'],
+    checks: [],
+  })
+  expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toBe('export const value = 2\n')
+  expect(await readFile(join(context.cwd, 'b.ts'), 'utf8')).toBe('export const value = 1\n')
   expect(await stat(join(context.cwd, 'later-check-ran')).catch(() => null)).toBeNull()
 })
 

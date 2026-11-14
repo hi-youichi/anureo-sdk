@@ -28,7 +28,7 @@ test('Hermes native queue separates overlapping turns, close only ends observati
       const client = await createClient({ adapter: fixture.adapter(), identity: { adapterId: 'hermes', runtimeConfigId: scenario } })
       const session = await client.sessions.create({ cwd: tmpdir() })
       return { client, session, first: 'first', second: 'second', relation: 'different',
-        /** The overlap/observer runner awaits this before the second receipt; release only after both native admissions exist. */
+        /** The overlap and observer checks call this after starting both submissions. Wait for both native inputs before releasing the fixture. */
         release: async () => {
           for (let i = 0; i < 100; i++) {
             if ((await fixture.state()).inputs.length === 2) { await fixture.control('release'); return }

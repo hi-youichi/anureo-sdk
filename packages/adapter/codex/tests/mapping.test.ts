@@ -1,10 +1,9 @@
-/** Guards public mapping contracts, unknown data and redaction; process lifecycle coverage belongs to adapter tests. */
+/** Guards mapping contracts for native input, output, unknown data and redaction. */
 import { describe, expect, test } from 'bun:test'
 import { fileURLToPath } from 'node:url'
 import { itemStatus, json, mapItems, mapTurnError, mapUsage, nativeInput, safe } from '../src/mapping'
 import { record, string } from '../src/native-values'
 
-/** Register synchronous input contracts through the compatibility subpath; fixtures reference files but never open them. */
 describe('native input mapping', () => {
   /** Assert mixed-block ordering and URL precedence without requiring the mentioned file to exist. */
   test('text, inline images, remote images and file mentions map to native records', () => {
@@ -39,7 +38,6 @@ describe('native input mapping', () => {
   })
 })
 
-/** Register item-envelope vocabulary contracts; collaboration state is checked independently because it has different terminal words. */
 describe('native item status vocabulary', () => {
   /** Both native denial spellings must stay distinguishable from failures for approval UI callers. */
   test('every denial word maps to declined', () => {
@@ -48,7 +46,6 @@ describe('native item status vocabulary', () => {
   })
 })
 
-/** Register content contracts that preserve block positions even when native clients add new block kinds. */
 describe('native userMessage content projection', () => {
   /** Typed attachments and placeholders must preserve their positions without reading local image paths. */
   test('remote images, local images and unsupported blocks stay typed', () => {
@@ -105,13 +102,18 @@ test('metadata preserves nullish timing fallback and explicit unknown history st
 
 /** Attachment identity must suppress inline bytes; viewing an image must never claim that its result was generated. */
 test('image projection omits unsupplied fields and retains safe failure output', () => {
-  expect(mapItems({ id: 'g', type: 'imageGeneration', fileId: 'attachment', result: 'ignored', savedPath: '', path: '/ignored', failure: { apiKey: 'secret', reason: 'failed' } }, true)[0])
-    .toEqual({
-      id: 'g', status: 'completed', type: 'toolCall', kind: 'image', nativeType: 'imageGeneration', title: 'Image', input: null,
-      image: { kind: 'generated', fileId: 'attachment' }, output: safe({ failure: { apiKey: 'secret', reason: 'failed' } }),
-    })
-  expect(mapItems({ id: 'v', type: 'imageView', result: 'ignored' }, false)[0]).toMatchObject({ image: { kind: 'view' } })
-  expect(mapItems({ id: 'v', type: 'imageView', result: 'ignored' }, false)[0]).not.toHaveProperty('image.data')
+  const [generated] = mapItems({
+    id: 'g', type: 'imageGeneration', fileId: 'attachment', result: 'ignored',
+    savedPath: '', path: '/ignored', failure: { apiKey: 'secret', reason: 'failed' },
+  }, true)
+  expect(generated).toEqual({
+    id: 'g', status: 'completed', type: 'toolCall', kind: 'image', nativeType: 'imageGeneration', title: 'Image', input: null,
+    image: { kind: 'generated', fileId: 'attachment' },
+    output: { failure: { apiKey: '[redacted]', reason: 'failed' } },
+  })
+  const [viewed] = mapItems({ id: 'v', type: 'imageView', result: 'ignored' }, false)
+  expect(viewed).toMatchObject({ image: { kind: 'view' } })
+  expect(viewed).not.toHaveProperty('image.data')
 })
 
 /** Missing tool names and explicit empty names differ; falsy native output still wins over a fallback field. */

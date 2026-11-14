@@ -1,4 +1,4 @@
-/** Verifies read-only discovery, catalog connection reuse and cancellation cleanup; it must not start real Codex threads. */
+/** Exercises read-only discovery and connection ownership with fake native transports. */
 import { expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -171,6 +171,31 @@ test('query cancellation closes shared users and permits reconnection', async ()
     expect(f.children[0]?.disposals).toBe(1)
   } finally { await f.session.dispose() }
   expect(f.children[1]?.disposals).toBe(1)
+})
+
+test('cancellation from the models phase observer skips the native query', async () => {
+  const f = scriptedCatalog(() => ({ result: { data: [] } }))
+  const abort = new AbortController()
+  const phases: CatalogProbeEvent[] = []
+  try {
+    await f.session.prepare()
+    const failure = await rejectionOf(f.session.listModels({
+      signal: abort.signal,
+      onPhase: event => {
+        phases.push(event)
+        if (event.outcome === 'started') abort.abort()
+      },
+    }))
+    expect(failure).toMatchObject({ code: 'RPC_ABORTED' })
+    expect(f.calls.some(call => call.method === 'model/list')).toBe(false)
+    expect(phases.map(event => [event.phase, event.outcome])).toEqual([
+      ['models', 'started'],
+      ['models', 'cancelled'],
+    ])
+  } finally {
+    await f.session.dispose()
+  }
+  expect(f.children[0]?.disposals).toBe(1)
 })
 
 /** Concurrent callers must observe one launch failure; explicit disposal after retry must also allow a new preparation instead of permanently closing the catalog. */

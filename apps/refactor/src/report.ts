@@ -1,12 +1,10 @@
-// Renders host-observed reports as text; it must not run refactors or persist their state.
 import { join } from 'node:path'
 import type { RefactorReport, StepResult } from './results'
 
-/** Render a structured run as newline-terminated text for CLI/library presentation.
- * executeRefactor prints this result for text-mode CLI runs; library consumers may format a report
- * returned by refactorCode. Preserves design-before-module order and includes check statuses and
- * observer errors, but omits check output and raw failure codes. Supply a valid host record;
- * formatting it has no expected errors, I/O or mutation. */
+/** Render a report from refactorCode as newline-terminated text, the format executeRefactor
+ * prints in CLI text mode. Design appears before module results in plan order. The text includes
+ * check statuses and observer errors. For check output and raw failure codes, read the report
+ * fields directly. Formatting a valid report performs no I/O or mutation. */
 export function formatReport(report: RefactorReport): string {
   const lines = [
     `Refactor: ${report.status}${report.reviewOnly ? ' (review only)' : ''}`,
@@ -32,9 +30,8 @@ export function formatReport(report: RefactorReport): string {
   return `${lines.join('\n')}\n`
 }
 
-/** Append one step's host facts to formatReport's buffer in presentation order, returning void.
- * Mutates only the buffer; valid step records have no expected errors. Unknown outcomes remain
- * explicit because a failure message alone cannot establish whether edits ran. */
+/** Append a design or module result to formatReport's text buffer. Call out execution uncertainty
+ * explicitly because the error text alone cannot tell a reader whether edits ran. */
 function appendStep(lines: string[], step: StepResult): void {
   lines.push(`Result: ${step.status}. ${step.error ?? step.summary}`)
   if (step.failure?.outcomeUnknown) lines.push('Agent execution outcome is unknown; inspect source and backend execution before starting another run.')

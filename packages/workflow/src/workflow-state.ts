@@ -1,17 +1,22 @@
 import { HarnessSdkError, sdkError } from '@anureo/sdk'
-import type { StoredFailure } from './persistence/store'
+import type { StoredFailure } from './persistence/records'
 
-/** Recognize SDK cleanup evidence so fatal classification and persisted failure metadata agree. */
+/** Recognize SDK resource-release errors and explicit cleanup evidence on another failure.
+ * isFatal, storedFailure and RunState.failure share this rule for dispatch and reporting. */
 export function cleanupFailed(error: HarnessSdkError): boolean {
   return error.code === 'RESOURCE_RELEASE_FAILED'
     || error.details?.cleanupFailed === true
     || (Array.isArray(error.details?.cleanupErrors) && error.details.cleanupErrors.length > 0)
 }
 
-/** Reduce workflow's abort error to the manifest's failure fields without persisting diagnostics. */
+/** Project abortRun's failure into manifest metadata, excluding diagnostic messages and details. */
 export function storedFailure(error: HarnessSdkError): StoredFailure {
-  return { code: error.code, retryable: error.retryable,
-    outcomeUnknown: error.outcomeUnknown, cleanupFailed: cleanupFailed(error) }
+  return {
+    code: error.code,
+    retryable: error.retryable,
+    outcomeUnknown: error.outcomeUnknown,
+    cleanupFailed: cleanupFailed(error),
+  }
 }
 
 /** Tell memoizedAgent and RunState.track when a failure must stop later dispatch even if caught.
@@ -26,11 +31,14 @@ export function isFatal(error: HarnessSdkError): boolean {
  * Ordinary step failures mark completion incomplete; sticky failures reject the run and block dispatch.
  * workflow's completion and abort phases close admission and drain registered work. */
 export class RunState {
-  /** Remember a sticky failure for workflow and future dispatch checks; does not cancel active work. */
+  /** Preserve a failure for workflow's rejection and prevent later dispatch. Active work keeps settling. */
   stop(error: HarnessSdkError): void { this.stops.add(error) }
 
-  /** Aggregate sticky failures with the first code/message, combined uncertainty and cleanup evidence.
-   * workflow reports this after draining and releasing its handle; absent means no sticky failure. */
+  /** Record a normalized storage failure when abortRun cannot publish or workflow cannot release the handle. */
+  noteStorageFailure(): void { this.stop(new HarnessSdkError('WORKFLOW_STORAGE_FAILED')) }
+
+  /** Return the first sticky code and message with all recorded codes, uncertainty and cleanup evidence.
+   * abortRun snapshots this for failure publication. workflow reads it again after lock release. */
   get failure(): HarnessSdkError | undefined {
     const failures = [...this.stops]
     const first = failures[0]
@@ -44,11 +52,11 @@ export class RunState {
 
   /** Publication status for workflow when no sticky failure remains to reject the run. */
   get status(): 'completed' | 'incomplete' {
-    return this.rejected ? 'incomplete' : 'completed'
+    return this.incomplete ? 'incomplete' : 'completed'
   }
 
-  /** Let memoizedAgent mark a dropped, fulfilled null outcome incomplete without stopping dispatch. */
-  noteIncomplete(): void { this.rejected++ }
+  /** Mark a drop from memoizedAgent or a rejection from track incomplete. Fatality is checked separately. */
+  noteIncomplete(): void { this.incomplete = true }
 
   /** Throw the sticky aggregate before dispatch. memoizedAgent checks again after publishing
    * its started marker because another call may have stopped the run during that await.
@@ -73,7 +81,7 @@ export class RunState {
       work = Promise.reject(cause)
     }
     const observed = work.then(() => {}, cause => {
-      this.rejected++
+      this.noteIncomplete()
       const error = sdkError(cause, 'WORKFLOW_STEP_FAILED')
       if (isFatal(error)) this.stop(error)
     })
@@ -93,5 +101,5 @@ export class RunState {
   private accepting = true
   private pending = new Set<Promise<void>>()
   private stops = new Set<HarnessSdkError>()
-  private rejected = 0
+  private incomplete = false
 }

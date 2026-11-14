@@ -1,7 +1,7 @@
 import { BoundedEventQueue, HarnessSdkError } from '@anureo/sdk'
 import type { GatewayGrant } from './attach'
 import type { HermesAdapterOptions } from './options'
-import { event, HermesRpcError, object, protocolError, type NativeEvent, type NativeObject } from './native'
+import { event, GATEWAY_PROTOCOL, HermesRpcError, object, protocolError, type NativeEvent, type NativeObject } from './native'
 
 /** Internal gateway-to-client request; probe handlers and HermesInteractions reply or reject using the same id. */
 export interface ServerRequest { id: string | number; method: string; params: NativeObject }
@@ -9,7 +9,8 @@ export interface ServerRequest { id: string | number; method: string; params: Na
 /**
  * Internal, bounded JSON-RPC channel for adapter probes and sessions. Responses settle requests
  * immediately; events and server requests run serially so a handler can await an RPC acknowledgement.
- * HermesAdapter.initialize disposes its probe; HermesSession disposes each channel on recovery/close.
+ * HermesAdapter.probeRuntime disposes its probe. HermesSession owns the channel during observation
+ * and disposes it on recovery or close.
  */
 export class HermesRpc {
   /** Install transport listeners and start serial delivery before connect waits for the opening handshake. */
@@ -31,7 +32,8 @@ export class HermesRpc {
   /**
    * Open a fresh grant and require hermes-gateway-v1 negotiation. Reject factory/open failures,
    * timeout, protocol mismatch or abort; after channel construction, failure disposes its socket.
-   * The signal only cancels opening. On success the caller must dispose the channel separately.
+   * The signal only cancels opening. On success the caller must dispose the channel separately
+   * and must use a freshly minted grant for each connection attempt.
    */
   static async connect(grant: GatewayGrant, handlers: Handlers, options: HermesAdapterOptions, signal?: AbortSignal): Promise<HermesRpc> {
     if (signal?.aborted) throw new HarnessSdkError('RUNTIME_DISPOSED')
@@ -43,15 +45,19 @@ export class HermesRpc {
     try {
       await waitForOpen(socket, options.timeoutMs ?? 30_000, signal)
       return client
-    } catch (cause) { client.dispose(); throw cause }
+    } catch (cause) {
+      client.dispose()
+      throw cause
+    }
   }
-  /** Whether the local channel still permits writes; this does not establish remote liveness. */
+  /** Whether the local channel still permits writes. HermesSession.ready uses this to decide when to recover. */
   get connected(): boolean { return !this.closed && this.socket.readyState === 1 }
   /**
    * Resolve with the correlated native result, without waiting for event delivery or execution
    * completion. Reject native RPC errors, admission/write failures, timeout or channel closure.
-   * mutation marks timeout/lost-delivery outcomes unknown; it never retries or cancels remote work.
-   * HermesSession and HermesInteractions supply it for operations that can change native state.
+   * HermesSession and HermesInteractions set mutation for submissions, creation, interrupts and
+   * prompt answers so timeout, channel loss or an unclassified write failure reports an unknown
+   * outcome. A request never retries or cancels remote work.
    */
   request(method: string, params: NativeObject = {}, mutation = false): Promise<unknown> {
     if (!this.connected) return Promise.reject(new HarnessSdkError('CONNECTION_CLOSED'))
@@ -65,7 +71,7 @@ export class HermesRpc {
       this.pending.set(id, { resolve, reject, timer, mutation })
       try { this.send({ jsonrpc: '2.0', id, method, params }) }
       catch (cause) {
-        clearTimeout(timer); this.pending.delete(id)
+        this.forgetRequest(id, timer)
         reject(cause instanceof HarnessSdkError ? cause : new HarnessSdkError('CONNECTION_CLOSED', 'Hermes write failed', false, mutation))
       }
     })
@@ -91,17 +97,18 @@ export class HermesRpc {
     this.stop(new HarnessSdkError('CONNECTION_CLOSED', 'Hermes observation closed', false, true))
   }
 
+  /**
+   * Settle when queued delivery ends and any failure callback returns. Disposal skips buffered
+   * entries and lets the active handler finish. HermesSession.retryRecovery awaits this before
+   * opening a replacement. Reader failures are reported to the callback, whose own throw rejects this promise.
+   */
+  readonly finished: Promise<void>
+
   private readonly queue: BoundedEventQueue<Incoming>
   private readonly pending = new Map<string | number, Waiting>()
   private nextId = 0
   private closed = false
   private disposed = false
-  /**
-   * Settle after queued handling ends and failure is reported. Disposal skips buffered entries but
-   * does not cancel an active handler; HermesSession.recover awaits this before replaying a new channel.
-   * Transport/handler failures are handled here rather than rejected, unless failure itself throws.
-   */
-  readonly finished: Promise<void>
 
   /**
    * Deliver queued events/requests in order. The constructor's catch closes the channel on handler
@@ -116,36 +123,48 @@ export class HermesRpc {
   }
   /** The message listener validates/routes each frame; throwing closes the channel through that listener. */
   private receive(raw: unknown): void {
-    const frame = decodeFrame(raw, this.options.maxFrameBytes ?? 8 * 1024 * 1024)
-    const id = frame.id
-    if (typeof frame.method === 'string') {
-      if (id === undefined) {
-        if (frame.method === 'event') this.queue.push({ kind: 'event', value: event(frame.params) })
-      } else {
-        if (typeof id !== 'string' && (typeof id !== 'number' || !Number.isSafeInteger(id))) throw protocolError()
-        this.queue.push({ kind: 'request', value: { id, method: frame.method, params: object(frame.params ?? {}) } })
-      }
+    const frame = decodeFrame(raw, this.options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES)
+    const { id, method } = frame
+    if (typeof method !== 'string') {
+      this.receiveResponse(frame)
       return
     }
-    this.receiveResponse(frame)
+    if (id === undefined) {
+      if (method === 'event') this.queue.push({ kind: 'event', value: event(frame.params) })
+      return
+    }
+    if (typeof id !== 'string' && (typeof id !== 'number' || !Number.isSafeInteger(id))) throw protocolError()
+    this.queue.push({ kind: 'request', value: { id, method, params: object(frame.params ?? {}) } })
   }
-  /** Settle a matching request without entering the handler queue; late or unknown response ids are ignored. */
+  /**
+   * Settle matching requests without entering the handler queue. Ignore uncorrelated responses
+   * after checking the envelope, so late replies after timeout leave other requests pending.
+   */
   private receiveResponse(frame: NativeObject): void {
     const id = frame.id
-    if (typeof id !== 'string' && typeof id !== 'number' || Object.hasOwn(frame, 'result') === Object.hasOwn(frame, 'error')) throw protocolError()
+    const hasError = Object.hasOwn(frame, 'error')
+    if ((typeof id !== 'string' && typeof id !== 'number') || Object.hasOwn(frame, 'result') === hasError) throw protocolError()
     const waiting = this.pending.get(id)
     if (!waiting) return
-    const nativeError = Object.hasOwn(frame, 'error') ? new HermesRpcError(object(frame.error)) : undefined
-    this.pending.delete(id); clearTimeout(waiting.timer)
+    // Invalid error data must leave the waiter visible so stop can reject it with the channel failure.
+    const nativeError = hasError ? new HermesRpcError(object(frame.error)) : undefined
+    this.forgetRequest(id, waiting.timer)
     if (nativeError) waiting.reject(nativeError)
     else waiting.resolve(frame.result)
   }
+
+  /** Release the pending slot and its deadline before settling a response or reporting a write failure. */
+  private forgetRequest(id: string | number, timer: Waiting['timer']): void {
+    clearTimeout(timer)
+    this.pending.delete(id)
+  }
+
   /** Enforce per-frame and socket backlog limits before a synchronous write; callers decide how to report failures. */
   private send(frame: NativeObject): void {
     if (!this.connected) throw new HarnessSdkError('CONNECTION_CLOSED', 'Hermes connection is closed')
     const value = JSON.stringify(frame)
     const bytes = Buffer.byteLength(value)
-    if (bytes > (this.options.maxFrameBytes ?? 8 * 1024 * 1024)) throw new HarnessSdkError('FRAME_TOO_LARGE')
+    if (bytes > (this.options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES)) throw new HarnessSdkError('FRAME_TOO_LARGE')
     if (this.socket.bufferedAmount + bytes > (this.options.maxBufferedBytes ?? 16 * 1024 * 1024)) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED')
     this.socket.send(value)
   }
@@ -154,7 +173,7 @@ export class HermesRpc {
     try { this.send(frame); return Promise.resolve() }
     catch { return Promise.reject(new HarnessSdkError('RESULT_UNKNOWN', 'Hermes response could not be delivered', false, true)) }
   }
-  /** End observation once; reject pending work with its mutation uncertainty before ending queued delivery and closing the socket. */
+  /** End observation once. Reject pending RPCs with their mutation uncertainty before ending queued delivery and closing the socket. */
   private stop(cause: HarnessSdkError): void {
     if (this.closed) return
     this.closed = true
@@ -162,12 +181,14 @@ export class HermesRpc {
       clearTimeout(waiting.timer)
       waiting.reject(new HarnessSdkError(cause.code, cause.message, false, waiting.mutation))
     }
-    this.pending.clear(); this.queue.end(cause); this.socket.close()
+    this.pending.clear()
+    this.queue.end(cause)
+    this.socket.close()
   }
 }
 
 /**
- * Supplied by HermesAdapter.initialize for probes and HermesSession.connect for session delivery.
+ * Supplied by HermesAdapter.probeRuntime for probes and HermesSession.connect for session delivery.
  * read awaits event/request callbacks serially; failure is invoked when read fails, unless disposed.
  * Callbacks must not wait for a user answer: response RPCs bypass this queue, but later events do not.
  */
@@ -183,6 +204,7 @@ interface Waiting {
   mutation: boolean
 }
 type Incoming = { kind: 'event'; value: NativeEvent } | { kind: 'request'; value: ServerRequest }
+const DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 /** Require bounded UTF-8 JSON-RPC input; decoding/parsing errors are normalized by the message listener. */
 function decodeFrame(raw: unknown, maxFrameBytes: number): NativeObject {
@@ -208,7 +230,7 @@ function waitForOpen(socket: WebSocket, timeoutMs: number, signal?: AbortSignal)
     }
     const opened = () => {
       cleanup()
-      socket.protocol === 'hermes-gateway-v1' ? resolve() : reject(new HarnessSdkError('HERMES_GATEWAY_UNSUPPORTED', 'Hermes WebSocket protocol mismatch'))
+      socket.protocol === GATEWAY_PROTOCOL ? resolve() : reject(new HarnessSdkError('HERMES_GATEWAY_UNSUPPORTED', 'Hermes WebSocket protocol mismatch'))
     }
     const failed = () => { cleanup(); reject(new HarnessSdkError('HARNESS_UNAVAILABLE', 'Hermes connection failed', true)) }
     const aborted = () => { cleanup(); reject(new HarnessSdkError('RUNTIME_DISPOSED')) }

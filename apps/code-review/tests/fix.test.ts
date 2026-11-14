@@ -7,7 +7,7 @@ import { HarnessSdkError } from '@anureo/sdk'
 import { correctnessAngle, formatReport, reviewCode, type ReviewProgress } from '../src'
 import { runCli } from '../src/cli'
 import { fixFindings } from '../src/fix'
-import { finding, fixture, output, plan, stages } from './helpers'
+import { finding, fixture, isModule, output, plan, stages } from './helpers'
 
 const exec = promisify(execFile)
 
@@ -30,14 +30,12 @@ async function commitFixture(cwd: string): Promise<void> {
 /** Supply fixture's submit-time responder with analysis, review, fix and verification outcomes.
  * Defaults to editing a.ts only during a fix and clearing findings at verification; a custom fix
  * owns its edits and response. fixture's afterEach owns client disposal and directory removal. */
-async function fixFixture(options: {
+function fixFixture(options: {
   fix?: (cwd: string) => unknown | Promise<unknown>
   verify?: unknown
   review?: unknown
 } = {}) {
-  // Safe: fixture() only invokes respond after it returns, so context is
-  // assigned before any prompt is answered.
-  const context = await fixture(async (prompt, sessionCwd) => {
+  return fixture(async (prompt, sessionCwd) => {
     if (prompt.startsWith(stages.analyze)) return plan
     if (prompt.startsWith(stages.fix)) {
       if (options.fix) return options.fix(sessionCwd)
@@ -47,16 +45,16 @@ async function fixFixture(options: {
     if (prompt.startsWith(stages.verify)) return options.verify ?? { findings: [] }
     return options.review ?? { findings: [finding] }
   })
-  return context
 }
 
 const single = { maxModules: 1, angles: [correctnessAngle] }
+const isModuleA = isModule('a')
+const isModuleB = isModule('b')
 const reviewedModules = plan.modules.slice(0, 1).map(module => ({
   module, angles: [{ angle: correctnessAngle, status: 'completed' as const, findings: [finding] }],
 }))
 
 test('module fixes start before later modules finish reviewing and are serialized', async () => {
-  // Safe: fixture() only invokes respond after it returns.
   let fixPeak = 0
   let activeFixes = 0
   const fixStarted = Promise.withResolvers<void>()
@@ -73,8 +71,9 @@ test('module fixes start before later modules finish reviewing and are serialize
     }
     if (prompt.startsWith(stages.verify)) return { findings: [] }
     // Module b's review stays pending until module a's fix agent has started.
-    if (prompt.includes('"id":"b"')) await fixStarted.promise
-    return { findings: prompt.includes('"id":"b"') ? [{ ...finding, file: 'b.ts' }] : [finding] }
+    const reviewingB = isModuleB(prompt)
+    if (reviewingB) await fixStarted.promise
+    return { findings: reviewingB ? [{ ...finding, file: 'b.ts' }] : [finding] }
   })
   await commitFixture(cwd)
   const events: ReviewProgress[] = []
@@ -111,9 +110,9 @@ test('final verification covers unchanged callers after a dependency fix', async
     if (prompt.startsWith(stages.verify)) {
       expect(dependencyFixed).toBe(true)
       const dependency = await readFile(join(sessionCwd, 'b.ts'), 'utf8')
-      return { findings: prompt.includes('"id":"a"') && dependency.includes('undefined') ? [regression] : [] }
+      return { findings: isModuleA(prompt) && dependency.includes('undefined') ? [regression] : [] }
     }
-    return { findings: prompt.includes('"id":"b"') ? [{ ...finding, file: 'b.ts' }] : [] }
+    return { findings: isModuleB(prompt) ? [{ ...finding, file: 'b.ts' }] : [] }
   })
   await writeFile(join(cwd, 'a.ts'), "import { value } from './b'\nexport const result = value() + 1\n")
   await writeFile(join(cwd, 'b.ts'), 'export const value = () => 0\n')
@@ -142,8 +141,9 @@ test.each(['scope', 'execution'] as const)('a %s failure stops queued fixes and 
       await writeFile(join(sessionCwd, failure === 'scope' ? 'b.ts' : 'a.ts'), fixed)
       return failure === 'scope' ? fixResult : new HarnessSdkError('NATIVE_FAILED', 'Failed after editing sources')
     }
-    if (prompt.includes('"id":"b"')) await fixStarted.promise
-    return { findings: [{ ...finding, file: prompt.includes('"id":"b"') ? 'b.ts' : 'a.ts' }] }
+    const reviewingB = isModuleB(prompt)
+    if (reviewingB) await fixStarted.promise
+    return { findings: [{ ...finding, file: reviewingB ? 'b.ts' : 'a.ts' }] }
   })
   await commitFixture(cwd)
   const report = await reviewCode({ client, cwd, fix: true, concurrency: 2, angles: [correctnessAngle], onProgress: event => {
@@ -364,6 +364,31 @@ test('a fix cannot overwrite source edited during its agent session', async () =
     status: 'failed', changedFiles: [], error: { code: 'REVIEW_FIX_CONFLICT' },
   })
   expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe(originalEdit)
+})
+
+test('a conflict in the last changed file prevents the entire fix from being applied', async () => {
+  const originalEdit = 'export const modifiedOutsideReview = true\n'
+  const { client, cwd, prompts } = await fixture(async (prompt, sessionCwd) => {
+    if (prompt.startsWith(stages.analyze)) {
+      return { ...plan, modules: [{ ...plan.modules[0], files: ['a.ts', 'b.ts'] }] }
+    }
+    if (prompt.startsWith(stages.fix)) {
+      await writeFile(join(sessionCwd, 'a.ts'), fixed)
+      await writeFile(join(sessionCwd, 'b.ts'), fixed)
+      await writeFile(join(cwd, 'b.ts'), originalEdit)
+      return { ...fixResult, changedFiles: ['a.ts', 'b.ts'] }
+    }
+    return { findings: [finding] }
+  })
+  await commitFixture(cwd)
+  const before = await readFile(join(cwd, 'a.ts'))
+  const report = await reviewCode({ client, cwd, ...single, fix: true })
+  expect(report.modules[0]?.fix).toMatchObject({
+    status: 'failed', changedFiles: [], error: { code: 'REVIEW_FIX_CONFLICT' },
+  })
+  expect(await readFile(join(cwd, 'a.ts'))).toEqual(before)
+  expect(await readFile(join(cwd, 'b.ts'), 'utf8')).toBe(originalEdit)
+  expect(prompts).toHaveLength(3)
 })
 
 test('fixing in a repository with an unborn branch leaves HEAD unborn', async () => {

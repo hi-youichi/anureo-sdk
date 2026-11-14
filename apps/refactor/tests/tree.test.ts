@@ -1,8 +1,9 @@
-// Verifies snapshot and source-safety boundaries; it must not duplicate orchestration or filesystem mocks.
+// Verifies Git snapshots and source eligibility against real filesystem entries.
 import { expect, test } from 'bun:test'
 import { chmod, lstat, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { captureTree, changes, gitFiles, treeVersion } from '../src/git-tree'
+import { captureTree, changes, treeVersion } from '../src/git-tree'
+import { gitFiles } from '../src/git'
 import { exec } from '../src/process'
 import { isSource, isTextSource } from '../src/source-policy'
 import { fixture, temporary } from './helpers'
@@ -12,7 +13,7 @@ test('snapshots sort visible files, omit deleted entries and metadata, and retai
   const { cwd } = await fixture()
   await writeFile(join(cwd, '.gitignore'), '.anureo/\nignored.ts\n')
   await writeFile(join(cwd, 'ignored.ts'), 'ignored')
-  await writeFile(join(cwd, 'notes.txt'), 'untracked non-source content')
+  await writeFile(join(cwd, 'notes.txt'), 'untracked text')
   await mkdir(join(cwd, '.anureo'))
   await writeFile(join(cwd, '.anureo', 'report.ts'), 'run output')
   await exec('git', ['-C', cwd, 'add', '--force', '.anureo/report.ts'])
@@ -52,7 +53,7 @@ test.skipIf(process.platform === 'win32')('snapshot changes track content and mo
   expect(changes(after, await captureTree(cwd))).toEqual(['a.ts'])
 })
 
-/** Exercise lexical rules and real ancestors, including missing paths accepted for future files. */
+/** Exercise scope precedence, path inspection and text detection independently. */
 test('source inventory accepts unfamiliar names and rejects unsafe paths, binary and non-file targets', async () => {
   const { cwd } = await fixture()
   const outside = await temporary()
@@ -62,6 +63,9 @@ test('source inventory accepts unfamiliar names and rejects unsafe paths, binary
   for (const file of ['docs/main.ts', 'node_modules/main.ts', 'README.md']) {
     expect(isSource(file)).toBe(false)
   }
+  expect(isSource('README.md', ['README.md'])).toBe(true)
+  expect(isSource('README.md', ['README.md'], ['*.md'])).toBe(false)
+  expect(isSource('docs/main.ts', ['docs/main.ts'])).toBe(false)
   for (const file of ['/absolute.ts', '../escape.ts', './a.ts', 'src//a.ts', 'src/../a.ts', 'src\\a.ts', 'docs/main.ts']) {
     await expect(isTextSource(cwd, file)).rejects.toThrow(`Invalid source path: ${file}`)
   }
@@ -76,6 +80,8 @@ test('source inventory accepts unfamiliar names and rejects unsafe paths, binary
   await writeFile(join(cwd, 'archive.dsl'), Buffer.from([0xff, 0, 0x80]))
   await expect(isTextSource(cwd, 'archive.dsl')).resolves.toBe(false)
   await writeFile(join(cwd, '构建'), Buffer.from('\uFEFFrun job\r\n', 'utf16le'))
+  await expect(isTextSource(cwd, '构建')).resolves.toBe(true)
+  await writeFile(join(cwd, '构建'), Buffer.from([0xfe, 0xff, 0x00, 0x61]))
   await expect(isTextSource(cwd, '构建')).resolves.toBe(true)
 })
 

@@ -63,6 +63,7 @@ test('older SDKs without reinitialize rebuild a fresh directory Query to refresh
 
 test('an aborted probe disposes the live directory connection', async () => {
   const controller = new AbortController()
+  const handshakeStarted = Promise.withResolvers<void>()
   const pendingProbeRejectors: Array<() => void> = []
   const session = createClaudeCatalogSession({
     queryFactory: ({ prompt }) => {
@@ -72,6 +73,7 @@ test('an aborted probe disposes the live directory connection', async () => {
         supportedModels: () => {
           return new Promise((_resolve, reject) => {
             pendingProbeRejectors.push(() => reject(new Error('probe closed')))
+            handshakeStarted.resolve()
           })
         },
         close: () => {
@@ -84,7 +86,7 @@ test('an aborted probe disposes the live directory connection', async () => {
   })
   try {
     const pending = session.listModels({ signal: controller.signal })
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    await handshakeStarted.promise
     controller.abort()
     await expect(pending).rejects.toThrow('probe closed')
   } finally { await session.dispose().catch(() => {}) }
@@ -99,9 +101,8 @@ test('spawn failures dispose the half-opened connection before surfacing', async
 
 test('disposal ends input, shares the native return wait and allows later discovery', async () => {
   let queries = 0, closes = 0, disposed = false
-  let releaseReturn = () => {}, notifyReturn = () => {}
-  const returnGate = new Promise<void>(resolve => { releaseReturn = resolve })
-  const returnStarted = new Promise<void>(resolve => { notifyReturn = resolve })
+  const returnGate = Promise.withResolvers<void>()
+  const returnStarted = Promise.withResolvers<void>()
   const pendingInputs: Array<Promise<IteratorResult<SDKUserMessage>>> = []
   const session = createClaudeCatalogSession({ queryFactory: ({ prompt }) => {
     const id = ++queries
@@ -110,8 +111,8 @@ test('disposal ends input, shares the native return wait and allows later discov
       supportedModels: async () => [{ value: `model-${id}`, displayName: `M${id}`, description: '' }],
       close: () => { closes++ },
       return: async () => {
-        notifyReturn()
-        await returnGate
+        returnStarted.resolve()
+        await returnGate.promise
         return { done: true, value: undefined }
       },
     } as unknown as ClaudeQuery
@@ -121,16 +122,16 @@ test('disposal ends input, shares the native return wait and allows later discov
     const pendingDispose = session.dispose()
     expect(session.dispose()).toBe(pendingDispose)
     void pendingDispose.then(() => { disposed = true })
-    await returnStarted
+    await returnStarted.promise
     expect(await pendingInputs[0]).toEqual({ done: true, value: undefined })
     expect(closes).toBe(1)
     expect(disposed).toBe(false)
 
-    releaseReturn()
+    returnGate.resolve()
     await pendingDispose
     expect((await session.listModels())[0]?.value).toBe('model-2')
     expect(queries).toBe(2)
-  } finally { releaseReturn(); await session.dispose() }
+  } finally { returnGate.resolve(); await session.dispose() }
   expect(closes).toBe(2)
   expect(await pendingInputs[1]).toEqual({ done: true, value: undefined })
 })

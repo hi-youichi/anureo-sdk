@@ -1,4 +1,3 @@
-// Verifies native-open dispatch timing through the public client; output policy belongs to the adapter wrapper.
 import { expect, test } from 'bun:test'
 import { AHP_PROTOCOL_CONTRACT } from '@anureo/protocol'
 import { createClient, type HarnessAdapter } from '../index'
@@ -23,7 +22,7 @@ for (const nativeOutput of [true, false]) test(`native open dispatches immediate
   const client = await createClient({ adapter, identity: { adapterId: 'fixture', runtimeConfigId: 'test' } })
   try {
     const pending = client.sessions.create({ cwd: process.cwd() })
-    // Callers can initiate other work immediately; optional bridge preparation must not delay dispatch.
+    // Check before awaiting the session so an extra promise turn before native open fails the test.
     expect(opened).toBe(true)
     await pending
   } finally { await client.dispose() }

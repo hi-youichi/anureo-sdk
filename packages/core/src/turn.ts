@@ -1,77 +1,82 @@
-// Provides independent turn observation handles; must not own or implicitly stop native execution.
+// Provides independent observation handles for Session-owned executions.
 import type { AhpEvent } from '@anureo/protocol';
 import { HarnessSdkError } from './errors';
-import { waitForRequest } from './request';
 import type { ExecutionObservation } from './lifecycle/execution-observation';
-
+import { waitForRequest } from './request';
 import type { EventSubscriptionOptions, Input, RequestOptions, TurnResult } from './types';
 
-/** Internal Session-to-Turn port; exported here for constructor typing, not as a native execution owner. */
+/** Internal Session-to-Turn port exposed here for constructor typing. */
 export type { ExecutionObservation } from './lifecycle/execution-observation';
 
 /**
  * Observe one execution's live events and retained terminal result, and explicitly steer or interrupt it.
- * Session.submit and Session.review return a handle when execution association resolves; observe creates
- * independent sibling handles. Disposing a handle releases its observations; Session owns execution.
+ * Get a handle from Session.submit or Session.review once the input or review is associated with
+ * an execution. Use observe to create an independently disposable sibling.
  */
 export class Turn {
   /**
-   * Session.submitExecution and Turn.observe supply the shared port for an existing execution, which
-   * may already be terminal. Create only local observation state; starting work remains Session's job.
+   * Internal construction from the shared execution port. Session.submitExecution calls this when
+   * association resolves, and Turn.observe calls it to create a sibling with its own cancellation.
+   * The shared execution may already be terminal.
    */
   constructor(private readonly execution: ExecutionObservation) {}
-  /** Hosts read the stable execution identity shared by sibling handles, even after local disposal. */
+  /** The stable execution ID shared by sibling handles, available after disposal. */
   get id(): string { return this.execution.id; }
   /**
-   * Hosts receive a live, isolated subscription without replay. Invalid queue limits throw; overflow
-   * or producer failure rejects reads. Caller abort ends this subscription; disposal ends every
-   * observation on this handle. Exhaust, return or abort the iterator to release it; sibling handles
-   * and native execution remain active.
+   * Subscribe immediately to future events for this execution without replay. Invalid queue limits
+   * throw INVALID_PARAMS synchronously. Buffered events drain before overflow or stream failure
+   * rejects reads. Exhaust or return the iterator to release it. While the subscription is live,
+   * abort or disposal completes pending reads and skips buffered events. An already ended stream's
+   * completion or failure is still observable, including when subscribing through a disposed handle.
    */
   events(options: EventSubscriptionOptions = {}): AsyncIterable<AhpEvent> {
     return this.execution.events.subscribe({ ...options, signal: this.observationSignal(options.signal) });
   }
   /**
-   * Await the shared frozen terminal snapshot, including failed/interrupted result values. Reject
-   * TURN_DISPOSED on a disposed handle, or propagate observation/wait failures. Caller abort and the
-   * deadline (30 seconds by default) affect only this wait; disposal ends all this handle's observations.
-   * Explicit interrupt remains the caller's responsibility when native execution should stop.
+   * Await the shared frozen terminal snapshot, including failed or interrupted status values.
+   * Reject with TURN_DISPOSED when called after disposal, or propagate observation closure and wait
+   * failures. Caller abort and the deadline (30 seconds by default) affect only this wait.
+   * Disposing the handle rejects its pending result waits with REQUEST_ABORTED.
    */
   result(wait: RequestOptions = {}): Promise<TurnResult> {
     if (this.disposed) return Promise.reject(new HarnessSdkError('TURN_DISPOSED'));
     return waitForRequest(() => this.execution.result, { ...wait, signal: this.observationSignal(wait.signal) });
   }
   /**
-   * Hosts explicitly submit input to this execution through Session.context's steer callback. Await
-   * the control receipt, not execution completion; admission/dispatch/wait failures reject. Throw
-   * TURN_DISPOSED synchronously after local disposal. Wait cancellation leaves admitted work alive,
-   * and disposing this handle does not cancel a control already invoked.
+   * Append text or input blocks to this exact execution. Requires atomic turn matching support.
+   * Resolve after the native control receipt is validated. Use result to await execution completion.
+   * Normalization, admission, dispatch and wait failures reject. Omit the timeout to use the
+   * session's request deadline (30 seconds by default). A disposed handle throws TURN_DISPOSED
+   * synchronously. Wait cancellation leaves admitted work alive. Disposal leaves an already invoked
+   * control wait active.
    */
   steer(options: { input: Input }, wait?: RequestOptions): Promise<void> {
     this.assertOpen();
     return this.execution.steer(options.input, wait);
   }
   /**
-   * Hosts explicitly request interruption through Session.context's callback. Await the native control
-   * receipt; Turn.result still waits for a terminal event. Throw TURN_DISPOSED synchronously after
-   * disposal, otherwise propagate control/wait rejection. Local disposal never invokes this control
-   * or cancels an already-invoked control wait.
+   * Request interruption of this execution. Requires adapter support for turn interruption.
+   * Resolve after the native control receipt is validated. Use result to await terminal status.
+   * Admission, dispatch and wait failures reject. Omit the timeout to use the session's request
+   * deadline (30 seconds by default). A disposed handle throws TURN_DISPOSED synchronously. Wait
+   * cancellation leaves admitted work alive. Disposal leaves an already invoked control wait active.
    */
   interrupt(wait?: RequestOptions): Promise<void> {
     this.assertOpen();
     return this.execution.interrupt(wait);
   }
   /**
-   * Hosts create another independently disposable handle over the shared result and live event hub.
-   * Throw TURN_DISPOSED if this handle is closed; creating a sibling neither starts nor replays work.
+   * Create an independently disposable handle for the same execution, including a retained terminal
+   * result when available. Throws TURN_DISPOSED synchronously if this handle is closed.
    */
   observe(): Turn {
     this.assertOpen();
     return new Turn(this.execution);
   }
   /**
-   * Hosts await this idempotent local release: abort subscriptions and result waits before resolving.
-   * Leave sibling handles, explicit control waits and Session-owned execution state untouched.
+   * Idempotently cancel this handle's live subscriptions and pending result waits before resolving.
+   * Sibling handles and explicit control waits retain their own lifetimes. Call interrupt to request
+   * native interruption while the handle is open.
    */
   async dispose(): Promise<void> {
     this.disposed = true;

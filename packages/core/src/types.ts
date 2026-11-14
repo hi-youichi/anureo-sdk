@@ -1,18 +1,16 @@
-// Defines host input and observation values; must not normalize input, dispatch requests or own resources.
 import type { HarnessError, InputBlock, Item, Usage } from '@anureo/protocol';
 /**
- * Hosts supply text or protocol blocks to Session.submit and Turn.steer. Session.submit and the
- * steer callback installed by Session.context pass this to inputBlocks before request validation;
- * strings become one text block and arrays are detached by cloning. Invalid input fails before dispatch.
+ * Send text or protocol blocks through Session.submit or Turn.steer. Text becomes one text block
+ * and block arrays are cloned. Invalid input rejects before native dispatch.
  */
 export type Input = string | readonly InputBlock[];
 /**
- * Read the frozen terminal snapshot returned by Turn.result. Native failed/interrupted terminals
- * resolve values with those statuses; observation closure or a caller timeout rejects Turn.result instead. This is
- * retained observation, so hosts needing authoritative history must request history/read separately.
+ * Read the frozen terminal snapshot returned by Turn.result. Failed and interrupted executions
+ * resolve with those statuses. Closing observation before the terminal or ending the caller's wait
+ * rejects the promise. Request history/read separately for native history when supported.
  */
 export type TurnResult = {
-  /** Final agent-message text joined in retained item order, separated by newlines. */
+  /** Text of final-phase agent messages in retained item order, separated by newlines. */
   text: string;
   /** Privacy-projected snapshots retained for this execution, including non-message items. */
   items: readonly Item[];
@@ -33,9 +31,9 @@ export type TurnResult = {
 );
 
 /**
- * Hosts pass these options to Client/Session operations and Turn.result or controls; waitForRequest
- * rejects that caller on abort/deadline while continuing to observe dispatched work. A pre-aborted
- * wait prevents dispatch where checked; cancellation never implicitly interrupts native execution.
+ * Bound one caller's wait for a Client, Session or Turn operation. Abort or timeout after dispatch
+ * rejects the waiter with outcomeUnknown while native work can continue. Use an explicit interrupt
+ * operation to request that execution stop.
  */
 export interface RequestOptions {
   /** Stops this caller waiting; does not interrupt accepted native execution. */
@@ -48,9 +46,9 @@ export interface RequestOptions {
 }
 
 /**
- * Hosts pass these to Session.events or Turn.events; EventHub.subscribe allocates a private bounded
- * queue. Invalid budgets throw and overflow rejects that observer's reads without pausing the native
- * producer. Consumers must finish/return the iterator or abort to release subscription membership.
+ * Configure an independent queue for Session.events or Turn.events. Invalid budgets throw at
+ * subscription. Overflow rejects that observer's reads after buffered events drain, without
+ * pausing the native producer. Exhaust or return the iterator, or abort this subscription.
  */
 export interface EventSubscriptionOptions {
   /** Aborts only this observer, releasing its pending read and membership. */

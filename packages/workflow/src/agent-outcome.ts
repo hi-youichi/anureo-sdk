@@ -2,9 +2,9 @@ import type { HarnessError } from '@anureo/protocol'
 import { HarnessSdkError } from '@anureo/sdk'
 
 /**
- * Internal policy for observeAgentTurn: confirmed failed API terminals, startup denial and explicit
- * interrupted skips may become agent's null result after cleanup. Unknown outcomes must still reject.
- * Do not apply this terminal-only classification to open, submit or observation exceptions.
+ * Let classifyAgentFailure identify terminal candidates for agent's null result after cleanup.
+ * Only known outcomes qualify. Interrupted terminals require an explicit skip, and failed
+ * terminals require a startup denial or a code from the terminal API allowlist.
  */
 export function isDroppedOutcome(error: HarnessError, status: 'failed' | 'interrupted'): boolean {
   if (error.outcomeUnknown) return false
@@ -12,12 +12,15 @@ export function isDroppedOutcome(error: HarnessError, status: 'failed' | 'interr
   return isStartupBlocked(error) || terminalApiErrors.has(error.code)
 }
 
-/** Shared terminal/exception rule: require the dedicated startup code, adapter disposition and a known outcome. */
+/** Check the dedicated code and adapter disposition required for a known startup denial. */
 export function isStartupBlocked(error: Pick<HarnessSdkError, 'code' | 'outcomeUnknown' | 'details'>): boolean {
   return !error.outcomeUnknown && error.code === 'AGENT_STARTUP_BLOCKED' && error.details?.workflowDisposition === 'startup_blocked'
 }
 
-/** openAgentSession and observeAgentTurn use this internal guard; only a definite SDK startup denial qualifies. */
+/**
+ * Recognize a thrown SDK startup denial. openAgentSession returns null for a matching rejection
+ * from session creation. observeAgentTurn records a drop candidate and leaves settlement to cleanup.
+ */
 export function isStartupBlockException(cause: unknown): cause is HarnessSdkError {
   return cause instanceof HarnessSdkError && isStartupBlocked(cause)
 }

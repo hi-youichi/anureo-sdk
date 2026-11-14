@@ -1,19 +1,32 @@
-// Owns the resident, prompt-less directory Query and its discovery/cleanup lifecycle.
+// Owns the resident Claude query for prompt-free model discovery.
 import { query, type Query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import { BoundedEventQueue, HarnessSdkError } from '@anureo/sdk'
 import { catalogPhase, type CatalogProbeOptions } from '@anureo/sdk/diagnostics'
 import { createClaudeAdapter } from './adapter'
 import type { ClaudeAdapterOptions, ClaudeQuery } from './options'
 
-/** Create a reusable model catalog without launching Claude or submitting prompts.
- * Directory consumers call prepare/listModels to launch and discover models, then await dispose
- * when finished. Active probe cancellation requests shared connection disposal and can affect
- * concurrent users. Failures during work await cleanup, whose failure takes precedence over
- * the original cause. Probe options report phases and observe cancellation; callers enforce
- * deadlines themselves because timeoutMs is not enforced here. */
+/** Create a reusable catalog for discovering Claude models without submitting prompts.
+ * Construction retains the adapter launch configuration. When a probe opens a query, it uses
+ * the current working directory and disables session persistence and file checkpoints.
+ * Await dispose when finished with the catalog. Aborting an active probe requests disposal of
+ * the shared connection and can affect concurrent callers. Pass a signal to request cancellation.
+ * Deadline enforcement belongs to the caller even when timeoutMs is supplied.
+ *
+ * @example
+ * ```ts
+ * import { createClaudeCatalogSession } from '@anureo/adapter-claude/catalog'
+ *
+ * const catalog = createClaudeCatalogSession({ defaultHome: true })
+ * try {
+ *   console.log(await catalog.listModels())
+ * } finally {
+ *   await catalog.dispose()
+ * }
+ * ```
+ */
 export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
   const adapter = createClaudeAdapter(options)
-  let stream: ClaudeQuery | undefined
+  let stream: DirectoryQuery | undefined
   let input: BoundedEventQueue<SDKUserMessage> | undefined
   let pendingHandshakeModels: Awaited<ReturnType<Query['supportedModels']>> | undefined
   let preparing: Promise<void> | undefined
@@ -21,24 +34,39 @@ export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
 
   return { prepare, listModels, dispose }
 
-  /** Await launch and initial model discovery, sharing any preparation already in flight.
-   * Wait for ongoing disposal before reusing or opening a connection. The caller that starts
-   * preparation supplies its spawn/handshake observers; other callers await that same work.
-   * Startup failures reject after cleanup. Already-aborted signals reject RPC_ABORTED before work. */
+  /** Warm up the catalog by awaiting launch and initial model discovery.
+   * Wait for ongoing disposal before reusing a prepared query or starting a new one. Concurrent
+   * callers share preparation, and the caller that starts it supplies the spawn and handshake
+   * observers. An already-aborted signal rejects with RPC_ABORTED before touching the connection.
+   * Startup failures reject after cleanup, with any cleanup failure taking precedence.
+   */
   function prepare(context: CatalogProbeOptions = {}): Promise<void> {
     return withProbeCleanup(context, async () => {
       await disposing
-      if (preparing) { await preparing; return }
+      if (preparing) {
+        await preparing
+        return
+      }
       if (stream) return
-      await (preparing ??= openConnection(context)
-        .catch(async cause => { await closeConnection(); throw cause })
-        .finally(() => { preparing = undefined }))
+      preparing = openConnection(context)
+        .catch(async cause => {
+          // Shared disposal can be waiting for this preparation to settle.
+          await closeConnection()
+          throw cause
+        })
+        .finally(() => { preparing = undefined })
+      await preparing
     })
   }
 
-  /** Return initial discovery once, then refresh through native reinitialization when available.
-   * Older queries are closed and replaced for refresh. Failures await shared cleanup before
-   * rejecting; successful calls leave the connection resident for the caller to dispose. */
+  /** Return native model metadata, preparing the catalog if needed.
+   * Use each query's initial discovery once. Later reads refresh via native reinitialization or
+   * replace the query when it lacks that capability. The supplied observer receives the spawn
+   * and handshake phases this call starts, and model reads are reported after initial preparation.
+   * Success leaves the connection open for reuse. An already-aborted signal rejects with
+   * RPC_ABORTED before work. Probe failures await shared cleanup before rejecting, with any
+   * cleanup failure taking precedence.
+   */
   async function listModels(context: CatalogProbeOptions = {}) {
     return withProbeCleanup(context, async () => {
       await prepare(context)
@@ -46,9 +74,11 @@ export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
     })
   }
 
-  /** End input, close the query and await its optional native return(), including any query
-   * established by pending preparation. Concurrent calls share cleanup; cleanup failures reject.
-   * This releases current resources without retiring the catalog: a later probe can open it again. */
+  /** Release the directory connection and allow a later probe to reopen it.
+   * End input, close the query and await its optional native return(). Then wait for pending
+   * preparation to settle and close any query it established in the meantime. Concurrent callers
+   * share the cleanup promise. A cleanup failure rejects that promise and skips remaining steps.
+   */
   function dispose(): Promise<void> {
     return disposing ??= (async () => {
       await closeConnection()
@@ -58,50 +88,60 @@ export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
     })().finally(() => { disposing = undefined })
   }
 
-  /** prepare tracks this launch/handshake as one shared operation. Retain the empty input queue
-   * before launching so disposal can end it even if creation or discovery fails. */
+  /** Run spawn and handshake in order for prepare, caching initial models for listModels.
+   * Retain the input queue before launch so prepare's rollback or dispose can end it after failure.
+   */
   async function openConnection(context: CatalogProbeOptions): Promise<void> {
     input = new BoundedEventQueue<SDKUserMessage>()
-    await catalogPhase(context, 'spawn', async () => {
-      stream = (options.queryFactory ?? query)({
-        prompt: input!,
-        options: {
-          ...adapter.queryOptions(process.cwd()),
-          persistSession: false,
-          sessionStore: undefined,
-          enableFileCheckpointing: false,
-          mcpServers: {},
-          settingSources: [],
-        },
-      })
-    })
+    await catalogPhase(context, 'spawn', launchDirectoryQuery)
     pendingHandshakeModels = await catalogPhase(context, 'handshake', () => stream!.supportedModels())
   }
 
-  /** listModels observes this read as its models phase. Consume discovery before requesting a
-   * refresh; queries without reinitialize need a replacement connection to obtain fresh metadata. */
+  /** Launch the query for openConnection's spawn phase. Publish it to shared state as soon as
+   * the factory returns so cleanup can reach it. A launch failure rejects the phase.
+   */
+  async function launchDirectoryQuery(): Promise<void> {
+    stream = (options.queryFactory ?? query)({
+      prompt: input!,
+      options: {
+        ...adapter.queryOptions(process.cwd()),
+        persistSession: false,
+        sessionStore: undefined,
+        enableFileCheckpointing: false,
+        mcpServers: {},
+        settingSources: [],
+      },
+    })
+  }
+
+  /** Supply listModels with cached discovery or refreshed models during its models phase.
+   * A query without reinitialize needs a replacement to obtain fresh metadata. Await disposal
+   * before reopening so a failed close rejects the read before a replacement starts.
+   */
   async function readModels(context: CatalogProbeOptions) {
     if (pendingHandshakeModels) return takeHandshakeModels()
-    const current = stream as ClaudeQuery & Partial<Pick<Query, 'reinitialize'>>
+    const current = stream!
     if (current.reinitialize) return (await current.reinitialize()).models
     await dispose()
     await prepare(context)
     return takeHandshakeModels()
   }
 
-  /** Consume the cached result once; readModels calls only with a cache or after preparation. */
+  /** Transfer the handshake result to readModels and clear the cache so the next read refreshes. */
   function takeHandshakeModels() {
     const models = pendingHandshakeModels!
     pendingHandshakeModels = undefined
     return models
   }
 
-  /** prepare/listModels register cancellation while work runs and await disposal on failure.
-   * Already-aborted calls reject before work or cleanup; abort listeners suppress cleanup failures
-   * because an event listener cannot return a cleanup rejection to the caller. */
+  /** Scope a cancellation listener to each prepare or listModels call. The signal invokes it to
+   * request shared disposal so native closure can settle pending work. Reject pre-aborted probes
+   * before registration. If work rejects, await disposal and propagate the cleanup failure if any,
+   * otherwise propagate the work failure.
+   */
   async function withProbeCleanup<T>(context: CatalogProbeOptions, work: () => Promise<T>): Promise<T> {
     const disposeOnAbort = () => {
-      // Cancellation reaches in-flight work by disposing its resources; cleanup errors are ignored here.
+      // The abort event has no caller awaiting this cleanup promise.
       void dispose().catch(() => {})
     }
     if (context.signal?.aborted) {
@@ -111,7 +151,6 @@ export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
     try {
       return await work()
     } catch (cause) {
-      // Await cleanup before rethrowing; a disposal failure takes precedence over cause.
       await dispose()
       throw cause
     } finally {
@@ -119,9 +158,11 @@ export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
     }
   }
 
-  /** Detach shared state before native cleanup so concurrent disposal cannot close it twice.
-   * prepare uses this for failed startup; dispose also calls it after waiting for preparation.
-   * End the prompt stream before closing, then await return when supplied; failures propagate. */
+  /** Release the current input and query for prepare's startup rollback or either disposal pass.
+   * Clear shared query state before calling native cleanup so overlapping calls cannot close the
+   * same query twice. End input before closing, then await native return when supplied. Native
+   * cleanup failures reject the caller's cleanup path.
+   */
   async function closeConnection(): Promise<void> {
     const current = stream
     stream = undefined
@@ -129,6 +170,9 @@ export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
     input?.end()
     input = undefined
     current?.close()
-    await (current as (ClaudeQuery & Partial<Pick<Query, 'return'>>) | undefined)?.return?.()
+    await current?.return?.()
   }
 }
+
+/** Directory queries can also provide in-place refresh and awaitable native cleanup. */
+type DirectoryQuery = ClaudeQuery & Partial<Pick<Query, 'reinitialize' | 'return'>>

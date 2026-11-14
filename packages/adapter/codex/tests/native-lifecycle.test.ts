@@ -1,11 +1,13 @@
-/** Guards SDK lifecycle behavior against the deterministic native process; real Codex execution and isolated projection rules belong elsewhere. */
+/** Exercises SDK lifecycle behavior through a deterministic Codex JSONL process. */
 import { expect, test } from 'bun:test';
 import { fileURLToPath } from 'node:url';
 import { createClient } from '@anureo/sdk';
 import { createCodexAdapter } from '../src';
 import { runNativeConformance } from '@anureo/conformance';
 const executable = fileURLToPath(new URL('./native-lifecycle-fixture.mjs', import.meta.url));
-/** Launch the scripted stdio process for a profile and return its SDK client/session. Startup failures reject; successful callers must dispose the client in finally. */
+const lifecycleProfiles = ['0.148.0', '0.164.0'];
+
+/** Open a session on the scripted process (modern profile by default). Startup failures reject. The caller owns disposal of the returned client. */
 async function fixture(version = '0.164.0') {
   const client = await createClient({
     adapter: createCodexAdapter({
@@ -22,7 +24,7 @@ async function fixture(version = '0.164.0') {
   const session = await client.sessions.create({ cwd: process.cwd() });
   return { client, session };
 }
-for (const version of ['0.148.0', '0.164.0']) {
+for (const version of lifecycleProfiles) {
   /** Keep the first execution active across a definite rejection and a join; both handles must resolve from client-ID evidence. The fixture client is always disposed. */
   test(`${version}: real JSONL process correlates joined submissions by clientId rather than response turn id`, async () => {
     const f = await fixture(version);
@@ -46,11 +48,11 @@ test('native unsubscribe while active closes observation without inventing an in
     await expect(turn.result()).rejects.toMatchObject({ code: 'OBSERVATION_CLOSED' });
   } finally { await f.client.dispose(); }
 });
-for (const version of ['0.148.0', '0.164.0']) {
+for (const version of lifecycleProfiles) {
   /** Delegate lifecycle assertions and fixture disposal to shared conformance; a failed report must fail this test for each supported profile. */
   test(`${version}: Codex revised v1 passes shared native lifecycle conformance over actual stdio`, async () => {
     const report = await runNativeConformance(
-      /** Supply a fresh owned process per conformance scenario; the runner disposes successful fixtures and startup failures reject. */
+      /** Supply a fresh session per case. The runner records setup failures and disposes each returned client. */
       async () => ({ ...await fixture(version), first: 'first', second: 'join', relation: 'same' }),
     );
     expect(report).toMatchObject({ passed: true });

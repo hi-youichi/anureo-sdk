@@ -1,4 +1,4 @@
-/** Owns native thread state, execution evidence and ordered SDK projection; discovery, transport scheduling and version policy belong elsewhere. */
+/** Owns a native thread's binding, execution evidence, and projection into SDK state and events. */
 import { randomUUID } from 'node:crypto'
 import type { ApprovalOption, Capabilities, AhpRequestMap, AhpResultMap, GoalState, HistoryItem, HistoryPage, InteractionRequested, InteractionResponse, Item, JsonObject, SessionBinding, SessionOpenParams, SessionState, Usage } from '@anureo/protocol'
 import { HarnessSdkError, sdkError, type BackendSession, type SessionEventSink, type SessionMethod } from '@anureo/sdk'
@@ -14,18 +14,17 @@ import type { CodexProfile } from './profile'
 import type { CodexAdapterOptions } from './options'
 
 /**
- * Package-internal thread owner and BackendSession implementation for CodexNativeAdapter.openSession.
- * Attach before opening; transport must serialize notifications while allowing interactions to overlap.
- * Native/sink failures propagate from operations, and disposal closes observation without proving execution stopped.
+ * Per-thread BackendSession created by CodexNativeAdapter.openSession. Attach its transport
+ * before opening. Feed notifications in wire order while server requests settle concurrently.
  */
 export class CodexBackendSession implements BackendSession {
-  /** Native binding committed by open; the SDK adopts it when attaching this backend. */
+  /** Native binding committed by open and adopted through OutputSession by the SDK session. */
   binding: SessionBinding
   /** Session-local capability copy; missing optional native methods revoke support through the sink. */
   readonly capabilities: Capabilities
-  /** Attachment snapshot updated by native evidence and successful configuration; clone before retaining it independently. */
+  /** Live state used by OutputSession at SDK attachment. Clone it to retain an independent snapshot. */
   state: SessionState
-  /** Accept adapter-validated open parameters, clone binding/capabilities and seed ready state. No I/O; clone errors throw before the adapter attaches a transport. */
+  /** Seed ready state from validated open parameters. Binding and capability clones can throw before transport attachment. */
   constructor({ params, sink, native, capabilities, options }: SessionInputs) {
     this.params = params
     this.sink = sink
@@ -36,64 +35,76 @@ export class CodexBackendSession implements BackendSession {
     const model = params.model ?? string(params.config?.model)
     this.state = { binding: this.binding, status: 'ready', activeTurnIds: [], config: params.config ?? {}, capabilities: this.capabilities, capabilityRevision: 1, ...(model ? { model } : {}) }
   }
-  /** Called once by the adapter before open to transfer client cleanup ownership; stores the reference without I/O. */
+  /** CodexNativeAdapter.openSession supplies the session client before the handshake. Dispose releases it after a successful open. */
   attach(client: CodexJsonlClient): void { this.client = client }
-  /** Let adapter fork resolution look up an observed native identity; unknown canonical IDs return undefined without effects. */
+  /** Return the native identity CodexNativeAdapter.resolveFork can use for a canonical boundary, or undefined if unseen. */
   resolveNativeTurn(canonical: string): string | undefined { return this.nativeTurnIdByCanonicalId.get(canonical) }
-  /** Let the adapter seed a fork before open with copies of source identity maps; no I/O or shared mutable maps. */
+  /** Copy the source's observed turn identities for CodexNativeAdapter.openSession before the fork opens. */
   importTurnMap(source: CodexBackendSession): void {
     this.canonicalTurnIdByNativeId = new Map(source.canonicalTurnIdByNativeId)
     this.nativeTurnIdByCanonicalId = new Map(source.nativeTurnIdByCanonicalId)
   }
-  /** Open the adapter-validated mode on the attached client, commit native binding, then publish restored metadata. Reject policy, identity, native or sink failures; the adapter disposes failed opens. */
+  /** Open the native thread after the handshake and await any restored metadata publication. CodexNativeAdapter.openSession registers the backend on success and disposes the client if policy, identity, native, or sink errors reject. */
   async open(): Promise<void> {
-    const common = this.threadOptions()
-    const result = await this.openNativeThread(common)
+    const threadOptions = this.threadOptions()
+    const result = await this.openNativeThread(threadOptions)
     await this.restoreThread(result)
   }
-  /** SDK BackendSession entry for validated requests: return the method's result after ordered native dispatch/local commit. Reject unsupported methods and native/sink failures; the SDK registry handles interaction answers. */
+  /**
+   * OutputSession.execute dispatches validated requests here and consumes their receipts or results.
+   * Submission, steer, interrupt, and compaction receipts acknowledge their respective requests.
+   * Native notifications carry execution evidence separately. Admission, unsupported methods,
+   * native errors, and sink failures can reject. The SDK registry handles interaction answers.
+   */
   async execute<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
     let result: AhpResultMap[SessionMethod]
-    const p = params as AhpRequestMap[SessionMethod]
+    const p: AhpRequestMap[SessionMethod] = params
     switch (method) {
       case 'input/submit': return await this.submitInput({ method: 'input/submit', params: p as AhpRequestMap['input/submit'] }) as AhpResultMap[M]
       case 'review/start': return await this.submitInput({ method: 'review/start', params: p as AhpRequestMap['review/start'] }) as AhpResultMap[M]
-      case 'turn/steer': {
-        const steer = p as AhpRequestMap['turn/steer']
-        const native = this.nativeTurn({ canonical: steer.expectedTurnId, missing: 'TURN_MISMATCH' })
-        const response = record(await this.optional('turn/steer', { threadId: this.threadId, expectedTurnId: native, input: nativeInput(steer.input), clientUserMessageId: steer.submissionId }, () => { delete this.capabilities.input!.steer }))
-        if (response.turnId !== native) throw new HarnessSdkError('TURN_MISMATCH', 'Native steer did not target the same turn', false, true)
-        result = { submissionId: steer.submissionId, turnId: steer.expectedTurnId, accepted: true }; break
-      }
+      case 'turn/steer':
+        result = await this.steer(p as AhpRequestMap['turn/steer'])
+        break
       case 'turn/interrupt': {
         const interrupt = p as AhpRequestMap['turn/interrupt']
         await this.client.request('turn/interrupt', { threadId: this.threadId, turnId: this.nativeTurn({ canonical: interrupt.turnId, missing: 'TURN_MISMATCH' }) })
-        result = { accepted: true, turnId: interrupt.turnId }; break
-      }
-      case 'session/config/set': result = await this.setConfig((p as AhpRequestMap['session/config/set']).patch); break
-      case 'session/revert': result = await this.revert(p as AhpRequestMap['session/revert']); break
-      case 'history/read': result = await this.readHistory(p as AhpRequestMap['history/read']); break
-      case 'goal/set': {
-        const goal = (p as AhpRequestMap['goal/set']).goal
-        const nativeGoal = Object.fromEntries(Object.entries(goal).filter(([key]) => ['objective','status','tokenBudget'].includes(key)))
-        const value = record(await this.optional('thread/goal/set', { ...nativeGoal, threadId: this.threadId }, () => { this.capabilities.goal = { actions: [] } }))
-        result = { goal: json(value.goal) as JsonObject, status: 'active' }
-        this.state.goal = result as GoalState
+        result = { accepted: true, turnId: interrupt.turnId }
         break
       }
+      case 'session/config/set':
+        result = await this.setConfig((p as AhpRequestMap['session/config/set']).patch)
+        break
+      case 'session/revert':
+        result = await this.revert(p as AhpRequestMap['session/revert'])
+        break
+      case 'history/read':
+        result = await this.readHistory(p as AhpRequestMap['history/read'])
+        break
+      case 'goal/set':
       case 'goal/clear': {
-        await this.optional('thread/goal/clear', { threadId: this.threadId }, () => { this.capabilities.goal = { actions: [] } })
-        result = { goal: null, status: 'cleared' }
-        this.state.goal = result as GoalState
+        const disableGoal = () => { this.capabilities.goal = { actions: [] } }
+        let goal: GoalState
+        if (method === 'goal/set') {
+          const { goal: requested } = p as AhpRequestMap['goal/set']
+          const nativeGoal = Object.fromEntries(Object.entries(requested).filter(([key]) => ['objective', 'status', 'tokenBudget'].includes(key)))
+          const value = record(await this.optional('thread/goal/set', { ...nativeGoal, threadId: this.threadId }, disableGoal))
+          goal = { goal: json(value.goal) as JsonObject, status: 'active' }
+        } else {
+          await this.optional('thread/goal/clear', { threadId: this.threadId }, disableGoal)
+          goal = { goal: null, status: 'cleared' }
+        }
+        this.state.goal = goal
+        result = goal
         break
       }
       case 'compact/start': {
         await this.optional('thread/compact/start', { threadId: this.threadId }, () => { this.capabilities.compact = false })
-        result = { maintenanceId: p.requestId, status: 'accepted' }; break
+        result = { maintenanceId: p.requestId, status: 'accepted' }
+        break
       }
       case 'session/close': {
         await this.client.request('thread/unsubscribe', { threadId: this.threadId })
-        // Unsubscribing ends observation; only terminal evidence can confirm execution stopped.
+        // Only terminal evidence can confirm execution stopped.
         this.closing = true
         result = { closed: true, observationClosed: true, executionStopped: 'unconfirmed' }
         break
@@ -102,21 +113,13 @@ export class CodexBackendSession implements BackendSession {
     }
     return result as AhpResultMap[M]
   }
-  /** Transport entry for wire-ordered notifications: filter thread scope, correlate evidence, then project events and state. Reject malformed data or sink errors; callers must serialize this independently of concurrent interactions. */
+  /**
+   * CodexNativeAdapter.openSession registers this handler with CodexJsonlClient. The reader awaits
+   * it before dispatching the next frame. Foreign-thread notifications are ignored once the local
+   * identity is known. Projection or publication failures reject and fail the reader.
+   */
   async notification(method: string, params: NativeRecord): Promise<void> {
     if (typeof params.threadId === 'string' && this.threadId && params.threadId !== this.threadId) return
-    if (method === 'item/started' || method === 'item/completed') {
-      const item = record(params.item)
-      const submissionId = string(item.clientId)
-      const native = string(params.turnId)
-      // A user message identifies its submission even when the receipt does not name an execution.
-      if (item.type === 'userMessage' && submissionId && native && this.awaitingTurnSubmissionIds.has(submissionId)) {
-        const actual = await this.ensureStarted(native)
-        await this.sink.bindSubmission(submissionId, actual)
-        this.awaitingTurnSubmissionIds.delete(submissionId)
-        this.receiptTurnIdBySubmissionId.delete(submissionId)
-      }
-    }
     if (method === 'thread/started') return
     if (method === 'thread/name/updated') {
       const title = typeof params.threadName === 'string' ? params.threadName : null
@@ -131,35 +134,22 @@ export class CodexBackendSession implements BackendSession {
       if (id) await this.ensureStarted(id)
       return
     }
+    if (method === 'item/started' || method === 'item/completed') {
+      await this.observeItem({ params, phase: method === 'item/completed' ? 'completed' : 'started' })
+      return
+    }
     const turnId = this.scope(params)
     if (method === 'turn/completed') {
       await this.completeTurn(record(params.turn))
       return
     }
-    if (method === 'item/started' || method === 'item/completed') {
-      if (!turnId) throw new HarnessSdkError('PROTOCOL_ERROR', 'Native item has no turn')
-      await this.projectItem({ params, turnId, phase: method === 'item/completed' ? 'completed' : 'started' })
-      return
-    }
-    const deltaKinds: Record<string, 'text'|'reasoningSummary'|'output'|'patch'> = {
-      'item/agentMessage/delta': 'text',
-      'item/reasoning/summaryTextDelta': 'reasoningSummary',
-      'item/reasoning/textDelta': 'reasoningSummary',
-      'item/commandExecution/outputDelta': 'output',
-      'item/fileChange/outputDelta': 'output',
-      'item/plan/delta': 'text',
-    }
-    if (deltaKinds[method]) {
-      await this.projectDelta({ method, params, turnId, kind: deltaKinds[method]! })
+    const deltaKind = DELTA_KIND_BY_METHOD[method]
+    if (deltaKind) {
+      await this.projectDelta({ method, params, turnId, kind: deltaKind })
       return
     }
     if (method === 'thread/tokenUsage/updated') {
-      const tokenUsage = record(params.tokenUsage)
-      const lastUsage = mapUsage(tokenUsage.last, 'turn')
-      const usage = mapUsage(tokenUsage.total, 'session')
-      if (turnId) this.nativeUsage.set(turnId, lastUsage)
-      if (typeof tokenUsage.modelContextWindow === 'number') usage.contextWindow = tokenUsage.modelContextWindow
-      await this.sink.emit({ type: 'usage/updated', payload: usage }, { turnId })
+      await this.projectUsage(params, turnId)
       return
     }
     if (method === 'turn/plan/updated' && turnId) {
@@ -167,9 +157,7 @@ export class CodexBackendSession implements BackendSession {
       return
     }
     if ((method === 'hook/started' || method === 'hook/completed') && turnId) {
-      const hook = record(params.hook ?? params)
-      const id = string(hook.id) ?? string(params.hookId)
-      if (id) await this.sink.emit({ type: method === 'hook/started' ? 'item/started' : 'item/completed', payload: { item: { id, type: 'hook', name: string(hook.name) ?? 'hook', status: method === 'hook/started' ? 'running' : 'completed', output: safe(hook.output) } } }, { turnId, itemId: id })
+      await this.projectHook({ params, turnId, phase: method === 'hook/started' ? 'started' : 'completed' })
       return
     }
     if (method === 'thread/compacted') {
@@ -180,34 +168,35 @@ export class CodexBackendSession implements BackendSession {
   }
   /**
    * Transport entry for concurrent native requests: scope and translate each prompt with its answer
-   * encoder, then await SDK answer delivery and settlement. CodexNativeAdapter.openSession registers
-   * this callback with CodexJsonlClient, which keeps draining stdout while it waits. Invalid/unsupported
-   * requests receive wire errors; projection/rejection failures reach transport fallback. Registry
-   * failures are absorbed after its cancellation attempt when applicable.
+   * encoder, then await SDK settlement. CodexNativeAdapter.openSession registers this handler with
+   * CodexJsonlClient, which keeps draining stdout. Invalid or unsupported requests receive wire
+   * errors. Projection and error-write failures reject to the transport fallback. The SDK invokes
+   * the responder for answer delivery and when cancellation requires a native reply. This handler
+   * absorbs sink rejection.
    */
   async serverRequest(request: NativeRequest, reply: (result: unknown) => Promise<void>, reject: (code: number, message: string) => Promise<void>): Promise<void> {
-    const p = request.params
-    if (p.threadId !== this.threadId) {
+    const { params } = request
+    if (params.threadId !== this.threadId) {
       await reject(-32602, 'Unknown thread')
       return
     }
-    const turnId = this.scope(p)
-    const itemId = string(p.itemId)
+    const turnId = this.scope(params)
+    const itemId = string(params.itemId)
     const id = `codex:${typeof request.id}:${request.id}`
-    const common = { interactionId: id, ...(turnId ? { turnId } : {}), ...(itemId ? { itemId } : {}) }
-    const projected = this.interactionFor(request, common)
+    const scope = { interactionId: id, ...(turnId ? { turnId } : {}), ...(itemId ? { itemId } : {}) }
+    const projected = projectInteraction(request, scope)
     if ('code' in projected) {
       await reject(projected.code, projected.message)
       return
     }
     const { interaction, encode } = projected
     try { await this.sink.requestInteraction(interaction, answer => reply(encode(answer))) }
-    catch { /* Registry has already attempted non-authorizing cancellation when applicable. */ }
+    catch { /* The SDK owns interaction settlement, including any cancellation reply. */ }
   }
 
-  /** Let transport failure close SDK observation unless already closing; return after sink acceptance or propagate its rejection. Process cleanup remains owned by dispose, without asserting execution stopped. */
+  /** Forward CodexJsonlClient's transport failure to the sink while observation is open. Await the sink's failure handling and propagate its rejection. */
   async failure(cause: HarnessSdkError): Promise<void> { if (!this.closing) await this.sink.fail(cause) }
-  /** For adapter teardown, mark observation closing and drop retained history/output before disposing the client. Reject disposal failures; releasing transport resources cannot confirm native execution stopped. */
+  /** Release the client for OutputSession.dispose or adapter teardown. Discard retained history and output before awaiting transport disposal. Process release failures reject. Execution stop stays unconfirmed. */
   async dispose(): Promise<void> {
     this.closing = true
     this.history.clear()
@@ -237,7 +226,72 @@ export class CodexBackendSession implements BackendSession {
   private closing = false
   private unverifiedNoticed = false
   private capabilityRevision = 1
-  /** Build open's native settings before dispatch, retaining normalized permission mode in SDK state. Policy translation can throw; caller configuration is copied so native-only fields never leak back into it. */
+
+  /**
+   * execute awaits the steer receipt for the specified execution. Reject an unknown target before
+   * dispatch, or report an uncertain TURN_MISMATCH if native names another turn. Method absence
+   * revokes steer support before rejection.
+   */
+  private async steer(params: AhpRequestMap['turn/steer']): Promise<AhpResultMap['turn/steer']> {
+    const native = this.nativeTurn({ canonical: params.expectedTurnId, missing: 'TURN_MISMATCH' })
+    const response = record(await this.optional('turn/steer', {
+      threadId: this.threadId,
+      expectedTurnId: native,
+      input: nativeInput(params.input),
+      clientUserMessageId: params.submissionId,
+    }, () => { delete this.capabilities.input!.steer }))
+    if (response.turnId !== native) throw new HarnessSdkError('TURN_MISMATCH', 'Native steer did not target the same turn', false, true)
+    return { submissionId: params.submissionId, turnId: params.expectedTurnId, accepted: true }
+  }
+
+  /**
+   * notification awaits correlation and item publication before the next frame. A matching
+   * user-message client ID can bind a pending submission even if its receipt carries a different ID.
+   * Publish the binding before item snapshots. Missing item scope or sink failure rejects.
+   */
+  private async observeItem({ params, phase }: { params: NativeRecord; phase: ItemPhase }): Promise<void> {
+    const item = record(params.item)
+    const submissionId = string(item.clientId)
+    const native = string(params.turnId)
+    if (item.type === 'userMessage' && submissionId && native && this.awaitingTurnSubmissionIds.has(submissionId)) {
+      const actual = await this.ensureStarted(native)
+      await this.sink.bindSubmission(submissionId, actual)
+      this.awaitingTurnSubmissionIds.delete(submissionId)
+      this.receiptTurnIdBySubmissionId.delete(submissionId)
+    }
+    const turnId = this.scope(params)
+    if (!turnId) throw new HarnessSdkError('PROTOCOL_ERROR', 'Native item has no turn')
+    await this.projectItem({ params, turnId, phase })
+  }
+
+  /**
+   * notification awaits session usage publication and retains scoped last usage for completeTurn.
+   * Sink rejection fails the notification after any scoped usage has been stored.
+   */
+  private async projectUsage(params: NativeRecord, turnId: string | undefined): Promise<void> {
+    const tokenUsage = record(params.tokenUsage)
+    const lastUsage = mapUsage(tokenUsage.last, 'turn')
+    const usage = mapUsage(tokenUsage.total, 'session')
+    if (turnId) this.nativeUsage.set(turnId, lastUsage)
+    if (typeof tokenUsage.modelContextWindow === 'number') usage.contextWindow = tokenUsage.modelContextWindow
+    await this.sink.emit({ type: 'usage/updated', payload: usage }, { turnId })
+  }
+
+  /** Publish notification's scoped hook snapshot when a hook ID exists. Output sanitization and sink failures reject. */
+  private async projectHook({ params, turnId, phase }: { params: NativeRecord; turnId: string; phase: ItemPhase }): Promise<void> {
+    const hook = record(params.hook ?? params)
+    const id = string(hook.id) ?? string(params.hookId)
+    if (!id) return
+    const item: Item = {
+      id,
+      type: 'hook',
+      name: string(hook.name) ?? 'hook',
+      status: phase === 'started' ? 'running' : 'completed',
+      output: safe(hook.output),
+    }
+    await this.sink.emit({ type: phase === 'started' ? 'item/started' : 'item/completed', payload: { item } }, { turnId, itemId: id })
+  }
+  /** Translate a copy of the configuration for open and record the selected permission mode in SDK state. An explicit config permission mode takes precedence. Invalid policy can throw before dispatch. */
   private threadOptions(): NativeRecord {
     const config: NativeRecord = { ...(this.params.config ?? {}) }
     const mode = config.permissionMode ?? (PERMISSION_MODES.includes(this.params.permissionMode as typeof PERMISSION_MODES[number]) ? this.params.permissionMode : undefined)
@@ -268,33 +322,36 @@ export class CodexBackendSession implements BackendSession {
       ...(permissions ? { approvalPolicy: permissions.approvalPolicy, sandbox: permissions.sandbox } : {}),
     }
   }
-  /** Dispatch open's mode using its translated settings. Resume records the requested identity before I/O as a fallback for replies without one. Fork throws for missing native evidence before dispatch; native request failures reject without retry. */
-  private openNativeThread(common: NativeRecord): Promise<unknown> {
-    if (this.params.mode === 'new') return this.client.request('thread/start', common)
-    else if (this.params.mode === 'resume') {
+  /** Dispatch open's mode using its translated settings. Resume records the requested identity before I/O as a reply fallback. Fork throws for missing native evidence before dispatch. Native request failures reject without retry. */
+  private openNativeThread(options: NativeRecord): Promise<unknown> {
+    if (this.params.mode === 'new') return this.client.request('thread/start', options)
+    if (this.params.mode === 'resume') {
       // SDK validation requires nativeRef for resume and fork data for fork before adapter dispatch.
       this.threadId = this.params.binding.nativeRef!.value
-      return this.client.request('thread/resume', { ...common, threadId: this.threadId })
-    } else {
-      const fork = this.params.fork!
-      const nativeId = fork.boundary.nativeTurnId
-      if (!nativeId) throw new HarnessSdkError('BOUNDARY_NATIVE_ID_REQUIRED', 'Fork requires a resolved native turn identity')
-      const sourceNative = fork.nativeRef?.value ?? this.params.binding.nativeRef?.value
-      if (!sourceNative) throw new HarnessSdkError('SESSION_NATIVE_REF_REQUIRED', 'Fork requires the source native reference')
-      return this.client.request('thread/fork', { ...common, threadId: sourceNative, ...(fork.boundary.relation === 'before' ? { beforeTurnId: nativeId } : { lastTurnId: nativeId }) })
+      return this.client.request('thread/resume', { ...options, threadId: this.threadId })
     }
+    const fork = this.params.fork!
+    const nativeId = fork.boundary.nativeTurnId
+    if (!nativeId) throw new HarnessSdkError('BOUNDARY_NATIVE_ID_REQUIRED', 'Fork requires a resolved native turn identity')
+    const sourceNative = fork.nativeRef?.value ?? this.params.binding.nativeRef?.value
+    if (!sourceNative) throw new HarnessSdkError('SESSION_NATIVE_REF_REQUIRED', 'Fork requires the source native reference')
+    return this.client.request('thread/fork', {
+      ...options,
+      threadId: sourceNative,
+      ...(fork.boundary.relation === 'before' ? { beforeTurnId: nativeId } : { lastTurnId: nativeId }),
+    })
   }
   /** Commit open's native identity and restored title before publishing metadata. Missing identity or sink failure rejects the open; CodexNativeAdapter.openSession then disposes its client. */
   private async restoreThread(result: unknown): Promise<void> {
-    this.threadId = string(record(record(result).thread).id) ?? this.threadId
+    const thread = record(record(result).thread)
+    this.threadId = string(thread.id) ?? this.threadId
     if (!this.threadId) throw new HarnessSdkError('PROTOCOL_ERROR', 'Native thread identity missing')
     this.binding = { ...this.binding, nativeRef: { provider: 'codex', value: this.threadId } }
     this.state.binding = this.binding
-    const thread = record(record(result).thread)
     if (typeof thread.name === 'string' || thread.name === null) this.state.metadata = { title: thread.name }
     if (this.state.metadata) await this.sink.emit({ type: 'session/metadata', payload: this.state.metadata })
   }
-  /** For control/revert builders, prefer a supplied native boundary over the observed map; throw the caller's missing-identity code before I/O or mutation. */
+  /** Resolve a native identity for steer, interrupt, or revert. A supplied boundary ID takes precedence over observed evidence. Throw the operation's missing-identity code before dispatch. */
   private nativeTurn({ canonical, provided, missing = 'BOUNDARY_NATIVE_ID_REQUIRED' }: { canonical: string; provided?: string; missing?: string }): string {
     const native = provided ?? this.nativeTurnIdByCanonicalId.get(canonical)
     if (!native) throw new HarnessSdkError(missing, 'Native turn identity is not known')
@@ -307,7 +364,11 @@ export class CodexBackendSession implements BackendSession {
     this.canonicalTurnIdByNativeId.set(native, native)
     return native
   }
-  /** For execution evidence, publish the first start before activating the turn and binding receipts. Return its canonical ID; sink rejection stops subsequent mutations, and receipt acknowledgements alone must never call this. */
+  /**
+   * Use start, matching user-message, or terminal evidence from notification, observeItem, or
+   * completeTurn. Publish the first start before activating the turn, then bind matching receipts to
+   * the returned canonical ID. Sink failure leaves prior mutations in place and stops further binding.
+   */
   private async ensureStarted(nativeId: string): Promise<string> {
     const turnId = this.registerNativeTurnIdentity(nativeId)
     if (!this.started.has(turnId)) {
@@ -327,8 +388,16 @@ export class CodexBackendSession implements BackendSession {
     return turnId
   }
   /** Resolve notification/interaction scope from params.turnId, registering identity without proving a start; absent IDs return undefined without publication or I/O. */
-  private scope(params: NativeRecord): string | undefined { const native = string(params.turnId); return native ? this.registerNativeTurnIdentity(native) : undefined }
-  /** For execute, reserve pending capacity, dispatch the typed submission and return acceptance from its receipt. Bind only observed turns; reject admission/auth/native/sink failures, releasing IDs only for definite outcomes. */
+  private scope(params: NativeRecord): string | undefined {
+    const native = string(params.turnId)
+    return native ? this.registerNativeTurnIdentity(native) : undefined
+  }
+  /**
+   * execute awaits input or review acceptance here. Check pending capacity (128 by default)
+   * and conflicts before the one-time version warning. Track the submission before dispatch
+   * so early notifications can bind it. A definite dispatch or receipt failure releases its
+   * pending ID. An unknown outcome keeps any pending slot available to later execution evidence.
+   */
   private async submitInput(submission: SubmissionRequest): Promise<import('@anureo/protocol').SubmissionAcceptance> {
     const { params } = submission
     if (this.awaitingTurnSubmissionIds.size >= (this.options.maxPending ?? 128)) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED')
@@ -346,15 +415,14 @@ export class CodexBackendSession implements BackendSession {
         : record(await this.optional('review/start', { threadId: this.threadId, target: submission.params.target, delivery: 'inline' }, () => { this.capabilities.review = false }))
       const id = string(record(value.turn).id)
       if (!id) throw new HarnessSdkError('PROTOCOL_ERROR')
-      // A turn/start response can contain a submission id; only observed execution facts bind it.
+      // Native may return the submitted client ID. A receipt can bind only to an observed execution.
       if (this.started.has(id)) {
         await this.sink.bindSubmission(params.submissionId, id)
         this.awaitingTurnSubmissionIds.delete(params.submissionId)
-        return previousTurns.has(id)
-          ? { submissionId: params.submissionId, accepted: true, disposition: 'joined', turnId: id }
-          : { submissionId: params.submissionId, accepted: true, disposition: 'accepted', receipt: { nativeSubmissionId: id } }
+        if (previousTurns.has(id)) return { submissionId: params.submissionId, accepted: true, disposition: 'joined', turnId: id }
+      } else if (this.awaitingTurnSubmissionIds.has(params.submissionId)) {
+        this.receiptTurnIdBySubmissionId.set(params.submissionId, id)
       }
-      if (this.awaitingTurnSubmissionIds.has(params.submissionId)) this.receiptTurnIdBySubmissionId.set(params.submissionId, id)
       return { submissionId: params.submissionId, accepted: true, disposition: 'accepted', receipt: { nativeSubmissionId: id } }
     } catch (cause) {
       if (!sdkError(cause).outcomeUnknown) this.awaitingTurnSubmissionIds.delete(params.submissionId)
@@ -362,9 +430,10 @@ export class CodexBackendSession implements BackendSession {
     }
   }
   /**
-   * For admitted input submissions, authenticate and build turn settings before dispatching turn/start.
-   * Return the untrusted receipt; reject auth, policy or transport errors without binding an execution.
-   * submitInput owns pending-ID cleanup so uncertain dispatch failures retain their evidence slot.
+   * For native input delivery, read account status before applying settings and dispatching turn/start.
+   * Request overrides take precedence over session settings. Return the raw receipt to submitInput,
+   * which owns correlation and pending-ID cleanup. Unsupported delivery, required authentication,
+   * invalid settings, and transport failures reject.
    */
   private async startInput(start: AhpRequestMap['input/submit']): Promise<NativeRecord> {
     if (start.delivery !== 'native') throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
@@ -391,9 +460,13 @@ export class CodexBackendSession implements BackendSession {
     }
     return record(await this.client.request('turn/start', turnStartParams))
   }
-  /** Dispatch an optional native method for session operations. Return its reply; method-not-found invokes disable and publishes revised capabilities before rejecting unsupported. Other native/sink errors propagate. */
-  private async optional<T>(method: string, params: NativeRecord, disable: () => void): Promise<T> {
-    try { return await this.client.request<T>(method, params) }
+  /**
+   * Return an optional native method's reply. On method-not-found, invoke the caller's synchronous
+   * capability mutation and await revised state publication before rejecting as unsupported.
+   * Mutation or publication failure replaces that rejection. Other native errors propagate.
+   */
+  private async optional(method: string, params: NativeRecord, disable: () => void): Promise<unknown> {
+    try { return await this.client.request(method, params) }
     catch (cause) {
       if (cause instanceof CodexRpcError && cause.rpcCode === -32601) {
         disable()
@@ -430,26 +503,31 @@ export class CodexBackendSession implements BackendSession {
     if (typeof patch.model === 'string') this.state.model = patch.model
     return structuredClone(this.state)
   }
-  /** For execute, revert conversation at a supplied/observed boundary and invalidate snapshots only on success. Reject unsupported scope, missing turns/identities or native/sink errors; workspace files are outside this operation. */
+  /**
+   * execute returns the applied conversation boundary after native revert or rollback succeeds,
+   * or after the turn list shows an empty suffix. Invalidate snapshots after either success.
+   * Unsupported scope, missing identity or required turn, and native or sink failures reject.
+   */
   private async revert(params: AhpRequestMap['session/revert']): Promise<AhpResultMap['session/revert']> {
     if (params.scope !== 'conversation') throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
     const native = this.nativeTurn({ canonical: params.boundary.turnId, provided: params.boundary.nativeTurnId })
+    const disableRevert = () => { this.capabilities.session!.revert = [] }
     if (this.native.profile.revert === 'thread/revert' && params.boundary.relation === 'before') {
-      await this.optional('thread/revert', { threadId: this.threadId, beforeTurnId: native }, () => { this.capabilities.session!.revert = [] })
+      await this.optional('thread/revert', { threadId: this.threadId, beforeTurnId: native }, disableRevert)
     } else {
       const turns = await this.turns()
-      const index = turns.findIndex(turn => turn.id === native)
-      if (index < 0) throw new HarnessSdkError('TURN_NOT_FOUND')
-      const remove = turns.length - index - (params.boundary.relation === 'through' ? 1 : 0)
-      if (remove > 0) {
-        if (this.native.profile.revert === 'thread/revert') await this.optional('thread/revert', { threadId: this.threadId, beforeTurnId: turns[turns.length - remove]!.id }, () => { this.capabilities.session!.revert = [] })
-        else await this.optional('thread/rollback', { threadId: this.threadId, numTurns: remove }, () => { this.capabilities.session!.revert = [] })
+      const suffix = revertSuffix({ turns, nativeTurnId: native, relation: params.boundary.relation })
+      if (suffix) {
+        const request = this.native.profile.revert === 'thread/revert'
+          ? { method: 'thread/revert', params: { threadId: this.threadId, beforeTurnId: suffix.first.id } }
+          : { method: 'thread/rollback', params: { threadId: this.threadId, numTurns: suffix.count } }
+        await this.optional(request.method, request.params, disableRevert)
       }
     }
     this.history.clear()
     return { appliedScope: 'conversation', boundary: params.boundary }
   }
-  /** Fetch native turns in ascending order for revert or legacy history. Reject malformed pages, paged-history overflow or transport errors; read-only requests never change thread execution. */
+  /** Fetch turns in native thread/read order or ascending page order for revert and legacy history. Malformed responses, page-limit overflow, and transport errors reject. */
   private async turns(): Promise<NativeRecord[]> {
     if (this.native.profile.turns === 'thread/read') {
       const response = record(await this.client.request('thread/read', { threadId: this.threadId, includeTurns: true }))
@@ -468,7 +546,7 @@ export class CodexBackendSession implements BackendSession {
     } while (cursor)
     return turns
   }
-  /** For execute, decode a cursor, resolve a retained snapshot and return a cloned page. Reject cursor/cache/native/projection errors; snapshots retain order until eviction, revert or disposal. Cache insertion precedes offset validation. */
+  /** Return a detached item page for execute (200 items by default). A cursor selects a snapshot and offset. An explicit nonempty snapshot token must agree with the cursor. Invalid cursors, expired snapshots, or history fetch errors reject. */
   private async readHistory(params: AhpRequestMap['history/read']): Promise<HistoryPage> {
     let token = params.snapshotToken
     let offset = 0
@@ -505,24 +583,16 @@ export class CodexBackendSession implements BackendSession {
       if (!items) throw new HarnessSdkError('CURSOR_EXPIRED')
       return { token, items }
     }
-    const items = await this.loadHistoryItems()
+    const items = this.native.profile.history === 'thread/items/list'
+      ? await this.pagedHistoryItems()
+      : await this.turnHistoryItems()
     const snapshotToken = randomUUID()
     this.history.set(snapshotToken, items)
     // Size > 8 proves the insertion-ordered map has an oldest key.
     if (this.history.size > 8) this.history.delete(this.history.keys().next().value!)
     return { token: snapshotToken, items }
   }
-  /**
-   * For a new history snapshot, collect native pages in ascending order without publishing the cache.
-   * Preserve per-entry timestamps and canonical identities; reject malformed item pages, native/sink errors
-   * or configured paged-history overflow. Legacy turn snapshots keep their native item order.
-   */
-  private async loadHistoryItems(): Promise<HistoryItem[]> {
-    return this.native.profile.history === 'thread/items/list'
-      ? await this.pagedHistoryItems()
-      : await this.turnHistoryItems()
-  }
-  /** For loadHistoryItems on modern profiles, map ascending item pages and enforce the item limit after each page. Method absence revokes history support; malformed entries, overflow and native/sink failures reject before snapshot retention. */
+  /** historySnapshot awaits ascending item pages before retaining a snapshot. Enforce maxHistoryItems after each page (10,000 by default). Malformed entries, overflow, and native or sink errors reject. Method absence revokes history support. */
   private async pagedHistoryItems(): Promise<HistoryItem[]> {
     const items: HistoryItem[] = []
     let cursor: string | undefined
@@ -540,7 +610,7 @@ export class CodexBackendSession implements BackendSession {
     } while (cursor)
     return items
   }
-  /** For loadHistoryItems on legacy profiles, flatten each native turn's items in source order, skipping turns without identity/items. Fetch/projection errors reject; this path adds no item limit beyond turns' own paging policy. */
+  /** historySnapshot awaits legacy items flattened in native turn/item order. Skip turns without identity or items. Fetch or projection failures reject, with no separate limit on flattened items. */
   private async turnHistoryItems(): Promise<HistoryItem[]> {
     const items: HistoryItem[] = []
     for (const turn of await this.turns()) {
@@ -569,7 +639,7 @@ export class CodexBackendSession implements BackendSession {
       item,
     }))
   }
-  /** For turn/plan/updated notifications, publish a start or patch before retaining the latest plan for completeTurn. Keep the candidate local across publication; sink failures leave the retained plan unchanged. */
+  /** Publish notification's plan start or patch before storing the latest plan for completeTurn. If publication fails, reject and keep the previous plan. */
   private async projectPlan(params: NativeRecord, turnId: string): Promise<void> {
     const id = `plan:${turnId}`
     const item: Item = {
@@ -594,11 +664,11 @@ export class CodexBackendSession implements BackendSession {
     this.nativePlans.set(turnId, plan)
   }
   /**
-   * For scoped item notifications after submission correlation, publish snapshots in map order.
-   * Keep the first start time, patch repeated starts and attach retained tool output only when absent.
-   * Mutate caches at the original publication boundaries; projection and sink failures reject.
+   * observeItem awaits these snapshots after any submission correlation. Publish in map order.
+   * Keep the first known start time, patch repeated starts, and fill missing tool output from the buffer.
+   * Clear buffered output on completion before publication. Projection and sink failures reject.
    */
-  private async projectItem({ params, turnId, phase }: { params: NativeRecord; turnId: string; phase: 'started' | 'completed' }): Promise<void> {
+  private async projectItem({ params, turnId, phase }: { params: NativeRecord; turnId: string; phase: ItemPhase }): Promise<void> {
     const completed = phase === 'completed'
     for (const sourceItem of mapItems(params.item, completed, false, { startedAtMs: completed ? undefined : params.startedAtMs })) {
       const key = `${turnId}\0${sourceItem.id}`
@@ -606,8 +676,9 @@ export class CodexBackendSession implements BackendSession {
       const startedAt = this.itemStartedAt.get(key) ?? sourceItem.startedAt
       if (startedAt !== undefined) this.itemStartedAt.set(key, startedAt)
       const timedItem = startedAt !== undefined ? { ...sourceItem, startedAt } : sourceItem
-      const item = timedItem.type === 'toolCall' && timedItem.output == null && this.executionOutput.has(key)
-        ? { ...timedItem, output: this.executionOutput.get(key)! }
+      const output = this.executionOutput.get(key)
+      const item = timedItem.type === 'toolCall' && timedItem.output == null && output !== undefined
+        ? { ...timedItem, output }
         : timedItem
       if (completed) this.executionOutput.delete(key)
       if (!completed && this.items.has(key)) {
@@ -627,7 +698,7 @@ export class CodexBackendSession implements BackendSession {
     method: string
     params: NativeRecord
     turnId: string | undefined
-    kind: 'text' | 'reasoningSummary' | 'output' | 'patch'
+    kind: NativeDeltaKind
   }): Promise<void> {
     const itemId = string(params.itemId)
     if (!itemId || !turnId) throw new HarnessSdkError('PROTOCOL_ERROR')
@@ -650,9 +721,9 @@ export class CodexBackendSession implements BackendSession {
     await this.sink.emit({ type: 'item/delta', payload: { itemId, kind, text: deltaText } }, { turnId, itemId })
   }
   /**
-   * For terminal native evidence, ensure start/binding precedes plan and turn completion publication.
-   * Retire diagnostics and active state only after the sink accepts completion; malformed identities
-   * or sink errors reject at their original boundary rather than asserting successful cleanup.
+   * notification awaits start/binding and plan completion before publishing the terminal result.
+   * Missing identity or sink failures reject. Diagnostics, timing, usage, and active state retire
+   * after successful terminal publication.
    */
   private async completeTurn(turn: NativeRecord): Promise<void> {
     const native = string(turn.id)
@@ -668,100 +739,20 @@ export class CodexBackendSession implements BackendSession {
     }
     const usage = this.nativeUsage.get(canonical)
     await this.sink.emit({ type: 'turn/completed', payload: { turnId: canonical, status: state, ...(nativeError ? { error: nativeError } : {}), ...(usage ? { usage } : {}) } }, { turnId: canonical })
-    this.nativeUsage.delete(canonical)
-    for (const key of this.executionOutput.keys()) if (key.startsWith(`${canonical}\0`)) this.executionOutput.delete(key)
-    for (const key of this.itemStartedAt.keys()) if (key.startsWith(`${canonical}\0`)) this.itemStartedAt.delete(key)
-    this.state.activeTurnIds = this.state.activeTurnIds.filter(id => id !== canonical)
-    this.state.status = this.state.activeTurnIds.length ? 'running' : 'ready'
+    this.retireTurn(canonical)
   }
-  /** Build serverRequest's prompt and matching responder without I/O. Each encoder closes over only its own native choices; unsupported methods or an empty supported decision set return wire errors, while JSON projection failures throw to transport fallback. */
-  private interactionFor(request: NativeRequest, common: InteractionScope): InteractionProjection {
-    const p = request.params
-    let interaction: InteractionRequested
-    let encode: (answer: InteractionResponse | null) => unknown
-    // Keep prompt data and its encoder in the same request closure: overlapping approvals and
-    // questions must never consult mutable state from another pending interaction.
-    if (['item/commandExecution/requestApproval','item/fileChange/requestApproval','item/permissions/requestApproval'].includes(request.method)) {
-      const permissions = request.method === 'item/permissions/requestApproval'
-      const advertised = Array.isArray(p.availableDecisions) ? p.availableDecisions : ['accept','acceptForSession','decline','cancel']
-      const decisions = new Map<string, unknown>()
-      const options = advertised.flatMap<ApprovalOption>(
-        /** Advertise supported choices and retain their exact native values for this request's encoder; unsupported choices disappear without authorizing anything. */
-        (decision, i) => {
-          if (typeof decision === 'string' && ['accept','acceptForSession','decline','cancel'].includes(decision)) {
-            decisions.set(decision, decision)
-            return [{
-              id: decision,
-              label: decision,
-              semantic: decision === 'accept' ? 'allowOnce' as const
-                : decision === 'acceptForSession' ? 'allowSession' as const
-                : decision === 'cancel' ? 'cancel' as const : 'deny' as const,
-            }]
-          }
-          if (record(decision).acceptWithExecpolicyAmendment || record(decision).applyNetworkPolicyAmendment) {
-            const optionId = `rule:${i}`
-            decisions.set(optionId, decision)
-            return [{ id: optionId, label: 'Apply supplied policy rule', semantic: 'allowWithRule' as const }]
-          }
-          return []
-        },
-      )
-      if (!options.length) {
-        return { code: -32602, message: 'No supported approval decisions' }
+
+  /** After completeTurn publishes a result, free transient buffers and recompute active state. Keep start and identity evidence for later receipts and boundaries. */
+  private retireTurn(turnId: string): void {
+    this.nativeUsage.delete(turnId)
+    const itemKeyPrefix = `${turnId}\0`
+    for (const cache of [this.executionOutput, this.itemStartedAt]) {
+      for (const key of cache.keys()) {
+        if (key.startsWith(itemKeyPrefix)) cache.delete(key)
       }
-      interaction = { ...common, kind: 'approval', title: string(p.reason) ?? 'Approval required', options, input: safe({ command: p.command, permissions: p.permissions, cwd: p.cwd }) }
-      /** Encode an SDK answer against this request's advertised decisions; absent/invalid answers cancel or grant no permissions, without I/O. */
-      encode = answer => {
-        const decision = answer?.kind === 'approval' ? decisions.get(answer.optionId) : 'cancel'
-        if (permissions) return { permissions: decision === 'accept' || decision === 'acceptForSession' ? p.permissions : {}, scope: decision === 'acceptForSession' ? 'session' : 'turn' }
-        return { decision: decision ?? 'cancel' }
-      }
-    } else if (request.method === 'item/tool/requestUserInput') {
-      const questions = (Array.isArray(p.questions) ? p.questions : []).map(
-        /** Preserve native question IDs and index choices for SDK answers; this pure projection retains secret-input intent. */
-        value => {
-          const q = record(value)
-          return {
-            id: string(q.id) ?? '',
-            prompt: string(q.question) ?? '',
-            secret: q.isSecret === true,
-            options: Array.isArray(q.options) ? q.options.map((option, index) => ({ id: String(index), label: string(record(option).label) ?? '' })) : undefined,
-          }
-        },
-      )
-      interaction = { ...common, kind: 'userInput', questions }
-      /** Translate SDK choice IDs back to this prompt's labels; cancellation returns no answers, with no I/O or mutation. */
-      encode = answer => ({
-        answers: answer?.kind === 'userInput' ? Object.fromEntries(Object.entries(answer.answers).map(
-          /** Encode one native question answer, preserving free text and selection order when no advertised label matches. */
-          ([key, value]) => {
-            const q = questions.find(question => question.id === key)
-            const selected = Array.isArray(value) ? value : [value]
-            return [key, { answers: selected.map(v => q?.options?.find(option => option.id === v)?.label ?? String(v)) }]
-          },
-        )) : {},
-      })
-    } else if (request.method === 'mcpServer/elicitation/request') {
-      // Newer native schemas may carry mode-specific fields through anyOf branches.
-      const mode = p.mode === 'url' || typeof p.url === 'string' ? 'url' : 'form'
-      interaction = { ...common, kind: 'elicitation', mode, ...(p.requestedSchema ? { schema: json(p.requestedSchema) as JsonObject } : {}), message: string(p.message) ?? 'MCP input required', ...(mode === 'url' ? { privatePayload: { url: string(p.url) ?? '' } } : {}) }
-      /** Encode only accepted elicitation content; absent/wrong-kind answers cancel and expose no content, without effects. */
-      encode = answer => ({ action: answer?.kind === 'elicitation' ? answer.action : 'cancel', content: answer?.kind === 'elicitation' && answer.action === 'accept' ? answer.content ?? null : null })
-    } else if (request.method === 'item/tool/call') {
-      interaction = { ...common, kind: 'dynamicTool', toolName: string(p.tool) ?? string(p.name) ?? 'unknown', arguments: json(p.arguments ?? {}) as JsonObject }
-      /** Encode SDK tool success and native-compatible content in order; cancellation is unsuccessful with no output and no I/O. */
-      encode = answer => ({
-        success: answer?.kind === 'dynamicTool' && !answer.isError,
-        contentItems: answer?.kind === 'dynamicTool' ? answer.content.flatMap<NativeRecord>(block =>
-          block.type === 'text' ? [{ type: 'inputText', text: block.text }]
-            : block.type === 'image' ? [{ type: 'inputImage', imageUrl: block.url ?? `data:${block.mimeType};base64,${block.data}` }]
-            : [],
-        ) : [],
-      })
-    } else {
-      return { code: -32601, message: 'Unsupported native request' }
     }
-    return { interaction, encode }
+    this.state.activeTurnIds = this.state.activeTurnIds.filter(id => id !== turnId)
+    this.state.status = this.state.activeTurnIds.length ? 'running' : 'ready'
   }
 }
 
@@ -779,10 +770,186 @@ type SessionInputs = {
   options: CodexAdapterOptions
 }
 
-/** Scope allocated by serverRequest before projection, preserving native request-ID type in the interaction identity. */
+/** Scope allocated by serverRequest. Including the native ID type distinguishes numeric and string IDs with the same text. */
 type InteractionScope = { interactionId: string; turnId?: string; itemId?: string }
 
 /** A request-local prompt/responder pair, or the native error serverRequest must send instead of registering an interaction. */
 type InteractionProjection =
   | { interaction: InteractionRequested; encode: (answer: InteractionResponse | null) => unknown }
   | { code: number; message: string }
+
+type ItemPhase = 'started' | 'completed'
+type NativeDeltaKind = 'text' | 'reasoningSummary' | 'output' | 'patch'
+
+/** Route native text and diagnostic delta methods to the corresponding SDK item delta. */
+const DELTA_KIND_BY_METHOD: Partial<Record<string, NativeDeltaKind>> = {
+  'item/agentMessage/delta': 'text',
+  'item/reasoning/summaryTextDelta': 'reasoningSummary',
+  'item/reasoning/textDelta': 'reasoningSummary',
+  'item/commandExecution/outputDelta': 'output',
+  'item/fileChange/outputDelta': 'output',
+  'item/plan/delta': 'text',
+}
+
+/**
+ * Find the suffix revert removes from the ascending native turn list. A through boundary
+ * retains the named turn. Return undefined for an empty suffix and throw if the boundary is absent.
+ */
+function revertSuffix({ turns, nativeTurnId, relation }: {
+  turns: NativeRecord[]
+  nativeTurnId: string
+  relation: AhpRequestMap['session/revert']['boundary']['relation']
+}): { first: NativeRecord; count: number } | undefined {
+  const index = turns.findIndex(turn => turn.id === nativeTurnId)
+  if (index < 0) throw new HarnessSdkError('TURN_NOT_FOUND')
+  const start = index + (relation === 'through' ? 1 : 0)
+  const first = turns[start]
+  if (first) return { first, count: turns.length - start }
+}
+
+/**
+ * Build the prompt and its responder for serverRequest. Keep encoder state local to each
+ * request so interactions can overlap independently. Return wire errors for unsupported methods
+ * or unusable approvals. Serialization failures throw to the transport fallback.
+ */
+function projectInteraction({ method, params }: NativeRequest, scope: InteractionScope): InteractionProjection {
+  switch (method) {
+    case 'item/commandExecution/requestApproval':
+    case 'item/fileChange/requestApproval':
+    case 'item/permissions/requestApproval':
+      return projectApproval({ method, params, scope })
+    case 'item/tool/requestUserInput':
+      return projectUserInput(params, scope)
+    case 'mcpServer/elicitation/request':
+      return projectElicitation(params, scope)
+    case 'item/tool/call':
+      return projectDynamicTool(params, scope)
+    default:
+      return { code: -32601, message: 'Unsupported native request' }
+  }
+}
+
+/**
+ * Pair approval choices with the native values their encoder can return, using standard choices
+ * when the server omits its decision array. Return a wire error for an empty supported set.
+ * Prompt data is sanitized before publication, which can throw.
+ */
+function projectApproval({ method, params, scope }: {
+  method: string
+  params: NativeRecord
+  scope: InteractionScope
+}): InteractionProjection {
+  const advertised = Array.isArray(params.availableDecisions) ? params.availableDecisions : ['accept', 'acceptForSession', 'decline', 'cancel']
+  const decisions = new Map<string, unknown>()
+  const options = advertised.flatMap<ApprovalOption>(
+    /** Advertise supported choices and retain their exact native values for this request's encoder; unsupported choices disappear without authorizing anything. */
+    (decision, i) => {
+      if (typeof decision === 'string' && ['accept', 'acceptForSession', 'decline', 'cancel'].includes(decision)) {
+        decisions.set(decision, decision)
+        return [{
+          id: decision,
+          label: decision,
+          semantic: decision === 'accept' ? 'allowOnce' as const
+            : decision === 'acceptForSession' ? 'allowSession' as const
+            : decision === 'cancel' ? 'cancel' as const : 'deny' as const,
+        }]
+      }
+      if (record(decision).acceptWithExecpolicyAmendment || record(decision).applyNetworkPolicyAmendment) {
+        const optionId = `rule:${i}`
+        decisions.set(optionId, decision)
+        return [{ id: optionId, label: 'Apply supplied policy rule', semantic: 'allowWithRule' as const }]
+      }
+      return []
+    },
+  )
+  if (!options.length) {
+    return { code: -32602, message: 'No supported approval decisions' }
+  }
+  const interaction: InteractionRequested = {
+    ...scope,
+    kind: 'approval',
+    title: string(params.reason) ?? 'Approval required',
+    options,
+    input: safe({ command: params.command, permissions: params.permissions, cwd: params.cwd }),
+  }
+  /** Encode an SDK answer against this request's advertised decisions; absent/invalid answers cancel or grant no permissions, without I/O. */
+  const encode = (answer: InteractionResponse | null) => {
+    const decision = answer?.kind === 'approval' ? decisions.get(answer.optionId) : 'cancel'
+    if (method === 'item/permissions/requestApproval') {
+      return {
+        permissions: decision === 'accept' || decision === 'acceptForSession' ? params.permissions : {},
+        scope: decision === 'acceptForSession' ? 'session' : 'turn',
+      }
+    }
+    return { decision: decision ?? 'cancel' }
+  }
+  return { interaction, encode }
+}
+
+/** Preserve question IDs and secret-input intent. The responder translates advertised choice IDs back to labels and passes free text through. */
+function projectUserInput(params: NativeRecord, scope: InteractionScope): InteractionProjection {
+  const questions = (Array.isArray(params.questions) ? params.questions : []).map(
+    value => {
+      const q = record(value)
+      return {
+        id: string(q.id) ?? '',
+        prompt: string(q.question) ?? '',
+        secret: q.isSecret === true,
+        options: Array.isArray(q.options) ? q.options.map((option, index) => ({ id: String(index), label: string(record(option).label) ?? '' })) : undefined,
+      }
+    },
+  )
+  const interaction: InteractionRequested = { ...scope, kind: 'userInput', questions }
+  /** Translate SDK choice IDs back to this prompt's labels; cancellation returns no answers, with no I/O or mutation. */
+  const encode = (answer: InteractionResponse | null) => ({
+    answers: answer?.kind === 'userInput' ? Object.fromEntries(Object.entries(answer.answers).map(
+      /** Encode one native question answer, preserving free text and selection order when no advertised label matches. */
+      ([key, value]) => {
+        const q = questions.find(question => question.id === key)
+        const selected = Array.isArray(value) ? value : [value]
+        return [key, { answers: selected.map(v => q?.options?.find(option => option.id === v)?.label ?? String(v)) }]
+      },
+    )) : {},
+  })
+  return { interaction, encode }
+}
+
+/** Keep URL-mode data private in the SDK prompt and return content only for accepted responses. Schema serialization can throw. */
+function projectElicitation(params: NativeRecord, scope: InteractionScope): InteractionProjection {
+  // Newer native schemas may carry mode-specific fields through anyOf branches.
+  const mode = params.mode === 'url' || typeof params.url === 'string' ? 'url' : 'form'
+  const interaction: InteractionRequested = {
+    ...scope,
+    kind: 'elicitation',
+    mode,
+    ...(params.requestedSchema ? { schema: json(params.requestedSchema) as JsonObject } : {}),
+    message: string(params.message) ?? 'MCP input required',
+    ...(mode === 'url' ? { privatePayload: { url: string(params.url) ?? '' } } : {}),
+  }
+  /** Encode only accepted elicitation content. Absent and wrong-kind answers cancel. */
+  const encode = (answer: InteractionResponse | null) => ({
+    action: answer?.kind === 'elicitation' ? answer.action : 'cancel',
+    content: answer?.kind === 'elicitation' && answer.action === 'accept' ? answer.content ?? null : null,
+  })
+  return { interaction, encode }
+}
+
+/** Project native tool arguments into the prompt and encode text and image results in source order. Argument serialization can throw. */
+function projectDynamicTool(params: NativeRecord, scope: InteractionScope): InteractionProjection {
+  const interaction: InteractionRequested = {
+    ...scope,
+    kind: 'dynamicTool',
+    toolName: string(params.tool) ?? string(params.name) ?? 'unknown',
+    arguments: json(params.arguments ?? {}) as JsonObject,
+  }
+  /** Encode SDK tool success and native-compatible content in order; cancellation is unsuccessful with no output and no I/O. */
+  const encode = (answer: InteractionResponse | null) => ({
+    success: answer?.kind === 'dynamicTool' && !answer.isError,
+    contentItems: answer?.kind === 'dynamicTool' ? answer.content.flatMap<NativeRecord>(block =>
+      block.type === 'text' ? [{ type: 'inputText', text: block.text }]
+        : block.type === 'image' ? [{ type: 'inputImage', imageUrl: block.url ?? `data:${block.mimeType};base64,${block.data}` }]
+        : [],
+    ) : [],
+  })
+  return { interaction, encode }
+}

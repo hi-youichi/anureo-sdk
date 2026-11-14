@@ -5,8 +5,12 @@ import type { AhpEvent } from '@anureo/protocol'
 import type { HermesAdapterOptions } from '../src'
 import { startFake, until } from './helpers'
 
-/** Run a scenario with an initialized client, disposing client observation before the shared fixture owner on every outcome. */
-async function withFixture(scenario: string, run: (fixture: Awaited<ReturnType<typeof startFake>>, client: Client) => Promise<void>, options: HermesAdapterOptions = {}, interactions?: InteractionHandlers) {
+/** Run assertions with an initialized client, then dispose client observation before stopping the fixture owner. */
+async function withFixture(
+  scenario: string,
+  run: (fixture: Awaited<ReturnType<typeof startFake>>, client: Client) => Promise<void>,
+  { options, interactions }: { options?: HermesAdapterOptions; interactions?: InteractionHandlers } = {},
+): Promise<void> {
   const fixture = await startFake(scenario)
   let client: Client | undefined
   try {
@@ -17,9 +21,24 @@ async function withFixture(scenario: string, run: (fixture: Awaited<ReturnType<t
 
 /** Record live events while turn.result remains the source-error assertion; callers must stop the iterator before client disposal. */
 function collect(session: Session) {
-  const events: AhpEvent[] = [], iterator = session.events()[Symbol.asyncIterator]()
-  const task = (async () => { try { for (;;) { const next = await iterator.next(); if (next.done) return; events.push(next.value) } } catch { /* Tests assert source errors through the public turn. */ } })()
-  return { events, async stop() { await iterator.return?.(); await task } }
+  const events: AhpEvent[] = []
+  const iterator = session.events()[Symbol.asyncIterator]()
+  const task = (async () => {
+    try {
+      for (;;) {
+        const next = await iterator.next()
+        if (next.done) return
+        events.push(next.value)
+      }
+    } catch { /* Tests assert source errors through the public turn. */ }
+  })()
+  return {
+    events,
+    async stop() {
+      await iterator.return?.()
+      await task
+    },
+  }
 }
 
 test('initialization describes a ticketed owner without creating a session and keeps diagnostics credential-free', async () => {
@@ -34,7 +53,7 @@ test('initialization describes a ticketed owner without creating a session and k
     const state = await fixture.state()
     expect(state.attachArgs[0]).toContain('--start')
     expect(state.methods).not.toContain('client.capabilities')
-  }, { diagnostic: value => diagnostics.push(value), env: { FAKE_HERMES_STDERR: 'test-sensitive-stderr' } })
+  }, { options: { diagnostic: value => diagnostics.push(value), env: { FAKE_HERMES_STDERR: 'test-sensitive-stderr' } } })
 })
 
 test.each(['old-contract', 'code-mismatch', 'legacy', 'bad-stdout'])('incompatible or malformed %s fails before session creation', async scenario => {
@@ -158,10 +177,12 @@ test('approval choices retain native semantics and permanent grants are not offe
     const session = await client.sessions.create({ cwd: tmpdir() })
     expect((await (await session.submit({ input: 'ask' })).result()).status).toBe('completed')
     expect((await fixture.state()).responses[0]).toMatchObject({ method: 'approval.respond', params: { choice: 'once', execution_generation: 1, prompt_id: 'approval-1' } })
-  }, {}, { approval: async request => {
-    expect(request.options.some(value => value.id === 'always')).toBe(false)
-    return { kind: 'approval', optionId: request.options.find(value => value.semantic === 'allowOnce')!.id }
-  } })
+  }, {
+    interactions: { approval: async request => {
+      expect(request.options.some(value => value.id === 'always')).toBe(false)
+      return { kind: 'approval', optionId: request.options.find(value => value.semantic === 'allowOnce')!.id }
+    } },
+  })
 })
 
 test('batch clarify uses a response frame and answers each native qid', async () => {
@@ -169,7 +190,7 @@ test('batch clarify uses a response frame and answers each native qid', async ()
     const session = await client.sessions.create({ cwd: tmpdir() })
     expect((await (await session.submit({ input: 'ask' })).result()).status).toBe('completed')
     expect((await fixture.state()).responses[0]).toMatchObject({ id: 'srq-1', result: { answers: { q1: 'yes', q2: 'free text' }, outcome: 'submitted' } })
-  }, {}, { userInput: async () => ({ kind: 'userInput', answers: { q1: 'yes', q2: 'free text' } }) })
+  }, { interactions: { userInput: async () => ({ kind: 'userInput', answers: { q1: 'yes', q2: 'free text' } }) } })
 })
 
 test('secret answers reach the native response but are redacted from final results', async () => {
@@ -179,10 +200,12 @@ test('secret answers reach the native response but are redacted from final resul
     expect(result.status).toBe('completed')
     expect(JSON.stringify(result)).not.toContain('fixture-private-value')
     expect((await fixture.state()).responses[0]).toMatchObject({ id: 'srq-1', result: { value: 'fixture-private-value' } })
-  }, {}, { userInput: async request => {
-    expect(request.questions[0]!.secret).toBe(true)
-    return { kind: 'userInput', answers: { value: 'fixture-private-value' } }
-  } })
+  }, {
+    interactions: { userInput: async request => {
+      expect(request.questions[0]!.secret).toBe(true)
+      return { kind: 'userInput', answers: { value: 'fixture-private-value' } }
+    } },
+  })
 })
 
 test('unsupported desktop requests receive a native error instead of stalling the reader', async () => {
@@ -257,9 +280,11 @@ test.each(['approval-reconnect', 'batch-reconnect'])('%s restores one pending qu
       expect(questions).toBe(1)
       expect((await fixture.state()).responses).toHaveLength(1)
       expect((await fixture.state()).inputs).toHaveLength(1)
-    }, {}, {
-      approval: async () => { questions++; await answer; return { kind: 'approval', optionId: 'once' } },
-      userInput: async () => { questions++; await answer; return { kind: 'userInput', answers: { q1: 'yes', q2: 'text' } } },
+    }, {
+      interactions: {
+        approval: async () => { questions++; await answer; return { kind: 'approval', optionId: 'once' } },
+        userInput: async () => { questions++; await answer; return { kind: 'userInput', answers: { q1: 'yes', q2: 'text' } } },
+      },
     })
   } finally { release() }
 })
@@ -278,7 +303,7 @@ test('another viewer settling a prompt closes the interaction without submitting
         expect(read.events.some(event => event.type === 'interaction/resolved' && event.payload.outcome === 'unknown')).toBe(true)
         expect((await fixture.state()).responses).toHaveLength(0)
       } finally { await read.stop() }
-    }, {}, { approval: async () => { await answer; return { kind: 'approval', optionId: 'once' } } })
+    }, { interactions: { approval: async () => { await answer; return { kind: 'approval', optionId: 'once' } } } })
   } finally { release() }
 })
 
@@ -290,5 +315,5 @@ test('a response still open on the owner after reconnect remains unknown and is 
     expect(failure).toMatchObject({ code: 'RESULT_UNKNOWN', outcomeUnknown: true })
     expect((await fixture.state()).responses).toHaveLength(1)
     expect((await fixture.state()).inputs).toHaveLength(1)
-  }, {}, { userInput: async () => ({ kind: 'userInput', answers: { value: 'private-once' } }) })
+  }, { interactions: { userInput: async () => ({ kind: 'userInput', answers: { value: 'private-once' } }) } })
 })

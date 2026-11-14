@@ -8,7 +8,10 @@ import { agent } from './agent'
 test('workflow schema uses direct Pi tools and retains Zod refinement validation', async () => {
   const fake = fakeFactory(host => {
     let output: StructuredOutputToolDefinition | undefined
-    Object.assign(host, { async setOutputTool(tool?: StructuredOutputToolDefinition) { output = tool } })
+    Object.assign(host, {
+      /** The Pi adapter forwards SDK registration before the script and omits the tool to clear it. */
+      async setOutputTool(tool?: StructuredOutputToolDefinition) { output = tool },
+    })
     host.script = async host => {
       if (!output) throw new Error('Output tool must be registered before scripted execution')
       await output.execute({ sum: 42 })
@@ -17,9 +20,11 @@ test('workflow schema uses direct Pi tools and retains Zod refinement validation
   })
   const client = await createClient({ adapter: createPiAdapter({ version: '1.5.2', createHost: fake.factory }), identity: { adapterId: 'pi', runtimeConfigId: 'workflow-direct-tool' } })
   try {
+    const options = { client, cwd: process.cwd() }
     const schema = z.object({ sum: z.number().int() })
-    expect(await agent('17 + 25', { client, cwd: process.cwd(), schema })).toEqual({ sum: 42 })
-    await expect(agent('17 + 25', { client, cwd: process.cwd(), schema: schema.refine(value => value.sum < 0) })).rejects.toMatchObject({ code: 'AGENT_STRUCTURED_OUTPUT_INVALID', outcomeUnknown: false })
+    expect(await agent('17 + 25', { ...options, schema })).toEqual({ sum: 42 })
+    await expect(agent('17 + 25', { ...options, schema: schema.refine(value => value.sum < 0) }))
+      .rejects.toMatchObject({ code: 'AGENT_STRUCTURED_OUTPUT_INVALID', outcomeUnknown: false })
     expect(fake.opens.every(open => !Object.hasOwn(open, 'mcpServers'))).toBe(true)
   } finally { await client.dispose() }
 })

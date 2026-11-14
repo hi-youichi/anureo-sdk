@@ -1,4 +1,3 @@
-// Verifies native interaction settlement contracts; must not implement production policy or session integration.
 import { expect, test } from "bun:test";
 import { InteractionRegistry } from "./interactions";
 import { approveWithNarrowestScope } from "./approval";
@@ -80,6 +79,34 @@ test("external resolution rejects the local waiter and publishes the peer outcom
   await expect(observed).rejects.toThrow("Interaction was resolved by the native peer");
   expect(published.at(-1)).toMatchObject({ interactionId: "i1", outcome: "responded" });
   expect(registry.pendingCount).toBe(0);
+});
+
+test("peer settlement supersedes an in-flight answer and retries replay the failure", async () => {
+  const native = deferred<void>();
+  const { registry, published } = harness();
+  let deliveries = 0;
+  const observed = registry.begin(approval("i1"), async () => {
+    deliveries++;
+    await native.promise;
+  });
+  const operation = registry.respond("i1", "r1", answer);
+  const peerResult = { interactionId: "i1", outcome: "expired" } as const;
+  try {
+    await registry.resolveExternally(peerResult);
+    await expect(observed).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
+    expect(registry.pendingCount).toBe(0);
+
+    native.resolve();
+    await expect(operation).rejects.toMatchObject({ code: "RESULT_UNKNOWN", outcomeUnknown: true });
+    const error = await operation.catch(cause => cause);
+    await expect(registry.respond("i1", "r1", answer)).rejects.toBe(error);
+    expect(deliveries).toBe(1);
+    expect(published).toEqual([peerResult]);
+  } finally {
+    native.resolve();
+    await operation.catch(() => {});
+    await registry.cancelAll("test_cleanup");
+  }
 });
 
 /** Hold native delivery to verify replay/conflict rules and capacity, then release all owned work. */

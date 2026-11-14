@@ -1,4 +1,4 @@
-// Checks subprocess I/O and process-tree cleanup; must not implement production process control.
+// Checks subprocess I/O and process-tree cleanup.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, link, copyFile, rm, realpath } from 'node:fs/promises';
@@ -16,13 +16,15 @@ async function textOf(stream: AsyncIterable<Uint8Array>): Promise<string> {
 /** Read until the readiness line or reject early EOF; keep the child running so process-tree cleanup tests can inspect descendants. */
 async function firstLine(stream: AsyncIterable<Uint8Array>): Promise<string> {
   const iterator = stream[Symbol.asyncIterator]();
-  const decoder = new TextDecoder(); let text = '';
-  while (!text.includes('\n')) {
+  const decoder = new TextDecoder();
+  let text = '';
+  while (true) {
     const next = await iterator.next();
     if (next.done) throw new Error('Process ended before readiness');
     text += decoder.decode(next.value, { stream: true });
+    const newline = text.indexOf('\n');
+    if (newline !== -1) return text.slice(0, newline);
   }
-  return text.split('\n')[0]!;
 }
 
 /**
@@ -140,11 +142,6 @@ test('external ownership detaches without terminating the process', async () => 
   } finally { process.kill(child.pid, 'SIGKILL'); await child.exited; }
 });
 
-test('invalid timeout and NUL arguments fail before spawning', async () => {
-  await assert.rejects(spawnHarnessProcess({ command: process.execPath, shutdownTimeoutMs: -1 }));
-  await assert.rejects(spawnHarnessProcess({ command: process.execPath, args: ['\0'] }));
-});
-
 test('abruptly exited children retain their original PID for safe cleanup', async () => {
   for (let i = 0; i < 12; i++) {
     const child = await spawnHarnessProcess({ command: process.execPath, args: ['-e', 'process.exit(1)'] });
@@ -193,11 +190,16 @@ test('posix dispose rejects when group signaling reports ESRCH while the child r
   } });
 });
 
-test('missing executables, NUL arguments, and excessive timeouts report HARNESS_UNAVAILABLE', async () => {
-  await assert.rejects(spawnHarnessProcess({ command: 'definitely-not-a-real-executable-xyz' }), (error: unknown) =>
-    error instanceof ProcessPortError && error.code === 'HARNESS_UNAVAILABLE');
-  await assert.rejects(spawnHarnessProcess({ command: 'valid', args: ['bad\0arg'] }), (error: unknown) =>
-    error instanceof ProcessPortError && error.code === 'HARNESS_UNAVAILABLE');
-  await assert.rejects(spawnHarnessProcess({ command: 'valid', shutdownTimeoutMs: 99_999 }), (error: unknown) =>
-    error instanceof ProcessPortError && error.code === 'HARNESS_UNAVAILABLE');
+test('missing executables and invalid process options report HARNESS_UNAVAILABLE', async () => {
+  const cases = [
+    { command: 'definitely-not-a-real-executable-xyz' },
+    { command: process.execPath, shutdownTimeoutMs: -1 },
+    { command: process.execPath, args: ['\0'] },
+    { command: 'valid', args: ['bad\0arg'] },
+    { command: 'valid', shutdownTimeoutMs: 99_999 },
+  ];
+  for (const options of cases) {
+    await assert.rejects(spawnHarnessProcess(options), (error: unknown) =>
+      error instanceof ProcessPortError && error.code === 'HARNESS_UNAVAILABLE');
+  }
 });

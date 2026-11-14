@@ -1,21 +1,20 @@
 import type { ReviewFailure } from './errors'
-import type { AngleReview, FixReport, ModuleReview, ReviewReport } from './results'
+import type { AngleReview, FixReport, ModuleOutcome, ReviewReport } from './results'
 
-/** Render reviewCode's report, including failed coverage, fixes and observer errors, as text with
- * a trailing newline. CLI callers choose output streams; this formatter has no I/O or mutation. */
+/** Render a ReviewReport as text with a trailing newline. Sections follow the report's module and
+ * angle order and retain failed coverage, fix outcomes and observer errors. The caller owns output.
+ * The CLI's reviewAndPrintReport writes this text to stdout when JSON output is disabled. */
 export function formatReport(report: ReviewReport): string {
-  const lines = [`Code review: ${report.status}`, `Run: ${report.runId}`, `Workflow storage: ${report.workflowDirectory}`,
+  const lines = [
+    `Code review: ${report.status}`,
+    `Run: ${report.runId}`,
+    `Workflow storage: ${report.workflowDirectory}`,
     `Directory: ${report.cwd}`,
     `Scope: ${report.scope.moduleIds.length} of ${report.plan.modules.length} planned modules; angles: ${report.scope.angleIds.join(', ')}`,
-    '', report.plan.summary]
-  // Each module's section carries its own review, fix, and post-fix verification.
+    '', report.plan.summary,
+  ]
   for (const outcome of report.modules) {
-    appendModuleReview(lines, outcome.review)
-    if (outcome.fix) appendFix(lines, outcome.fix)
-    if (outcome.verification) {
-      lines.push('', '### Review after fixes')
-      appendAngleReviews(lines, outcome.verification.angles, title => `#### ${title}`)
-    }
+    appendModuleOutcome(lines, outcome)
   }
   if (report.progressErrors.length > 0) {
     lines.push('', '## Progress reporting errors')
@@ -26,30 +25,28 @@ export function formatReport(report: ReviewReport): string {
   return `${lines.join('\n')}\n`
 }
 
-/** Append a normalized failure's diagnostic and issues to the report buffer. The section supplies
- * an uncertainty notice only when an unknown execution outcome affects review or fix interpretation. */
-function appendFailure(lines: string[], input: {
-  error: ReviewFailure
-  prefix: string
-  unknownOutcomeMessage?: string
-}): void {
-  const { error, prefix, unknownOutcomeMessage } = input
-  lines.push(`${prefix}${error.message}${error.code ? ` [${error.code}]` : ''}`)
-  for (const issue of error.issues ?? []) {
-    lines.push(`Validation issue: ${JSON.stringify(issue.path)} [${issue.code}]`)
+/** Keep the original review, fix and final verification together under the module heading. */
+function appendModuleOutcome(lines: string[], outcome: ModuleOutcome): void {
+  const { review } = outcome
+  lines.push('', `## ${review.module.name} (${review.module.id})`)
+  appendAngleReviews(lines, review.angles, '###')
+  if (outcome.fix) appendFix(lines, outcome.fix)
+  if (outcome.verification) {
+    lines.push('', '### Review after fixes')
+    appendAngleReviews(lines, outcome.verification.angles, '####')
   }
-  if (error.outcomeUnknown && unknownOutcomeMessage) lines.push(unknownOutcomeMessage)
 }
 
 /** Render angle outcomes in report order with caller-selected heading depth, retaining failures. */
-function appendAngleReviews(lines: string[], angles: readonly AngleReview[], heading: (title: string) => string): void {
+function appendAngleReviews(lines: string[], angles: readonly AngleReview[], headingPrefix: string): void {
   for (const result of angles) {
-    lines.push('', heading(result.angle.title))
+    lines.push('', `${headingPrefix} ${result.angle.title}`)
     appendAngleResult(lines, result)
   }
 }
 
-/** Render one angle's coverage independently of its heading depth; preserve multiline finding indentation. */
+/** Distinguish failed coverage from a completed angle with no findings. Indent continuation
+ * lines so multiline finding bodies and suggestions stay under their finding. */
 function appendAngleResult(lines: string[], result: AngleReview): void {
   if (result.status === 'failed') {
     appendFailure(lines, { error: result.error, prefix: 'Review failed: ',
@@ -62,18 +59,15 @@ function appendAngleResult(lines: string[], result: AngleReview): void {
   }
   const indent = (text: string) => text.replace(/\n/g, '\n  ')
   for (const finding of result.findings) {
-    lines.push(`- [${finding.severity}] ${finding.title} (${finding.file}:${finding.lineStart}-${finding.lineEnd})`, `  ${indent(finding.body)}`,
-      `  Suggestion: ${indent(finding.suggestion)}`)
+    lines.push(
+      `- [${finding.severity}] ${finding.title} (${finding.file}:${finding.lineStart}-${finding.lineEnd})`,
+      `  ${indent(finding.body)}`,
+      `  Suggestion: ${indent(finding.suggestion)}`,
+    )
   }
 }
 
-/** Add the module heading and original review before its fix/verification sections. */
-function appendModuleReview(lines: string[], review: ModuleReview): void {
-  lines.push('', `## ${review.module.name} (${review.module.id})`)
-  appendAngleReviews(lines, review.angles, title => `### ${title}`)
-}
-
-/** Render host-observed edits and failure uncertainty so partial work remains visible to CLI users. */
+/** Show recorded edits even if a later failure made the fix incomplete. */
 function appendFix(lines: string[], fix: FixReport): void {
   lines.push('', `### Fix: ${fix.status}`, fix.summary)
   if (fix.changedFiles.length > 0) lines.push(`Changed files: ${fix.changedFiles.join(', ')}`)
@@ -81,4 +75,19 @@ function appendFix(lines: string[], fix: FixReport): void {
     appendFailure(lines, { error: fix.error, prefix: 'Fix failed: ',
       unknownOutcomeMessage: 'The backend could not confirm the fix agent outcome.' })
   }
+}
+
+/** Append a failure's message, optional code and validation issues in that order. Review and fix
+ * sections supply their own uncertainty notices. The progress section leaves the notice unset. */
+function appendFailure(lines: string[], input: {
+  error: ReviewFailure
+  prefix: string
+  unknownOutcomeMessage?: string
+}): void {
+  const { error, prefix, unknownOutcomeMessage } = input
+  lines.push(`${prefix}${error.message}${error.code ? ` [${error.code}]` : ''}`)
+  for (const issue of error.issues ?? []) {
+    lines.push(`Validation issue: ${JSON.stringify(issue.path)} [${issue.code}]`)
+  }
+  if (error.outcomeUnknown && unknownOutcomeMessage) lines.push(unknownOutcomeMessage)
 }

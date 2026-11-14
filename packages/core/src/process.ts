@@ -2,35 +2,42 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 
-/** Exit observation, independent of output EOF; startup errors carry a native code without arguments or messages. */
+/** Child exit status observed independently of output EOF. */
 export type ProcessExit = {
   /** Exit status, or null for signal termination or startup failure. */
   code: number | null;
   /** Terminating signal, or null for normal exit or startup failure. */
   signal: string | null;
-  /** Native error code when an error is observed without a child PID. */
+  /** Native code, if supplied, when the exit observer receives a child error without a PID. */
   errorCode?: string;
 };
 
-/** Direct executable launch and ownership policy; shell parsing is disabled and shutdown timeout bounds the graceful termination phase. */
+/** Configure a shell-free harness launch and choose who is responsible for terminating the child. */
 export interface HarnessProcessOptions {
-  /** Executable path/name passed directly to the OS without shell interpretation. */
+  /** Executable path or name. Empty strings and NUL bytes are rejected before launch. */
   command: string;
-  /** Literal argument vector; each entry is preserved as one argument. */
+  /** Literal argument vector, empty by default. Entries containing NUL bytes are rejected before launch. */
   args?: readonly string[];
   /** Working directory for the child; omitted means the parent working directory. */
   cwd?: string;
-  /** A complete child environment; omitted means inherit. Never mutates the parent environment. */
+  /** Complete environment for the child. Omit to inherit the parent environment. */
   env?: Record<string, string | undefined>;
-  /** Defaults to true; false leaves termination to an external owner while this handle still owns its pipes. */
+  /** Defaults to true. Set to false when another owner will terminate the launched child. */
   owned?: boolean;
-  /** Grace period for owned-tree termination; defaults to 1000 ms, accepts integer milliseconds in 0..60000. */
+  /**
+   * Grace period before escalation for an owned child. Accepts integer milliseconds from 0 to
+   * 60,000 and defaults to 1000. Validated for either ownership mode.
+   */
   shutdownTimeoutMs?: number;
 }
 
-/** Local I/O handles for one harness process; drain output and await disposal even after the process exits. */
+/**
+ * Local I/O handles for one harness process. Drain output and await disposal even after exit.
+ * Custom process factories for the AHP, Codex, and Hermes adapters also supply this handle.
+ * The adapter receiving it takes responsibility for disposal.
+ */
 export interface HarnessProcess {
-  /** Original positive PID, retained even if the runtime clears child.pid after exit. */
+  /** PID captured at launch and retained after exit. */
   readonly pid: number;
   /** True when this handle is responsible for terminating the process tree on disposal. */
   readonly owned: boolean;
@@ -38,27 +45,29 @@ export interface HarnessProcess {
   readonly stdout: AsyncIterable<Uint8Array>;
   /** Child stderr bytes; callers should drain buffered output before disposal. */
   readonly stderr: AsyncIterable<Uint8Array>;
-  /** Resolves without rejecting at exit (or startup error without a PID); output EOF and disposal are separate. */
+  /**
+   * Resolves with status on child exit or an observed child error without a PID. Read the output
+   * streams through EOF to collect buffered bytes.
+   */
   readonly exited: Promise<ProcessExit>;
   /**
    * Write once to stdin and resolve when its native write callback completes, without waiting for
-   * the peer to consume the bytes. Reject closed, exited, or disposing input and native write failure
-   * with PROCESS_WRITE_FAILED; no retries are performed.
+   * the peer to consume the bytes. Reject with PROCESS_WRITE_FAILED if the input is closed, exit
+   * has been observed, disposal has started, or the native write callback reports an error.
    */
   write(chunk: string | Uint8Array): Promise<void>;
   /**
-   * End stdin after queued writes; await writes before calling. Resolve on the native end callback,
-   * or immediately if input is already ending or destroyed; reject native close failure with
-   * PROCESS_WRITE_FAILED. Output and process exit remain independently observable.
+   * End stdin after queued writes. Await writes first to observe each write's outcome. Resolve when
+   * the native end callback completes, or immediately if input is already ending or destroyed.
+   * A native close callback error rejects with PROCESS_WRITE_FAILED. Output and exit remain observable.
    */
   closeInput(): Promise<void>;
   /**
-   * Share one teardown promise across calls. Terminate an owned process tree and observe child exit;
-   * otherwise unref without signalling or waiting for exit. Owned cleanup escalates when needed
-   * and allows a further 1000 ms for child exit observation, rejecting PROCESS_DISPOSE_FAILED
-   * if cleanup fails or the child still has not exited. Failure is cached rather than retried.
-   * Always destroys local stdin/stdout/stderr streams, regardless of ownership or
-   * termination success. Drain buffered output before disposal.
+   * Release local stdin, stdout, and stderr even when termination fails. Drain buffered output first.
+   * For an owned child, terminate the tree, escalating as needed, then allow up to 1000 ms for any
+   * pending child exit observation. Termination failure or a missing exit observation rejects with
+   * PROCESS_DISPOSE_FAILED. For an external child, unref it and release the pipes without waiting for
+   * exit. Every call returns the same promise, including after rejection.
    */
   dispose(): Promise<void>;
 }
@@ -67,7 +76,7 @@ export interface HarnessProcess {
 export class ProcessPortError extends Error {
   /**
    * Construct a failure using caller-supplied safe message text, which is retained verbatim.
-   * Inspect the optional native cause for a code, but never retain its message, arguments, or cause.
+   * Supply a native cause to retain only its format-checked error code.
    */
   constructor(code: ProcessPortError['code'], message: string, options?: ErrorOptions) {
     // Native spawn errors contain spawnargs. Never retain their raw cause in a public error.
@@ -77,134 +86,287 @@ export class ProcessPortError extends Error {
     const nativeCode = readNativeErrorCode(options?.cause);
     if (nativeCode !== undefined) this.nativeCode = nativeCode;
   }
-  /** Stable adapter-facing category; native error messages are not exposed. */
+  /** Stable category for adapter startup, input, or disposal failures. */
   readonly code: 'HARNESS_UNAVAILABLE' | 'PROCESS_WRITE_FAILED' | 'PROCESS_DISPOSE_FAILED';
-  /** Native code matching the bounded uppercase format; raw arguments and causes are not retained. */
+  /**
+   * Native code of 1 to 64 characters, beginning with an uppercase letter and containing only
+   * uppercase letters, digits, and underscores.
+   */
   readonly nativeCode?: string;
 }
 
 /**
  * Launch a harness executable directly with piped I/O and literal arguments, without a shell.
- * Resolve after the OS spawn event, without waiting for protocol readiness. Invalid inputs or launch
- * failures reject with HARNESS_UNAVAILABLE and release local pipes acquired during failed startup.
- * Adapter consumers must drain output and await dispose, including after child exit; owned processes
- * default to tree termination on disposal, while external owners remain responsible for termination.
+ * Resolve after the spawn event provides a process handle. The caller handles protocol readiness.
+ * Invalid inputs or launch failures reject with HARNESS_UNAVAILABLE. Failed startup releases any
+ * local pipes it acquired. Drain output and await disposal even after child exit.
+ *
+ * ACP's processStream awaits launch to wire the pipes into its channel, propagates launch
+ * rejection, and delegates channel disposal to the handle.
  */
 export async function spawnHarnessProcess(options: HarnessProcessOptions): Promise<HarnessProcess> {
   const timeoutMs = validateProcessOptions(options);
   const owned = options.owned ?? true;
   const child = launchProcess({ options, owned });
-  const observation = observeProcess(child);
+  const initialPid = child.pid;
+  const exit = observeProcessExit(child);
   // Prevent an unhandled pipe error if a peer closes while the caller isn't writing.
   child.stdin.on('error', () => {});
-  const pid = await waitForSpawn(child, observation);
-  return createProcessHandle({ child, pid, owned, timeoutMs, didExit: observation.didExit, exited: observation.exited });
+  const pid = await waitForSpawn(child, initialPid);
+  return createProcessHandle({ child, pid, owned, timeoutMs, ...exit });
 }
 
 /**
- * Extract only a bounded uppercase code for ProcessPortError; a native cause may contain private
- * spawn arguments and must never become part of the public error.
+ * Return the validated grace period for disposal. Throw HARNESS_UNAVAILABLE for an empty
+ * executable, NUL bytes in the executable or arguments, or an invalid timeout. spawnHarnessProcess
+ * calls this before launching the child.
  */
-function readNativeErrorCode(cause: unknown): string | undefined {
-  if (!cause || typeof cause !== 'object' || !('code' in cause)) return undefined;
-  if (typeof cause.code !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/.test(cause.code)) return undefined;
-  return cause.code;
+function validateProcessOptions(options: HarnessProcessOptions): number {
+  if (!options.command || options.command.includes('\0') || options.args?.some((arg) => arg.includes('\0'))) {
+    throw new ProcessPortError('HARNESS_UNAVAILABLE', 'Invalid harness executable or argument');
+  }
+  const timeoutMs = options.shutdownTimeoutMs ?? 1000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 60_000) {
+    throw new ProcessPortError('HARNESS_UNAVAILABLE', 'Invalid process shutdown timeout');
+  }
+  return timeoutMs;
 }
 
-/** Shared child resources; the exit observer must be installed before waiting for spawn. */
-interface ProcessResources {
+/**
+ * Open piped stdio for a shell-free launch. Detach owned POSIX children so teardown can signal
+ * their whole group. Convert synchronous spawn failures to HARNESS_UNAVAILABLE. spawnHarnessProcess
+ * installs the event observers after this returns.
+ */
+function launchProcess({ options, owned }: { options: HarnessProcessOptions; owned: boolean }): ChildProcessWithoutNullStreams {
+  try {
+    return spawn(options.command, [...(options.args ?? [])], {
+      cwd: options.cwd, env: options.env, stdio: ['pipe', 'pipe', 'pipe'],
+      detached: owned && process.platform !== 'win32', shell: false, windowsHide: true,
+    });
+  } catch (cause) {
+    throw new ProcessPortError('HARNESS_UNAVAILABLE', 'Unable to start harness executable', { cause });
+  }
+}
+
+/** Shared exit state for stdin admission and disposal, both of which can run after spawn returns. */
+interface ProcessExitObservation {
+  readonly exited: Promise<ProcessExit>;
+  readonly didExit: () => boolean;
+}
+
+/**
+ * Register child exit and error listeners before spawnHarnessProcess awaits startup. Update the exit
+ * flag before resolving so writes and teardown can consult the observation immediately.
+ */
+function observeProcessExit(child: ChildProcessWithoutNullStreams): ProcessExitObservation {
+  let didExit = false;
+  const exited = new Promise<ProcessExit>((resolve) => {
+    child.once('exit', (code, signal) => {
+      didExit = true;
+      resolve({ code, signal });
+    });
+    child.once('error', (error: NodeJS.ErrnoException) => {
+      if (!child.pid) {
+        didExit = true;
+        resolve({ code: null, signal: null, errorCode: error.code });
+      }
+    });
+  });
+  return { exited, didExit: () => didExit };
+}
+
+/**
+ * Wait for the spawn event and retain its PID before the runtime can clear it on exit. Fall back
+ * to the initial PID if the event provides no usable PID. On failure, release the pipes and
+ * reject with HARNESS_UNAVAILABLE so spawnHarnessProcess never publishes a partial handle.
+ */
+async function waitForSpawn(child: ChildProcessWithoutNullStreams, initialPid: number | undefined): Promise<number> {
+  let pid = initialPid;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.once('spawn', () => {
+        const spawnPid = child.pid;
+        if (spawnPid !== undefined && spawnPid > 1) pid = spawnPid;
+        resolve();
+      });
+      child.once('error', reject);
+    });
+  } catch (cause) {
+    return failProcessStartup(child, cause);
+  }
+  if (pid === undefined || pid <= 1) return failProcessStartup(child);
+  return pid;
+}
+
+/** Release startup's local pipes before rejecting launch with a privacy-safe error. */
+function failProcessStartup(child: ChildProcessWithoutNullStreams, cause?: unknown): never {
+  destroyProcessStreams(child);
+  throw new ProcessPortError('HARNESS_UNAVAILABLE', 'Unable to start harness executable', { cause });
+}
+
+/** Close all three local pipes after failed startup or after disposal, even if termination failed. */
+function destroyProcessStreams(child: ChildProcessWithoutNullStreams): void {
+  child.stdin.destroy();
+  child.stdout.destroy();
+  child.stderr.destroy();
+}
+
+/** Resources transferred to the handle after spawn, including the PID retained for teardown. */
+interface ProcessResources extends ProcessExitObservation {
   readonly child: ChildProcessWithoutNullStreams;
-  /** Original positive spawn PID, independent of later changes to child.pid. */
   readonly pid: number;
   readonly owned: boolean;
-  /** Validated graceful termination timeout in milliseconds. */
   readonly timeoutMs: number;
-  /** Read current exit state, including events delivered during asynchronous teardown. */
-  readonly didExit: () => boolean;
-  readonly exited: Promise<ProcessExit>;
 }
 
 /**
- * spawnHarnessProcess transfers a successfully spawned child's pipes here. Keep write admission
- * and the cached teardown promise under one owner so disposal immediately closes admission and
- * repeated disposal shares its outcome. Consumers still own output draining and invoking disposal.
+ * Give spawnHarnessProcess's callers the pipes and exit observation. Keep stdin write admission
+ * and the teardown promise together so disposing closes admission and shares the cleanup outcome.
  */
 function createProcessHandle(resources: ProcessResources): HarnessProcess {
   const { child, pid, owned, didExit, exited } = resources;
+  const { stdin, stdout, stderr } = child;
   let disposePromise: Promise<void> | undefined;
   return {
-    pid, owned, stdout: child.stdout, stderr: child.stderr, exited,
-    /** Write to live stdin and resolve its native callback; reject closed/disposed/exited input or OS write failure without retrying. */
+    pid, owned, stdout, stderr, exited,
     write(chunk) {
-      if (disposePromise || child.stdin.destroyed || child.stdin.writableEnded || didExit()) {
+      if (disposePromise || isInputClosed(stdin) || didExit()) {
         return Promise.reject(new ProcessPortError('PROCESS_WRITE_FAILED', 'Harness process input is closed'));
       }
-      return new Promise<void>((resolve, reject) => {
-        child.stdin.write(chunk, (error?: Error | null) => error
-          ? reject(new ProcessPortError('PROCESS_WRITE_FAILED', 'Unable to write harness input', { cause: error }))
-          : resolve());
+      return runInputOperation('Unable to write harness input', (complete) => {
+        stdin.write(chunk, complete);
       });
     },
-    closeInput: () => closeProcessInput(child),
-    /**
-     * Cache tree teardown, escalate owned children, and always destroy all local pipes; unowned
-     * children are unrefed without waiting. Reject sanitized cleanup failure.
-     */
+    closeInput() {
+      return runInputOperation('Unable to close harness input', (complete) => {
+        if (isInputClosed(stdin)) complete();
+        else stdin.end(complete);
+      });
+    },
     dispose() {
       return disposePromise ??= disposeProcess(resources);
     },
   };
 }
 
-/**
- * processGroupExists uses this for POSIX polling; windowsKillTree uses it to distinguish a taskkill
- * failure from concurrent child exit. Probe a PID or negative POSIX group without signalling it; EPERM
- * counts as existing so cleanup still escalates.
- */
-function processOrGroupExists(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
+/** Treat ending as closed for writes and redundant close requests. */
+function isInputClosed(stdin: ChildProcessWithoutNullStreams['stdin']): boolean {
+  return stdin.destroyed || stdin.writableEnded;
 }
 
 /**
- * terminatePosixTree polls this during the graceful phase and before escalation. Probe the original
- * POSIX group, including descendants that can outlive the direct child.
+ * Settle the handle's write or close promise from the callback passed to stdin. Convert callback
+ * errors to PROCESS_WRITE_FAILED and let synchronous exceptions reject through the promise executor.
  */
-function processGroupExists(processGroupId: number): boolean {
-  return processOrGroupExists(-processGroupId);
+function runInputOperation(
+  failureMessage: string,
+  start: (complete: (error?: Error | null) => void) => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    start((error) => {
+      if (error) reject(new ProcessPortError('PROCESS_WRITE_FAILED', failureMessage, { cause: error }));
+      else resolve();
+    });
+  });
 }
 
 /**
- * signalGroupWithExitRace calls this for each bounded attempt. Signal the original POSIX group; ignore
- * vanished groups and propagate other OS failures to the cleanup owner.
+ * createProcessHandle's dispose method caches this promise. Terminate owned trees or unref
+ * external processes, then destroy local pipes even on failure. Convert native termination or
+ * unref errors to a ProcessPortError containing only safe error details.
  */
-function signalGroup(pid: number, signal: NodeJS.Signals): void {
-  try { process.kill(-pid, signal); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+async function disposeProcess({ child, pid, owned, timeoutMs, didExit, exited }: ProcessResources): Promise<void> {
+  try {
+    if (owned) {
+      await terminateTree(pid, timeoutMs, didExit);
+      if (!didExit()) await waitForTerminatedProcessExit(didExit, exited);
+    } else {
+      child.unref();
+    }
+  } catch (cause) {
+    if (cause instanceof ProcessPortError) throw cause;
+    throw new ProcessPortError('PROCESS_DISPOSE_FAILED', 'Unable to dispose harness process', { cause });
+  } finally {
+    destroyProcessStreams(child);
   }
 }
 
 /**
- * terminatePosixTree awaits this for SIGTERM and any SIGKILL escalation. Signal a POSIX group with
- * short bounded retries for exit-time EPERM races; propagate persistent permission or other OS
- * failure.
+ * After tree termination, disposeProcess allows 1000 ms for any pending child exit observation.
+ * A vanished group can precede the child exit event. Reject PROCESS_DISPOSE_FAILED if exit still
+ * has not been observed.
  */
-async function signalGroupWithExitRace(pid: number, signal: NodeJS.Signals): Promise<void> {
-  // A source can close its pipes just before process exit is delivered. Give that
-  // short race time to settle; a persistent permission failure is still an error.
+async function waitForTerminatedProcessExit(didExit: () => boolean, exited: Promise<ProcessExit>): Promise<void> {
+  await Promise.race([exited, delay(1000)]);
+  if (!didExit()) throw new ProcessPortError('PROCESS_DISPOSE_FAILED', 'Harness process did not exit after termination');
+}
+
+/**
+ * disposeProcess awaits this only for owned children and sanitizes failures before rejecting its
+ * public dispose promise. Validate the retained PID, then delegate platform cleanup; callers retain
+ * ownership of exit observation and pipe destruction.
+ */
+async function terminateTree(pid: number, timeoutMs: number, didExit: () => boolean): Promise<void> {
+  // Bun may clear/change ChildProcess.pid after exit. Only use the original positive PID.
+  if (!Number.isSafeInteger(pid) || pid <= 1) throw new ProcessPortError('PROCESS_DISPOSE_FAILED', 'Invalid original harness PID');
+  if (process.platform === 'win32') return terminateWindowsTree(pid, timeoutMs, didExit);
+  return terminatePosixTree(pid, timeoutMs);
+}
+
+/**
+ * terminateTree delegates here on POSIX; exit observation and pipe destruction remain in
+ * disposeProcess. Stop the detached POSIX group and force remaining descendants after the grace
+ * period.
+ */
+async function terminatePosixTree(pid: number, timeoutMs: number): Promise<void> {
+  // Descendants can keep inherited pipes open after the direct child has exited.
+  const group = -pid;
+  await signalGroupWithExitRace(group, 'SIGTERM');
+  const deadline = Date.now() + timeoutMs;
+  while (processOrGroupExists(group) && Date.now() < deadline) await delay(10);
+  if (processOrGroupExists(group)) await signalGroupWithExitRace(group, 'SIGKILL');
+}
+
+/**
+ * Signal the negative group PID for terminatePosixTree. A vanished group completes the attempt.
+ * Retry a short exit-time EPERM race up to four times, then propagate the failure to disposal.
+ */
+async function signalGroupWithExitRace(group: number, signal: NodeJS.Signals): Promise<void> {
   for (let attempt = 0; ; attempt++) {
-    try { signalGroup(pid, signal); return; }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EPERM' || attempt >= 4) throw error;
+    try {
+      process.kill(group, signal);
+      return;
+    } catch (error) {
+      const { code } = error as NodeJS.ErrnoException;
+      if (code === 'ESRCH') return;
+      if (code !== 'EPERM' || attempt >= 4) throw error;
       await delay(10);
     }
   }
 }
 
 /**
- * terminateWindowsTree awaits this for graceful or forced teardown. Run taskkill without a shell for
- * the original child/tree; reject spawn or persistent nonzero failure, allowing concurrent exit races.
+ * Stop the Windows tree for terminateTree. Attempt graceful taskkill while the child is still
+ * running. Escalate immediately if that attempt fails and exit is still pending, or after the
+ * grace period if the child remains alive. Forced taskkill failures reject teardown.
+ */
+async function terminateWindowsTree(pid: number, timeoutMs: number, didExit: () => boolean): Promise<void> {
+  if (!didExit()) {
+    try {
+      await windowsKillTree(pid, 'graceful');
+    } catch {
+      // Console-less Windows children may reject non-forced taskkill, so retry while alive.
+      if (!didExit()) await windowsKillTree(pid, 'force');
+    }
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (!didExit() && Date.now() < deadline) await delay(10);
+  if (!didExit()) await windowsKillTree(pid, 'force');
+}
+
+/**
+ * Run shell-free taskkill for terminateWindowsTree. Reject if the tool fails to start or exits
+ * unsuccessfully while the original PID is still present.
  */
 async function windowsKillTree(pid: number, mode: 'graceful' | 'force'): Promise<void> {
   await new Promise<void>((resolve, reject) => {
@@ -221,183 +383,21 @@ async function windowsKillTree(pid: number, mode: 'graceful' | 'force'): Promise
 }
 
 /**
- * disposeProcess awaits this only for owned children and sanitizes failures before rejecting its
- * public dispose promise. Validate the retained PID, then delegate platform cleanup; callers retain
- * ownership of exit observation and pipe destruction.
+ * terminatePosixTree uses this for POSIX polling; windowsKillTree uses it to distinguish a taskkill
+ * failure from concurrent child exit. Probe a PID or negative POSIX group without signalling it; EPERM
+ * counts as existing so cleanup still escalates.
  */
-async function terminateTree(pid: number, timeoutMs: number, didExit: () => boolean): Promise<void> {
-  // Bun may clear/change ChildProcess.pid after exit. Only use the original positive PID.
-  if (!Number.isSafeInteger(pid) || pid <= 1) throw new ProcessPortError('PROCESS_DISPOSE_FAILED', 'Invalid original harness PID');
-  if (process.platform === 'win32') return terminateWindowsTree(pid, timeoutMs, didExit);
-  return terminatePosixTree(pid, timeoutMs);
+function processOrGroupExists(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
 }
 
 /**
- * terminateTree delegates here on win32 using the exit observation supplied by observeProcess.
- * Gracefully stop the Windows tree, escalating when taskkill or the grace period leaves the child
- * alive.
+ * Extract only a bounded uppercase code for ProcessPortError; a native cause may contain private
+ * spawn arguments and must never become part of the public error.
  */
-async function terminateWindowsTree(pid: number, timeoutMs: number, didExit: () => boolean): Promise<void> {
-  if (!didExit()) {
-    try { await windowsKillTree(pid, 'graceful'); }
-    catch {
-      // Console-less Windows children may reject non-forced taskkill, so retry while alive.
-      if (!didExit()) await windowsKillTree(pid, 'force');
-    }
-  }
-  const deadline = Date.now() + timeoutMs;
-  while (!didExit() && Date.now() < deadline) await delay(10);
-  if (!didExit()) await windowsKillTree(pid, 'force');
-}
-
-/**
- * terminateTree delegates here on POSIX; exit observation and pipe destruction remain in
- * disposeProcess. Stop the detached POSIX group and force remaining descendants after the grace
- * period.
- */
-async function terminatePosixTree(pid: number, timeoutMs: number): Promise<void> {
-  // A detached POSIX child leads its own group. Kill the group, not only its parent.
-  // Children holding inherited pipes must not keep either the stream or SDK alive.
-  await signalGroupWithExitRace(pid, 'SIGTERM');
-  const deadline = Date.now() + timeoutMs;
-  while (processGroupExists(pid) && Date.now() < deadline) await delay(10);
-  if (processGroupExists(pid)) await signalGroupWithExitRace(pid, 'SIGKILL');
-}
-
-/**
- * spawnHarnessProcess uses the returned timeout for later disposal and propagates validation failure
- * without launching. Validate spawn inputs before any OS effect; reject malformed executable,
- * arguments, or shutdown timeout.
- */
-function validateProcessOptions(options: HarnessProcessOptions): number {
-  if (!options.command || options.command.includes('\0') || options.args?.some((arg) => arg.includes('\0'))) {
-    throw new ProcessPortError('HARNESS_UNAVAILABLE', 'Invalid harness executable or argument');
-  }
-  const timeoutMs = options.shutdownTimeoutMs ?? 1000;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 60_000) {
-    throw new ProcessPortError('HARNESS_UNAVAILABLE', 'Invalid process shutdown timeout');
-  }
-  return timeoutMs;
-}
-
-/**
- * spawnHarnessProcess calls this after input validation, then installs exit observation and waits for
- * spawn. Start a direct, shell-free child with piped stdio; synchronous OS launch errors become
- * privacy-safe failures.
- */
-function launchProcess({ options, owned }: { options: HarnessProcessOptions; owned: boolean }): ChildProcessWithoutNullStreams {
-  try {
-    return spawn(options.command, [...(options.args ?? [])], {
-      cwd: options.cwd, env: options.env, stdio: ['pipe', 'pipe', 'pipe'],
-      detached: owned && process.platform !== 'win32', shell: false, windowsHide: true,
-    });
-  } catch (cause) {
-    throw new ProcessPortError('HARNESS_UNAVAILABLE', 'Unable to start harness executable', { cause });
-  }
-}
-
-/** Lifecycle observations for one child; only recordSpawn updates the retained PID. */
-interface ProcessObservation {
-  readonly exited: Promise<ProcessExit>;
-  readonly didExit: () => boolean;
-  readonly originalPid: () => number | undefined;
-  /** The spawn-event listener refreshes the retained PID before startup resolves. */
-  readonly recordSpawn: () => void;
-}
-
-/**
- * spawnHarnessProcess registers exit/error listeners here before waiting for spawn. Its returned
- * handle exposes the non-rejecting exit promise and uses didExit for write admission and disposal.
- * Retain the spawn-time PID because runtimes may clear or change child.pid after exit.
- */
-function observeProcess(child: ChildProcessWithoutNullStreams): ProcessObservation {
-  let didExit = false;
-  let originalPid = child.pid;
-  const exited = new Promise<ProcessExit>((resolve) => {
-    child.once('exit', (code, signal) => { didExit = true; resolve({ code, signal }); });
-    child.once('error', (error: NodeJS.ErrnoException) => {
-      if (!child.pid) { didExit = true; resolve({ code: null, signal: null, errorCode: error.code }); }
-    });
-  });
-  return {
-    exited,
-    didExit: () => didExit,
-    originalPid: () => originalPid,
-    recordSpawn: () => { if (child.pid !== undefined && child.pid > 1) originalPid = child.pid; },
-  };
-}
-
-/**
- * spawnHarnessProcess awaits this PID before returning its I/O handles. Wait for the spawn event,
- * recording its PID; on startup failure destroy every local pipe before rejecting.
- */
-async function waitForSpawn(child: ChildProcessWithoutNullStreams, observation: ProcessObservation): Promise<number> {
-  try {
-    await new Promise<void>((resolve, reject) => {
-      child.once('spawn', () => { observation.recordSpawn(); resolve(); });
-      child.once('error', reject);
-    });
-  } catch (cause) {
-    destroyProcessStreams(child);
-    throw new ProcessPortError('HARNESS_UNAVAILABLE', 'Unable to start harness executable', { cause });
-  }
-  const pid = observation.originalPid();
-  if (pid === undefined || pid <= 1) {
-    destroyProcessStreams(child);
-    throw new ProcessPortError('HARNESS_UNAVAILABLE', 'Unable to start harness executable');
-  }
-  return pid;
-}
-
-/**
- * waitForSpawn calls this after failed startup; disposeProcess always calls it from finally. Destroy
- * local stdio handles; disposal uses this in finally so pipe cleanup survives termination errors.
- */
-function destroyProcessStreams(child: ChildProcessWithoutNullStreams): void {
-  child.stdin.destroy();
-  child.stdout.destroy();
-  child.stderr.destroy();
-}
-
-/**
- * The HarnessProcess.closeInput callback returned by spawnHarnessProcess delegates here; adapters must
- * finish their writes before closing input. Idempotently end stdin after pending writes; reject native
- * close failures without terminating the child.
- */
-function closeProcessInput(child: ChildProcessWithoutNullStreams): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (child.stdin.destroyed || child.stdin.writableEnded) { resolve(); return; }
-    child.stdin.end((error?: Error | null) => error
-      ? reject(new ProcessPortError('PROCESS_WRITE_FAILED', 'Unable to close harness input', { cause: error }))
-      : resolve());
-  });
-}
-
-/**
- * createProcessHandle caches this promise so repeated dispose calls share success or failure.
- * Terminate owned trees or unref external processes, then destroy local pipes even on failure;
- * convert native termination errors to ProcessPortError without retaining private causes.
- */
-async function disposeProcess({ child, pid, owned, timeoutMs, didExit, exited }: ProcessResources): Promise<void> {
-  try {
-    if (owned) {
-      await terminateTree(pid, timeoutMs, didExit);
-      if (!didExit()) await waitForTerminatedProcessExit(didExit, exited);
-    } else child.unref();
-  } catch (cause) {
-    if (cause instanceof ProcessPortError) throw cause;
-    throw new ProcessPortError('PROCESS_DISPOSE_FAILED', 'Unable to dispose harness process', { cause });
-  } finally {
-    destroyProcessStreams(child);
-  }
-}
-
-/**
- * disposeProcess awaits this when owned-tree termination has not yet produced a child exit event:
- * a vanished group does not prove the direct child has exited. Allow up to 1000 ms, then reject failure;
- * disposeProcess still destroys the pipes in its finally block.
- */
-async function waitForTerminatedProcessExit(didExit: () => boolean, exited: Promise<ProcessExit>): Promise<void> {
-  await Promise.race([exited, delay(1000)]);
-  if (!didExit()) throw new ProcessPortError('PROCESS_DISPOSE_FAILED', 'Harness process did not exit after termination');
+function readNativeErrorCode(cause: unknown): string | undefined {
+  if (!cause || typeof cause !== 'object' || !('code' in cause)) return undefined;
+  if (typeof cause.code !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/.test(cause.code)) return undefined;
+  return cause.code;
 }

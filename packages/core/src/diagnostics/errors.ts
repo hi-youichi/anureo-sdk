@@ -1,9 +1,10 @@
 // Projects failure classifications without retaining native error text.
 /**
- * Project a catalog failure to an allowlisted code or CATALOG_QUERY_FAILED without retaining raw
- * text. An object's code property takes precedence, even when invalid; only Errors without that
- * property fall back to their message. Property getters and proxy traps may throw synchronously.
- * catalogPhase uses the result in its terminal report; direct diagnostics consumers can do the same.
+ * Classify a catalog failure for reporting without disclosing raw text. Return the allowlisted
+ * string or CATALOG_QUERY_FAILED. An object's own or inherited code property takes precedence,
+ * even when invalid. An Error without that property uses its message as the candidate.
+ * Property getters and proxy traps may throw synchronously. catalogPhase's failure report uses
+ * the returned value as errorCode.
  */
 export function safeCatalogErrorCode(cause: unknown): string {
   let code: unknown
@@ -15,10 +16,10 @@ export function safeCatalogErrorCode(cause: unknown): string {
   return typeof code === 'string' && safeCatalogCodes.has(code) ? code : 'CATALOG_QUERY_FAILED'
 }
 /**
- * Internal helper for catalogPhase's failure report: read rpcCode when its type check is numeric,
- * otherwise return undefined. No coercion or range validation is applied; accessors are read for
- * both the type check and the returned value. Property getters and proxy traps may throw, replacing
- * the phase rejection before its terminal report is emitted.
+ * Internal to diagnostics. reportCatalogFailure reads this value for the event's nativeRpcCode.
+ * Return undefined for a missing or nonnumeric rpcCode. Preserve separate reads for the type
+ * check and the returned value, which an accessor can observe. Property getters and proxy traps
+ * can throw synchronously, preventing the report and replacing the phase rejection.
  */
 export function readNativeRpcCode(cause: unknown): number | undefined {
   if (!cause || typeof cause !== 'object' || !('rpcCode' in cause)) return undefined
@@ -26,7 +27,6 @@ export function readNativeRpcCode(cause: unknown): number | undefined {
   return cause.rpcCode
 }
 
-/** Keep safeCatalogErrorCode's disclosure policy in one allowlist, independent of native messages. */
 const safeCatalogCodes = new Set([
   'AUTH_REQUIRED',
   'AUTH_FORBIDDEN',

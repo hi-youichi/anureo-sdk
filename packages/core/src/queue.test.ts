@@ -1,4 +1,3 @@
-// Checks queue settlement, isolated subscriptions and request waits; must not implement production policy.
 import { expect, test } from "bun:test";
 import { BoundedEventQueue } from "./queue";
 import { waitForRequest } from "./request";
@@ -18,8 +17,8 @@ test("a full queue pauses an awaited writer without dropping values", async () =
   queue.end(); expect((await reader.next()).done).toBe(true);
 });
 
-/** Exercise synchronous overflow and endWithControl; the rejected value must not replace data, and the reserved terminal control must drain last. */
-test("non-pausable overflow is explicit, with a reserved terminal slot", async () => {
+/** A full regular buffer leaves room for a terminal control, which drains after the original value. */
+test("regular overflow still allows a terminal control", async () => {
   const queue = new BoundedEventQueue<string>({ maxEvents: 1 });
   queue.push("first"); expect(() => queue.push("lost")).toThrow("BACKPRESSURE_EXCEEDED");
   queue.endWithControl("failed");
@@ -29,14 +28,14 @@ test("non-pausable overflow is explicit, with a reserved terminal slot", async (
   expect((await reader.next()).done).toBe(true);
 });
 
-/** Register a pending next before endWithControl; direct delivery must expose the control before a subsequent next observes completion. */
-test("an awaited reader receives the reserved failure before completion", async () => {
+/** endWithControl delivers to a pending read before a subsequent read observes completion. */
+test("a pending reader receives the terminal control before completion", async () => {
   const queue = new BoundedEventQueue<string>(); const reader = queue[Symbol.asyncIterator]();
   const pending = reader.next(); queue.endWithControl("failed");
   expect((await pending).value).toBe("failed"); expect((await reader.next()).done).toBe(true);
 });
 
-/** Return a blocked reader and claim a replacement; the original read must complete while the replacement can still consume producer data. Return both readers. */
+/** Returning a blocked reader releases ownership. Later calls on it cannot consume the replacement's data or complete its pending read. */
 test("detach releases ownership without closing the producer", async () => {
   const queue = new BoundedEventQueue<number>();
   const reader = queue[Symbol.asyncIterator]();
@@ -49,7 +48,13 @@ test("detach releases ownership without closing the producer", async () => {
   queue.push(3);
 
   const replacementReader = queue[Symbol.asyncIterator]();
+  expect((await reader.next()).done).toBe(true);
   expect((await replacementReader.next()).value).toBe(3);
+
+  const replacementRead = replacementReader.next();
+  await reader.return?.();
+  queue.push(4);
+  expect(await replacementRead).toEqual({ done: false, value: 4 });
   await replacementReader.return?.();
 });
 
@@ -90,6 +95,16 @@ test("request abort before dispatch has no side effect; abort after dispatch is 
   after.abort(); await expect(pending).rejects.toMatchObject({ code: "REQUEST_ABORTED", outcomeUnknown: true }); expect(calls).toBe(1);
 });
 
+/** Register the abort listener before calling the operation and observe its rejection even when abort settles the wait first. */
+test("synchronous abort during dispatch wins over the operation's rejection", async () => {
+  const controller = new AbortController();
+  const pending = waitForRequest(() => {
+    controller.abort();
+    return Promise.reject(new Error("operation failed"));
+  }, { signal: controller.signal });
+  await expect(pending).rejects.toMatchObject({ code: "REQUEST_ABORTED", outcomeUnknown: true });
+});
+
 /** Let the request deadline precede backend rejection; await both intervals to detect unobserved rejection and prove the operation is never resubmitted. */
 test("timeout observes a late backend rejection without resubmitting", async () => {
   let calls = 0;
@@ -122,7 +137,7 @@ test("regular data drains before controls regardless of admission order", async 
   expect((await reader.next()).done).toBe(true);
 });
 
-/** End a full queue with a failure while write is blocked; reject admission immediately but retain regular/control drain order before read failure and release ownership. */
+/** Closing with a cause wakes blocked writers to reject and preserves buffered delivery before read failure. */
 test("failed closure rejects writers and drains admitted values before rejecting reads", async () => {
   const queue = new BoundedEventQueue<number>({ maxEvents: 1 });
   const failure = new Error("producer failed");

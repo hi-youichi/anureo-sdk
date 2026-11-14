@@ -24,15 +24,14 @@ export const plan = { summary: 'Two cohesive modules', modules: [
 ] }
 /** Default work response for fixture agents; consumers reuse it without mutating shared state. */
 export const unchanged = { summary: 'Read the code; direct expression is appropriate.', changes: [], deferred: [] }
-/** Return an edit-claim response for a test-supplied description; performs no I/O and does not throw.
- * Tests must make the real edit separately so host observations remain independent of agent claims. */
+/** Return an agent's edit claim. Tests make the real edit separately so host observations
+ * remain independent of the claim. */
 export const edited = (change = 'Renamed internal value') => ({ summary: 'Edited', changes: [change], deferred: [] })
-/** Return the first heading (empty for empty input) for test routing; pure, with no expected errors. */
+/** Return the first line for prompt routing, or an empty string for empty input. */
 export const kind = (prompt: string) => prompt.split('\n')[0]!
-/** Read a module ID from its serialized prompt header for test routing, or undefined if absent.
- * Pure matching does not parse the rest of the prompt and has no expected errors. */
+/** Read a module ID from its serialized prompt header, or return undefined when absent. */
 export const moduleOf = (prompt: string) => /Module: \{"id":"([^"]+)"/.exec(prompt)?.[1]
-/** Return a schema-compatible two-node graph for a test cwd without validation, I/O or expected errors. */
+/** Build a two-file graph rooted at the test target for injected graph loaders. */
 export function graph(cwd: string): RepositoryGraph {
   return { schemaVersion: 1, repositoryPath: cwd, kind: 'all', indexReport: { status: 'indexed' }, nodes: [
     { id: 'a', labels: ['Function'], name: 'calculate', filePath: 'a.ts', startLine: 1, endLine: 1 },
@@ -44,10 +43,8 @@ export function graph(cwd: string): RepositoryGraph {
  * Defaults to the shared plan for planning prompts and unchanged work otherwise. A supplied responder
  * is awaited on each submission; return HarnessSdkError to fail the turn or a JSON-serializable value
  * as agent output. Tests make edits themselves so host snapshots can verify them independently.
- * Returns the cwd, client, adapter, prompt log and an in-memory graph loader; setup failures reject.
- * Shared afterEach disposes registered clients and removes registered directories, even if setup fails. */
-type Responder = (prompt: string, cwd: string) => unknown | Promise<unknown>
-
+ * Returns the cwd, client, adapter, prompt log and an in-memory graph loader. Setup failures reject.
+ * Shared afterEach handles registered resources, including directories from failed setup. */
 export async function fixture(respond: Responder = prompt => prompt.startsWith('PLAN') ? plan : unchanged) {
   const cwd = await temporary()
   await Promise.all(['a.ts', 'b.ts'].map(file => writeFile(join(cwd, file), 'export const value = 1\n')))
@@ -61,6 +58,9 @@ export async function fixture(respond: Responder = prompt => prompt.startsWith('
   return { cwd, client, adapter, prompts, graphLoader: async () => graph(cwd) }
 }
 
+/** Script one submission's output against the session's own working directory. */
+type Responder = (prompt: string, cwd: string) => unknown | Promise<unknown>
+
 const clients: Client[] = []
 const directories: string[] = []
 /** Attempt client disposal before removing test repositories. Disposal or removal failures reject
@@ -70,16 +70,16 @@ afterEach(async () => {
   finally { await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true }))) }
 })
 
-/** Build the fixture adapter with a caller-supplied responder and prompt log; no resources start yet.
- * createScriptedAdapter invokes execute for session calls: submissions append their text to prompts
- * and emit start before awaiting respond. A returned HarnessSdkError becomes a failed terminal event;
- * other values become final JSON followed by completion. Thrown responder/serialization/event errors
- * reject submission; non-submission calls fall through to the adapter defaults. */
+/** Build the adapter that fixture passes to createClient. During submission, the scripted
+ * backend invokes execute to log the prompt and emit start before awaiting the responder.
+ * A returned HarnessSdkError becomes a failed terminal event. Other values are serialized to
+ * final JSON before completion. Responder, serialization and event errors reject the submission.
+ * Other session calls use the adapter defaults. */
 function respondingAdapter(respond: Responder, prompts: string[]) {
-  const directories = new Map<string, string>()
+  const sessionDirectories = new Map<string, string>()
   return createScriptedAdapter({
-    onOpen: async params => { directories.set(params.binding.sessionId, params.cwd) },
-    /** Handle submissions in SDK event order, awaiting the test responder before completing each turn. */
+    /** The adapter awaits this at session open, before a submission can use the recorded cwd. */
+    onOpen: async params => { sessionDirectories.set(params.binding.sessionId, params.cwd) },
     execute: async (call, sink) => {
       if (call.method !== 'input/submit' || !('input' in call.params) || !('submissionId' in call.params)) return undefined
       const { input, submissionId, sessionId } = call.params
@@ -87,7 +87,7 @@ function respondingAdapter(respond: Responder, prompts: string[]) {
       prompts.push(prompt)
       const turnId = randomUUID()
       await sink.emit({ type: 'turn/started', payload: { turnId } })
-      const result = await respond(prompt, directories.get(sessionId)!)
+      const result = await respond(prompt, sessionDirectories.get(sessionId)!)
       if (result instanceof HarnessSdkError) {
         await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: {
           code: result.code, message: result.message, retryable: result.retryable, outcomeUnknown: result.outcomeUnknown,

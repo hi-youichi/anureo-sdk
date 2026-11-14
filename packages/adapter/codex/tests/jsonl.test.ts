@@ -1,18 +1,11 @@
-/** Verifies transport framing, ordering and cleanup with controlled streams; it must not interpret session policy or require a native process. */
+/** Verifies JSONL framing, ordering and cleanup with controlled in-memory process streams. */
 import { describe, expect, test } from 'bun:test'
 import { PassThrough } from 'node:stream'
 import { CodexJsonlClient, CodexRpcError } from '../src/jsonl'
 import type { JsonlHandlers, JsonlOptions } from '../src/jsonl'
 import type { HarnessProcess } from '@anureo/sdk/process'
 
-/** Give concurrency tests a manually released barrier without timers or I/O; the synchronous Promise executor installs resolve before this returns. */
-function deferred() {
-  let resolve!: () => void
-  const promise = new Promise<void>(release => { resolve = release })
-  return { promise, resolve }
-}
-
-/** Build an in-memory client with optional handler overrides and captured effects. Tests drive stdout and must dispose the client; waitForWrite observes only the first completed write, not handler completion. */
+/** Build an in-memory client with optional handler overrides and captured effects. Tests drive stdout and must dispose the client; waitForWrite observes the first captured write, which can precede handler completion. */
 function fixture({
   options = {},
   request = async (_request, reply) => { await reply({ accepted: true }) },
@@ -24,7 +17,7 @@ function fixture({
 } = {}) {
   const stdout = new PassThrough(), stderr = new PassThrough()
   const writes: string[] = [], diagnostics: string[] = [], failures: unknown[] = []
-  const firstWrite = deferred()
+  const firstWrite = Promise.withResolvers<void>()
   const process: HarnessProcess = {
     pid: 1,
     owned: true,
@@ -129,7 +122,7 @@ describe('native JSONL transport', () => {
     expect(f.stderr.writableEnded).toBe(true)
   })
   /** Handler exceptions need a safe fallback so native callers are not left waiting for an answer. */
-  test('a throwing native handler replies with an interaction-unavailable error', async () => {
+  test('a rejected native handler replies with an interaction-unavailable error', async () => {
     const f = fixture({ request: async () => { throw new Error('handler crashed') } })
     f.stdout.write(JSON.stringify({ id: 'native-2', method: 'permission', params: {} }) + '\n')
     await f.waitForWrite()
@@ -139,10 +132,22 @@ describe('native JSONL transport', () => {
     expect(f.stderr.writableEnded).toBe(true)
   })
 
+  /** A synchronous throw reaches the reader's failure path before the handler returns a promise. */
+  test('a synchronous native handler throw fails the reader without replying', async () => {
+    const f = fixture({ request: () => { throw new Error('private handler failure') } })
+    try {
+      f.stdout.write(JSON.stringify({ id: 'native-sync', method: 'permission' }) + '\n')
+      await f.client.finished
+      expect(f.writes).toEqual([])
+      expect(f.failures).toHaveLength(1)
+      expect(f.failures[0]).toMatchObject({ code: 'PROTOCOL_ERROR', message: 'Invalid Codex stream', outcomeUnknown: true })
+    } finally { await f.client.dispose() }
+  })
+
   /** Notifications form a wire-order barrier, while a user interaction must leave stdout free to deliver other notifications and RPC results. */
   test('awaits notifications in order while server requests run concurrently', async () => {
-    const notificationStarted = deferred(), releaseNotification = deferred()
-    const releaseInteraction = deferred(), interactionAnswered = deferred()
+    const notificationStarted = Promise.withResolvers<void>(), releaseNotification = Promise.withResolvers<void>()
+    const releaseInteraction = Promise.withResolvers<void>(), interactionAnswered = Promise.withResolvers<void>()
     const events: string[] = []
     const f = fixture({
       /** Hold the first notification so assertions can inspect the stream before the barrier opens. */
@@ -191,7 +196,7 @@ describe('native JSONL transport', () => {
   for (const outcome of ['written', 'failed'] as const) {
     /** Ownership is claimed before I/O; neither duplicate callbacks nor handler fallback may retry a possibly delivered response. */
     test(`retains single-response ownership after a ${outcome} reply`, async () => {
-      const handled = deferred()
+      const handled = Promise.withResolvers<void>()
       const attempts: unknown[] = []
       let replyFailure: unknown, duplicateFailure: unknown
       const f = fixture({
@@ -227,7 +232,7 @@ describe('native JSONL transport', () => {
 
   /** Reply completion cannot free capacity while the handler still owns work; otherwise slow handlers evade the concurrency bound. */
   test('holds server capacity until the entire handler completes', async () => {
-    const replied = deferred(), releaseHandler = deferred()
+    const replied = Promise.withResolvers<void>(), releaseHandler = Promise.withResolvers<void>()
     const handled: (number | string)[] = []
     const f = fixture({
       options: { maxServerRequests: 1 },
@@ -255,7 +260,7 @@ describe('native JSONL transport', () => {
 
   /** Disposal forbids new writes but must not cancel admitted writes; a failed predecessor must also leave the queue usable. */
   test('preserves queued writes across write failure and shared disposal', async () => {
-    const started = deferred(), releaseWrite = deferred()
+    const started = Promise.withResolvers<void>(), releaseWrite = Promise.withResolvers<void>()
     const f = fixture()
     const attempts: string[] = []
     let disposals = 0

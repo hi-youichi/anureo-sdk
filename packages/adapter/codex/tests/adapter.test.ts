@@ -1,4 +1,4 @@
-/** Owns adapter integration regressions, including cross-module compatibility and projection assertions; it must use fake native processes and never contact a real Codex account. */
+/** Exercises Codex adapter and SDK integration against fake native processes. */
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
@@ -6,18 +6,16 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { createClient, type Client } from '@anureo/sdk'
 import type { HarnessProcess } from '@anureo/sdk/process'
-import { type AhpEvent, type InteractionResponse, type JsonObject } from '@anureo/protocol'
+import { type AhpEvent, type InitializeParams, type InteractionResponse, type JsonObject } from '@anureo/protocol'
 import { createCodexAdapter, codexCapabilities, mapItems, mapUsage, resolveCodexProfile, type CodexAdapterOptions } from '../src'
 import { rejectionOf } from './test-helpers'
 
 const resources: Array<{ dispose(): Promise<void> }> = []
 const dirs: string[] = []
 
-/** Release registered runtimes before deleting their working directories; cleanup failures reject the test hook rather than hiding retained resources. */
+/** Release registered runtimes before removing directories their processes may still use. */
 afterEach(async () => {
   await Promise.all(resources.splice(0).map(resource => resource.dispose()))
-
-  // Remove working directories only after all process resources are disposed.
   await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })))
 })
 
@@ -30,27 +28,38 @@ type SetupOptions = {
   model?: string
 }
 
-/** Create a temporary cwd, fake native process and SDK session, registering resources for afterEach cleanup. Return event/log waiters; reject startup failures without using a real account. */
+/** Open a fake Codex session, register its runtime and cwd for cleanup, and expose the event stream and wire log for assertions. Startup failures reject. */
 async function setup({ scenario = 'normal', version = '0.164.0', timeoutMs = 1000, config, model }: SetupOptions = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), 'codex adapter '))
   dirs.push(dir)
   const log = path.join(dir, 'calls.jsonl')
   // Bootstrap is not the operation under timeout test; Windows process startup may exceed 100ms.
   const bootstrapTimeoutMs = Math.max(1000, timeoutMs)
-  const adapter = createCodexAdapter({ command: process.execPath, args: [fileURLToPath(new URL('./fake-app-server.mjs', import.meta.url))], version, env: { ...process.env, FAKE_SCENARIO: scenario, FAKE_LOG_FILE: log }, timeoutMs: bootstrapTimeoutMs })
-  const runtime = await createClient({adapter,identity:{adapterId:'codex',runtimeConfigId:'codex-test'},interactions:{approval:undefined,userInput:undefined,elicitation:undefined,dynamicTool:undefined}}); resources.push(runtime)
-  const session = await runtime.openSession({ requestId: 'open', mode: 'new', binding: { sessionId: 'session', adapterId: 'codex', runtimeConfigId: 'codex-test' }, cwd: dir, config, ...(model ? { model } : {}) })
+  const identity = { adapterId: 'codex', runtimeConfigId: 'codex-test' }
+  const adapter = createCodexAdapter({
+    command: process.execPath,
+    args: [fileURLToPath(new URL('./fake-app-server.mjs', import.meta.url))],
+    version,
+    env: { ...process.env, FAKE_SCENARIO: scenario, FAKE_LOG_FILE: log },
+    timeoutMs: bootstrapTimeoutMs,
+  })
+  const runtime = await createClient({
+    adapter, identity, interactions: { approval: undefined, userInput: undefined, elicitation: undefined, dynamicTool: undefined },
+  })
+  resources.push(runtime)
+  const session = await runtime.openSession({
+    requestId: 'open', mode: 'new', binding: { sessionId: 'session', ...identity }, cwd: dir,
+    config, ...(model ? { model } : {}),
+  })
   adapter.options.timeoutMs = timeoutMs
-  const { events, waitFor, consume } = collectSessionEvents(session)
   /** Read the fake process log in wire order for assertions; filesystem/JSON errors reject and afterEach owns temporary directory removal. */
   const calls = async () => (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { method?: string; params?: Record<string, unknown>; id?: string|number; result?: unknown; error?: unknown })
-  return { adapter, runtime, session, events, waitFor, calls, consume, dir }
+  return { adapter, runtime, session, calls, dir, ...collectSessionEvents(session) }
 }
 /** For setup, collect one SDK session's events and return predicate waiters plus collector completion. Each waiter owns its timer/listener; stream failures remain visible as unmet-condition timeouts, while afterEach owns session disposal. */
 function collectSessionEvents(session: Awaited<ReturnType<Client['openSession']>>) {
   const events: AhpEvent[] = []
   const listeners = new Set<() => void>()
-  /** Drain this fixture's event stream in order and notify current waiters; absorb stream failures so each unmet condition fails through its own deadline. */
   const consume = (async () => {
     try {
       for await (const event of session.events()) {
@@ -70,7 +79,6 @@ function collectSessionEvents(session: Awaited<ReturnType<Client['openSession']>
       resolve()
       return
     }
-    /** Event-collector callback resolves this waiter only after its predicate holds, releasing its timer/listener; predicate errors propagate into the collector and timeout still owns failure. */
     const done = () => {
       if (condition()) {
         clearTimeout(timer)
@@ -230,8 +238,7 @@ describe('independent account readiness', () => {
   /** Return malformed fake readiness evidence and require failure before dispatch rather than silently assuming an anonymous provider. */
   test('invalid account status is not treated as an anonymous provider', async () => {
     const s = await setup({ scenario: 'auth-malformed' })
-    let failure: unknown; try { await s.session.submit(start) } catch (cause) { failure = cause }
-    expect(failure).toMatchObject({ code: 'PROTOCOL_ERROR' })
+    expect(await rejectionOf(s.session.submit(start))).toMatchObject({ code: 'PROTOCOL_ERROR' })
     expect((await s.calls()).some(call => call.method === 'turn/start')).toBe(false)
   })
   /** Wait for terminal fake evidence to verify auth classification and diagnostic redaction after dispatch; setup owns process cleanup. */
@@ -336,7 +343,7 @@ describe('versioned controls and history', () => {
   /** Call an absent fake method twice around a successful turn: only definite method absence may revoke the capability and suppress later probes. */
   test('revokes an absent optional history method while keeping the new session usable for its first turn', async () => {
     const s = await setup({ scenario: 'no-history' })
-    let failure: unknown; try { await s.session.request('history/read', { requestId: 'history', sessionId: 'session' }) } catch (cause) { failure = cause }
+    const failure = await rejectionOf(s.session.request('history/read', { requestId: 'history', sessionId: 'session' }))
     expect(failure).toMatchObject({ code: 'CAPABILITY_UNSUPPORTED', outcomeUnknown: false })
     expect(s.session.capabilities.session?.history).toBe(false)
     expect(await s.session.submit(start)).toMatchObject({ id: 'native-turn-1' })
@@ -652,20 +659,30 @@ describe('version probe', () => {
       async closeInput() {}, async dispose() {},
     }
   }
-  /** Initialize an adapter with an injected version process and register it for afterEach disposal; return negotiation/probe completion or rejection without opening a session. */
-  const initializeWith = (processFactory: NonNullable<CodexAdapterOptions['processFactory']>) => {
-    const adapter = createCodexAdapter({ command: process.execPath, args: ['app-server'], version: undefined, timeoutMs: 2000, processFactory })
+  /** Initialize against the supplied fake launcher. afterEach owns the adapter even if the probe rejects. */
+  function initializeWith({
+    processFactory, version, timeoutMs = 2000, clientCapabilities,
+  }: Pick<CodexAdapterOptions, 'version' | 'timeoutMs'> & {
+    processFactory: NonNullable<CodexAdapterOptions['processFactory']>
+    clientCapabilities?: InitializeParams['clientCapabilities']
+  }) {
+    const adapter = createCodexAdapter({ command: process.execPath, args: ['app-server'], version, timeoutMs, processFactory })
     resources.push(adapter)
-    return adapter.initialize({protocolVersions:[1],protocolContract:'native-lifecycle',clientInfo:{name:'test',version:'1'}})
+    return adapter.initialize({
+      protocolVersions: [1], protocolContract: 'native-lifecycle', clientInfo: { name: 'test', version: '1' },
+      ...(clientCapabilities && { clientCapabilities }),
+    })
   }
   /** Inject finite probe stdout and count cleanup before accepting initialization; app-server arguments must not leak into the version command. */
   test('an unpinned version resolves from a short-lived --version process', async () => {
     let disposals = 0
-    const initialized = await initializeWith(async options => {
-      expect(options).toMatchObject({ command: process.execPath, args: ['--version'] })
-      const probe = fakeProbeProcess({ output: 'codex-cli 0.164.0 (probe build)\n', code: 0 })
-      probe.dispose = async () => { disposals++ }
-      return probe
+    const initialized = await initializeWith({
+      processFactory: async options => {
+        expect(options).toMatchObject({ command: process.execPath, args: ['--version'] })
+        const probe = fakeProbeProcess({ output: 'codex-cli 0.164.0 (probe build)\n', code: 0 })
+        probe.dispose = async () => { disposals++ }
+        return probe
+      },
     })
     expect(initialized.runtime.version).toBe('0.164.0')
     expect(disposals).toBe(1)
@@ -677,10 +694,12 @@ describe('version probe', () => {
       ['x'.repeat(5000) + '\n', 0, 'PROTOCOL_ERROR'],
     ] as const) {
       let disposals = 0
-      await expect(initializeWith(async () => {
-        const probe = fakeProbeProcess({ output, code })
-        probe.dispose = async () => { disposals++ }
-        return probe
+      await expect(initializeWith({
+        processFactory: async () => {
+          const probe = fakeProbeProcess({ output, code })
+          probe.dispose = async () => { disposals++ }
+          return probe
+        },
       })).rejects.toMatchObject({ code: expectedCode })
       expect(disposals).toBe(1)
     }
@@ -691,29 +710,33 @@ describe('version probe', () => {
       ['codex-cli 0.164.0-dev+build', '0.164.0'],
       ['custom build', 'custom build'],
     ]) {
-      const adapter = createCodexAdapter({ command: process.execPath, version, processFactory: async () => { throw new Error('Override must bypass process creation') } })
-      resources.push(adapter)
-      const initialized = await adapter.initialize({ protocolVersions: [1], protocolContract: 'native-lifecycle', clientInfo: { name: 'test', version: '1' } })
+      const initialized = await initializeWith({
+        version,
+        processFactory: async () => { throw new Error('Override must bypass process creation') },
+      })
       expect(initialized.runtime.version).toBe(expected)
     }
   })
   /** Inject adjacent decoded-text boundary sizes; accepting the exact limit must preserve unknown-version capability fallback without changing the limit unit. */
   test('probe output keeps the exact decoded-text limit and preserves unmatched version text', async () => {
-    const accepted = await initializeWith(async () => fakeProbeProcess({ output: 'x'.repeat(4096), code: 0 }))
+    const accepted = await initializeWith({ processFactory: async () => fakeProbeProcess({ output: 'x'.repeat(4096), code: 0 }) })
     expect(accepted.runtime.version).toBe('x'.repeat(4096))
     expect(accepted.capabilities.session?.resume).toBe(false)
-    await expect(initializeWith(async () => fakeProbeProcess({ output: 'x'.repeat(4097), code: 0 }))).rejects.toMatchObject({ code: 'PROTOCOL_ERROR' })
+    await expect(initializeWith({ processFactory: async () => fakeProbeProcess({ output: 'x'.repeat(4097), code: 0 }) })).rejects.toMatchObject({ code: 'PROTOCOL_ERROR' })
   })
   /** Inject stalled stdout and a counted disposer; initialization must reject at its deadline and finish cleanup before the rejection is observed. */
   test('a hung probe is bounded by the version timeout', async () => {
     let disposals = 0
-    const adapter = createCodexAdapter({ command: process.execPath, args: ['app-server'], version: undefined, timeoutMs: 30, processFactory: async () => {
-      const probe = fakeProbeProcess({ output: '', code: 0, stdout: 'stalled' })
-      probe.dispose = async () => { disposals++ }
-      return probe
-    } })
-    resources.push(adapter)
-    await expect(adapter.initialize({ protocolVersions: [1],protocolContract:'native-lifecycle', clientInfo: { name: 'test', version: '1' }, clientCapabilities: { interactions: [] } })).rejects.toMatchObject({ code: 'HARNESS_UNAVAILABLE', message: 'Codex version probe timed out' })
+    const initialized = initializeWith({
+      timeoutMs: 30,
+      clientCapabilities: { interactions: [] },
+      processFactory: async () => {
+        const probe = fakeProbeProcess({ output: '', code: 0, stdout: 'stalled' })
+        probe.dispose = async () => { disposals++ }
+        return probe
+      },
+    })
+    await expect(initialized).rejects.toMatchObject({ code: 'HARNESS_UNAVAILABLE', message: 'Codex version probe timed out' })
     expect(disposals).toBe(1)
   })
 })

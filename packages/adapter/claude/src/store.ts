@@ -5,28 +5,32 @@ import type { SessionKey, SessionStore, SessionStoreEntry } from "@anthropic-ai/
 import { HarnessSdkError } from "@anureo/sdk";
 
 /** Persist JSON-safe, opaque Claude transcript entries in a host-owned directory.
- * Supply this as sessionStore or let ClaudeNativeAdapter create it under stateDir. The native SDK
- * invokes the SessionStore methods for mirroring, resume and history; no private transcript parsing
- * is required. Keys isolate projects, sessions and subpaths. The host owns retention and must
- * coordinate deletion with writers; construction opens no resources and needs no disposal.
- * Filesystem/JSON failures reject the corresponding operation. */
+ * Supply this as sessionStore to ClaudeNativeAdapter. With a configured state directory and no
+ * supplied store, the adapter creates one in its ahp-session-store subdirectory and also uses it
+ * to persist turn IDs for boundary lookup. The native SDK invokes the SessionStore methods for
+ * mirroring, resume and history. Transcript keys include the project, session and optional
+ * subpath. The host owns retention and coordinates deletion with writers. Construction opens no
+ * resources and requires no disposal. */
 export class FileSessionStore implements SessionStore {
-  /** Retain the storage directory without creating it; writes create it with mode 0700. */
+  /** Use directory for transcripts and turn maps. Writes create missing directories with mode 0700. */
   constructor(readonly directory: string) {}
 
-  /** Commit an opaque batch under a per-key process lock, replacing matching truthy UUIDs in place.
-   * Entries without a truthy UUID append in batch order. Resolve after file sync, atomic rename and
-   * lock cleanup; a rejection may occur after publication. Lock contention polls every 10 ms and
-   * rejects SESSION_STORE_BUSY after 10 seconds unless a dead owner's lock can be reclaimed.
-   * The native SDK owns mirror retry policy; callers must supply JSON-safe entries. */
+  /** Commit a batch of JSON-safe entries under the lock for this transcript key.
+   * A truthy UUID replaces its existing entry in place. New UUIDs and entries without a truthy
+   * UUID append in batch order. Resolve after file sync, atomic rename and lock cleanup.
+   * An unreclaimable lock that is still contended at the 10-second retry deadline rejects with
+   * SESSION_STORE_BUSY. Transcript read, write and cleanup failures also reject, including
+   * cleanup after publication. ClaudeBackendSession.observedStore awaits successful
+   * main-transcript appends before scheduling a title refresh for the active query. Rejections
+   * return to the native SDK. */
   async append(key: SessionKey, entries: SessionStoreEntry[]): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    const file = this.file(key);
+    const file = this.transcriptPath(key);
     const lockPath = `${file}.lock`;
     const lockHandle = await acquireSessionLock(lockPath);
     const temporary = `${file}.${randomUUID()}.tmp`;
     try {
-      const stored = await this.read(file) ?? { key: structuredClone(key), entries: [], mtime: 0 };
+      const stored = await this.readTranscript(file) ?? { key: structuredClone(key), entries: [], mtime: 0 };
       mergeSessionEntries(stored, entries);
       await publishJson({ file, temporary, value: stored });
     } finally {
@@ -36,50 +40,62 @@ export class FileSessionStore implements SessionStore {
     }
   }
 
-  /** Load a detached full transcript, or null when the key has no file.
-   * The native SDK uses these entries for resume/history; a missing key or non-array entries reject
-   * SESSION_STORE_INVALID, and filesystem or JSON parse failures propagate. */
+  /** Load a detached full transcript, or null when the requested file is absent.
+   * An envelope without a truthy key or an entries array rejects with SESSION_STORE_INVALID.
+   * Other filesystem and JSON parse failures propagate. ClaudeBackendSession.boundaryPoint and
+   * structuredHistory also read these entries to include opaque records omitted by native history
+   * in fork/revert cutoffs and structured output in history pages, respectively. */
   async load(key: SessionKey): Promise<SessionStoreEntry[] | null> {
-    const value = await this.read(this.file(key));
-    return value ? structuredClone(value.entries) : null;
+    const stored = await this.readTranscript(this.transcriptPath(key));
+    return stored ? structuredClone(stored.entries) : null;
   }
 
-  /** List main transcripts for a project in filesystem order, without sorting.
-   * mtime is Unix epoch milliseconds, increased by at least one per committed append.
-   * A missing directory yields []; unreadable or invalid session files reject the scan. */
+  /** List transcripts with no truthy subpath for a project in filesystem order.
+   * The stored mtime is in Unix epoch milliseconds and advances on every committed append.
+   * A missing directory yields an empty list. Read and envelope errors anywhere in the
+   * transcript scan reject the listing. */
   async listSessions(projectKey: string): Promise<Array<{ sessionId: string; mtime: number }>> {
-    return (await this.all())
+    return (await this.scanTranscripts())
       .filter((entry) => entry.key.projectKey === projectKey && !entry.key.subpath)
       .map(({ key, mtime }) => ({ sessionId: key.sessionId, mtime }));
   }
 
-  /** List truthy subpaths for native resume materialization within one project/session.
-   * A missing directory yields []; scan failures propagate as in listSessions. */
+  /** List nonempty transcript subpaths for a project and session in filesystem order.
+   * A missing directory yields an empty list. Scan failures propagate as in listSessions. */
   async listSubkeys(key: { projectKey: string; sessionId: string }): Promise<string[]> {
-    return (await this.all()).flatMap((entry) => {
+    return (await this.scanTranscripts()).flatMap((entry) => {
       if (entry.key.projectKey !== key.projectKey || entry.key.sessionId !== key.sessionId) return [];
       return entry.key.subpath ? [entry.key.subpath] : [];
     });
   }
 
-  /** Remove only this transcript file, accepting an absent file.
-   * Subpaths and turn maps remain; the caller must coordinate this unlocked deletion with writers. */
-  async delete(key: SessionKey): Promise<void> { await rm(this.file(key), { force: true }); }
-
-  /** Load the adapter's native-input UUID to AHP turn-ID map, or {} if absent.
-   * ClaudeBackendSession.open and boundaryPoint use it to restore verified turn identities;
-   * other read/parse failures reject their open or boundary operation. This is separate from
-   * the native SessionStore contract and scoped by session ID, not project. */
-  async loadTurnMap(sessionId: string): Promise<Record<string, string>> {
-    try { return JSON.parse(await readFile(this.turnMapPath(sessionId), "utf8")); }
-    catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT") return {}; throw cause; }
+  /** Remove the transcript for this exact key, accepting an absent file.
+   * Other subpaths and turn maps remain. The caller must coordinate this unlocked deletion with
+   * writers. Other removal failures reject. */
+  async delete(key: SessionKey): Promise<void> {
+    await rm(this.transcriptPath(key), { force: true });
   }
 
-  /** Replace the adapter's turn map, resolving after sync, atomic rename and temporary-file cleanup.
-   * ClaudeBackendSession awaits this during open, input association, native-ID changes and
-   * conversation restoration; failures reject those operations into their existing error paths.
-   * Concurrent saves are unlocked replacements; callers own ordering, and cleanup can reject
-   * after publication. This adapter metadata is separate from the native SessionStore contract. */
+  /** Load adapter boundary metadata mapping native input UUIDs to AHP turn IDs by native session ID.
+   * Return the parsed JSON as stored, or an empty map when the file is absent. Other read and
+   * parse failures reject.
+   * ClaudeBackendSession.open restores the map for the active session or reads it from the fork
+   * source. ClaudeBackendSession.boundaryPoint uses the map to resolve AHP turn IDs to candidates
+   * that it verifies in native history. */
+  async loadTurnMap(sessionId: string): Promise<Record<string, string>> {
+    try {
+      return JSON.parse(await readFile(this.turnMapPath(sessionId), "utf8"));
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return {};
+      throw cause;
+    }
+  }
+
+  /** Replace the adapter's turn map for a native session ID.
+   * Resolve after file sync, atomic rename and temporary-file cleanup. Callers must order
+   * concurrent replacements if publication order matters. Cleanup can reject after publication.
+   * ClaudeBackendSession.open and restoreConversation await the save before starting a query.
+   * Saves during input association or a native ID change can fail the query pump. */
   async saveTurnMap(sessionId: string, turns: Record<string, string>): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     const file = this.turnMapPath(sessionId);
@@ -91,51 +107,83 @@ export class FileSessionStore implements SessionStore {
     }
   }
 
-  private file(key: SessionKey): string { return join(this.directory, `${createHash("sha256").update(JSON.stringify([key.projectKey, key.sessionId, key.subpath ?? null])).digest("hex")}.json`); }
+  /** Keep each transcript at its stable hashed path. Omitted subpaths use the null slot in the
+   * tuple, preserving the on-disk key format and keeping an explicit empty string distinct. */
+  private transcriptPath(key: SessionKey): string {
+    return join(this.directory, `${createHash("sha256")
+      .update(JSON.stringify([key.projectKey, key.sessionId, key.subpath ?? null]))
+      .digest("hex")}.json`);
+  }
 
-  /** Read only our envelope, leaving native entry payloads opaque; absence is distinct from corruption. */
-  private async read(file: string): Promise<StoredSession | null> {
+  /** Read a transcript envelope for load, append or a scan. Return null on absence and reject
+   * malformed JSON or a missing key/entries array so append cannot overwrite those records. */
+  private async readTranscript(file: string): Promise<StoredSession | null> {
     try {
       const value: StoredSession = JSON.parse(await readFile(file, "utf8"));
       if (!value || !value.key || !Array.isArray(value.entries)) throw new HarnessSdkError("SESSION_STORE_INVALID");
       return value;
-    } catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT") return null; throw cause; }
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw cause;
+    }
   }
 
-  /** Scan only hashed transcript files, excluding turn maps, locks and temporary publications. */
-  private async all(): Promise<StoredSession[]> {
-    const names = await readdir(this.directory).catch((cause: NodeJS.ErrnoException) => { if (cause.code === "ENOENT") return []; throw cause; });
-    const entries = await Promise.all(names.filter((name) => /^[a-f0-9]{64}\.json$/.test(name)).map((name) => this.read(join(this.directory, name))));
+  /** Scan the hashed transcript filenames for both listing methods. Preserve directory order and
+   * skip files removed before they can be read. Directory absence also yields an empty result.
+   * Other read or envelope errors reject before the caller filters by project or session. */
+  private async scanTranscripts(): Promise<StoredSession[]> {
+    const names = await readdir(this.directory).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code === "ENOENT") return [];
+      throw cause;
+    });
+    const transcripts = names.filter((name) => /^[a-f0-9]{64}\.json$/.test(name));
+    const entries = await Promise.all(transcripts.map((name) => this.readTranscript(join(this.directory, name))));
     return entries.filter((entry): entry is StoredSession => entry !== null);
   }
 
-  private turnMapPath(sessionId: string): string { return join(this.directory, `${createHash("sha256").update(`turns:${sessionId}`).digest("hex")}.turns.json`); }
+  /** Keep boundary metadata at its stable session-ID path, outside the transcript filename pattern. */
+  private turnMapPath(sessionId: string): string {
+    return join(this.directory, `${createHash("sha256").update(`turns:${sessionId}`).digest("hex")}.turns.json`);
+  }
 }
 
-interface StoredSession { key: SessionKey; entries: SessionStoreEntry[]; mtime: number }
+interface StoredSession {
+  /** Retain the full key so listings can filter hashed files by project and subpath. */
+  key: SessionKey;
+  entries: SessionStoreEntry[];
+  /** Record append order for this transcript even when the wall clock repeats or moves backward. */
+  mtime: number;
+}
 
-/** Acquire append's exclusive lock and record its PID; the caller owns close and lock-file removal.
- * Reclaim only owners proven absent, since age alone cannot distinguish a slow live writer.
- * Contention times out with SESSION_STORE_BUSY; other acquisition/write failures propagate.
- * A failed PID write after open leaves the acquired handle/lock unreleased;
- * ownership transfers to the caller only on success. */
+/** Acquire append's exclusive lock and record its PID. Once the handle is returned, append owns
+ * close and removal. A rejected PID write can strand the handle and lock file before transfer. */
 async function acquireSessionLock(lockPath: string): Promise<Awaited<ReturnType<typeof open>>> {
-  const expires = Date.now() + 10_000;
+  const deadline = Date.now() + 10_000;
   let lockHandle: Awaited<ReturnType<typeof open>> | undefined;
   while (!lockHandle) {
     try {
       lockHandle = await open(lockPath, "wx", 0o600);
       await lockHandle.writeFile(String(process.pid));
-    }
-    catch (cause) {
+    } catch (cause) {
       if ((cause as NodeJS.ErrnoException).code !== "EEXIST") throw cause;
-      const pid = Number(await readFile(lockPath, "utf8").catch(() => ""));
-      if (isLockOwnerDefinitelyAbsent(pid)) { await rm(lockPath, { force: true }); continue; }
-      if (Date.now() >= expires) throw new HarnessSdkError("SESSION_STORE_BUSY");
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await waitForSessionLock({ lockPath, deadline });
     }
   }
   return lockHandle;
+}
+
+/** Resolve contention before acquireSessionLock retries. Reclaim only a lock whose PID is gone,
+ * since an unreadable PID or an old lock can still belong to a live writer. For other owners,
+ * wait 10 ms before retrying or reject with SESSION_STORE_BUSY at the deadline. A failed removal
+ * also rejects append. */
+async function waitForSessionLock({ lockPath, deadline }: { lockPath: string; deadline: number }): Promise<void> {
+  const pid = Number(await readFile(lockPath, "utf8").catch(() => ""));
+  if (isLockOwnerDefinitelyAbsent(pid)) {
+    await rm(lockPath, { force: true });
+    return;
+  }
+  if (Date.now() >= deadline) throw new HarnessSdkError("SESSION_STORE_BUSY");
+  await new Promise((resolve) => setTimeout(resolve, 10));
 }
 
 /** Treat only ESRCH for a valid positive PID as proof; permission errors leave the lock intact. */
@@ -165,9 +213,10 @@ function mergeSessionEntries(stored: StoredSession, entries: SessionStoreEntry[]
   stored.mtime = Math.max(Date.now(), stored.mtime + 1);
 }
 
-/** Publish JSON only after the exclusive mode-0600 temporary file is synced and closed.
- * append/saveTurnMap supply a unique same-directory path and own its removal on success or failure;
- * write/sync/close/rename failures reject, and a close failure prevents rename. */
+/** Publish JSON by renaming an exclusive mode-0600 temporary file after sync and close.
+ * append and saveTurnMap supply a unique path in the destination directory for atomic rename
+ * and own path cleanup. File and serialization failures reject, and the temporary handle closes
+ * before the destination can be replaced. */
 async function publishJson({ file, temporary, value }: { file: string; temporary: string; value: unknown }): Promise<void> {
   const temporaryHandle = await open(temporary, "wx", 0o600);
   try {

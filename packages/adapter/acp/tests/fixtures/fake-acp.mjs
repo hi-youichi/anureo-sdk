@@ -11,7 +11,8 @@ const noResume = process.argv.includes('--load-only');
 const missingSteer = process.argv.includes('--missing-steer');
 const invalidExtension = process.argv.includes('--bad-extension');
 const authRequired = process.argv.includes('--auth-required');
-const scenario = process.argv[process.argv.indexOf('--scenario') + 1] && process.argv.includes('--scenario') ? process.argv[process.argv.indexOf('--scenario') + 1] : undefined;
+const scenarioIndex = process.argv.indexOf('--scenario');
+const scenario = scenarioIndex >= 0 ? process.argv[scenarioIndex + 1] || undefined : undefined;
 // Outbound client request ID -> { resolve, reject } callbacks.
 const pendingClientRequests = new Map();
 // Session ID -> inbound session/prompt request ID held by the 'wait' command.
@@ -34,17 +35,9 @@ async function handle(frame) {
   if (!frame.method && pendingClientRequests.has(frame.id)) { const wait = pendingClientRequests.get(frame.id); pendingClientRequests.delete(frame.id); frame.error ? wait.reject(frame.error) : wait.resolve(frame.result); return; }
   const p = frame.params ?? {}; const respond = (result) => { if ('id' in frame) send({ id: frame.id, result }); };
   if (frame.method === 'initialize') { respondInitialization(p, respond); return; }
-  if (frame.method === 'session/new') { if (authRequired) { send({ id: frame.id, error: { code: -32000, message: 'Authentication required' } }); return; } const id = `native-${++nextId}`; historyBySession.set(id, []); mcpBySession.set(id, p.mcpServers); respond({ sessionId: id, ...configFor(id) }); return; }
+  if (frame.method === 'session/new') { respondNewSession({ frame, p, respond }); return; }
   if (frame.method === 'session/resume' || frame.method === 'session/load') {
-    mcpBySession.set(p.sessionId, p.mcpServers);
-    if (scenario === 'titles') {
-      update(p.sessionId, { sessionUpdate: 'session_info_update', title: `Restored via ${frame.method}` });
-      update(p.sessionId, { sessionUpdate: 'session_info_update', updatedAt: '2026-10-28T00:00:00Z' });
-    }
-    if (frame.method === 'session/load') {
-      update(p.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'history-message', content: { type: 'text', text: 'loaded snapshot' } });
-    }
-    respond(configFor(p.sessionId));
+    respondRestoredSession({ method: frame.method, p, respond });
     return;
   }
   if (frame.method === 'session/close') { respond({}); return; }
@@ -54,6 +47,31 @@ async function handle(frame) {
   if (frame.method === 'session/prompt') return handlePrompt({ frame, p, respond });
   if (extensions && frame.method.startsWith('_ahp/')) { handleExtension({ frame, p, respond }); return; }
   if ('id' in frame) send({ id: frame.id, error: { code: -32601, message: 'Method not found' } });
+}
+
+/** Allocate native state before replying, except in the authentication-required scenario. */
+function respondNewSession({ frame, p, respond }) {
+  if (authRequired) {
+    send({ id: frame.id, error: { code: -32000, message: 'Authentication required' } });
+    return;
+  }
+  const id = `native-${++nextId}`;
+  historyBySession.set(id, []);
+  mcpBySession.set(id, p.mcpServers);
+  respond({ sessionId: id, ...configFor(id) });
+}
+
+/** Send restore notifications before the reply so the adapter exercises its snapshot capture path. */
+function respondRestoredSession({ method, p, respond }) {
+  mcpBySession.set(p.sessionId, p.mcpServers);
+  if (scenario === 'titles') {
+    update(p.sessionId, { sessionUpdate: 'session_info_update', title: `Restored via ${method}` });
+    update(p.sessionId, { sessionUpdate: 'session_info_update', updatedAt: '2026-10-28T00:00:00Z' });
+  }
+  if (method === 'session/load') {
+    update(p.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'history-message', content: { type: 'text', text: 'loaded snapshot' } });
+  }
+  respond(configFor(p.sessionId));
 }
 
 /** Answer initialize from the selected fixture mode without starting session work. */
@@ -147,29 +165,35 @@ async function handlePrompt({ frame, p, respond }) {
   } else if (command === 'unknown-request') {
     try { await request('_future/unknown', { sessionId: p.sessionId }); throw Error('Unexpected approval'); } catch (error) { if (error.code !== -32601) throw error; }
   } else {
-    update(p.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'reused', content: { type: 'text', text: 'Hello ' } });
-    update(p.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'reused', content: { type: 'text', text: command } });
-    update(p.sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'summary' } });
-    update(p.sessionId, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'input' } });
-    update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tool', title: 'Display only', kind: 'execute', status: 'in_progress', rawInput: { command: 'ls', token: 'redact-me' } });
-    update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tool', status: 'completed', rawOutput: 'done' });
-    update(p.sessionId, { sessionUpdate: 'plan', entries: [{ content: 'one', priority: 'high', status: 'in_progress' }] });
-    update(p.sessionId, { sessionUpdate: 'usage_update', used: 5, size: 100 });
-    update(p.sessionId, { sessionUpdate: 'compaction_update', compactionId: 'c', status: 'in_progress' });
-    update(p.sessionId, { sessionUpdate: 'compaction_summary_chunk', compactionId: 'c', content: { type: 'text', text: 'summary' } });
-    update(p.sessionId, { sessionUpdate: 'compaction_update', compactionId: 'c', status: 'completed', summary: [{ type: 'text', text: 'full summary' }] });
-    update(p.sessionId, { sessionUpdate: 'available_commands_update', availableCommands: [] });
-    update(p.sessionId, { sessionUpdate: 'session_info_update', title: 'Title' });
-    update(p.sessionId, { sessionUpdate: 'plan_update', plan: { planId: 'p', type: 'content', content: 'native plan' } });
-    update(p.sessionId, { sessionUpdate: 'plan_removed', planId: 'p' });
-    update(p.sessionId, { sessionUpdate: 'subagent_spawned', subagentSessionId: 'child', name: 'Child', task: 'Task' });
-    update(p.sessionId, { sessionUpdate: 'subagent_state_update', subagentSessionId: 'child', state: 'completed' });
-    update(p.sessionId, { sessionUpdate: 'future_update', safe: 'retained', token: 'redact-me' });
-    if (scenario === 'unknown-item') update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId: 'future-tool', title: 'Future', kind: 'future_kind', status: 'completed', rawInput: { safe: true } });
-    const nativeTurnId = p._meta?.ahp?.turnId ?? `native-turn-${++nextId}`;
-    historyBySession.get(p.sessionId)?.push({ turnId: nativeTurnId, item: { id: 'agent_message_chunk:reused', type: 'agentMessage', text: `Hello ${command}`, phase: 'final' } });
+    publishOrdinaryPrompt(p, command);
   }
-  respond({ stopReason: 'end_turn' }); return;
+  respond({ stopReason: 'end_turn' });
+}
+
+/** Publish an ordered mix of standard and optional updates, then record the final message for
+ * extension history calls. Reuse message IDs across prompts to exercise turn-local projection. */
+function publishOrdinaryPrompt(p, command) {
+  update(p.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'reused', content: { type: 'text', text: 'Hello ' } });
+  update(p.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'reused', content: { type: 'text', text: command } });
+  update(p.sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'summary' } });
+  update(p.sessionId, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'input' } });
+  update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId: 'tool', title: 'Display only', kind: 'execute', status: 'in_progress', rawInput: { command: 'ls', token: 'redact-me' } });
+  update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tool', status: 'completed', rawOutput: 'done' });
+  update(p.sessionId, { sessionUpdate: 'plan', entries: [{ content: 'one', priority: 'high', status: 'in_progress' }] });
+  update(p.sessionId, { sessionUpdate: 'usage_update', used: 5, size: 100 });
+  update(p.sessionId, { sessionUpdate: 'compaction_update', compactionId: 'c', status: 'in_progress' });
+  update(p.sessionId, { sessionUpdate: 'compaction_summary_chunk', compactionId: 'c', content: { type: 'text', text: 'summary' } });
+  update(p.sessionId, { sessionUpdate: 'compaction_update', compactionId: 'c', status: 'completed', summary: [{ type: 'text', text: 'full summary' }] });
+  update(p.sessionId, { sessionUpdate: 'available_commands_update', availableCommands: [] });
+  update(p.sessionId, { sessionUpdate: 'session_info_update', title: 'Title' });
+  update(p.sessionId, { sessionUpdate: 'plan_update', plan: { planId: 'p', type: 'content', content: 'native plan' } });
+  update(p.sessionId, { sessionUpdate: 'plan_removed', planId: 'p' });
+  update(p.sessionId, { sessionUpdate: 'subagent_spawned', subagentSessionId: 'child', name: 'Child', task: 'Task' });
+  update(p.sessionId, { sessionUpdate: 'subagent_state_update', subagentSessionId: 'child', state: 'completed' });
+  update(p.sessionId, { sessionUpdate: 'future_update', safe: 'retained', token: 'redact-me' });
+  if (scenario === 'unknown-item') update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId: 'future-tool', title: 'Future', kind: 'future_kind', status: 'completed', rawInput: { safe: true } });
+  const nativeTurnId = p._meta?.ahp?.turnId ?? `native-turn-${++nextId}`;
+  historyBySession.get(p.sessionId)?.push({ turnId: nativeTurnId, item: { id: 'agent_message_chunk:reused', type: 'agentMessage', text: `Hello ${command}`, phase: 'final' } });
 }
 
 /** Join two prompt receipts to one execution, publishing its terminal event before either receipt. */
@@ -182,8 +206,13 @@ function respondCorrelatedPrompt({ frame, p, respond }) {
   update(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'correlated ACP result' }, _meta: { ahp: { turnId: 'actual-acp' } } });
   event('turn/completed', { turnId: 'actual-acp', status: 'completed' });
   const first = nativeHeld.get(p.sessionId); nativeHeld.delete(p.sessionId);
-  send({ id: first.id, result: { stopReason: 'end_turn', _meta: { ahp: { acceptance: { accepted: true, submissionId: first.submissionId, disposition: 'started', turnId: 'actual-acp' } } } } });
-  respond({ stopReason: 'end_turn', _meta: { ahp: { acceptance: { accepted: true, submissionId, disposition: 'joined', turnId: 'actual-acp' } } } }); return;
+  send({ id: first.id, result: correlatedReceipt(first.submissionId, 'started') });
+  respond(correlatedReceipt(submissionId, 'joined'));
+}
+
+/** Both receipts carry the same native execution identity after its terminal event. */
+function correlatedReceipt(submissionId, disposition) {
+  return { stopReason: 'end_turn', _meta: { ahp: { acceptance: { accepted: true, submissionId, disposition, turnId: 'actual-acp' } } } };
 }
 
 /** Dispatch negotiated legacy methods; unknown methods still receive JSON-RPC method-not-found. */
@@ -192,12 +221,7 @@ function handleExtension({ frame, p, respond }) {
     const sessionId = `fork-${++nextId}`;
     const source = historyBySession.get(p.sessionId) ?? [];
     const boundaryIndex = source.findIndex((item) => item.turnId === p.boundary.turnId);
-    let historyEndIndex;
-    if (boundaryIndex < 0) {
-      historyEndIndex = 0;
-    } else {
-      historyEndIndex = p.boundary.relation === 'before' ? boundaryIndex : boundaryIndex + 1;
-    }
+    const historyEndIndex = boundaryIndex < 0 ? 0 : endOfHistory(boundaryIndex, p.boundary.relation);
     historyBySession.set(sessionId, source.slice(0, historyEndIndex));
     respond({ sessionId, ...config() });
     return;
@@ -207,8 +231,7 @@ function handleExtension({ frame, p, respond }) {
     const source = historyBySession.get(p.sessionId) ?? [];
     const boundaryIndex = source.findIndex((item) => item.turnId === p.boundary.turnId);
     if (boundaryIndex >= 0 && p.scope !== 'files') {
-      const historyEndIndex = p.boundary.relation === 'before' ? boundaryIndex : boundaryIndex + 1;
-      source.splice(historyEndIndex);
+      source.splice(endOfHistory(boundaryIndex, p.boundary.relation));
     }
     respond({ appliedScope: p.scope, boundary: p.boundary });
     return;
@@ -220,6 +243,11 @@ function handleExtension({ frame, p, respond }) {
   if (frame.method === '_ahp/review/start') { send({ method: '_ahp/event', params: { sessionId: p.sessionId, event: { type: 'turn/started', payload: { turnId: p.turnId } } } }); send({ method: '_ahp/event', params: { sessionId: p.sessionId, event: { type: 'turn/completed', payload: { turnId: p.turnId, status: 'completed' } } } }); respond({ turnId: p.turnId, accepted: true }); return; }
   if ('id' in frame) send({ id: frame.id, error: { code: -32601, message: 'Method not found' } });
 }
+/** Return the exclusive end of retained history for a matched fork or revert boundary. */
+function endOfHistory(boundaryIndex, relation) {
+  return relation === 'before' ? boundaryIndex : boundaryIndex + 1;
+}
+
 const input = createInterface({ input: process.stdin });
 input.on('line', (line) => { if (!line.trim()) return; void handle(JSON.parse(line)).catch((error) => { process.stderr.write(`fake ACP failed: ${error.code ?? 'local'}\n`); process.exit(2); }); });
 input.on('close', () => process.exit(0));

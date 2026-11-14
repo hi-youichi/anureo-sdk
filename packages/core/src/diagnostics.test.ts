@@ -83,6 +83,32 @@ test('native RPC accessors are read for classification and delivery without repl
   })
 })
 
+test('failure reporting classifies a synchronous throw before sampling cancellation', async () => {
+  const controller = new AbortController()
+  const events: CatalogProbeEvent[] = []
+  const reads: string[] = []
+  const cause = {
+    get code() {
+      reads.push('code')
+      return 'NATIVE_RPC_ERROR'
+    },
+    get rpcCode() {
+      reads.push('rpcCode')
+      if (reads.length === 3) controller.abort()
+      return -32603
+    },
+  }
+  await expect(catalogPhase({
+    signal: controller.signal,
+    onPhase: event => { events.push(event) },
+  }, 'models', () => { throw cause })).rejects.toBe(cause)
+  expect(reads).toEqual(['code', 'rpcCode', 'rpcCode'])
+  expect(events).toEqual([
+    { phase: 'models', outcome: 'started' },
+    { phase: 'models', outcome: 'cancelled', errorCode: 'NATIVE_RPC_ERROR', nativeRpcCode: -32603, durationMs: expect.any(Number) },
+  ])
+})
+
 test('catalog phases are logged to LogTape without leaking private causes', async () => {
   const records: LogRecord[] = []
   await configure({ sinks: { memory: record => { records.push(record) } }, loggers: [

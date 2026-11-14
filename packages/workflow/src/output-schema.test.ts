@@ -64,7 +64,13 @@ test('schema-like keys in business enum and default data are not treated as sche
 test('raw JSON is validated before Zod can strip extra fields or supply defaults', async () => {
   const output = prepareOutputSchema(z.object({ count: z.number().default(3) }))
   expect(await output.parse('{"count":4}')).toEqual({ count: 4 })
-  for (const text of ['{}', '{"count":4,"extra":1}', '{"count":"4"}', 'null', '[]']) {
+  await expect(output.parse('{}')).rejects.toMatchObject({
+    code: 'AGENT_STRUCTURED_OUTPUT_INVALID',
+    retryable: false,
+    outcomeUnknown: false,
+    details: { issues: [{ path: '', code: 'required' }] },
+  })
+  for (const text of ['{"count":4,"extra":1}', '{"count":"4"}', 'null', '[]']) {
     await expect(output.parse(text)).rejects.toMatchObject({ code: 'AGENT_STRUCTURED_OUTPUT_INVALID', retryable: false, outcomeUnknown: false })
   }
 })
@@ -90,7 +96,11 @@ test('sync and async refinements and formats validate locally and sanitize custo
     } catch (error) {
       failure = error
     }
-    expect(failure).toMatchObject({ code: 'AGENT_STRUCTURED_OUTPUT_INVALID', outcomeUnknown: false })
+    expect(failure).toMatchObject({
+      code: 'AGENT_STRUCTURED_OUTPUT_INVALID',
+      outcomeUnknown: false,
+      details: { issues: [{ path: [], code: 'custom' }] },
+    })
     expect(JSON.stringify(failure)).not.toContain('private-')
   }
   await expect(output.parse('{"count":1,"email":"bad"}')).rejects.toMatchObject({ code: 'AGENT_STRUCTURED_OUTPUT_INVALID' })

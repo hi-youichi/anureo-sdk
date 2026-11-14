@@ -1,19 +1,20 @@
 /** Identify a new durable run and optionally supply a compatible source journal for replay. */
 export interface WorkflowOptions<Input> {
-  /** Nonempty workflow identity; must match the source when resuming. */
+  /** Nonempty workflow name. Resume requires the same name in the source manifest. */
   name: string
-  /** Nonempty, application-managed compatibility revision; must match the source when resuming. */
+  /** Nonempty application-managed revision. Change it when existing journals are incompatible. */
   revision: string
-  /** Parent of run directories, resolved relative to the process working directory. */
+  /** Nonempty storage root. Relative paths are resolved against the process working directory. */
   directory: string
-  /** New target directory name; defaults to a random UUID. Must be a nonblank single path
-   * component of at most 255 UTF-8 bytes, without control characters. Existing runs reject. */
+  /** New target directory name, defaulting to a random UUID. Use a nonblank single path
+   * component of at most 255 UTF-8 bytes. Control characters, separators, `.` and `..` are
+   * invalid. A locked or nonempty target directory rejects. */
   runId?: string
-  /** Strict JSON data copied and deeply frozen before the body runs; the caller's value is untouched. */
+  /** Strict JSON input. The body receives a deeply frozen copy. */
   input: Input
-  /** Omit for a fresh journal. A string selects a source run in directory; an object selects
-   * a run under another parent directory. The inactive source is read, never modified;
-   * the body reruns with this run's input and reuses eligible agent results. */
+  /** Omit for a fresh journal. A string selects a run under `directory`. An object supplies the
+   * source's storage root and ID explicitly. Resume requires an inactive source with matching
+   * name and revision and copies its journal into the new run before invoking the body. */
   resumeFrom?: string | { directory: string; runId: string }
 }
 
@@ -21,7 +22,7 @@ export interface WorkflowOptions<Input> {
 export interface WorkflowContext<Input> {
   /** Identity of the new run, including when replaying a source journal. */
   readonly runId: string
-  /** Isolated, deeply frozen JSON copy of WorkflowOptions.input. */
+  /** Isolated, deeply frozen JSON copy of the input supplied for this invocation. */
   readonly input: Input
 }
 
@@ -29,8 +30,8 @@ export interface WorkflowContext<Input> {
 export interface WorkflowResult<Result> {
   /** Identity of the run that published this result. */
   runId: string
-  /** Incomplete if any registered agent work rejected or was dropped, even if the body recovered.
-   * Fatal failures reject workflow instead of returning a result. */
+  /** Incomplete if registered agent work rejected or was dropped and the workflow could still
+   * publish a result. Fatal agent failures reject the workflow promise. */
   status: 'completed' | 'incomplete'
   /** JSON copy of the awaited body return value. */
   result: Result

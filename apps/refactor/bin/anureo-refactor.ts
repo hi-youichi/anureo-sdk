@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// Passes process arguments to runCli and assigns its exit code after cleanup; it must not parse input or own clients.
+// Set the process exit code after the CLI has finished any client cleanup.
 import { runCli } from '../src/cli'
 
 process.exitCode = await runCli(process.argv.slice(2))

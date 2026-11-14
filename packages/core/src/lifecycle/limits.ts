@@ -1,11 +1,10 @@
-// Checks integer retention budgets; must not allocate storage or select resource-specific defaults.
 import { HarnessSdkError } from '../errors';
 
 /**
- * Client's assertClientOptions rejects invalid retention settings with this check. Session.context,
- * record and retainEvent also use the returned explicit value or fallback for execution, submission
- * and result budgets. Throw INVALID_PARAMS unless it is a positive safe integer; callers retain
- * allocation, admission and overflow handling. This check changes no state and performs no I/O.
+ * Validate the selected retention budget as a positive safe integer, using the caller's fallback
+ * for an omitted value. Throw INVALID_PARAMS on failure. assertClientOptions checks configured
+ * limits at construction. Session.context, getOrCreateSubmission and retainEvent use the returned
+ * budget for allocation or accounting in units chosen at each call site.
  */
 export function positive(value: number | undefined, fallback: number): number {
   const result = value ?? fallback;

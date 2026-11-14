@@ -16,15 +16,15 @@ export interface HermesAdapterOptions {
   toolsets?: string[]
   /** Complete child environment; omitted means inherit. */
   env?: Record<string, string | undefined>
-  /** Defaults to start, which ensures a shared owner. attach only connects and disables owner recovery. */
+  /** Defaults to start, which ensures a shared owner. attach uses an existing owner even during reconnects. */
   startup?: 'start' | 'attach'
-  /** Separate deadline for each CLI attach, WebSocket open and RPC response; defaults to 30,000 ms. */
+  /** Separate deadline in ms for CLI response after spawn, WebSocket open and each RPC response. Defaults to 30,000. */
   timeoutMs?: number
   /** Maximum UTF-8 frame/queued-entry bytes; defaults to 8 MiB. CLI attach stdout has its own 64 KiB cap. */
   maxFrameBytes?: number
   /** Byte budget for socket backlog and, separately, incoming buffers, retained inputs and each turn's items; defaults to 16 MiB. */
   maxBufferedBytes?: number
-  /** Maximum buffered incoming events/requests, including those held for replay; defaults to 2048. */
+  /** Separate count limit for the incoming queue and traffic held during setup or recovery. Defaults to 2048 each. */
   maxEvents?: number
   /** Maximum outstanding RPC requests per channel; defaults to 128. */
   maxPending?: number
@@ -34,17 +34,27 @@ export interface HermesAdapterOptions {
   maxExecutions?: number
   /** Maximum retained submissions per session; defaults to 1024. Eligible acknowledged submissions are evicted first. */
   maxSubmissions?: number
-  /** Attempts per session recovery cycle; defaults to 3. Zero disables automatic recovery. */
+  /** Attempts per session recovery cycle, including the first attach-only attempt. Defaults to 3. Zero disables automatic recovery. */
   reconnectAttempts?: number
   /** Base retry delay in ms, doubled after each delayed attempt; defaults to 100. First attempt is immediate; zero selects a zero-ms delay. */
   reconnectDelayMs?: number
   /** Owner recovery requests per session in a rolling minute; defaults to 2. Zero prohibits owner recovery. */
   maxOwnerRecoveriesPerMinute?: number
-  /** Replace CLI spawning; resolve with usable pipes/exit observation. Attach drains output and awaits the handle's disposal on every outcome. */
+  /**
+   * Replace CLI spawning for each ticket request. Resolve with usable pipes and exit observation
+   * and release partial resources on rejection. The adapter takes ownership of the returned
+   * handle and awaits its disposal, including when attachment fails.
+   */
   processFactory?: (options: HarnessProcessOptions) => Promise<HarnessProcess>
-  /** Replace WebSocket construction; return a standard event-capable socket. The adapter owns closure; protocols includes a private ticket. */
+  /**
+   * Replace WebSocket construction for each ticket. Return a socket that implements the standard
+   * WebSocket interface. Keep the credential subprotocol private. The adapter owns socket closure.
+   */
   webSocketFactory?: (url: string, protocols: string[]) => WebSocket
-  /** Synchronous diagnostic sink; should not throw. Receives codes only, never native stderr, tickets or RPC contents. */
+  /**
+   * Receive fixed diagnostic codes synchronously when attach reports stderr or session detach
+   * cannot be confirmed. Return normally so detach cleanup can proceed.
+   */
   diagnostic?: (code: string) => void
 }
 
@@ -52,15 +62,15 @@ export interface HermesAdapterOptions {
 export function validateOptions(options: HermesAdapterOptions): void {
   for (const [key, value] of Object.entries(options)) {
     if (value === undefined) continue
-    if (key.endsWith('Ms') || key.startsWith('max') || key === 'reconnectAttempts') {
-      validateNumericOption(key, value)
-    }
+    if (key.endsWith('Ms') || key.startsWith('max') || key === 'reconnectAttempts') validateNumericOption(key, value)
   }
-  if (options.toolsets !== undefined && (!Array.isArray(options.toolsets) || options.toolsets.some(value => typeof value !== 'string' || !value.trim() || value.includes('\0')))) throw new Error('Invalid Hermes toolsets')
+  if (options.toolsets !== undefined && (!Array.isArray(options.toolsets)
+    || options.toolsets.some(value => typeof value !== 'string' || !value.trim() || value.includes('\0')))) throw new Error('Invalid Hermes toolsets')
   if (options.startup !== undefined && !['start', 'attach'].includes(options.startup)) throw new Error('Invalid Hermes startup mode')
   if (options.profile !== undefined && (!options.profile.trim() || options.profile.includes('\0'))) throw new Error('Invalid Hermes profile')
   if (options.command !== undefined && (typeof options.command !== 'string' || !options.command || options.command.includes('\0'))) throw new Error('Invalid Hermes command')
-  if (options.args !== undefined && (!Array.isArray(options.args) || options.args.some(value => typeof value !== 'string' || value.includes('\0')))) throw new Error('Invalid Hermes arguments')
+  if (options.args !== undefined && (!Array.isArray(options.args)
+    || options.args.some(value => typeof value !== 'string' || value.includes('\0')))) throw new Error('Invalid Hermes arguments')
 }
 
 /** Allow zero only for recovery controls; keep configured millisecond values within the native timer range. */

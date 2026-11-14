@@ -1,20 +1,49 @@
 import { expect, test } from "bun:test";
-import { createClient, HarnessSdkError, type Client, type Session, type RuntimeOptions, type SessionEventSink } from "@anureo/sdk";
-import type { AhpEvent, GoalState, InteractionRequested, InteractionResponse, SessionOpenParams, SessionState } from "@anureo/protocol";
+import { createClient, HarnessSdkError, type RuntimeOptions } from "@anureo/sdk";
+import type { AhpEvent, GoalState, InputSubmitParams, InteractionRequested, InteractionResponse, SessionOpenParams, SessionState, TurnSteerParams } from "@anureo/protocol";
 import { createScriptedAdapter, FAKE_CAPABILITIES, type FakeAdapterOptions } from "./fake";
 
 const OPEN: SessionOpenParams = { requestId: "open", mode: "new", binding: { sessionId: "s", adapterId: "fake", runtimeConfigId: "r" }, cwd: "/tmp" };
-/** Open an isolated scripted session; each test owns returning its event readers and disposing runtime. */
-async function setup(options?: FakeAdapterOptions, runtimeOptions?: RuntimeOptions) {
-  const adapter = createScriptedAdapter(options);
-  const runtime = await createClient({ adapter, identity: OPEN.binding, runtime: runtimeOptions,
-    interactions: { approval: undefined, userInput: undefined, elicitation: undefined, dynamicTool: undefined } });
-  const session = await runtime.openSession(OPEN); return { adapter, runtime, session, sink: adapter.sinks.get("s")! };
+/**
+ * Open a scripted session with manual responses enabled for every interaction kind. Setup failures
+ * reject. Each test owns its event readers and must dispose the returned client.
+ */
+async function setup({ adapterOptions, runtimeOptions }: {
+  adapterOptions?: FakeAdapterOptions;
+  runtimeOptions?: RuntimeOptions;
+} = {}) {
+  const adapter = createScriptedAdapter(adapterOptions);
+  const runtime = await createClient({
+    adapter, identity: OPEN.binding, runtime: runtimeOptions,
+    interactions: { approval: undefined, userInput: undefined, elicitation: undefined, dynamicTool: undefined },
+  });
+  const session = await runtime.openSession(OPEN);
+  const sink = adapter.sinks.get(OPEN.binding.sessionId);
+  if (!sink) throw new Error("Scripted session opened without recording its event sink");
+  return { adapter, runtime, session, sink };
 }
-/** Consume at most 100 events to find the expected publication; early stream closure fails the test. */
+/** Consume at most 100 events through a matching publication. Reject on early stream closure or no match. */
 async function nextType(reader: AsyncIterator<AhpEvent>, type: AhpEvent["type"]): Promise<AhpEvent> {
-  for (let i = 0; i < 100; i++) { const event = await reader.next(); if (event.done) throw new Error(`Stream ended before ${type}`); if (event.value.type === type) return event.value; }
+  for (let i = 0; i < 100; i++) {
+    const event = await reader.next();
+    if (event.done) throw new Error(`Stream ended before ${type}`);
+    if (event.value.type === type) return event.value;
+  }
   throw new Error(`Missing ${type}`);
+}
+
+/**
+ * Collect from the current reader position through the next terminal, inclusive, for sequence and
+ * redaction assertions. Reject if observation ends early. The test retains reader ownership.
+ */
+async function readThroughTurnCompletion(reader: AsyncIterator<AhpEvent>): Promise<AhpEvent[]> {
+  const events: AhpEvent[] = [];
+  for (;;) {
+    const event = await reader.next();
+    if (event.done) throw new Error("Stream ended before turn/completed");
+    events.push(event.value);
+    if (event.value.type === "turn/completed") return events;
+  }
 }
 
 test("root client retains immediate results and emits authoritative completed text", async () => {
@@ -22,8 +51,7 @@ test("root client retains immediate results and emits authoritative completed te
   const reader = session.events()[Symbol.asyncIterator]();
   const turn = await session.submit({ input: 'authority' });
   expect((await turn.result()).text).toBe('authority');
-  const events: AhpEvent[] = [];
-  while (true) { const event = (await reader.next()).value!; events.push(event); if (event.type === 'turn/completed') break; }
+  const events = await readThroughTurnCompletion(reader);
   expect(events.every((event, index) => event.seq === events[0]!.seq + index)).toBe(true);
   expect(events.filter(event => event.type === 'item/completed').map(event => event.payload.item)).toMatchObject([{ text: 'authority' }]);
   expect(session.binding.nativeRef).toEqual({ provider: 'scripted', value: 'native:s' });
@@ -31,7 +59,7 @@ test("root client retains immediate results and emits authoritative completed te
 });
 
 test("immutable binding and unsupported capabilities never reach the backend", async () => {
-  const { runtime, session, adapter } = await setup({ capabilities: {} });
+  const { runtime, session, adapter } = await setup({ adapterOptions: { capabilities: {} } });
   expect(Object.isFrozen(session.binding)).toBe(true); expect(Object.isFrozen(session.capabilities)).toBe(true);
   await expect(session.request("session/revert", { requestId: "rev", sessionId: "s", boundary: { turnId: "t", relation: "before" }, scope: "both" })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
   expect(adapter.calls).toHaveLength(0);
@@ -40,18 +68,23 @@ test("immutable binding and unsupported capabilities never reach the backend", a
 });
 
 test("native admission owns overlap; exact steer and interrupt use the observed execution", async () => {
-  const { runtime, session, adapter } = await setup({ execute: async (call, sink) => {
-    if (call.method === 'input/submit') {
-      const { submissionId } = call.params as import('@anureo/protocol').InputSubmitParams;
-      const turnId = `native:${submissionId}`;
-      await sink.emit({ type: 'turn/started', payload: { turnId } });
-      return { submissionId, accepted: true, disposition: 'started', turnId };
-    }
-    if (call.method === 'turn/steer') {
-      const value = call.params as import('@anureo/protocol').TurnSteerParams;
-      return { submissionId: value.submissionId, accepted: true, turnId: value.expectedTurnId };
-    }
-  } });
+  const { runtime, session, adapter } = await setup({
+    adapterOptions: {
+      /** Keep admitted turns active so each control can target the observed native ID. */
+      async execute(call, sink) {
+        if (call.method === 'input/submit') {
+          const { submissionId } = call.params as InputSubmitParams;
+          const turnId = `native:${submissionId}`;
+          await sink.emit({ type: 'turn/started', payload: { turnId } });
+          return { submissionId, accepted: true, disposition: 'started', turnId };
+        }
+        if (call.method === 'turn/steer') {
+          const { submissionId, expectedTurnId } = call.params as TurnSteerParams;
+          return { submissionId, accepted: true, turnId: expectedTurnId };
+        }
+      },
+    },
+  });
   const first = await session.submit({ input: 'first' });
   const second = await session.submit({ input: 'second' });
   expect(first.id).not.toBe(second.id);
@@ -77,12 +110,18 @@ test("item IDs reused by different executions remain separate; duplicate native 
 });
 
 test("non-pausable source overflow fails observation without inventing a native terminal", async () => {
-  const { runtime, session, sink } = await setup({ execute: async (call, events) => {
-    if(call.method !== 'input/submit')return undefined;
-    const { submissionId } = call.params as import('@anureo/protocol').InputSubmitParams;
-    await events.emit({type:'turn/started',payload:{turnId:'active'}});
-    return {submissionId,accepted:true,disposition:'started',turnId:'active'};
-  } }, { queue: { maxFrameBytes: 4096 } });
+  const { runtime, session, sink } = await setup({
+    adapterOptions: {
+      /** Leave the accepted turn active so overflow must fail observation of live work. */
+      async execute(call, events) {
+        if (call.method !== 'input/submit') return undefined;
+        const { submissionId } = call.params as InputSubmitParams;
+        await events.emit({ type: 'turn/started', payload: { turnId: 'active' } });
+        return { submissionId, accepted: true, disposition: 'started', turnId: 'active' };
+      },
+    },
+    runtimeOptions: { queue: { maxFrameBytes: 4096 } },
+  });
   const turn = await session.submit({ input:'hold' }), reader = session.events()[Symbol.asyncIterator]();
   expect(sink.tryEmit({type:'notice',payload:{severity:'info',code:'FLOOD',message:'x'.repeat(8192)}})).toBe(false);
   await expect(turn.result()).rejects.toMatchObject({code:'BACKPRESSURE_EXCEEDED',details:{source:'sdk'}});
@@ -123,17 +162,22 @@ for (const entry of interactions) test(`interaction ${entry.request.kind} waits 
 });
 
 test("invalid interaction answers keep pending; racing valid replies invoke native once", async () => {
-  const { runtime, session, sink } = await setup(); let release!: () => void; let calls = 0;
-  const pending = sink.requestInteraction(approvalInteraction.request, async () => { calls++; await new Promise<void>((resolve) => { release = resolve; }); });
+  const { runtime, session, sink } = await setup();
+  const responseGate = Promise.withResolvers<void>();
+  let calls = 0;
+  const pending = sink.requestInteraction(approvalInteraction.request, async () => {
+    calls++;
+    await responseGate.promise;
+  });
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
   await expect(session.request("interaction/respond", { requestId: "invalid", sessionId: "s", interactionId: approvalInteraction.request.interactionId, response: { kind: "approval", optionId: "invented" } })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
   const first = session.request("interaction/respond", { requestId: "first", sessionId: "s", interactionId: approvalInteraction.request.interactionId, response: approvalInteraction.response });
   await expect(session.request("interaction/respond", { requestId: "second", sessionId: "s", interactionId: approvalInteraction.request.interactionId, response: { kind: "approval", optionId: "no" } })).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
-  expect(calls).toBe(1); release(); await first; await pending; await reader.return?.(); await runtime.dispose();
+  expect(calls).toBe(1); responseGate.resolve(); await first; await pending; await reader.return?.(); await runtime.dispose();
 });
 
 test("timeout cancels a pending native interaction rather than approving it", async () => {
-  const { runtime, session, sink } = await setup({}, { interactionTimeoutMs: 15 }); let response: InteractionResponse | null | undefined;
+  const { runtime, session, sink } = await setup({ runtimeOptions: { interactionTimeoutMs: 15 } }); let response: InteractionResponse | null | undefined;
   const pending = sink.requestInteraction(approvalInteraction.request, async (value) => { response = value; });
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
   await expect(pending).rejects.toMatchObject({ code: "INTERACTION_CANCELLED" });
@@ -181,7 +225,7 @@ test("runtime disposal preserves backend stop failure after cleaning every owner
 });
 
 test("remote resolved events retire the registry without submitting another native response", async () => {
-  const { runtime, session, sink } = await setup({}, { interactionTimeoutMs: 20 }); let calls = 0;
+  const { runtime, session, sink } = await setup({ runtimeOptions: { interactionTimeoutMs: 20 } }); let calls = 0;
   const pending = sink.requestInteraction(approvalInteraction.request, async () => { calls++; }); void pending.catch(() => {});
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
   await sink.resolveInteraction({ interactionId: approvalInteraction.request.interactionId, outcome: "expired" });
@@ -202,7 +246,15 @@ test("open configuration and model survive the initial authority snapshot", asyn
 });
 
 test("a revert result updates the recoverable native reference without changing fixed session identity", async () => {
-  const { runtime, session, sink } = await setup({ execute: async (call) => call.method === "session/revert" ? { appliedScope: "conversation", boundary: { turnId: "old", relation: "before" }, nativeRef: { provider: "scripted", value: "native:reverted" } } : undefined });
+  const { runtime, session, sink } = await setup({
+    adapterOptions: {
+      /** Return a replacement native reference so the test can compare receipt and event updates. */
+      async execute(call) {
+        if (call.method !== "session/revert") return undefined;
+        return { appliedScope: "conversation", boundary: { turnId: "old", relation: "before" }, nativeRef: { provider: "scripted", value: "native:reverted" } };
+      },
+    },
+  });
   await session.request("session/revert", { requestId: "revert", sessionId: "s", scope: "conversation", boundary: { turnId: "old", relation: "before" } });
   expect(session.binding).toEqual({ ...OPEN.binding, nativeRef: { provider: "scripted", value: "native:reverted" } });
   expect(Object.isFrozen(session.binding.nativeRef)).toBe(true);
@@ -233,16 +285,14 @@ test("marked secret answers are redacted from native echoes, split deltas and hi
   await session.request("interaction/respond", { requestId: "respond", sessionId: "s", interactionId: "secret", response: { kind: "userInput", answers: { password: secret } } }); await pending;
   expect(nativeAnswers).toEqual([{ kind: "userInput", answers: { password: secret } }]);
   await session.submit({ input: [{ type: "text", text: `echo ${secret}` }] });
-  const events: AhpEvent[] = [];
-  while (true) { const event = (await reader.next()).value!; events.push(event); if (event.type === "turn/completed") break; }
+  const events = await readThroughTurnCompletion(reader);
   expect(JSON.stringify(events)).not.toContain(secret); expect(JSON.stringify(await session.request("history/read", { requestId: "history", sessionId: "s" }))).not.toContain(secret);
   await sink.emit({ type: "turn/started", payload: { turnId: "split" } });
   await sink.emit({ type: "item/started", payload: { item: { id: "split-text", type: "agentMessage", text: "" } } }, { turnId: "split" });
   for (const part of ["PRIVATE_", "ANSWER_", "123"]) await sink.emit({ type: "item/delta", payload: { itemId: "split-text", kind: "text", text: part } }, { turnId: "split" });
   await sink.emit({ type: "item/completed", payload: { item: { id: "split-text", type: "agentMessage", text: secret } } }, { turnId: "split" });
   await sink.emit({ type: "turn/completed", payload: { turnId: "split", status: "completed" } });
-  const split: AhpEvent[] = [];
-  while (true) { const event = (await reader.next()).value!; split.push(event); if (event.type === "turn/completed") break; }
+  const split = await readThroughTurnCompletion(reader);
   expect(split.filter((event) => event.type === "item/delta").map((event) => event.payload.text).join("")).toBe("[redacted]");
   expect(JSON.stringify(split)).not.toContain(secret); await reader.return?.(); await runtime.dispose();
 });
@@ -257,54 +307,86 @@ test("elicitation writeOnly values are marked before a synchronous native echo",
 });
 
 test("accepted compaction does not impose a universal Core busy scheduler", async () => {
-  const {runtime,session,sink,adapter}=await setup({execute:async call=>call.method==='compact/start'?{maintenanceId:'async',status:'accepted'}:undefined});
-  expect(await session.request('compact/start',{requestId:'compact',sessionId:'s'})).toMatchObject({status:'accepted'});
-  await sink.emit({type:'session/metadata',payload:{title:'Maintenance'}});
-  const turn=await session.submit({ input:'native admission' });expect((await turn.result()).status).toBe('completed');
-  expect(adapter.calls.filter(call=>call.method==='input/submit')).toHaveLength(1);await runtime.dispose();
+  const { runtime, session, sink, adapter } = await setup({
+    adapterOptions: {
+      async execute(call) {
+        if (call.method === 'compact/start') return { maintenanceId: 'async', status: 'accepted' };
+      },
+    },
+  });
+  expect(await session.request('compact/start', { requestId: 'compact', sessionId: 's' })).toMatchObject({ status: 'accepted' });
+  await sink.emit({ type: 'session/metadata', payload: { title: 'Maintenance' } });
+  const turn = await session.submit({ input: 'native admission' });
+  expect((await turn.result()).status).toBe('completed');
+  expect(adapter.calls.filter(call => call.method === 'input/submit')).toHaveLength(1);
+  await runtime.dispose();
 });
 
 test("an in-flight fork does not add a universal Core mutation lock", async () => {
-  let notifyForkEntered!: () => void;
-  let releaseFork!: () => void;
-  const forkEntered = new Promise<void>(resolve => { notifyForkEntered = resolve; });
-  const allowForkToFinish = new Promise<void>(resolve => { releaseFork = resolve; });
-  const { runtime, session } = await setup({ onOpen: async params => {
-    if (params.mode === 'fork') {
-      notifyForkEntered();
-      await allowForkToFinish;
-    }
-  } });
+  const forkEntered = Promise.withResolvers<void>();
+  const allowForkToFinish = Promise.withResolvers<void>();
+  const { runtime, session } = await setup({
+    adapterOptions: {
+      /** Hold native fork acquisition until the source session has accepted another submission. */
+      async onOpen(params) {
+        if (params.mode === 'fork') {
+          forkEntered.resolve();
+          await allowForkToFinish.promise;
+        }
+      },
+    },
+  });
   const original = await session.submit({ input: 'boundary' });
   await original.result();
   const branch = runtime.sessions.fork(session.reference, { boundary: { turnId: original.id, relation: 'through' } });
 
-  await forkEntered;
+  await forkEntered.promise;
   const during = await session.submit({ input: 'during fork' });
   expect((await during.result()).status).toBe('completed');
 
-  releaseFork();
+  allowForkToFinish.resolve();
   await branch;
   await runtime.dispose();
 });
 
 test("a compact completion snapshot before acknowledgement cannot leave the session stuck busy", async () => {
-  let session!: Awaited<ReturnType<Client["openSession"]>>;
-  const fixture = await setup({ execute: async (call, sink) => {
-    if (call.method !== "compact/start") return undefined;
-    await sink.emit({ type: "session/state", payload: { binding: structuredClone(session.binding), capabilities: structuredClone(session.capabilities), config: {}, capabilityRevision: 1, activeTurnIds: [], status: "ready" } });
-    return { maintenanceId: "fast", status: "accepted" };
-  } });
-  session = fixture.session;
+  const { runtime, session } = await setup({
+    adapterOptions: {
+      /** Publish the ready state before resolving the compaction admission receipt. */
+      async execute(call, sink) {
+        if (call.method !== "compact/start") return undefined;
+        await sink.emit({
+          type: "session/state",
+          payload: {
+            binding: structuredClone(session.binding),
+            capabilities: structuredClone(session.capabilities),
+            config: {},
+            capabilityRevision: 1,
+            activeTurnIds: [],
+            status: "ready",
+          },
+        });
+        return { maintenanceId: "fast", status: "accepted" };
+      },
+    },
+  });
   expect(await session.request("compact/start", { requestId: "compact", sessionId: "s" })).toMatchObject({ status: "accepted" });
-  await session.submit({ input: [{ type: "text", text: "go" }] }); await fixture.runtime.dispose();
+  await session.submit({ input: [{ type: "text", text: "go" }] });
+  await runtime.dispose();
 });
 
 test("privacy metadata ports run before native submission and project restored authoritative history", async () => {
   const remembered: Array<{ sessionId: string; value: string }> = []; let nativeSeen = false;
-  const { runtime, session, sink } = await setup({}, {
-    onMarkedSecret: (binding, value) => { remembered.push({ sessionId: binding.sessionId, value }); },
-    redactHistory: (_binding, page) => ({ ...page, items: page.items.map((entry) => ({ ...entry, item: entry.item.type === "agentMessage" ? { ...entry.item, text: "host-persistent-projection" } : entry.item })) }),
+  const { runtime, session, sink } = await setup({
+    runtimeOptions: {
+      onMarkedSecret: (binding, value) => { remembered.push({ sessionId: binding.sessionId, value }); },
+      redactHistory: (_binding, page) => ({
+        ...page,
+        items: page.items.map(entry => entry.item.type === "agentMessage"
+          ? { ...entry, item: { ...entry.item, text: "host-persistent-projection" } }
+          : { ...entry }),
+      }),
+    },
   });
   const pending = sink.requestInteraction({ interactionId: "private", kind: "userInput", questions: [{ id: "q", prompt: "Secret", secret: true }] }, async () => { nativeSeen = true; expect(remembered).toEqual([{ sessionId: "s", value: "secret-port-value" }]); });
   const reader = session.events()[Symbol.asyncIterator](); await nextType(reader, "interaction/requested");
@@ -321,14 +403,28 @@ test("successful configuration, goal results and state displays redact marked co
   const capabilities = { ...structuredClone(FAKE_CAPABILITIES), config: { options: [{ id: "model", scope: "session" as const, title: secret, value: secret, schema: { type: "string", title: secret, description: secret, default: secret, examples: [secret], enum: ["model", "string"], $defs: { choice: { type: "string", description: secret } }, properties: { title: { type: "string", description: secret } } } }] } };
   const activeGoal: GoalState = { goal: { text: secret, numericAnswer: 1 }, status: "active" };
   const clearedGoal: GoalState = { goal: { echo: secret }, status: "cleared" };
-  let nativeState!: SessionState;
-  const { runtime, session, sink } = await setup({ capabilities, execute: async (call) => {
-    if (call.method === "session/config/set") return nativeState;
-    if (call.method === "goal/set") return activeGoal;
-    if (call.method === "goal/clear") return clearedGoal;
-    return undefined;
-  } });
-  nativeState = { binding: structuredClone(session.binding), status: "ready", activeTurnIds: [], config: { model: secret, numericAnswer: 1 }, model: "model", capabilityRevision: 1, capabilities, goal: { goal: { text: secret }, status: "active" } };
+  const { runtime, session, sink } = await setup({
+    adapterOptions: {
+      capabilities,
+      /** Supply retained native results so the test can compare their SDK projections. */
+      async execute(call) {
+        if (call.method === "session/config/set") return nativeState;
+        if (call.method === "goal/set") return activeGoal;
+        if (call.method === "goal/clear") return clearedGoal;
+        return undefined;
+      },
+    },
+  });
+  const nativeState: SessionState = {
+    binding: structuredClone(session.binding),
+    status: "ready",
+    activeTurnIds: [],
+    config: { model: secret, numericAnswer: 1 },
+    model: "model",
+    capabilityRevision: 1,
+    capabilities,
+    goal: { goal: { text: secret }, status: "active" },
+  };
   const reader = session.events()[Symbol.asyncIterator]();
   const pending = sink.requestInteraction({ interactionId: "result-secret", kind: "userInput", questions: Object.keys(secretAnswersIncludingProtocolValues).map((id) => ({ id, prompt: id, secret: true })) }, async () => {});
   await nextType(reader, "interaction/requested");

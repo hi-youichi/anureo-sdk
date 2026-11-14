@@ -1,25 +1,27 @@
 import { createHash } from 'node:crypto'
 import { HarnessSdkError } from '@anureo/sdk'
 
-/** Lossless workflow data: finite numbers, dense arrays and string-keyed JSON objects. */
+/** Workflow JSON data shape. The encoder also checks runtime properties and rejects cycles. */
 export type JsonValue = null | boolean | number | string | JsonValue[] | {
   [key: string]: JsonValue
 }
 
 /** Encode strict JSON with sorted object keys for persistence and cache identity.
- * Throws WORKFLOW_NON_JSON_VALUE for lossy values, cycles, non-plain objects, symbol keys,
- * accessors or non-enumerable fields. Shared acyclic objects are allowed; toJSON is never called. */
+ * Throws WORKFLOW_NON_JSON_VALUE for unsupported values such as non-finite numbers, sparse
+ * arrays, cycles, non-plain objects, symbol keys, accessors and hidden data fields.
+ * Shared acyclic references encode by value. Encoding never calls toJSON. */
 export function canonicalJson(value: unknown): string {
   return encodeJson(value, new Set())
 }
 
-/** Return an isolated JSON copy, rejecting the same unsupported values as canonicalJson. */
+/** Return a detached copy of JSON-compatible data. Unsupported values throw as in canonicalJson.
+ * Shared references are copied by value. */
 export function jsonCopy<T>(value: T): T {
   return JSON.parse(canonicalJson(value)) as T
 }
 
 /** Deeply freeze an already validated, acyclic JSON value in place and return it.
- * prepareRun applies this to its private copy before exposing workflow's body input. */
+ * prepareRun passes an owned copy for workflow to expose to the body. */
 export function freezeJson<T>(value: T): T {
   if (value && typeof value === 'object') {
     for (const child of Object.values(value)) freezeJson(child)
@@ -46,7 +48,9 @@ function encodeJson(item: unknown, ancestors: Set<object>): string {
     return Array.isArray(item)
       ? encodeArray(item, descriptors, ancestors)
       : encodeObject(item, descriptors, ancestors)
-  } finally { ancestors.delete(item) }
+  } finally {
+    ancestors.delete(item)
+  }
 }
 
 /** Dense array slots must be the only own properties besides length to avoid silent data loss. */

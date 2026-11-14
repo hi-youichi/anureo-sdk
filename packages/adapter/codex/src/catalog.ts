@@ -1,4 +1,4 @@
-/** Owns reusable read-only catalog connections and cancellation; it must not create threads or turns. */
+/** Owns the shared connection for read-only Codex discovery. */
 import { catalogPhase, type CatalogProbeOptions } from '@anureo/sdk/diagnostics'
 import { HarnessSdkError } from '@anureo/sdk'
 import { spawnHarnessProcess, type HarnessProcess } from '@anureo/sdk/process'
@@ -6,60 +6,147 @@ import { CodexJsonlClient } from './jsonl'
 import { readAccountStatus } from './account'
 import { readCodexModels } from './models'
 import type { CodexAdapterOptions } from './options'
-/** Public launch/transport options shared with adapters; the catalog owns every process it creates. */
+
+/** Launch and transport settings for a catalog and its owned process handles. */
 export type { CodexAdapterOptions } from './options'
-/** Public read-only model metadata; interpretation is shared with adapter probes. */
+/** Metadata returned by model discovery, including hidden entries. */
 export type { CodexModel } from './models'
 
 /**
- * Construct a reusable read-only catalog without I/O; the host must await dispose after use.
- * prepare/queries reject launch, handshake, query or abort failures. Aborting an active call requests
- * shared connection cleanup and can fail concurrent reads. dispose awaits cleanup and may reject;
- * later calls may prepare again. No thread or turn is created.
+ * Create a reusable catalog for model discovery and account readiness without starting a process.
+ * Preparation and reads share a connection and never open a thread or start a turn. Aborting an
+ * active operation requests shared cleanup, so concurrent operations can fail too. Await dispose
+ * after use. The same catalog can reconnect after disposal or reader closure.
  */
 export function createCodexCatalogSession(options: CodexAdapterOptions) {
   let client: CodexJsonlClient | undefined
   let preparationInFlight: Promise<void> | undefined
   let connectionCloseInFlight: Promise<void> | undefined
   let disposalInFlight: Promise<void> | undefined
-  /** Share connection disposal across racing callers, detaching it before awaiting cleanup so it cannot be reused; return cleanup completion or rejection without waiting for preparation. */
-  const closeConnection = (): Promise<void> => {
-    if (connectionCloseInFlight) return connectionCloseInFlight
-    const current = client
-    client = undefined
-    return connectionCloseInFlight = (current?.dispose() ?? Promise.resolve()).finally(() => { connectionCloseInFlight = undefined })
+
+  /**
+   * Wait for any pending cleanup and share the next spawn and handshake with concurrent callers.
+   * The caller that starts preparation supplies spawn and handshake diagnostics and the per-RPC
+   * timeout for this connection (10,000 ms by default), excluding spawn.
+   * Reject startup, cleanup or cancellation failures.
+   */
+  const prepare = (context: CatalogProbeOptions = {}): Promise<void> => {
+    return withAbortCleanup(context, async () => {
+      // Disposal's second close must finish before a replacement client can be published.
+      await disposalInFlight
+      await connectionCloseInFlight
+      if (preparationInFlight) {
+        await preparationInFlight
+        return
+      }
+      if (client) return
+      await (preparationInFlight ??= startConnection(context).finally(() => { preparationInFlight = undefined }))
+    })
   }
-  /** Release this preparation’s resources for explicit cleanup or cancellation. Close before and after awaiting preparation to catch clients created during the race; concurrent callers share completion and cleanup failures propagate. */
-  const dispose = (): Promise<void> => disposalInFlight ??= (async () => {
-    await closeConnection()
-    await preparationInFlight?.catch(() => {})
-    await closeConnection()
-  })().finally(() => { disposalInFlight = undefined })
-  /** Run a catalog operation with its caller’s abort listener; pre-aborted calls reject RPC_ABORTED and later abort requests shared cleanup, also affecting concurrent users. Always remove the listener and propagate work failures. */
-  const guarded = async <T>(context: CatalogProbeOptions, work: () => Promise<T>): Promise<T> => {
-    /** Abort listener requests shared disposal without throwing from event dispatch; guarded work observes resulting transport failure. */
+
+  /**
+   * Prepare or reuse the connection and return all model pages in native order, including hidden
+   * entries. Report the models phase and reject preparation, query, decoding or cancellation
+   * failures. The catalog retains the connection for later reads.
+   */
+  const listModels = (context: CatalogProbeOptions = {}) =>
+    query(context, getClient => catalogPhase(context, 'models', () => readCodexModels(getClient())))
+
+  /**
+   * Prepare or reuse the connection and return account readiness without refreshing credentials.
+   * Return unknown if the native method is unsupported. Preparation and other read failures
+   * reject. The catalog retains the connection for later reads.
+   */
+  const readAuthStatus = (context: CatalogProbeOptions = {}) =>
+    query(context, getClient => readAccountStatus(getClient()))
+
+  /**
+   * Release the shared connection and wait for any in-flight preparation to settle if the first
+   * close succeeds. Concurrent disposal calls share completion and observe cleanup failures.
+   * A preparation failure belongs to its caller. Dispose also closes a client published during
+   * that preparation.
+   */
+  const dispose = (): Promise<void> => {
+    return disposalInFlight ??= (async () => {
+      await closeConnection()
+      await preparationInFlight?.catch(() => {})
+      await closeConnection()
+    })().finally(() => { disposalInFlight = undefined })
+  }
+
+  return { prepare, listModels, readAuthStatus, dispose }
+
+  /**
+   * For explicit disposal and startup rollback, wait for the close already started by any
+   * caller or start a new one. Return the close outcome without waiting for preparation.
+   */
+  function closeConnection(): Promise<void> {
+    if (connectionCloseInFlight) return connectionCloseInFlight
+    return releaseConnection(client)
+  }
+
+  /**
+   * Detach the current client before disposing it so prepare cannot reuse it. Track the close
+   * until it settles so racing prepare and dispose calls can await the same cleanup outcome.
+   */
+  function releaseConnection(current: CodexJsonlClient | undefined): Promise<void> {
+    client = undefined
+    connectionCloseInFlight = (current?.dispose() ?? Promise.resolve()).finally(() => {
+      connectionCloseInFlight = undefined
+    })
+    return connectionCloseInFlight
+  }
+
+  /**
+   * Keep cancellation active from preparation through the read. The models phase observer can
+   * run before the read begins, so look up the shared client when invoking the read itself.
+   */
+  function query<T>(
+    context: CatalogProbeOptions,
+    work: (getClient: () => CodexJsonlClient) => Promise<T>,
+  ): Promise<T> {
+    return withAbortCleanup(context, async () => {
+      await prepare(context)
+      return await work(() => client!)
+    })
+  }
+
+  /**
+   * Reject pre-aborted calls with RPC_ABORTED and remove the abort listener when work settles.
+   * During work the listener starts shared disposal without waiting for it. The operation
+   * propagates its own result or failure, including transport failures caused by disposal.
+   */
+  async function withAbortCleanup<T>(context: CatalogProbeOptions, work: () => Promise<T>): Promise<T> {
     const abort = () => { void dispose().catch(() => {}) }
     if (context.signal?.aborted) throw new HarnessSdkError('RPC_ABORTED')
     context.signal?.addEventListener('abort', abort, { once: true })
-    try { return await work() } finally { context.signal?.removeEventListener('abort', abort) }
+    try {
+      return await work()
+    } finally {
+      context.signal?.removeEventListener('abort', abort)
+    }
   }
-  /** Publish startConnection's client before handshake so cancellation can reach it. The registered finished callback detaches and disposes only this connection after reader completion; an old reader must never detach a replacement. Background cleanup failures are absorbed here but remain observable while cleanup is in flight. */
-  const publishConnection = (connected: CodexJsonlClient): void => {
+
+  /**
+   * Expose the client to disposal before handshaking. When its JSONL reader finishes, close it
+   * only if it is still the current client. The observer has no caller to receive cleanup errors.
+   */
+  function publishConnection(connected: CodexJsonlClient): void {
     client = connected
     void connected.finished.then(() => {
-      if (client === connected) {
-        client = undefined
-        connectionCloseInFlight = connected.dispose().finally(() => { connectionCloseInFlight = undefined })
-        void connectionCloseInFlight.catch(() => {})
-      }
+      if (client === connected) void releaseConnection(connected).catch(() => {})
     })
   }
-  /** For preparation only, spawn and publish one connection before handshaking so cancellation can close pending RPCs. Report phases and release partial resources on failure; cleanup rejection takes precedence over the startup cause. */
-  const startConnection = (context: CatalogProbeOptions): Promise<void> => {
+
+  /**
+   * Spawn and handshake for prepare. On failure, close the published client and release any
+   * process acquired during spawn. A cleanup rejection takes precedence over the startup cause.
+   */
+  function startConnection(context: CatalogProbeOptions): Promise<void> {
     let spawned: HarnessProcess | undefined
     return (async () => {
       const child = await catalogPhase(context, 'spawn', async () => {
-        // Retain ownership before phase completion, which can reject for cancellation after spawning.
+        // The phase can reject for cancellation after the launcher has returned a process.
         spawned = await (options.processFactory ?? spawnHarnessProcess)({
           command: options.command,
           args: options.args ?? ['app-server'],
@@ -68,51 +155,45 @@ export function createCodexCatalogSession(options: CodexAdapterOptions) {
         })
         return spawned
       })
-      if (context.signal?.aborted) { await child.dispose(); throw new HarnessSdkError('RPC_ABORTED') }
+      if (context.signal?.aborted) {
+        // A success observer can abort after the spawn phase's own cancellation check.
+        await child.dispose()
+        throw new HarnessSdkError('RPC_ABORTED')
+      }
+
       const connected = createCatalogClient(child, options, context)
       publishConnection(connected)
-      await catalogPhase(context, 'handshake', async () => {
-        await connected.request('initialize', { clientInfo: { name: 'anureo-catalog', version: '1' }, capabilities: { experimentalApi: true } })
-        await connected.notify('initialized')
-      })
+      await handshake(connected, context)
     })().catch(async cause => {
       await closeConnection()
-      // Covers cancellation during spawn before a client took ownership of the process.
+      // A failed spawn phase may still have acquired a process before client publication.
       await spawned?.dispose()
       throw cause
     })
   }
-  /** Lazily share spawn/handshake after prior cleanup settles; reject abort/startup errors after releasing partial resources. The first preparation sets per-RPC timeoutMs (default 10,000ms) until reconnection; it does not bound spawning. Later calls reuse the connection or reconnect after disposal/EOF. */
-  const prepare = (context: CatalogProbeOptions = {}): Promise<void> => guarded(context, async () => {
-    // Disposal's second close must finish before a replacement client can be published.
-    await disposalInFlight
-    await connectionCloseInFlight
-    if (preparationInFlight) { await preparationInFlight; return }
-    if (client) return
-    await (preparationInFlight ??= startConnection(context).finally(() => { preparationInFlight = undefined }))
-  })
-  return {
-    prepare,
-    /** Prepare/reuse a read-only connection and return ordered model metadata with phase diagnostics; propagate abort/query errors and leave connection ownership with this catalog. */
-    listModels: (context: CatalogProbeOptions = {}) => guarded(context, async () => {
-      await prepare(context)
-      return await catalogPhase(context, 'models', () => readCodexModels(client!))
-    }),
-    /** Prepare/reuse a read-only connection and return ready/required without authenticating, or unknown when account/read is unsupported. Propagate abort/query errors and retain the connection until cleanup. */
-    readAuthStatus: (context: CatalogProbeOptions = {}) => guarded(context, async () => {
-      await prepare(context)
-      return await readAccountStatus(client!)
-    }),
-    dispose,
-  }
 }
 
-/** Start readers for startConnection's process without handshaking. JSONL invokes the non-interactive handlers; publishConnection observes reader completion and owns subsequent cleanup. The returned client retains the first preparation's request deadline, overriding options.timeoutMs. */
+/** Complete startup after the initialize reply and the initialized notification write. Report the handshake phase and propagate its failure to startup rollback. */
+function handshake(client: CodexJsonlClient, context: CatalogProbeOptions): Promise<void> {
+  return catalogPhase(context, 'handshake', async () => {
+    await client.request('initialize', {
+      clientInfo: { name: 'anureo-catalog', version: '1' },
+      capabilities: { experimentalApi: true },
+    })
+    await client.notify('initialized')
+  })
+}
+
+/**
+ * Start JSONL readers for the launched child. Use the preparation context's per-RPC timeout in
+ * place of the adapter timeout. The caller publishes the client so reader completion and
+ * cancellation can release the process.
+ */
 function createCatalogClient(child: HarnessProcess, options: CodexAdapterOptions, context: CatalogProbeOptions): CodexJsonlClient {
   return new CodexJsonlClient(child, {
-    // Read-only queries have no session state to update; the finished observer owns closure cleanup.
+    // Catalog reads keep no notification state. The finished observer owns closure cleanup.
     notification: async () => {},
-    /** Reject every server interaction without consulting a user; transport write failures reach the JSONL handler's fallback. */
+    /** When JSONL dispatches a native interaction, await the method-not-found reply write. */
     request: async (_request, _reply, reject) => { await reject(-32601, 'Catalog queries are non-interactive') },
     failure: async () => {},
     diagnostic: options.diagnostic,

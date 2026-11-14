@@ -1,41 +1,72 @@
-import { createClient, type HarnessAdapter, type Client, type Session, type Turn, type RuntimeOptions, type InteractionHandlers } from '@anureo/sdk';
-import type { Capabilities, AhpEvent, InteractionRequested, InteractionResponse, SessionOpenParams } from '@anureo/protocol';
+import { createClient, type Client, type HarnessAdapter, type InteractionHandlers, type RuntimeOptions, type Session, type Turn } from '@anureo/sdk';
+import type { AhpEvent, Boundary, Capabilities, InteractionRequested, InteractionResponse, RevertScope, SessionOpenParams } from '@anureo/protocol';
 
-/** Shared acceptance cases; native overlap and observation ownership are checked separately by runNativeConformance. */
-export const CONFORMANCE_SCENARIOS = ['lifecycle','immediate','identity','approval','userInput','elicitation','dynamicTool','interrupt','steer','fork','revert','history','unknown-item','disconnect','backpressure'] as const;
-/** Select a shared behavioral case for an adapter fixture. */
+/** Default shared acceptance cases in execution order. Use runNativeConformance for native lifecycle cases. */
+export const CONFORMANCE_SCENARIOS = [
+  'lifecycle', 'immediate', 'identity', 'approval', 'userInput', 'elicitation', 'dynamicTool',
+  'interrupt', 'steer', 'fork', 'revert', 'history', 'unknown-item', 'disconnect', 'backpressure',
+] as const;
+
+/** Select a shared behavioral case to run or to supply fixture behavior for. */
 export type ConformanceScenario = typeof CONFORMANCE_SCENARIOS[number];
-/** Supply scenario-specific native behavior; runConformance creates and disposes the SDK client. */
+
+/** Supply scenario-specific native behavior to the runner that manages the SDK client. */
 export interface ConformanceDriver {
-  /** Fresh adapter owned by the runner once client creation begins. */
+  /** Fresh adapter passed to createClient for SDK-managed initialization and release. */
   adapter: HarnessAdapter;
-  /** Initial session identity and native setup, passed to Client.openSession. */
+  /** Native session setup passed to Client.openSession. Its binding also supplies the client identity. */
   openParams: SessionOpenParams;
   /** SDK policy overrides, including queue limits for backpressure fixtures. */
   runtimeOptions?: RuntimeOptions;
-  /** Awaited after submit and any steer/interrupt, before result observation; rejection fails the case (or supplies the expected source fault). */
+  /**
+   * runConformance awaits this hook after obtaining the initial Turn and completing any control request,
+   * before waiting for its result. Fixtures can use it to induce source loss. A rejection reaches the
+   * case as an execution failure and can satisfy a fault case if it carries one of that case's codes.
+   */
   afterStart?: (session: Session) => Promise<void>;
-  /** Authoritative text expected by lifecycle/immediate; defaults to 'conformance'. */
+  /** Authoritative text expected by lifecycle and immediate. Defaults to 'conformance'. */
   expectedText?: string;
-  /** Automatic interaction answer; defaults to the first approval/choice, 'conformance' input/tool text, or declined elicitation. */
+  /**
+   * Answer a native interaction with a response of the matching kind. The SDK calls the runner's
+   * registered handler after publishing the request and delivers the answer to the native responder.
+   * If the callback throws, the SDK cancels the interaction while it is still actionable.
+   * By default the runner selects the first approval option and the first option for each question,
+   * uses 'conformance' for free-text answers and tool output, and declines elicitation.
+   */
   answer?: (request: InteractionRequested) => InteractionResponse;
 }
-/** Called once per selected case. Return isolated fixtures; retain cleanup responsibility for external resources and failed factory setup. */
+/** Supply an isolated driver each time runConformance starts a selected case, even if it later skips the case. Release external resources and clean up failed factory setup yourself. */
 export type ConformanceFactory = (scenario: ConformanceScenario) => Promise<ConformanceDriver> | ConformanceDriver;
-/** A missing optional capability is not-applicable; declared but broken behavior is failed. */
-export interface ConformanceCaseResult { scenario: ConformanceScenario; status: 'passed' | 'failed' | 'not-applicable'; message?: string }
-/** Ordered case verdicts; passed means no selected case failed, including when cases are not-applicable. */
-export interface ConformanceReport { passed: boolean; cases: ConformanceCaseResult[] }
+
+/** Verdict for one selected case. */
+export interface ConformanceCaseResult {
+  scenario: ConformanceScenario;
+  /** An undeclared required capability yields 'not-applicable'. A broken declared capability yields 'failed'. */
+  status: 'passed' | 'failed' | 'not-applicable';
+  /** Diagnostic for a failed case, replaced by RESOURCE_RELEASE_FAILED if disposal of its client rejects. */
+  message?: string;
+}
+
+/** Shared case verdicts in the order requested by the caller. */
+export interface ConformanceReport {
+  /** True when no selected case failed, including an empty selection or cases that were skipped. */
+  passed: boolean;
+  cases: ConformanceCaseResult[];
+}
 
 /**
  * Check an adapter through the public SDK, sequentially in the selected order (all shared cases by default).
- * Adapter suites assert the returned verdicts; fixture/assertion failures become failed cases and client
- * release failures replace that case's message with RESOURCE_RELEASE_FAILED. Event-reader teardown
- * failures reject the run before client disposal. Initial turn observation has a 3000 ms deadline unless timeoutMs is supplied;
- * setup, later history/fork checks and cleanup retain their own SDK/fixture wait policies.
- * The runner releases readers and clients; factories must release their external fixture resources.
+ * The timeoutMs option bounds initial submission, controls, afterStart and result observation.
+ * It defaults to 3000 ms and leaves setup, later session operations and cleanup on their own
+ * SDK or fixture wait policies. The runner awaits reader teardown before client disposal and
+ * starts the next case after cleanup. Setup and check failures become case verdicts. Reader
+ * teardown failure rejects the run before client disposal. Client disposal failure marks the
+ * case failed with RESOURCE_RELEASE_FAILED. Callers still own resources outside the SDK client.
  */
-export async function runConformance(factory: ConformanceFactory, options: {timeoutMs?:number;scenarios?:readonly ConformanceScenario[]}={}):Promise<ConformanceReport>{
+export async function runConformance(
+  factory: ConformanceFactory,
+  options: { timeoutMs?: number; scenarios?: readonly ConformanceScenario[] } = {},
+): Promise<ConformanceReport> {
   const cases: ConformanceCaseResult[] = [];
   for (const scenario of options.scenarios ?? CONFORMANCE_SCENARIOS) {
     cases.push(await runConformanceCase({ factory, scenario, timeoutMs: options.timeoutMs ?? 3000 }));
@@ -43,7 +74,11 @@ export async function runConformance(factory: ConformanceFactory, options: {time
   return { passed: cases.every(entry => entry.status !== 'failed'), cases };
 }
 
-/** Keep acquisition and ordered release together so skipped and failed cases release the same owners. */
+/**
+ * Supply runConformance with one verdict after fixture setup, applicable checks and ordered cleanup.
+ * Returning the reader first detaches it from the session and lets its collection task finish.
+ * Reader teardown failure propagates directly. Client disposal failure replaces any earlier verdict.
+ */
 async function runConformanceCase({ factory, scenario, timeoutMs }: {
   factory: ConformanceFactory; scenario: ConformanceScenario; timeoutMs: number;
 }): Promise<ConformanceCaseResult> {
@@ -52,12 +87,9 @@ async function runConformanceCase({ factory, scenario, timeoutMs }: {
   let result: ConformanceCaseResult;
   try {
     const driver = await factory(scenario);
-    const handlers = Object.fromEntries(['approval','userInput','elicitation','dynamicTool'].map(kind => [kind,
-      async (request: InteractionRequested) => (driver.answer ?? defaultAnswer)(request),
-    ])) as InteractionHandlers;
-    client = await createClient({ adapter: driver.adapter, identity: driver.openParams.binding, runtime: driver.runtimeOptions, interactions: handlers });
+    client = await createCaseClient(driver);
     const session = await client.openSession(driver.openParams);
-    if (!applicable(scenario, session.capabilities)) {
+    if (!isApplicable(scenario, session.capabilities)) {
       result = { scenario, status: 'not-applicable' };
     } else {
       observation = collectEvents(session);
@@ -78,7 +110,32 @@ async function runConformanceCase({ factory, scenario, timeoutMs }: {
   return result;
 }
 
-/** Own the reader's mutable state; a fulfilled task lets scenario logic decide whether source loss is expected. */
+const interactionKinds = ['approval', 'userInput', 'elicitation', 'dynamicTool'] as const;
+
+/**
+ * Initialize the driver adapter for runConformanceCase, advertising every interaction kind.
+ * The SDK invokes the registered handler after publishing the request and uses its answer for
+ * native settlement. Return createClient's initialization promise so runConformanceCase can
+ * open a session and later dispose the client, or record an initialization failure.
+ */
+function createCaseClient(driver: ConformanceDriver): Promise<Client> {
+  const handlers = Object.fromEntries(interactionKinds.map(kind => [
+    kind,
+    async (request: InteractionRequested) => (driver.answer ?? defaultAnswer)(request),
+  ])) as InteractionHandlers;
+  return createClient({
+    adapter: driver.adapter,
+    identity: driver.openParams.binding,
+    runtime: driver.runtimeOptions,
+    interactions: handlers,
+  });
+}
+
+/**
+ * Subscribe before submission so the case can inspect events published before association.
+ * The task records read failures and enforces a 10,000-event limit. checkScenario uses its
+ * completion and failure during verification. runConformanceCase owns reader teardown.
+ */
 function collectEvents(session: Session) {
   const reader = session.events()[Symbol.asyncIterator]();
   const events: AhpEvent[] = [];
@@ -98,7 +155,10 @@ function collectEvents(session: Session) {
   return { reader, events, task, get failure() { return failure; } };
 }
 
-/** Run the bounded observation phase, then verify retained events and any session operations. */
+/**
+ * Verify the initial execution before any follow-up operations add events. runConformanceCase
+ * awaits this before recording a pass. Only source fault cases expect observation to fail.
+ */
 async function checkScenario({ client, session, driver, scenario, observation, timeoutMs }: {
   client: Client; session: Session; driver: ConformanceDriver; scenario: ConformanceScenario;
   observation: ReturnType<typeof collectEvents>; timeoutMs: number;
@@ -106,7 +166,8 @@ async function checkScenario({ client, session, driver, scenario, observation, t
   const { events } = observation;
   const capabilities = session.capabilities;
   const execution = executeScenarioTurn({ session, driver, scenario, capabilities });
-  if (scenario === 'disconnect' || scenario === 'backpressure') {
+  const expectsSourceFailure = scenario === 'disconnect' || scenario === 'backpressure';
+  if (expectsSourceFailure) {
     await checkSourceFailure({ execution, scenario, events, timeoutMs });
   } else {
     const { turn, result } = await deadline(Promise.race([
@@ -114,15 +175,46 @@ async function checkScenario({ client, session, driver, scenario, observation, t
       observation.task.then(() => { throw observation.failure ?? new Error('Source ended before result'); }),
     ]), timeoutMs);
     checkTurnResult({ scenario, driver, events, result });
-    if (['identity', 'history', 'fork', 'revert'].includes(scenario)) {
-      await checkSessionOperations({ client, session, scenario, turn, capabilities });
+    if (scenario === 'identity' || scenario === 'history' || scenario === 'fork' || scenario === 'revert') {
+      await checkSessionOperation({ client, session, turn, scenario, capabilities });
     }
   }
-  requireCondition(!observation.failure || scenario === 'disconnect' || scenario === 'backpressure', 'Unexpected source failure');
-  requireCondition(events.every((event, index) => event.seq === events[0]!.seq + index && event.sessionId === session.id && event.streamId === events[0]!.streamId), 'Source sequence gap');
+  requireCondition(!observation.failure || expectsSourceFailure, 'Unexpected source failure');
+  checkEventSequence(session, events);
 }
 
-/** Preserve native admission ordering: session interruption can precede a receipt; turn controls require its identity. */
+/** Dispatch the selected follow-up after initial terminal evidence passes. Its rejection fails the case. */
+async function checkSessionOperation({ client, session, turn, scenario, capabilities }: {
+  client: Client; session: Session; turn: Turn;
+  scenario: 'identity' | 'history' | 'fork' | 'revert'; capabilities: Capabilities;
+}): Promise<void> {
+  switch (scenario) {
+    case 'identity':
+      await checkDistinctExecution(session, turn);
+      break;
+    case 'history':
+      await checkHistoryIdentity(session);
+      break;
+    case 'fork': {
+      const relations = capabilities.session?.fork;
+      requireCondition(relations !== undefined, 'Fork capability missing');
+      await checkForkBoundaries({ client, session, turn, relations, history: capabilities.session?.history });
+      break;
+    }
+    case 'revert': {
+      const scope = capabilities.session?.revert?.[0];
+      requireCondition(scope !== undefined, 'Revert capability missing');
+      await checkRevertBoundary({ session, turn, scope, history: capabilities.session?.history });
+      break;
+    }
+  }
+}
+
+/**
+ * Start the initial input for checkScenario and return its associated Turn and retained result.
+ * Session-level interruption is issued before awaiting association, which turn controls require.
+ * Await afterStart after controls so its effects or failure precede the result wait.
+ */
 async function executeScenarioTurn({ session, driver, scenario, capabilities }: {
   session: Session; driver: ConformanceDriver; scenario: ConformanceScenario; capabilities: Capabilities;
 }) {
@@ -141,11 +233,10 @@ async function executeScenarioTurn({ session, driver, scenario, capabilities }: 
   return { turn, result: await turn.result() };
 }
 
-/** Lost sources must reject with a recognized observation error, never a fabricated native terminal. */
+/** Fail the case unless execution rejects with an allowed source-loss code and no terminal event was published. */
 async function checkSourceFailure({ execution, scenario, events, timeoutMs }: {
   execution: ReturnType<typeof executeScenarioTurn>; scenario: 'disconnect' | 'backpressure'; events: AhpEvent[]; timeoutMs: number;
 }): Promise<void> {
-  let failed = false;
   try {
     await deadline(execution, timeoutMs);
   } catch (cause) {
@@ -154,10 +245,10 @@ async function checkSourceFailure({ execution, scenario, events, timeoutMs }: {
       ? ['CONNECTION_CLOSED', 'ACP_CONNECTION_CLOSED', 'RPC_CONNECTION_CLOSED']
       : ['BACKPRESSURE_EXCEEDED', 'FRAME_TOO_LARGE'];
     requireCondition(expectedCodes.includes(String(cause.code)), `Unexpected observation error: ${String(cause.code)}`);
-    failed = true;
+    requireCondition(!events.some(event => event.type === 'turn/completed'), 'SDK must not fabricate native terminal');
+    return;
   }
-  requireCondition(failed, 'Lost source must fail observation');
-  requireCondition(!events.some(event => event.type === 'turn/completed'), 'SDK must not fabricate native terminal');
+  throw new Error('Lost source must fail observation');
 }
 
 /** Check native terminal evidence before identity/history operations add further executions and events. */
@@ -167,51 +258,76 @@ function checkTurnResult({ scenario, driver, events, result }: {
   requireCondition(result.status === (scenario === 'interrupt' ? 'interrupted' : 'completed'), 'Unexpected native terminal');
   requireCondition(events.filter(event => event.type === 'turn/started').length === 1, 'Execution must start once');
   requireCondition(events.filter(event => event.type === 'turn/completed').length === 1, 'Execution must end once');
-  if (['approval','userInput','elicitation','dynamicTool'].includes(scenario)) {
+  if (isInteractionScenario(scenario)) {
     requireCondition(events.some(event => event.type === 'interaction/requested') && events.some(event => event.type === 'interaction/resolved'), 'Interaction not exercised');
   }
-  if (scenario === 'lifecycle' || scenario === 'immediate') requireCondition(result.text === (driver.expectedText ?? 'conformance'), 'Authoritative final text missing');
-  if (scenario === 'unknown-item') requireCondition(result.items.some(item => item.type === 'toolCall' && item.kind === 'other' && item.nativeType), 'Unknown native item lost');
+  if (scenario === 'lifecycle' || scenario === 'immediate') {
+    requireCondition(result.text === (driver.expectedText ?? 'conformance'), 'Authoritative final text missing');
+  }
+  if (scenario === 'unknown-item') {
+    requireCondition(result.items.some(item => item.type === 'toolCall' && item.kind === 'other' && item.nativeType), 'Unknown native item lost');
+  }
 }
 
-/** Exercise only the selected post-turn operation; applicability has already established required capabilities. */
-async function checkSessionOperations({ client, session, scenario, turn, capabilities }: {
-  client: Client; session: Session; scenario: ConformanceScenario; turn: Turn; capabilities: Capabilities;
+/** After the first terminal result, wait for a second execution and require a fresh identity. */
+async function checkDistinctExecution(session: Session, turn: Turn): Promise<void> {
+  const other = await session.submit({ input: 'conformance' });
+  await other.result();
+  requireCondition(other.id !== turn.id, 'Execution identity reused');
+}
+
+/** Verify the first history page retains both execution and item IDs after completion. */
+async function checkHistoryIdentity(session: Session): Promise<void> {
+  const page = await session.request('history/read', { sessionId: session.id, requestId: 'history' });
+  requireCondition(page.items.length && page.items.every(item => item.turnId && item.item.id), 'History identity missing');
+}
+
+/**
+ * Verify each advertised fork boundary in order. Check history when supported and close each
+ * verified fork before opening the next. The case client still owns a fork if a check rejects.
+ */
+async function checkForkBoundaries({ client, session, turn, relations, history }: {
+  client: Client; session: Session; turn: Turn; relations: readonly Boundary['relation'][]; history?: boolean;
 }): Promise<void> {
-  const sessionId = session.id;
-  if (scenario === 'identity') {
-    const other = await session.submit({ input: 'conformance' });
-    await other.result();
-    requireCondition(other.id !== turn.id, 'Execution identity reused');
-  }
-  if (scenario === 'history') {
-    const page = await session.request('history/read', { sessionId, requestId: 'history' });
-    requireCondition(page.items.length && page.items.every(item => item.turnId && item.item.id), 'History identity missing');
-  }
-  if (scenario === 'fork') for (const relation of capabilities.session!.fork!) {
+  for (const relation of relations) {
     const fork = await client.sessions.fork(session.reference, { boundary: { turnId: turn.id, relation } });
     requireCondition(fork.id !== session.id && fork.binding.adapterId === session.binding.adapterId, 'Fork binding invalid');
-    if (capabilities.session?.history) {
+    if (history) {
       const page = await fork.request('history/read', { sessionId: fork.id, requestId: 'fork-history' });
-      requireCondition(relation === 'before' ? !page.items.some(item => item.turnId === turn.id) : page.items.some(item => item.turnId === turn.id), 'Fork boundary lost');
+      const includesBoundary = page.items.some(item => item.turnId === turn.id);
+      requireCondition(includesBoundary === (relation !== 'before'), 'Fork boundary lost');
     }
     await fork.close();
   }
-  if (scenario === 'revert') {
-    const scope = capabilities.session!.revert![0]!;
-    const result = await session.request('session/revert', { sessionId, requestId: 'revert', scope, boundary: { turnId: turn.id, relation: 'before' } });
-    requireCondition(result.appliedScope === scope && result.boundary.turnId === turn.id, 'Revert scope mismatch');
-    if (scope !== 'files' && capabilities.session?.history) {
-      const page = await session.request('history/read', { sessionId, requestId: 'reverted-history' });
-      requireCondition(!page.items.some(item => item.turnId === turn.id), 'Revert boundary retained');
-    }
+}
+
+/** Verify the receipt for the first advertised scope, and check supported history when the scope includes conversation. */
+async function checkRevertBoundary({ session, turn, scope, history }: {
+  session: Session; turn: Turn; scope: RevertScope; history?: boolean;
+}): Promise<void> {
+  const sessionId = session.id;
+  const result = await session.request('session/revert', { sessionId, requestId: 'revert', scope, boundary: { turnId: turn.id, relation: 'before' } });
+  requireCondition(result.appliedScope === scope && result.boundary.turnId === turn.id, 'Revert scope mismatch');
+  if (scope !== 'files' && history) {
+    const page = await session.request('history/read', { sessionId, requestId: 'reverted-history' });
+    requireCondition(!page.items.some(item => item.turnId === turn.id), 'Revert boundary retained');
   }
+}
+
+/** Check the contiguous session stream from the first observed sequence, since subscriptions have no replay. */
+function checkEventSequence(session: Session, events: AhpEvent[]): void {
+  const firstEvent = events[0];
+  if (firstEvent === undefined) return;
+  const contiguous = events.every((event, index) =>
+    event.seq === firstEvent.seq + index && event.sessionId === session.id && event.streamId === firstEvent.streamId,
+  );
+  requireCondition(contiguous, 'Source sequence gap');
 }
 
 /** Throw assertion messages that runConformanceCase records as failed-case diagnostics. */
 function requireCondition(value: unknown, message: string): asserts value { if (!value) throw new Error(message); }
 
-/** Bound observation without cancelling its work; the case owner still returns the reader and disposes the client. */
+/** Reject the wait at its deadline. The underlying promise stays observed and the case owner handles cleanup. */
 function deadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('Conformance timed out')), timeoutMs);
@@ -219,9 +335,9 @@ function deadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
-/** Omitted optional capabilities skip cases; a declared capability must exercise its native fixture. */
-function applicable(scenario: ConformanceScenario, capabilities: Capabilities): boolean {
-  if (['approval','userInput','elicitation','dynamicTool'].includes(scenario)) return capabilities.interactions?.includes(scenario as InteractionRequested['kind']) ?? false;
+/** Let runConformanceCase skip scenarios whose required session capability was omitted. */
+function isApplicable(scenario: ConformanceScenario, capabilities: Capabilities): boolean {
+  if (isInteractionScenario(scenario)) return capabilities.interactions?.includes(scenario) ?? false;
   if (scenario === 'steer') return capabilities.input?.steer?.atomicMatch === true;
   if (scenario === 'interrupt') return !!capabilities.input?.interrupt?.targets.length;
   if (scenario === 'fork') return !!capabilities.session?.fork?.length;
@@ -230,7 +346,12 @@ function applicable(scenario: ConformanceScenario, capabilities: Capabilities): 
   return true;
 }
 
-/** Automatic handler fallback for fixture requests; approval fixtures must supply at least one option. */
+/** Identify cases whose applicability and verdict depend on a native interaction. */
+function isInteractionScenario(scenario: ConformanceScenario): scenario is typeof interactionKinds[number] {
+  return interactionKinds.some(kind => kind === scenario);
+}
+
+/** Answer the SDK handler's request when the driver supplies no override. Approval fixtures must provide an option. */
 function defaultAnswer(request: InteractionRequested): InteractionResponse {
   switch (request.kind) {
     case 'approval': return { kind: request.kind, optionId: request.options[0]!.id };

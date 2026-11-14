@@ -1,15 +1,19 @@
-/** AHP turn status. Mirrors the `turn/completed` payload union. */
-export type TurnStatus = 'completed' | 'interrupted' | 'failed';
+import type { TurnCompletedEvent } from '@anureo/protocol';
 
-/** Internal classification consumed by submitStandardInput to publish a terminal and optional warning. */
+/** Status published in the AHP turn/completed payload. */
+export type TurnStatus = TurnCompletedEvent['payload']['status'];
+
+/** Internal prompt outcome with the terminal turn status and any preceding warning. */
 export interface StopOutcome {
   status: TurnStatus;
   notice?: { code: string; message: string };
 }
 
 /**
- * Classify a terminal prompt response for AcpBackendSession.submitStandardInput.
- * Return the table lookup or a failed fallback when absent; callers must not mutate shared mapping entries.
+ * Classify a prompt stop reason for AcpBackendSession.submitStandardInput, which publishes any
+ * warning before turn/completed. A lookup miss or non-string value yields a failed outcome
+ * with ACP_STOP_UNKNOWN.
+ * Treat returned table entries as read-only because later prompts reuse them.
  */
 export function stopOutcome(stopReason: unknown): StopOutcome {
   const key = typeof stopReason === 'string' ? stopReason : '';
@@ -20,12 +24,8 @@ export function stopOutcome(stopReason: unknown): StopOutcome {
 }
 
 /**
- * ACP v1 stop reasons → AHP turn status.
- *
- * `max_tokens` and `max_turn_requests` are terminal success with a caveat: AHP has
- * no truncated status, so the turn completes and a notice carries the caveat rather
- * than misreporting in either direction. Missing table lookups get a failed fallback
- * with a warning in stopOutcome.
+ * AHP has no truncated status. Limits complete the turn with a warning so observers
+ * can distinguish a response that hit a limit from an ordinary end_turn.
  */
 const STOP_REASONS: Readonly<Record<string, StopOutcome>> = {
   end_turn: { status: 'completed' },
