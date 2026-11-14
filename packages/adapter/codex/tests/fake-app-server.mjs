@@ -188,6 +188,16 @@ function sendHistoryItems(msg) {
     send({ id: msg.id, error: { code: -32601, message: 'No optional native history method' } })
     return
   }
+  /** Oversized replay: two ~160KiB command outputs plus a small message, served in one native page so adapters must cap items and budget public pages themselves. */
+  if (mode === 'oversized-history') {
+    if (msg.params.cursor) { sendResult(msg, { data: [], nextCursor: null }); return }
+    sendResult(msg, { data: [
+      { turnId: 'native-turn-1', item: { id: 'big-one', type: 'commandExecution', status: 'completed', command: 'one', aggregatedOutput: 'x'.repeat(160 * 1024) } },
+      { turnId: 'native-turn-1', item: { id: 'big-two', type: 'commandExecution', status: 'completed', command: 'two', aggregatedOutput: 'y'.repeat(160 * 1024) } },
+      { turnId: 'native-turn-1', item: { id: 'small', type: 'agentMessage', text: 'done' } },
+    ], nextCursor: null })
+    return
+  }
   if (!allowedHistory.length) {
     sendResult(msg, { data: [], nextCursor: null })
     return

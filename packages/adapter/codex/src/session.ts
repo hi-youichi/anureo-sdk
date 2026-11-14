@@ -1,7 +1,7 @@
 /** Owns native thread state, execution evidence and ordered SDK projection; discovery, transport scheduling and version policy belong elsewhere. */
 import { randomUUID } from 'node:crypto'
 import type { ApprovalOption, Capabilities, AhpRequestMap, AhpResultMap, GoalState, HistoryItem, HistoryPage, InteractionRequested, InteractionResponse, Item, JsonObject, SessionBinding, SessionOpenParams, SessionState, Usage } from '@anureo/protocol'
-import { HarnessSdkError, sdkError, type BackendSession, type SessionEventSink, type SessionMethod } from '@anureo/sdk'
+import { HarnessSdkError, sdkError, capItem, pageEndWithinBudget, DEFAULT_HISTORY_PAGE_BYTES, type BackendSession, type SessionEventSink, type SessionMethod } from '@anureo/sdk'
 import { CodexJsonlClient, CodexRpcError, type NativeRequest } from './jsonl'
 import { json, safe, record, string, type NativeRecord } from './native-values'
 import { mapItems } from './mapping'
@@ -322,7 +322,7 @@ export class CodexBackendSession implements BackendSession {
     const turns: NativeRecord[] = []
     let cursor: string | undefined
     do {
-      const page = record(await this.client.request('thread/turns/list', { threadId: this.threadId, sortDirection: 'asc', limit: 200, ...(cursor ? { cursor } : {}) }))
+      const page = record(await this.client.request('thread/turns/list', { threadId: this.threadId, sortDirection: 'asc', limit: this.options.nativePageLimit ?? 50, ...(cursor ? { cursor } : {}) }))
       if (!Array.isArray(page.data)) throw new HarnessSdkError('PROTOCOL_ERROR')
       turns.push(...page.data.map(record))
       if (turns.length > (this.options.maxHistoryItems ?? 10000)) throw new HarnessSdkError('HISTORY_LIMIT_EXCEEDED')
@@ -348,7 +348,8 @@ export class CodexBackendSession implements BackendSession {
     const { items } = snapshot
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > items.length) throw new HarnessSdkError('CURSOR_INVALID')
     const limit = params.limit ?? 200
-    const end = Math.min(offset + limit, items.length)
+    // Byte-budget the page so no transport hop (8MiB AHP frames, 16MiB WS receive limits) can reject it; capping at snapshot build bounds each item first.
+    const end = pageEndWithinBudget(items, offset, Math.min(offset + limit, items.length), this.options.maxPageBytes ?? DEFAULT_HISTORY_PAGE_BYTES)
     return {
       items: structuredClone(items.slice(offset, end)),
       snapshotToken: snapshot.token,
@@ -384,7 +385,7 @@ export class CodexBackendSession implements BackendSession {
     if (this.native.profile.history === 'thread/items/list') {
       let cursor: string | undefined
       do {
-        const page = record(await this.optional('thread/items/list', { threadId: this.threadId, sortDirection: 'asc', limit: 200, ...(cursor ? { cursor } : {}) }, () => { this.capabilities.session!.history = false }))
+        const page = record(await this.optional('thread/items/list', { threadId: this.threadId, sortDirection: 'asc', limit: this.options.nativePageLimit ?? 50, ...(cursor ? { cursor } : {}) }, () => { this.capabilities.session!.history = false }))
         if (!Array.isArray(page.data)) throw new HarnessSdkError('PROTOCOL_ERROR')
         for (const entry of page.data) {
           const native = record(entry)
@@ -420,7 +421,7 @@ export class CodexBackendSession implements BackendSession {
       turnId: this.canonicalTurnIdByNativeId.get(nativeTurnId) ?? nativeTurnId,
       nativeTurnId,
       nativeItemId: string(record(nativeItem).id),
-      item,
+      item: capItem(item),
     }))
   }
   /** Transport entry for wire-ordered notifications: filter thread scope, correlate evidence, then project events and state. Reject malformed data or sink errors; callers must serialize this independently of concurrent interactions. */

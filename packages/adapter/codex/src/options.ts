@@ -20,4 +20,8 @@ export interface CodexAdapterOptions extends JsonlOptions {
   diagnostic?: (code: string) => void;
   /** Maximum retained items or paged turns per history read; defaults to 10,000. */
   maxHistoryItems?: number;
+  /** Native page size for paged history requests (`thread/items/list`, `thread/turns/list`); defaults to 50 so one native response frame stays well under the transport limit even when items are large. */
+  nativePageLimit?: number;
+  /** Serialized byte budget for one public history page; defaults to 4MiB, and every page still carries at least one item so cursors progress. */
+  maxPageBytes?: number;
 }

@@ -28,7 +28,7 @@ export interface JsonlHandlers {
 export interface JsonlOptions {
   /** Per-request response deadline, default 30,000ms; timeout preserves an unknown native outcome. */
   timeoutMs?: number;
-  /** Maximum UTF-8 bytes per frame, default 8MiB; outgoing includes the newline, incoming excludes the CRLF/LF delimiter. */
+  /** Maximum UTF-8 bytes per frame, default 64MiB; native paged history responses legitimately exceed the previous 8MiB default, and a local stdio pipe has no external frame ceiling. Outgoing includes the newline, incoming excludes the CRLF/LF delimiter. */
   maxFrameBytes?: number;
   /** Maximum unresolved client requests, default 128. */
   maxPending?: number;
@@ -56,7 +56,7 @@ export class CodexJsonlClient {
   readonly finished: Promise<void>
   /** Start draining a supplied process with the owner's handlers before requests can be sent; no process is spawned here. The owner must dispose even if finished resolves or rejects. */
   constructor(readonly process: HarnessProcess, private readonly handlers: JsonlHandlers, private readonly options: JsonlOptions = {}) {
-    this.maxFrameBytes = options.maxFrameBytes ?? 8 * 1024 * 1024
+    this.maxFrameBytes = options.maxFrameBytes ?? 64 * 1024 * 1024
     // Read before initialize; stdout EOF, rather than process exit, preserves buffered final frames.
     this.finished = this.read().catch(cause => this.fail(cause instanceof HarnessSdkError ? cause : new HarnessSdkError('PROTOCOL_ERROR', 'Invalid Codex stream', false, true)))
     void this.drainDiagnostics()

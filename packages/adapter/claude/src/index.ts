@@ -9,7 +9,7 @@ import {
   type SessionStore, type SessionKey, type SessionMessage, type PermissionMode, type PermissionResult,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
-  BoundedEventQueue, HarnessSdkError, sdkError,
+  BoundedEventQueue, HarnessSdkError, sdkError, capHistoryEntry, pageEndWithinBudget, DEFAULT_HISTORY_PAGE_BYTES,
   type BackendSession, type HarnessAdapter, type SessionEventSink, type SessionMethod,
 } from "@anureo/sdk";
 import {
@@ -806,13 +806,13 @@ export class ClaudeBackendSession implements BackendSession {
         }
       }
       const withStructuredOutput = await this.structuredHistory(items);
-      snapshotToken = randomUUID(); this.historySnapshots.set(snapshotToken, withStructuredOutput);
+      snapshotToken = randomUUID(); this.historySnapshots.set(snapshotToken, withStructuredOutput.map(entry => capHistoryEntry(entry)));
       if (this.historySnapshots.size > 8) this.historySnapshots.delete(this.historySnapshots.keys().next().value!);
     }
     const snapshot = this.historySnapshots.get(snapshotToken); if (!snapshot) throw new HarnessSdkError("CURSOR_EXPIRED");
     const offset = request.cursor === undefined ? 0 : Number(request.cursor);
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > snapshot.length) throw new HarnessSdkError("CURSOR_INVALID");
-    const limit = Math.min(request.limit ?? 200, 1000); const page = snapshot.slice(offset, offset + limit);
+    const limit = Math.min(request.limit ?? 200, 1000); const end = pageEndWithinBudget(snapshot, offset, Math.min(offset + limit, snapshot.length), DEFAULT_HISTORY_PAGE_BYTES); const page = snapshot.slice(offset, end);
     return { items: structuredClone(page), ...(offset + page.length < snapshot.length ? { nextCursor: String(offset + page.length) } : {}), snapshotToken, source: this.binding.nativeRef };
   }
   private async structuredHistory(items: HistoryItem[]): Promise<HistoryItem[]> {

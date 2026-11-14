@@ -28,16 +28,17 @@ type SetupOptions = {
   timeoutMs?: number
   config?: JsonObject
   model?: string
+  adapterOptions?: Partial<CodexAdapterOptions>
 }
 
 /** Create a temporary cwd, fake native process and SDK session, registering resources for afterEach cleanup. Return event/log waiters; reject startup failures without using a real account. */
-async function setup({ scenario = 'normal', version = '0.164.0', timeoutMs = 1000, config, model }: SetupOptions = {}) {
+async function setup({ scenario = 'normal', version = '0.164.0', timeoutMs = 1000, config, model, adapterOptions }: SetupOptions = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), 'codex adapter '))
   dirs.push(dir)
   const log = path.join(dir, 'calls.jsonl')
   // Bootstrap is not the operation under timeout test; Windows process startup may exceed 100ms.
   const bootstrapTimeoutMs = Math.max(1000, timeoutMs)
-  const adapter = createCodexAdapter({ command: process.execPath, args: [fileURLToPath(new URL('./fake-app-server.mjs', import.meta.url))], version, env: { ...process.env, FAKE_SCENARIO: scenario, FAKE_LOG_FILE: log }, timeoutMs: bootstrapTimeoutMs })
+  const adapter = createCodexAdapter({ command: process.execPath, args: [fileURLToPath(new URL('./fake-app-server.mjs', import.meta.url))], version, env: { ...process.env, FAKE_SCENARIO: scenario, FAKE_LOG_FILE: log }, timeoutMs: bootstrapTimeoutMs, ...adapterOptions })
   const runtime = await createClient({adapter,identity:{adapterId:'codex',runtimeConfigId:'codex-test'},interactions:{approval:undefined,userInput:undefined,elicitation:undefined,dynamicTool:undefined}}); resources.push(runtime)
   const session = await runtime.openSession({ requestId: 'open', mode: 'new', binding: { sessionId: 'session', adapterId: 'codex', runtimeConfigId: 'codex-test' }, cwd: dir, config, ...(model ? { model } : {}) })
   adapter.options.timeoutMs = timeoutMs
@@ -504,6 +505,41 @@ describe('Codex fast mode', () => {
     const s = await setup()
     await s.session.submit(start); await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
     expect((await s.calls()).find(call => call.method === 'turn/start')?.params).not.toHaveProperty('serviceTier')
+  })
+})
+
+/** Register oversized-replay regressions together because capping and byte budgeting must hold for the same native payload that previously produced >8MiB single frames. */
+describe('history frame budget', () => {
+  /** Read fake oversized history through capped snapshots and budgeted pages; a page must still carry at least one item so cursors progress across three pages. */
+  test('caps oversized items and bounds public pages by bytes', async () => {
+    const s = await setup({ scenario: 'oversized-history', adapterOptions: { maxPageBytes: 96 * 1024 } })
+    const one = await s.session.request('history/read', { requestId: 'big1', sessionId: 'session', limit: 200 })
+    expect(one.items).toHaveLength(1)
+    const capped = one.items[0]!.item
+    expect(capped.type).toBe('toolCall')
+    expect(capped.extensions).toMatchObject({ historyTruncated: true })
+    const output = capped.type === 'toolCall' ? capped.output : undefined
+    expect(typeof output).toBe('string')
+    expect((output as string).length).toBeLessThan(80 * 1024)
+    expect((output as string).endsWith('\n[truncated]')).toBe(true)
+    const two = await s.session.request('history/read', { requestId: 'big2', sessionId: 'session', cursor: one.nextCursor!, snapshotToken: one.snapshotToken, limit: 200 })
+    expect(two.items.map(entry => entry.item.id)).toEqual(['big-two', 'small'])
+    expect(two.nextCursor).toBeNull()
+    expect((await s.calls()).filter(call => call.method === 'thread/items/list')).toHaveLength(1)
+  })
+  /** Inspect fake wire params so a bounded native page size is proven on the wire, not inferred from public page shapes. */
+  test('bounds the native history page size by default', async () => {
+    const s = await setup({ scenario: 'oversized-history' })
+    await s.session.request('history/read', { requestId: 'page', sessionId: 'session' })
+    const historyCalls = (await s.calls()).filter(call => call.method === 'thread/items/list')
+    expect(historyCalls[0]?.params?.limit).toBe(50)
+  })
+  /** Override the native page size and assert the fake wire received it; adapter options must reach native requests without page-bytes coupling. */
+  test('honors nativePageLimit overrides', async () => {
+    const s = await setup({ scenario: 'oversized-history', adapterOptions: { nativePageLimit: 7 } })
+    await s.session.request('history/read', { requestId: 'page', sessionId: 'session' })
+    const historyCalls = (await s.calls()).filter(call => call.method === 'thread/items/list')
+    expect(historyCalls[0]?.params?.limit).toBe(7)
   })
 })
 

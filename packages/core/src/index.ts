@@ -9,6 +9,7 @@ export type * from './ports';
 export * from './errors';
 export { waitForRequest } from './request';
 export * from './queue';
+export * from './history-pages';
 export * from './adapter/identity';
 export * from './lifecycle/interactions';
 export * from './process';
