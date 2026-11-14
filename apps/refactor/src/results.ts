@@ -1,6 +1,6 @@
 import type { ModulePlan, RefactorModule, Work } from './schema'
 
-/** Result recorded when the host runs a validation command after integrating a patch. */
+/** Result recorded when the host runs a validation command in a worktree before integration. */
 export interface CheckResult {
   command: string
   status: 'passed' | 'failed'
@@ -19,12 +19,12 @@ export interface Failure {
 /** Outcome of a design or module step, including host observations from integration and validation.
  * The inherited summary, changes and deferred fields are the agent's account of the work. */
 export interface StepResult extends Work {
-  /** Unchanged until a patch is applied, applied after integration succeeds, or failed when an
-   * error is recorded or integration is blocked. A failed step can still have applied edits. */
+  /** Unchanged for an empty edit, applied after integration, or failed on an error. A cleanup
+   * failure can be reported after a verified merge. */
   status: 'applied' | 'unchanged' | 'failed'
   /** Sorted Git-visible paths changed by the isolated agent within the target directory. */
   changedFiles: string[]
-  /** Absolute path to a saved patch, when one was captured. May include changes left unapplied. */
+  /** Legacy report field containing the path to a historical patch artifact. */
   patch?: string
   /** Executed checks in command order; a failure stops subsequent checks. */
   checks: CheckResult[]
@@ -36,7 +36,7 @@ export interface StepResult extends Work {
 /** Planned module and its step record, paired in plan order before any module starts. */
 export interface ModuleResult {
   module: RefactorModule
-  /** Null until the worker records its session result. Integration and checks can update it later. */
+  /** Null until the worktree has finished validation, integration and cleanup. */
   step: StepResult | null
 }
 /** Graph availability and declaration coverage for one phase's source inventory. */
@@ -67,7 +67,7 @@ export interface RefactorReport {
   design: StepResult | null
   /** Validated module assignments, or null until planning succeeds. */
   plan: ModulePlan | null
-  /** Module records in plan order, which can include completed worker results awaiting integration. */
+  /** Module records in plan order. Successful edits merge in readiness order. */
   modules: ModuleResult[]
   /** Graph availability and file coverage for the exports attempted during the run. */
   graphCoverage: GraphCoverage[]

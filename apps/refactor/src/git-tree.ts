@@ -22,7 +22,7 @@ export async function captureTree(cwd: string): Promise<Map<string, string>> {
 }
 
 /** Fingerprint one Git-relative path or return undefined if it is missing at inspection time.
- * applyWorktreePatch also probes ignored paths directly to detect local files in its way.
+ * mergeWorktree also probes ignored paths directly to detect local files in its way.
  * Linked ancestors, invalid paths and inspection or content read failures reject. */
 export async function fileFingerprint(cwd: string, file: string): Promise<string | undefined> {
   const { path, info, linkedAncestor } = await inspectGitPath(cwd, file)

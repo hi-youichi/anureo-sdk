@@ -30,6 +30,38 @@ test.each([
   }
 })
 
+/** Preserve the alternatives and their evidence requirements even when a graph is unavailable. */
+test.each(['read-only', 'edit'] as const)('structural decisions compare keeping, consolidation and extraction in %s mode', mode => {
+  const context = { graphFile: null, version: 'snapshot', checks: [], mode, isolated: true }
+  const design = designPrompt({ ...context, files: ['api.ts', 'types.ts'] })
+  const module = modulePrompt({ ...context, module: plan.modules[0]!, design: 'Keep the shared policy owner' })
+  for (const prompt of [design, module]) {
+    const instructions = prompt.replace(/\s+/g, ' ')
+    expect(instructions).toContain('compare keeping it, consolidating it into an existing owner and extracting it')
+    expect(instructions).toContain('Describe the current reading/editing path')
+    expect(instructions).toContain('Prefer an existing cohesive module before creating a new file')
+    expect(instructions).toContain('Preserve small modules with useful independent contracts')
+    expect(instructions).toContain('Keep related types with their owning feature')
+    expect(instructions).toContain('Set no target file count')
+    expect(instructions).toContain('An unchanged structure is a valid outcome')
+    expect(prompt.split('Optimize for the cost of understanding and changing the code.')).toHaveLength(2)
+    expect(prompt).toContain('Static graph unavailable.')
+  }
+  expect(design).not.toContain('Give each\n   its own file')
+  expect(design).not.toContain('Split by group')
+  expect(design).toContain('Later module agents receive this summary')
+  expect(design).toContain('the existing layout from proposed boundaries')
+  expect(module).not.toContain('Extract each phase')
+  expect(module).toContain('Read the design summary before changing structure')
+  expect(module).toContain('explain any revision supported by new source evidence')
+  expect(module).toContain('Keep short, cohesive sequences together')
+  expect(module).toContain('Keep simple one-use expressions inline')
+  expect(module).toContain('Consolidate or split code within this module')
+  expect(module).toContain('Preserve the existing-file assignment')
+  expect(module).toContain('Edit only the files assigned to this module')
+  if (mode === 'read-only') expect(module).toContain('describe resulting edits as proposals')
+})
+
 /** Both editing phases receive the same audience/language policy, even when only proposing changes. */
 test.each(['read-only', 'edit'] as const)('documentation guidance reaches both phases in %s mode', mode => {
   const context = { graphFile: 'graph.json', version: 'snapshot', checks: [], mode }
@@ -111,8 +143,14 @@ test('documentation scope is phase-specific and planning remains inventory-only'
   expect(module).toContain('including declarations\nwhose implementation stays unchanged')
   expect(module).toContain('keep accurate concise comments without cosmetic rewrites')
   expect(module).not.toContain('Design documentation scope:')
-  expect(planPrompt(files, 'snapshot')).not.toContain('Documentation conventions and tags:')
-  const hostChecks = `Validation commands: ${JSON.stringify(context.checks)}. The host runs them in the target checkout after integrating your edits.`
+  const planning = planPrompt(files, 'snapshot')
+  expect(planning).not.toContain('Documentation conventions and tags:')
+  expect(planning).toContain('cohesive review/edit task groups')
+  expect(planning).toContain('Keep files that require coordinated edits in the same assignment')
+  expect(planning).toContain('Plan against the existing inventory')
+  expect(planning).toContain('Assign every listed source file exactly once')
+  expect(planning).toContain('Do not review or edit yet')
+  const hostChecks = `Validation commands: ${JSON.stringify(context.checks)}. The host runs them in your worktree before merging your edits.`
   for (const prompt of [design, module]) {
     expect(prompt).toContain(hostChecks)
     expect(prompt).not.toContain('Run them before returning')
@@ -127,7 +165,7 @@ test.each(['a', 'A_0-module', 'a'.repeat(80)])('accepts safe module ID %s', id =
   expect(() => validatePlan(candidate, ['a.ts'])).not.toThrow()
 })
 
-/** Reject path components and out-of-policy IDs before their values can reach patch filenames. */
+/** Reject path components and out-of-policy IDs before their values can reach reports. */
 test.each(['', '../escape', 'a/b', 'a\\b', '_module', '-module', 'a.b', 'a b', 'a'.repeat(81)])('rejects unsafe module ID %s', id => {
   const candidate = { ...plan, modules: [{ ...plan.modules[0]!, id }] }
   expect(() => validatePlan(candidate, ['a.ts'])).toThrow(`Invalid or duplicate module id: ${id}`)

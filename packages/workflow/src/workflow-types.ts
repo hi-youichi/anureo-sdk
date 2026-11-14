@@ -2,7 +2,7 @@
 export interface WorkflowOptions<Input> {
   /** Nonempty workflow name. Resume requires the same name in the source manifest. */
   name: string
-  /** Nonempty application-managed revision. Change it when existing journals are incompatible. */
+  /** Nonempty application-managed revision. A changed revision prevents resuming older runs. */
   revision: string
   /** Nonempty storage root. Relative paths are resolved against the process working directory. */
   directory: string
@@ -13,8 +13,8 @@ export interface WorkflowOptions<Input> {
   /** Strict JSON input. The body receives a deeply frozen copy. */
   input: Input
   /** Omit for a fresh journal. A string selects a run under `directory`. An object supplies the
-   * source's storage root and ID explicitly. Resume requires an inactive source with matching
-   * name and revision and copies its journal into the new run before invoking the body. */
+   * source's storage root and ID explicitly. The source must be inactive, compatible by name and
+   * revision, and separate from the target tree. The new run copies its journal before invoking the body. */
   resumeFrom?: string | { directory: string; runId: string }
 }
 

@@ -4,9 +4,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
-import { createClient, type Client } from '@anureo/sdk'
+import { createClient, type Client, type StructuredOutputToolDefinition } from '@anureo/sdk'
+import { createAcpAdapter } from '@anureo/adapter-acp'
 import { createClaudeAdapter } from '@anureo/adapter-claude'
 import { createCodexAdapter } from '@anureo/adapter-codex'
+import { createPiAdapter } from '@anureo/adapter-pi'
+import { fakeFactory } from '../../adapter/pi/tests/fake-host'
 import { agent, parallel } from './index'
 
 const fakeClaude = fileURLToPath(new URL('../../adapter/claude/tests/fixtures/fake-claude.mjs', import.meta.url))
@@ -68,6 +71,43 @@ for (const { scenario, expected, description } of codexCases) test(`Zod agent cr
     await releaseNativeFixture(client, cwd)
   }
 }, 15_000)
+
+test('workflow Zod output uses MCP and retains local refinement failures', async () => {
+  const adapter = createAcpAdapter({ command: process.execPath, args: [fileURLToPath(new URL('../../adapter/acp/tests/fixtures/fake-acp.mjs', import.meta.url)), '--scenario', 'mcp-output'] })
+  const client = await createClient({ adapter, identity: { adapterId: 'acp', runtimeConfigId: 'workflow-mcp' } })
+  try {
+    const options = { client, cwd: process.cwd() }
+    const schema = z.object({ sum: z.number().int() })
+    const value = await agent('17 + 25', { ...options, schema })
+    expect(value).toEqual({ sum: 42 })
+    await expect(agent('17 + 25', { ...options, schema: schema.refine(value => value.sum < 0) }))
+      .rejects.toMatchObject({ code: 'AGENT_STRUCTURED_OUTPUT_INVALID', outcomeUnknown: false })
+  } finally { await client.dispose() }
+})
+
+test('workflow schema uses direct Pi tools and retains Zod refinement validation', async () => {
+  const fake = fakeFactory(host => {
+    let output: StructuredOutputToolDefinition | undefined
+    Object.assign(host, {
+      /** Store the SDK's tool for the host script. The Pi adapter forwards an omitted tool to clear it. */
+      async setOutputTool(tool?: StructuredOutputToolDefinition) { output = tool },
+    })
+    host.script = async host => {
+      if (!output) throw new Error('Output tool must be registered before scripted execution')
+      await output.execute({ sum: 42 })
+      await host.assistant('submitted')
+    }
+  })
+  const client = await createClient({ adapter: createPiAdapter({ version: '1.5.2', createHost: fake.factory }), identity: { adapterId: 'pi', runtimeConfigId: 'workflow-direct-tool' } })
+  try {
+    const options = { client, cwd: process.cwd() }
+    const schema = z.object({ sum: z.number().int() })
+    expect(await agent('17 + 25', { ...options, schema })).toEqual({ sum: 42 })
+    await expect(agent('17 + 25', { ...options, schema: schema.refine(value => value.sum < 0) }))
+      .rejects.toMatchObject({ code: 'AGENT_STRUCTURED_OUTPUT_INVALID', outcomeUnknown: false })
+    expect(fake.opens.every(open => !Object.hasOwn(open, 'mcpServers'))).toBe(true)
+  } finally { await client.dispose() }
+})
 
 /** Read the fixture's JSONL records in write order. Missing logs or malformed records fail the test. */
 async function readNativeLog(path: string) {

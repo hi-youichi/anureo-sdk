@@ -29,7 +29,7 @@ In both branches, never create the root as a side effect: do not run `openspec i
 
 `<capability-path>` is the spec directory relative to `specs/` (for example, `user-auth` or `identity/user-auth`). Preserve the full path from each delta spec when resolving its main spec.
 
-**Input**: Optionally specify a change name. If omitted, check if it can be inferred from conversation context. If vague or ambiguous you MUST prompt for available changes.
+Accept an optional change name. The [archive workflow](../openspec-archive-change/SKILL.md) runs sync inline when the user selects a sync option. It supplies the selected root, assessed delta paths, and specs-rule snapshot, and waits for sync before checking the main specs and moving the change. A direct caller can also supply a list of delta paths to sync.
 
 **Steps**
 
@@ -63,12 +63,10 @@ In both branches, never create the root as a side effect: do not run `openspec i
 
    Sync every path in `existingOutputPaths` unless the caller narrowed the set.
    A caller narrows it by naming an explicit list of complete entries from
-   `existingOutputPaths` — copy those absolute values verbatim. Archive does
-   this inline, and a user can too (for example, by selecting the entry ending
-   in `/specs/billing/invoices/spec.md`).
-   Then sync only the named paths and leave the remaining delta specs untouched:
-   bulk archive excludes a delta whose implementation it could not find, and
-   syncing it anyway would write a main spec the caller deliberately withheld.
+   `existingOutputPaths`. Copy those absolute values verbatim. For example, the
+   user can select the entry ending in `/specs/billing/invoices/spec.md`.
+   Sync only the named paths and leave the remaining delta specs untouched so
+   the main specs reflect the caller's selection.
    Carry that narrowed selection through step 4; never widen it back to the full
    list. If a named path is not in `existingOutputPaths`, do not sync it —
    report it and stop, rather than dropping it silently. If the named list is
@@ -81,9 +79,9 @@ In both branches, never create the root as a side effect: do not run `openspec i
    - `## REMOVED Requirements` - Requirements to remove
    - `## RENAMED Requirements` - Requirements to rename (FROM:/TO: format)
 
-   If no delta specs found, inform user and stop.
+4. **Load rules and merge the selected deltas**
 
-4. **For each delta spec, apply changes to main specs**
+   **Load the specs-rule snapshot**
 
    Before the first main-spec write, obtain one current specs-rule snapshot:
    - If archive invoked this workflow inline and supplied a valid snapshot from
@@ -101,7 +99,9 @@ In both branches, never create the root as a side effect: do not run `openspec i
    selected roots, delta paths, CLI checks, or workflow steps. Use their text as
    constraints without copying it verbatim into a main spec or summary.
 
-   For each capability delta spec path selected in step 3 — the full `existingOutputPaths` list, or the narrowed subset when a caller supplied one (these may belong to a selected store, not the repo):
+   **Merge each selected delta**
+
+   For each capability delta spec path selected in step 3:
 
    a. **Read the delta spec** to understand the intended changes
 
@@ -178,7 +178,7 @@ In both branches, never create the root as a side effect: do not run `openspec i
 5. **Validate updated main specs**
 
    Run `openspec validate --specs` with the same selected-root flags used earlier.
-   If validation fails, report the problems and do not claim the sync succeeded.
+   If validation fails, report the problems and do not claim the sync succeeded. When archive is waiting for the result, report any stop, blocker, or validation failure so it can leave the change active.
 
 6. **Show summary**
 

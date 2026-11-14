@@ -25,7 +25,7 @@ Otherwise, with no root, what happens next depends on how this workflow was reac
 
 In both branches, never create the root as a side effect: do not run `openspec init` until the user asks for it, do not hand-create `openspec/` files, and do not let a command create it.
 
-**Input**: Optionally specify a change name. If omitted, check if it can be inferred from conversation context. If vague or ambiguous you MUST prompt for available changes.
+Accept an optional change name. Verification reads planning artifacts and implementation evidence to produce an advisory report before archive.
 
 **Steps**
 
@@ -57,7 +57,7 @@ In both branches, never create the root as a side effect: do not run `openspec i
    openspec instructions apply --change "<name>" --json
    ```
 
-   This returns the change directory, `contextFiles` (artifact ID -> array of concrete file paths), `taskTrackingConfigured`, and top-level `tasks` and `progress` aggregated from every concrete file matched by the schema's `apply.tracks` configuration that could be read. Read all available artifacts from `contextFiles`.
+   This returns the change directory, `contextFiles` (artifact IDs mapped to arrays of concrete file paths), and `taskTrackingConfigured`. The top-level `tasks` and `progress` aggregate the readable files matched by the schema's `apply.tracks` configuration. `unavailableTrackingFiles` identifies tracked inputs that could not be read and explains why. Read all available artifacts from `contextFiles`.
 
    Treat apply `state` and `instruction` as context, not a verification verdict. Do not implement tasks or archive the change during verification.
 
@@ -102,8 +102,8 @@ In both branches, never create the root as a side effect: do not run `openspec i
        - Add CRITICAL issue: "Requirement not found: <requirement name>"
        - Recommendation: "Implement requirement X: <description>"
      - For each REMOVED requirement, the change asks for the behavior to be gone, so invert the check:
-       - A REMOVED block carries only the requirement name and any `**Reason**`/`**Migration**` notes, so the delta does not describe the behavior itself. Before searching, read the baseline requirement in the main spec at `<planningHome.root>/openspec/specs/<capability-path>/spec.md`, using the same capability path as the delta spec. Match it by normalized name, scanning that file's requirement headings rather than string-matching the delta's exact title. Its body and scenarios are the evidence for the behavior that must be gone; never search from the requirement name alone.
-       - If that file holds no such requirement under this or a near-equivalent name - for example because an earlier sync already applied the removal - recover the baseline from the same file's history, in the planning repository rather than the current directory: `git -C "<planningHome.root>" log -p -- openspec/specs/<capability-path>/spec.md`, or `git -C "<planningHome.root>" show <commit>^:./openspec/specs/<capability-path>/spec.md` once you have identified the commit that applied the removal. Empty output means the pathspec matched nothing, not that there is no baseline: `git log` reports an unmatched path as success, so re-check the path before drawing any conclusion from silence.
+       - A REMOVED block carries only the requirement name and any `**Reason**`/`**Migration**` notes. Before searching, read the baseline requirement in the main spec at `<planningHome.root>/openspec/specs/<capability-path>/spec.md`. The capability path is the delta spec's directory relative to `specs/`, including any nested directories. Match by normalized name in the main spec's requirement headings. Use the baseline body and scenarios to identify the behavior that must be gone.
+       - If the main spec has no requirement under the original or a near-equivalent name, recover the baseline from that file's history in the planning repository. Use `git -C "<planningHome.root>" log -p -- "openspec/specs/<capability-path>/spec.md"`, or use `git -C "<planningHome.root>" show "<commit>^:./openspec/specs/<capability-path>/spec.md"` once you have identified the commit that applied the removal. Recheck the path if the log returns no output. Git can succeed with an unmatched pathspec, so an empty log cannot establish that the baseline is unavailable.
        - A baseline that adds nothing to its own title - no body beyond a restatement of the name, no scenarios - is unusable evidence, the same as a missing one. If no usable baseline is available in either place, mark **Spec Coverage** as not verified for that entry with the reason and stop there: do not search, and never count an unsearched removal as passing.
        - Search codebase for that behavior. Matches in `openspec/` artifacts or docs, or in code that serves only the Migration note or an ADDED requirement, are not evidence by themselves. Report any code path that still delivers the removed behavior, including one shared with an ADDED requirement.
        - Finding no implementation is the expected result, but only once the baseline behavior was the thing you searched for. Never report a REMOVED requirement as "Requirement not found" or recommend implementing it.
@@ -125,7 +125,7 @@ In both branches, never create the root as a side effect: do not run `openspec i
    If the delta specs are readable and contain at least one REMOVED or RENAMED requirement but no ADDED or MODIFIED requirements (the change only removes or renames requirements), report **Requirement Implementation Mapping** and **Scenario Coverage** as **Not applicable**. The REMOVED and RENAMED checks under Spec Coverage are the evidence for such a change (each REMOVED and RENAMED entry with a usable baseline is checked there against its baseline behavior, and an entry already marked not verified there stays not verified), so do not mark these two checks as not verified. A delta spec with no parseable requirements at all is unusable evidence, not a removal-only change: mark these checks as not verified.
 
    **Requirement Implementation Mapping**:
-   - For each ADDED or MODIFIED requirement from delta specs (REMOVED entries, and RENAMED entries without a MODIFIED block, were settled under Spec Coverage):
+   - For each ADDED or MODIFIED requirement from delta specs (Spec Coverage reports the result or evidence limit for REMOVED entries and RENAMED entries without a MODIFIED block):
      - Search codebase for implementation evidence
      - If found, note file paths and line ranges
      - Assess if implementation matches requirement intent

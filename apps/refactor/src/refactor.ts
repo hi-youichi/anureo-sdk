@@ -2,7 +2,7 @@
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { agent } from '@anureo/workflow'
-import { inAgentWorktree, integrateAgentWork, markFailed, runAgentWork } from './agent-work'
+import { inAgentWorktree, runAgentWork } from './agent-work'
 import { defaultChecks, validateChecks, type CheckCommand } from './checks'
 import { repositoryDirectory } from './git'
 import { treeVersion } from './git-tree'
@@ -22,14 +22,11 @@ export type { RefactorOptions } from './options'
 /** Overall run report and the step, validation and failure records it contains. */
 export type { RefactorReport, ModuleResult, StepResult, CheckResult, Failure } from './results'
 
-/** Refactor a Git target by running design, planning the resulting tree, and editing modules in
- * concurrent detached worktrees. The host integrates module patches in plan order and runs checks
- * against the target after successful patch application. A failed design can leave a partial edit
- * in the target, and a failed check leaves the applied patch in place. Review-only runs produce no
- * integration or host checks.
+/** Refactor a Git target in detached worktrees. The host checks edits in each worktree and
+ * serializes transfers into the target as worktrees become ready. Review-only runs skip both.
  *
- * Returns a completed or incomplete report after final publication and writer-lock release. Phase
- * failures stop advancement and are recorded in the report. Invalid input, repository preflight,
+ * Returns a completed or incomplete report after final publication and writer-lock release. Design and planning failures
+ * stop advancement. Module failures are recorded while other modules continue. Invalid input, repository preflight,
  * lock acquisition, report initialization, final publication and lock cleanup failures reject.
  * Keep the supplied client usable until settlement and dispose it separately. */
 export async function refactorCode(input: RefactorOptions): Promise<RefactorReport> {
@@ -85,17 +82,15 @@ async function runDesign(context: RunContext): Promise<DesignResult> {
   progress('graph: started')
   const graphFile = await exportGraph(context, 'design', initial.files)
   progress('design: started')
-  const design = await withWorktreeBaseline(options.cwd, async baseline => {
-    const step = await runAgentWork({
-      baseline, options, patchPath: join(report.directory, 'design.patch'),
+  const design = await withWorktreeBaseline(options.cwd, baseline =>
+    runAgentWork({
+      baseline, options, checks, assignedFiles: initial.files, publish: operation => operation(),
       prompt: designPrompt({
         files: initial.files, graphFile, version: treeVersion(initial.tree), checks,
         mode: options.reviewOnly ? 'read-only' : 'edit', isolated: true,
       }),
-    })
-    await integrateAgentWork({ phase: 'design', baseline, cwd: options.cwd, step, checks })
-    return step
-  })
+    }),
+  )
   report.design = design
   await checkpointStep(context, 'design', design)
   if (design.status === 'failed') throw new Error(`Cross-module design failed: ${design.error}`)
@@ -116,50 +111,41 @@ async function prepareModules(context: RunContext, baseline: WorktreeBaseline, i
   return { plan: modulePlan, graphFile, design: input.design.summary, version }
 }
 
-/** Dispatch modules against one baseline and pass their results to integration only after the
- * worker pool settles. Registers plan-ordered result slots in the report before dispatch. Worker
- * rejections skip integration, while returned failed steps are handled by integrateModules. */
+/** Publish verified worktrees in readiness order. Reports retain plan order for lookup. */
 async function runModules(context: RunContext, baseline: WorktreeBaseline, input: ModuleExecution): Promise<void> {
   const { options, report, checks, progress } = context
   const results: ModuleResult[] = input.plan.modules.map(module => ({ module, step: null }))
   report.modules = results
+  let writer = Promise.resolve()
+  const publish = (operation: () => Promise<void>) => {
+    const result = writer.then(operation)
+    writer = result.catch(() => {})
+    return result
+  }
+
   await runModuleWorkers(results, options.concurrency ?? results.length, async result => {
     const { module } = result
     progress(`module/${module.id}: started`)
-    result.step = await runAgentWork({
-      baseline, options, assignedFiles: module.files, patchPath: join(report.directory, `module-${module.id}.patch`),
+    const step = await runAgentWork({
+      baseline, options, checks, publish, assignedFiles: module.files,
       prompt: modulePrompt({
         module, graphFile: input.graphFile, version: input.version, checks,
         mode: options.reviewOnly ? 'read-only' : 'edit', design: input.design, isolated: true,
       }),
     })
     progress(`module/${module.id}: finished`)
+    await publish(async () => {
+      result.step = step
+      await checkpointStep(context, `module/${module.id}`, step)
+    })
   })
 
-  await integrateModules(context, baseline, results)
-}
-
-/** Integrate completed work in plan order. After the first failed step, preserve existing
- * failures and mark later patches blocked. Publish every recorded outcome before rejecting for
- * the first failed step. A publication failure stops the loop immediately. */
-async function integrateModules(context: RunContext, baseline: WorktreeBaseline, results: readonly ModuleResult[]): Promise<void> {
-  const { options, checks } = context
-  let failed: ModuleResult | undefined
-  for (const result of results) {
-    const { module, step } = result
-    if (!step) continue
-    if (!failed) await integrateAgentWork({ phase: 'module', baseline, cwd: options.cwd, step, checks })
-    else if (step.patch && step.status !== 'failed') {
-      markFailed(step, new Error(`Integration blocked by failed module ${failed.module.id}`))
-    }
-    if (step.status === 'failed') failed ??= result
-    await checkpointStep(context, `module/${module.id}`, step)
-  }
+  const failed = results.find(result => result.step?.status === 'failed')
   if (failed) throw new Error(`Module ${failed.module.id} failed: ${failed.step?.error}`)
 }
 
 /** Emit the status of a step already in the report, then save the report. runDesign and
- * integrateModules await publication before enforcing their failure gates. A save failure rejects first. */
+ * runModules await publication before enforcing their failure gates. A save failure rejects first. */
 async function checkpointStep(context: RunContext, label: string, step: StepResult): Promise<void> {
   context.progress(`${label}: ${step.status}`)
   await saveReport(context.report)

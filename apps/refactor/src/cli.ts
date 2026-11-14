@@ -33,8 +33,8 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
 const help = `Usage: anureo-refactor [repository] [options]
 
 One agent fixes design between modules, then module agents work concurrently in separate Git
-worktrees. The host applies and checks their patches in plan order. Defaults to the current directory, which may
-be any directory inside a Git work tree. Preserves public APIs and behavior.
+worktrees. The host validates edits in each worktree and merges verified changes as they become
+ready. Defaults to the current directory, which may be any directory inside a Git work tree.
 Requires Bun, Git, and a configured harness. Graph export uses @youichi/repograph when installed.
 Use CODEX_BIN, CLAUDE_BIN, HERMES_BIN or DSH_BIN to override an executable.
 
@@ -62,7 +62,7 @@ Reports: <repository>/.anureo/refactor/<run-id>/report.json
 Scope: Git-visible UTF-8 or BOM-marked UTF-16 text under the target directory. Excludes docs and draft
 directories, dependencies, generated directories, and build/run output. Without --include, common
 metadata and prose are skipped.
-Runs start fresh. Captured patches and edits already applied remain available after a failure.
+Runs start fresh. Verified edits already merged remain in the target after a failure.
 Exit codes: 0 complete, 2 incomplete/error.
 `
 

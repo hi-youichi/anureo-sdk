@@ -1,6 +1,9 @@
-/** Independent agent/composition primitives and the durable workflow API for applications. */
-export { agent, type AgentOptions } from './agent'
+/** Application entry point for agent execution, concurrent composition, and durable runs. */
+export { agent } from './agent'
+export type { AgentOptions } from './agent-execution'
+
 export { parallel } from './parallel'
 export { pipeline } from './pipeline'
+
 export { workflow } from './workflow'
-export type { WorkflowOptions, WorkflowContext, WorkflowResult } from './workflow-types'
+export type { WorkflowContext, WorkflowOptions, WorkflowResult } from './workflow-types'

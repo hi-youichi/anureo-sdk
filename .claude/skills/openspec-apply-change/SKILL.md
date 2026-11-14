@@ -25,7 +25,7 @@ Otherwise, with no root, what happens next depends on how this workflow was reac
 
 In both branches, never create the root as a side effect: do not run `openspec init` until the user asks for it, do not hand-create `openspec/` files, and do not let a command create it.
 
-**Input**: Optionally specify a change name (e.g., `/opsx:apply add-auth`). If omitted, check if it can be inferred from conversation context. If vague or ambiguous you MUST prompt for available changes.
+An optional change name can come from a direct skill request or `/opsx:apply add-auth`. Use the selection step when the caller omits it.
 
 **Steps**
 
@@ -56,7 +56,7 @@ In both branches, never create the root as a side effect: do not run `openspec i
    This returns:
    - `contextFiles`: artifact ID -> array of concrete file paths (varies by schema - could be proposal/specs/design/tasks or spec/tests/implementation/docs)
    - Progress (total, complete, remaining)
-   - Task list with status, source path, and source line
+   - Task list with status, `sourcePath`, and `line` for the tracked checkbox
    - Dynamic instruction based on current state
    - Optional `context`: current required project instruction input from the selected root
    - Optional `operationGuidance`: current advisory guidance for apply
@@ -104,14 +104,17 @@ In both branches, never create the root as a side effect: do not run `openspec i
 
 6. **Implement tasks (loop until done or blocked)**
 
-   For each pending task:
+   For each pending task, finish both the implementation and the progress check before continuing:
+
+   **Implement the task**
+
    - Show which task is being worked on
    - Make the code changes required
    - Keep changes minimal and focused
-   - Before editing, confirm the checkbox at the returned `sourcePath` and `line` still matches the task description; if it does not, rerun the apply instructions and use the refreshed location
-   - Mark the task complete at its returned `sourcePath` and `line`: `- [ ]` → `- [x]`
-   - Rerun the apply instructions and confirm that task is now done and progress changed
-   - Continue to next task
+
+   **Record and confirm completion**
+
+   Once the specified behavior is fully implemented, confirm that the checkbox at the returned `sourcePath` and `line` still matches the task description. If it moved, rerun the apply instructions from step 3 and use the refreshed location. Change that checkbox from `- [ ]` to `- [x]`, then rerun the same instructions to confirm that the task is done and progress changed. Continue to the next task after that confirmation.
 
    **Pause if:**
    - Task is unclear → ask for clarification

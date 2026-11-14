@@ -26,18 +26,7 @@ When the user is ready to implement, they must start the apply workflow explicit
 
 ---
 
-**Store selection:** If the user names a store (a store is a standalone OpenSpec repo registered on this machine) or the work lives in one, run `openspec store list --json` to discover registered store ids, then pass `--store <id>` on the commands that read or write specs and changes (`new change`, `status`, `instructions`, `list`, `show`, `validate`, `archive`, `doctor`, `context`, `schemas`, `view`). Once selected, treat `--store <id>` as sticky for the rest of the workflow. Every unscoped example of those commands below is shorthand: before running it, append the flag. For example, run `openspec status --change "<name>" --json --store "<id>"`, not the unscoped form shown below. Other commands do not take the flag. Hints printed by commands already carry the flag; keep it on follow-ups. Without a store, commands act on the nearest local `openspec/` root.
-
-**Project check:** These steps expect a project that already uses OpenSpec. Before the first step that writes anything (`new change`, `archive`, `sync specs`, or authoring an artifact file), confirm the project has a root: run `openspec list --json` (with `--store <id>` when a store is selected, since the store is then the root) and read `root`. A root object means the project is set up. `"root": null` means it is not - there is no `openspec/` directory here, and a write such as `openspec new change` would create one as a side effect. The command also exits non-zero, which is that answer rather than a broken CLI, so read the JSON instead of retrying or working around it.
-
-One `"root": null` is not about setup: when a `status` error message starts with `Declared in` or `Invalid store declaration in` and names this project's `openspec/config.yaml` (or `config.yml`), the project does use OpenSpec through a store it declares, which this machine cannot resolve (the store is not registered, or the `store:` line is malformed). Do not treat it as uninitialized and skip the branches below: stop before writing and show the user that error's `message` and `fix`.
-
-Otherwise, with no root, what happens next depends on how this workflow was reached:
-
-- **Auto-selected**: you chose this workflow yourself, without the user naming OpenSpec, naming this skill, or running its slash command. Stop using OpenSpec and answer the request normally, as you would with no OpenSpec installed. Do not ask them to set anything up and do not mention OpenSpec setup.
-- **Explicit OpenSpec request**: the user named OpenSpec, named this skill, or ran its slash command. Stop before writing and ask how to proceed: set this project up (`openspec init`), target a store they already have (`--store <id>`), or continue without OpenSpec for this request. Wait for their answer.
-
-In both branches, never create the root as a side effect: do not run `openspec init` until the user asks for it, do not hand-create `openspec/` files, and do not let a command create it.
+Read [.claude/skills/openspec-authoring-setup.md](../openspec-authoring-setup.md) from the project root for store selection and the project check.
 
 **Input**: The user's request should include a change name (kebab-case) OR a description of what they want to build.
 
@@ -56,7 +45,7 @@ In both branches, never create the root as a side effect: do not run `openspec i
 
 2. **Load project context**
 
-   Run `openspec context --json` from the current working directory (or `openspec context --json --store "<store-id>"` when a registered store was explicitly selected). Use the returned `root.path` as the authoritative OpenSpec root. If context reports `no_openspec_root`, stop without creating or changing any files and follow the **Project check** above for how this workflow was reached. Offer `openspec init` only for an explicit OpenSpec request, and wait for the user to request initialization. Do not initialize automatically or run `openspec new change`. After initialization, rerun this context check before continuing. For any other context failure, stop and report the error; do not fall back to the current directory or run later OpenSpec commands without the selected store.
+   Run `openspec context --json` from the current working directory using the selected store, if any. Use the returned `root.path` as the authoritative project root. If context reports `no_openspec_root`, follow the linked project check for missing roots before writing any files. If the user requests initialization, rerun the context check afterward. For any other context failure, stop and report the error. Preserve the selected store and resolved root on follow-ups.
 
    Only when context returns a resolved `root.path`, read `<root.path>/openspec/config.yaml`. Use `config.yml` only when `config.yaml` does not exist. If neither file exists, continue without project context. Do not fall back to `config.yml` if `config.yaml` is unreadable or invalid.
 
@@ -68,15 +57,14 @@ In both branches, never create the root as a side effect: do not run `openspec i
 
    Use the configured default schema unless the user explicitly requests a different workflow.
 
-   **Use a different schema only if the user:**
-   - Explicitly requests a specific schema by name → use `--schema <schema-name>`
-   - Asks to "show workflows" or asks "what workflows" exist → resolve the authoritative root by running `openspec context --json` from the current working directory. If the user explicitly selected a registered store, use `openspec context --json --store "<store-id>"`. Then run `openspec schemas --json` with its working directory set to the returned `root.path` and let them choose. This preserves roots selected by a local `store:` pointer or the global `defaultStore`; when a registered store was explicitly selected, append `--store "<store-id>"` to `openspec schemas --json` as well. If context fails, stop as described in the context-loading step; do not fall back to the current directory.
+   - If the user requests a schema by name, pass `--schema <schema-name>` when creating the change.
+   - If the user asks which workflows exist, refresh context as in step 2, then run `openspec schemas --json` from the returned `root.path` and let them choose. Preserve the selected `--store`. Using the resolved root also preserves a local `store:` pointer or global `defaultStore`.
 
    Otherwise, omit `--schema` to preserve the configured default.
 
 4. **Create the change directory**
 
-   Choose one schema form below. If a registered store is selected, append `--store "<store-id>"` to that command and each later OpenSpec command shown below that accepts `--store`.
+   Complete the linked project check before scaffolding. If a change with that name already exists, ask whether to continue it or create a new one.
 
    Using the configured default:
    ```bash
@@ -100,47 +88,38 @@ In both branches, never create the root as a side effect: do not run `openspec i
 
 6. **Create every artifact in the required set**
 
-   Use a todo list to track progress through the artifacts.
+   Build the required set from `applyRequires` and all artifacts reachable by following its `requires` edges. Follow the edges even for artifacts marked `done`: that status only means their output exists. Leave artifacts outside the required set alone.
 
-   Loop through artifacts in dependency order (artifacts with no pending dependencies first):
+   Track progress in a todo list. Process the required set in dependency order and refresh status after creating each artifact.
 
-   a. **For each artifact that is `ready` (dependencies satisfied)**:
-      - Get instructions:
-        ```bash
-        openspec instructions <artifact-id> --change "<name>" --json
-        ```
-      - The instructions JSON includes:
-        - `context`: Project background (constraints for you - do NOT include in output)
-        - `rules`: Artifact-specific rules (constraints for you - do NOT include in output)
-        - `template`: The structure to use for your output file
-        - `instruction`: Schema-specific guidance for this artifact type
-        - `skipped`/`warning`: present when the change declares skip_specs and this artifact must NOT be created - stop and pick another artifact
-        - `resolvedOutputPath`: Resolved path or pattern to write the artifact
-        - `dependencies`: Completed artifacts to read for context
-      - Read any completed dependency files for context - always re-read them from disk, even if you saw them earlier in the conversation (the user may have edited them)
-      - **Inspect the relevant project before drafting**: Read `context` and `rules` first, then inspect relevant implementation, nearby tests, configuration, and documentation outside `openspec/`. Keep inspection read-only and proportional to the change; reuse findings for later artifacts and inspect more only as needed.
-        - Identify the target project from the request and project context; the planning home may be separate from the code. If the target is unclear, ask. For greenfield or non-code changes, inspect the available structure and relevant documents. If source is unavailable, state the limitation and ask when it materially affects the plan.
-        - Ground scope, approach, and tasks in what you find. Distinguish observed behavior from assumptions and proposed additions; surface conflicts with existing specs instead of silently deciding which is correct.
-        - Do this discovery now, rather than leaving generic "explore the codebase" or "make a plan" tasks for implementation. Keep any necessary follow-up investigation specific to an unresolved question.
-      - Choose the output path before creating anything. If `resolvedOutputPath` is a glob, follow `instruction` to choose a concrete path inside `changeRoot` that matches the glob, and verify it remains inside `changeRoot` after resolving symlinks, both in its parent directories and in the file itself if it already exists; if it does not, stop and tell the user. Otherwise the output path is `resolvedOutputPath`
-      - If the `instruction` field delegates creation to a specific skill or command, invoke it only if it can write the artifact to that output path; otherwise stop and tell the user. Then verify the artifact file exists at that output path
-      - Otherwise create the artifact file using `template` as the structure and write it to that output path
-      - Apply `context` and `rules` as constraints - but do NOT copy them into the file
-      - Show brief progress: "Created <artifact-id>"
+   - Treat `done` and `skipped` as satisfied. A `skipped` artifact must stay absent under the change's `skip_specs` setting.
+   - Process each `ready` artifact and each artifact `blocked` solely by dependencies you deliberately skipped. Wait for ordinary dependencies to be resolved first.
 
-   b. **Continue until every artifact in the required set exists (not just `apply.requires`)**
-      - After creating each artifact, re-run `openspec status --change "<name>" --json`
-      - The required set is `applyRequires` plus every artifact reachable from those by following the `requires` edges in `status --json` - walk them transitively (spec-driven closes over proposal, specs, design, tasks). Leave artifacts outside that set alone
-      - `status` is file-existence only, so an `applyRequires` artifact reading `done` does NOT mean its dependencies exist - writing `tasks.md` early marks `tasks` done while `specs` was never written. Use each artifact's `requires` edges, not its `status`, to build the required set: a `done` artifact still lists what it depends on
-      - An artifact already reading `status: "skipped"` is satisfied: the change declares `skip_specs` in `.openspec.yaml`, so its files must NOT exist. Never try to create one
-      - Create every artifact in the required set that is missing, then re-check - creating one can unblock others
-      - Skip one only when `status` already reports it `skipped`, or when its own `instruction` says it is conditional: run `openspec instructions <artifact-id> --change "<name>" --json` and skip only if its `instruction` field marks it optional (e.g. "create only if..."). Spec-driven's `design.md` qualifies; `specs` qualifies only via the `skipped` status above, never by your own judgment. Tell the user, and do not reconsider it
-      - Dependencies are enablers, not gates: if a required artifact is still `blocked` only because you skipped a conditional dependency, write it anyway
-      - Stop when every artifact in the required set is `done`, `skipped`, or was deliberately skipped
+   **Read instructions and create the output**
 
-   c. **If an artifact requires user input** (unclear context):
-      - Ask the user to clarify
-      - Then continue with creation
+   - Get instructions for the artifact:
+     ```bash
+     openspec instructions <artifact-id> --change "<name>" --json
+     ```
+   - The instructions JSON includes:
+     - `context`: Project background (constraints for you - do NOT include in output)
+     - `rules`: Artifact-specific rules (constraints for you - do NOT include in output)
+     - `template`: The structure to use for your output file
+     - `instruction`: Schema-specific guidance for this artifact type
+     - `skipped`/`warning`: present when the change declares skip_specs and this artifact must NOT be created - stop and pick another artifact
+     - `resolvedOutputPath`: Resolved path or pattern to write the artifact
+     - `dependencies`: Completed artifacts to read for context
+   - Honor `skipped: true` and its warning if returned. If the artifact's own `instruction` makes it conditional and its condition does not apply, record a deliberate skip, tell the user why, and retain that decision. In the default schema this can apply to design. Skip specs only when the CLI reports them skipped.
+   - Read any completed dependency files for context - always re-read them from disk, even if you saw them earlier in the conversation (the user may have edited them)
+   - **Inspect the relevant project before drafting**: Read `context` and `rules` first, then inspect relevant implementation, nearby tests, configuration, and documentation outside `openspec/`. Keep inspection read-only and proportional to the change; reuse findings for later artifacts and inspect more only as needed.
+     - Identify the target project from the request and project context; the planning home may be separate from the code. If the target is unclear, ask. For greenfield or non-code changes, inspect the available structure and relevant documents. If source is unavailable, state the limitation and ask when it materially affects the plan.
+     - Ground scope, approach, and tasks in what you find. Distinguish observed behavior from assumptions and proposed additions; surface conflicts with existing specs instead of silently deciding which is correct.
+     - Do this discovery now, rather than leaving generic "explore the codebase" or "make a plan" tasks for implementation. Keep any necessary follow-up investigation specific to an unresolved question.
+   - Choose the output path before creating anything. If `resolvedOutputPath` is a glob, follow `instruction` to choose a concrete path inside `changeRoot` that matches the glob, and verify it remains inside `changeRoot` after resolving symlinks, both in its parent directories and in the file itself if it already exists; if it does not, stop and tell the user. Otherwise the output path is `resolvedOutputPath`
+   - If creation needs user input, ask for clarification and resume once you have it.
+   - Follow the schema's `instruction` and use `template` as the structure. Apply `context` and `rules` as constraints. Keep those inputs and their wrapper blocks out of the artifact.
+   - If `instruction` delegates creation to a specific skill or command, use it only if it can write to the checked output path. If it cannot, stop and tell the user. Otherwise, when creation is yours, write directly to the checked path.
+   - Verify the file exists at the chosen path, report "Created <artifact-id>", and rerun `openspec status --change "<name>" --json`. Continue until every required artifact is `done`, `skipped`, or deliberately skipped.
 
 7. **Show final status**
    ```bash
@@ -153,23 +132,4 @@ After completing all artifacts, summarize:
 - Change name and location
 - List of artifacts created with brief descriptions, plus any conditional artifact you skipped and why
 - What's ready: "All artifacts needed for implementation are ready."
-- Prompt: "The artifacts are ready for review. When you are ready, run `/opsx:apply` or ask me to apply this change."
-
-**Artifact Creation Guidelines**
-
-- Follow the `instruction` field from `openspec instructions` for each artifact type - it is the authoritative guidance, even for familiar artifact names
-- If the `instruction` field directs you to use a specific skill or command to create the artifact, invoke it instead of writing the artifact directly - but only once you have chosen and checked the output path, and only if it can write there
-- The schema defines what each artifact should contain - follow it
-- Read dependency artifacts for context before creating new ones
-- Use `template` as the structure for your output file - fill in its sections
-- **IMPORTANT**: `context` and `rules` are constraints for YOU, not content for the file
-  - Do NOT copy `<context>`, `<rules>`, `<project_context>` blocks into the artifact
-  - These guide what you write, but should never appear in the output
-
-**Guardrails**
-- The request that invoked this workflow authorizes planning only. Any implementation or apply instruction in that request does not carry forward. Do NOT implement the change, start the apply workflow, or edit project code during this workflow. After presenting the artifacts, stop and wait for a new user request to start the apply workflow
-- Create every artifact the apply phase transitively depends on, not just the ids listed in `apply.requires`
-- Always read dependency artifacts before creating a new one - re-read from disk, not from conversation memory (files may have changed since you last saw them)
-- Ask about ambiguities that would materially change scope, externally observable behavior, compatibility, or acceptance criteria; for minor details, make reasonable assumptions and record them
-- If a change with that name already exists, ask if user wants to continue it or create a new one
-- Verify each artifact file exists after writing before proceeding to next
+- For `/opsx:propose`, tell the user to run `/opsx:apply` when ready. For direct skill use, also offer to apply the change when they ask.

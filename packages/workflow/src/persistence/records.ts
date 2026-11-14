@@ -2,26 +2,6 @@ import { z } from 'zod'
 import { HarnessSdkError } from '@anureo/sdk'
 import { digest, type JsonValue } from './json'
 
-/** Check target and source basenames before joining paths. Reject blanks, separators,
- * control characters, dot traversal and names over 255 UTF-8 bytes. Unicode and spaces
- * support caller-assigned CLI basenames. */
-export const runIdSchema = z.string().min(1).refine(value => value !== '.' && value !== '..'
-  && value.trim().length > 0 && !/[\\/\x00-\x1f\x7f]/.test(value) && Buffer.byteLength(value) <= 255)
-/** UUID rule shared by journal agent identities and writer-lock ownership tokens. */
-export const uuidSchema = z.string().uuid()
-/** Persist only safe failure metadata; diagnostic messages and details stay out of manifests. */
-export const failureSchema = z.strictObject({
-  code: z.string(),
-  retryable: z.boolean(),
-  /** The failure left execution's outcome uncertain. */
-  outcomeUnknown: z.boolean(),
-  /** Resource release failed even if execution itself had a known outcome. */
-  cleanupFailed: z.boolean(),
-})
-
-/** Versioned chained SHA-256 identity for an agent call, independent of its execution UUID. */
-export const journalKeySchema = z.string().regex(/^v1:[a-f0-9]{64}$/)
-
 /** Validated manifest shape; its digest and referenced result still require separate verification. */
 export type Manifest = z.output<typeof manifestSchema>
 
@@ -51,28 +31,62 @@ export function verifyRecord<S extends z.ZodType>(schema: S, value: unknown): z.
   return parsed.data
 }
 
-// These schemas must be initialized before the exported record schemas that compose them.
+/** File names and version used by the target writer and the compatible-source reader. */
+export const checkpointFormat = {
+  version: 2,
+  lock: 'writer.lock',
+  manifest: 'run.json',
+  journal: 'journal.json',
+  result: 'result.json',
+} as const
+
+/** Check target and source basenames before joining paths. Reject blanks, separators,
+ * control characters, dot traversal and names over 255 UTF-8 bytes. Unicode and spaces
+ * support caller-assigned CLI basenames. */
+export const runIdSchema = z.string().min(1).refine(value => value !== '.' && value !== '..'
+  && value.trim().length > 0 && !/[\\/\x00-\x1f\x7f]/.test(value) && Buffer.byteLength(value) <= 255)
+
+// The exported record schemas evaluate their component schemas during initialization.
+/** UUID rule shared by journal agent identities and writer-lock ownership tokens. */
+const uuidSchema = z.string().uuid()
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/)
+
+/** Format-v2 writer claim. Replay checks host/PID liveness. Release checks the held inode. */
+export const lockSchema = z.strictObject({
+  checkpointFormatVersion: z.literal(checkpointFormat.version), token: uuidSchema, hostname: z.string(),
+  pid: z.number().int().positive(), createdAt: z.string().datetime(), recordDigest: hashSchema,
+})
+
+/** Persist only safe failure metadata; diagnostic messages and details stay out of manifests. */
+const failureSchema = z.strictObject({
+  code: z.string(),
+  retryable: z.boolean(),
+  /** The failure left execution's outcome uncertain. */
+  outcomeUnknown: z.boolean(),
+  /** Resource release failed even if execution itself had a known outcome. */
+  cleanupFailed: z.boolean(),
+})
+
 const jsonSchema: z.ZodType<JsonValue> = z.lazy(() => z.union([
   z.null(), z.boolean(), z.number().finite(), z.string(), z.array(jsonSchema), z.record(z.string(), jsonSchema),
 ]))
 const identitySchema = z.strictObject({
   runId: runIdSchema, directory: z.string(), name: z.string().min(1), revision: z.string().min(1), input: jsonSchema,
 })
-/** Format-v2 writer claim. Replay checks host/PID liveness; release checks the held inode. */
-export const lockSchema = z.strictObject({
-  checkpointFormatVersion: z.literal(2), token: uuidSchema, hostname: z.string(),
-  pid: z.number().int().positive(), createdAt: z.string().datetime(), recordDigest: hashSchema,
-})
+
 /** Format-v2 run metadata. Replay rejects earlier formats, checks recordDigest with verifyRecord,
  * and checks resultDigest against result.json for completed and incomplete runs. */
 export const manifestSchema = z.strictObject({
-  checkpointFormatVersion: z.literal(2),
+  checkpointFormatVersion: z.literal(checkpointFormat.version),
   identity: identitySchema, createdAt: z.string().datetime(),
   resumedFrom: z.strictObject({ directory: z.string(), runId: runIdSchema }).nullable(),
   status: z.enum(['running', 'completed', 'incomplete', 'failed']),
   resultDigest: hashSchema.nullable(), failure: failureSchema.nullable(), recordDigest: hashSchema,
 })
+
+/** Versioned chained SHA-256 identity for an agent call, independent of its execution UUID. */
+const journalKeySchema = z.string().regex(/^v1:[a-f0-9]{64}$/)
+
 /** Strict persisted events. Replay validates the entire array before handing it to AgentJournal.
  * The chained key determines reuse. The execution UUID is recorded as agentId. */
 export const journalEventSchema = z.discriminatedUnion('type', [

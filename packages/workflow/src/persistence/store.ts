@@ -4,10 +4,10 @@ import { lstat, mkdir, open, readdir, realpath, unlink, type FileHandle } from '
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 import type { WorkflowOptions } from '../workflow-types'
-import { atomicPublish, syncDirectory } from './atomic'
+import { atomicPublish, storageError, syncDirectory } from './checkpoint-files'
 import { canonicalJson, digest, jsonCopy, type JsonValue } from './json'
 import { AgentJournal } from './journal'
-import { invalidCheckpoint, record, runIdSchema, type Manifest, type StoredFailure } from './records'
+import { checkpointFormat, invalidCheckpoint, record, runIdSchema, type Manifest, type StoredFailure } from './records'
 import { loadSourceJournal } from './replay'
 
 /** Internal identity saved before workflow enters its body. */
@@ -16,14 +16,17 @@ export interface RunIdentity {
   runId: string
   /** Canonical parent containing the run's subdirectory. */
   directory: string
+  /** Workflow name used to match a compatible source run. */
   name: string
+  /** Application revision used to match a compatible source run. */
   revision: string
   /** Isolated persistence snapshot. The body receives its own frozen copy from prepareRun. */
   input: JsonValue
 }
 
 /** Internal storage ownership returned to workflow. Drain agent work before finish or abort,
- * and always await close in finally. Only manifest operations are serialized by this handle. */
+ * and always await close in finally. The handle serializes finish and abort. AgentJournal
+ * serializes its own appends. */
 export interface RunHandle {
   /** Provides the canonical storage directory for workflow's error details. */
   readonly identity: RunIdentity
@@ -48,9 +51,7 @@ export interface RunHandle {
  * SDK errors propagate unless lock rollback fails. Rollback failures and otherwise unclassified
  * I/O failures reject as WORKFLOW_STORAGE_FAILED. If publication left run files behind,
  * a later attempt on the same target rejects with WORKFLOW_RUN_EXISTS. */
-export async function openFileRun(
-  options: FileRunOptions,
-): Promise<RunHandle> {
+export async function openFileRun(options: FileRunOptions): Promise<RunHandle> {
   validateRunOptions(options)
   try {
     const prepared = await prepareRunStorage(options)
@@ -90,7 +91,7 @@ class FileRunHandle implements RunHandle {
    * The manifest comes last so it refers to an already published result. */
   async finish(status: 'completed' | 'incomplete', result: JsonValue): Promise<void> {
     await this.updateManifest(async () => {
-      await atomicPublish(join(this.path, 'result.json'), result)
+      await atomicPublish(join(this.path, checkpointFormat.result), result)
       await this.publishManifest({ status, resultDigest: digest(result), failure: null })
     })
   }
@@ -109,7 +110,7 @@ class FileRunHandle implements RunHandle {
     if (this.closed) return
     try {
       await this.manifestQueue.catch(() => {})
-      await releaseLock(join(this.path, 'writer.lock'), this.lock)
+      await releaseLock(join(this.path, checkpointFormat.lock), this.lock)
     } catch (cause) {
       throw storageError(cause)
     } finally {
@@ -127,7 +128,7 @@ class FileRunHandle implements RunHandle {
   private manifest: Manifest
 
   /** Run finish/abort's publication callback in order, checking closure when it actually starts.
-   * A rejected predecessor does not poison later abort publication; non-SDK failures are normalized. */
+   * A rejected predecessor still permits abort publication. Non-SDK failures are normalized. */
   private updateManifest(update: () => Promise<void>): Promise<void> {
     const next = this.manifestQueue.catch(() => {}).then(async () => {
       if (this.closed) throw new HarnessSdkError('WORKFLOW_CLOSED')
@@ -142,7 +143,7 @@ class FileRunHandle implements RunHandle {
   private async publishManifest(update: Pick<Manifest, 'status' | 'resultDigest' | 'failure'>): Promise<void> {
     const { recordDigest: _, ...payload } = this.manifest
     this.manifest = record({ ...payload, ...update })
-    await atomicPublish(join(this.path, 'run.json'), this.manifest)
+    await atomicPublish(join(this.path, checkpointFormat.manifest), this.manifest)
   }
 }
 
@@ -161,7 +162,7 @@ async function prepareRunStorage(options: FileRunOptions): Promise<PreparedRun> 
   await mkdir(resolve(options.directory), { recursive: true, mode: 0o700 })
   const directory = await realpath(resolve(options.directory))
   const path = join(directory, options.runId)
-  const source = await resolveSourceRun({ options, directory, path })
+  const source = await resolveSourceRun({ resumeFrom: options.resumeFrom, directory, path })
   try {
     await mkdir(path, { mode: 0o700 })
     await syncDirectory(directory)
@@ -175,14 +176,13 @@ async function prepareRunStorage(options: FileRunOptions): Promise<PreparedRun> 
 /** Resolve optional replay coordinates before target creation so overlapping source/target trees
  * reject before a writer claim. Omission selects fresh execution. A string uses the target's
  * canonical parent, while an object supplies its own parent to resolve. */
-async function resolveSourceRun({ options, directory, path }: {
-  options: FileRunOptions
+async function resolveSourceRun({ resumeFrom, directory, path }: {
+  resumeFrom: FileRunOptions['resumeFrom']
   directory: string
   path: string
 }): Promise<SourceRun | null> {
-  if (options.resumeFrom === undefined) return null
-  const reference = typeof options.resumeFrom === 'string'
-    ? { directory, runId: options.resumeFrom } : options.resumeFrom
+  if (resumeFrom === undefined) return null
+  const reference = typeof resumeFrom === 'string' ? { directory, runId: resumeFrom } : resumeFrom
   if (!reference || !runIdSchema.safeParse(reference.runId).success || typeof reference.directory !== 'string') {
     throw new HarnessSdkError('INVALID_PARAMS')
   }
@@ -198,14 +198,14 @@ async function initializeLockedRun({ options, prepared }: {
   options: FileRunOptions
   prepared: PreparedRun
 }): Promise<RunHandle> {
-  const lockPath = join(prepared.path, 'writer.lock')
+  const lockPath = join(prepared.path, checkpointFormat.lock)
   const lock = await open(lockPath, 'wx', 0o600).catch(cause => {
     if ((cause as NodeJS.ErrnoException).code === 'EEXIST') throw new HarnessSdkError('WORKFLOW_RUN_EXISTS')
     throw cause
   })
   try {
     await writeWriterClaim(lock)
-    if ((await readdir(prepared.path)).some(name => name !== 'writer.lock')) {
+    if ((await readdir(prepared.path)).some(name => name !== checkpointFormat.lock)) {
       throw new HarnessSdkError('WORKFLOW_RUN_EXISTS')
     }
     return await publishInitialRun({ options, prepared, lock })
@@ -220,7 +220,7 @@ async function initializeLockedRun({ options, prepared }: {
  * record before probing its writer, and initializeLockedRun owns rollback on rejection. */
 async function writeWriterClaim(lock: FileHandle): Promise<void> {
   const claim = record({
-    checkpointFormatVersion: 2,
+    checkpointFormatVersion: checkpointFormat.version,
     token: randomUUID(),
     hostname: hostname(),
     pid: process.pid,
@@ -243,12 +243,12 @@ async function publishInitialRun({ options, prepared, lock }: {
       name: options.name, revision: options.revision, runId: source.runId,
     })
     : []
-  const journalPath = join(path, 'journal.json')
+  const journalPath = join(path, checkpointFormat.journal)
   const journal = new AgentJournal(journalPath, inherited)
   await atomicPublish(journalPath, [...inherited])
   const identity = { runId: options.runId, directory, name: options.name, revision: options.revision, input }
   const manifest: Manifest = record({
-    checkpointFormatVersion: 2,
+    checkpointFormatVersion: checkpointFormat.version,
     identity,
     createdAt: new Date().toISOString(),
     resumedFrom: source,
@@ -256,14 +256,8 @@ async function publishInitialRun({ options, prepared, lock }: {
     resultDigest: null,
     failure: null,
   })
-  await atomicPublish(join(path, 'run.json'), manifest)
+  await atomicPublish(join(path, checkpointFormat.manifest), manifest)
   return new FileRunHandle({ identity, path, lock, manifest, journal })
-}
-
-/** Preserve deliberate SDK failures while hiding filesystem-specific errors from workflow consumers. */
-function storageError(cause: unknown): HarnessSdkError {
-  if (cause instanceof HarnessSdkError) return cause
-  return new HarnessSdkError('WORKFLOW_STORAGE_FAILED')
 }
 
 /** Detect equal or nested run trees in either direction. resolveSourceRun uses canonical

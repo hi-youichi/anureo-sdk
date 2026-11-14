@@ -5,7 +5,10 @@ import type { JsonObject } from '@anureo/protocol'
 
 /** Package-internal schema and parser for agent execution and journal replay. */
 export interface AgentOutputSchema<S extends z.ZodObject = z.ZodObject> {
-  /** Closed draft-07 object schema for submission, JSON-text fallback prompts and journal cache keys. */
+  /**
+   * Closed draft-07 object schema. agentSubmission sends it or embeds it in the JSON-text
+   * prompt, and memoizedAgent includes it in the journal key.
+   */
   schema: JsonObject
   /**
    * Validate a complete JSON object before Zod can strip extra fields or fill omitted fields.
@@ -13,23 +16,24 @@ export interface AgentOutputSchema<S extends z.ZodObject = z.ZodObject> {
    * Blank text, malformed JSON and schema mismatches reject with AGENT_STRUCTURED_OUTPUT_MISSING,
    * AGENT_STRUCTURED_OUTPUT_NOT_JSON and AGENT_STRUCTURED_OUTPUT_INVALID, respectively. Exceptions
    * from Zod reject with AGENT_STRUCTURED_OUTPUT_VALIDATION_FAILED and omit the original cause.
-   * observeAgentTurn awaits this parser for completed turns and retains failures for settlement
-   * after session cleanup. memoizedAgent returns this promise for typed cache hits without opening
-   * a session.
+   * observeAgentTurn awaits this parser after a completed turn and captures rejections so
+   * executeAgent can release the session before settlement. For a typed cache hit,
+   * replayAgentResult passes the saved value as canonical JSON and propagates the outcome.
    */
   parse(text: string): Promise<z.output<S>>
 }
 
 /**
- * Compile a Zod object into a draft-07 schema and a parser for the same output type.
- * Require closed objects and required JSON fields. Reject conversion schemas. JSON-compatible
- * defaults may be declared, and raw validation still requires their fields. Unsupported or
- * unrepresentable schemas synchronously throw INVALID_PARAMS with a safe rule code.
- * executeAgent prepares the pair before acquiring its session and passes it to observeAgentTurn.
- * memoizedAgent prepares it before deriving the journal key and uses the parser on typed hits.
+ * Prepare a portable Zod object as a draft-07 schema and a parser for its inferred output.
+ * Require closed objects and required JSON fields, including fields with JSON-compatible defaults.
+ * Conversion schemas and other unsupported shapes synchronously throw INVALID_PARAMS with a
+ * rule code in details.rule.
+ * memoizedAgent prepares the pair before reserving a journal key and uses it for typed replay.
+ * executeAgent prepares its own pair before opening a session. On a journal miss this happens
+ * after the started record is published and dispatch is rechecked.
  */
 export function prepareOutputSchema<S extends z.ZodObject>(source: S): AgentOutputSchema<S> {
-  const { schema, validate } = compileSchema(source)
+  const { schema, validate } = compilePortableSchema(source)
   return {
     schema,
     async parse(text) {
@@ -49,9 +53,9 @@ export function prepareOutputSchema<S extends z.ZodObject>(source: S): AgentOutp
 }
 
 /**
- * Decode one JSON value and require a schema-valid object before parse runs any Zod checks.
- * Throw the missing, malformed or invalid output error synchronously and capture Ajv's
- * current diagnostics before the parser can yield.
+ * Decode a single JSON object and check its raw fields before parse awaits Zod.
+ * Throw the missing, malformed or invalid output error synchronously, copying any available
+ * Ajv issue paths and codes into the invalid output error.
  */
 function parseRawOutput(text: string, validate: ValidateFunction): unknown {
   if (!text.trim()) throw new HarnessSdkError('AGENT_STRUCTURED_OUTPUT_MISSING')
@@ -73,30 +77,30 @@ function outputMismatch(issues: Array<{ path: string | PropertyKey[]; code: stri
   return new HarnessSdkError('AGENT_STRUCTURED_OUTPUT_INVALID', 'Agent output does not match its schema', false, false, { issues })
 }
 
-/** Let compileSchema preserve known preflight rule codes while sanitizing user callback exceptions. */
-class SchemaParameterError extends HarnessSdkError {
-  constructor(rule: string) { super('INVALID_PARAMS', 'Unsupported agent output schema', false, false, { rule }) }
-}
-
-function rejectSchema(rule: string): never {
-  throw new SchemaParameterError(rule)
-}
-
 /**
- * Give prepareOutputSchema a detached draft-07 schema and a synchronous validator.
- * Check the Zod source before conversion, then check portability before compiling. Ajv leaves
- * fields as supplied and skips format assertions so Zod can run its own format checks.
- * Sanitize unexpected failures from conversion, schema callbacks and Ajv into INVALID_PARAMS.
+ * Give prepareOutputSchema a detached draft-07 schema and a synchronous validator. Check the
+ * Zod source before conversion, then check the emitted schema before compiling it with Ajv.
+ * Preserve preflight rule codes and replace unexpected conversion, callback or Ajv exceptions
+ * with INVALID_PARAMS. Ajv checks fields as supplied and leaves format assertions to Zod.
  */
-function compileSchema(source: z.ZodObject): { schema: JsonObject; validate: ValidateFunction } {
+function compilePortableSchema(source: z.ZodObject): { schema: JsonObject; validate: ValidateFunction } {
   if (!(source instanceof z.ZodObject)) rejectSchema('objectRootRequired')
   try {
-    checkZodSource(source)
-    const schema = structuredClone(z.toJSONSchema(source, { target: 'draft-7', io: 'output', unrepresentable: 'throw' })) as JsonObject
+    checkPortableZodSource(source)
+    const schema = structuredClone(z.toJSONSchema(source, {
+      target: 'draft-7',
+      io: 'output',
+      unrepresentable: 'throw',
+    })) as JsonObject
     delete schema.$schema
     if (schema.type !== 'object') rejectSchema('objectRootRequired')
-    checkJsonSchema(schema)
-    const validate = new Ajv({ allErrors: true, validateFormats: false, multipleOfPrecision: 6, logger: false }).compile(schema)
+    checkPortableJsonSchema(schema)
+    const validate = new Ajv({
+      allErrors: true,
+      validateFormats: false,
+      multipleOfPrecision: 6,
+      logger: false,
+    }).compile(schema)
     return { schema, validate }
   } catch (cause) {
     if (cause instanceof SchemaParameterError) throw cause
@@ -105,11 +109,11 @@ function compileSchema(source: z.ZodObject): { schema: JsonObject; validate: Val
 }
 
 /** Reject conversions and nonportable types in the source graph before Zod's output-mode converter can hide them. */
-function checkZodSource(root: z.ZodObject): void {
+function checkPortableZodSource(root: z.ZodObject): void {
   const seen = new WeakSet<object>()
   const nonportableTypes = new Set(['optional', 'record', 'tuple', 'pipe', 'transform', 'catch', 'prefault',
     'date', 'bigint', 'symbol', 'map', 'set', 'nan', 'undefined', 'void', 'custom', 'function', 'promise', 'file'])
-  /** Follow definition fields and invoke lazy getters once per visited lazy node. Propagate getter failures to compileSchema. */
+  /** Follow definition fields once per node, including lazy schemas. Getter failures reach compilePortableSchema. */
   function visitZodNode(value: unknown): void {
     if (!value || typeof value !== 'object' || seen.has(value)) return
     seen.add(value)
@@ -136,7 +140,7 @@ function checkZodSource(root: z.ZodObject): void {
  * Reject portability violations before Ajv compiles the generated schema. Follow only
  * subschema keywords because examples, defaults and enum values may contain schema-like keys.
  */
-function checkJsonSchema(node: unknown): void {
+function checkPortableJsonSchema(node: unknown): void {
   if (!node || typeof node !== 'object' || Array.isArray(node)) return
   const schema = node as JsonObject
   if (schema.$async || (typeof schema.$ref === 'string' && !schema.$ref.startsWith('#'))) {
@@ -149,29 +153,34 @@ function checkJsonSchema(node: unknown): void {
   for (const key of ['properties', 'patternProperties', 'definitions', '$defs', 'dependentSchemas']) {
     const children = schema[key]
     if (children && typeof children === 'object' && !Array.isArray(children)) {
-      Object.values(children).forEach(checkJsonSchema)
+      Object.values(children).forEach(checkPortableJsonSchema)
     }
   }
   for (const key of ['allOf', 'anyOf', 'oneOf']) {
     const children = schema[key]
-    if (Array.isArray(children)) children.forEach(checkJsonSchema)
+    if (Array.isArray(children)) children.forEach(checkPortableJsonSchema)
   }
   for (const key of ['items', 'contains', 'additionalProperties', 'propertyNames', 'not', 'if', 'then', 'else']) {
-    checkJsonSchema(schema[key])
+    checkPortableJsonSchema(schema[key])
   }
 }
 
-/** Reject open/optional objects and required keys that a closed object cannot admit, including pattern keys. */
+/** Check closure and requiredness before testing whether explicit properties or patterns admit each required key. */
 function checkObjectProperties(schema: JsonObject): void {
   if (schema.type !== 'object' && !(Array.isArray(schema.type) && schema.type.includes('object'))) return
   if (schema.additionalProperties !== false) rejectSchema('openObject')
   const properties = schema.properties as JsonObject | undefined
-  const required = new Set(Array.isArray(schema.required) ? schema.required : [])
+  const requiredKeys = Array.isArray(schema.required) ? schema.required : undefined
+  const required = new Set(requiredKeys)
   if (properties && Object.keys(properties).some(key => !required.has(key))) rejectSchema('optionalProperty')
+
   const patterns = schema.patternProperties && typeof schema.patternProperties === 'object'
-    ? Object.keys(schema.patternProperties).map(pattern => new RegExp(pattern, 'u')) : []
-  if (Array.isArray(schema.required) && schema.required.some(key => typeof key === 'string'
-    && !Object.hasOwn(properties ?? {}, key) && !patterns.some(pattern => pattern.test(key)))) {
+    ? Object.keys(schema.patternProperties).map(pattern => new RegExp(pattern, 'u'))
+    : []
+  const impossibleRequiredKey = requiredKeys?.some(key =>
+    typeof key === 'string' && !Object.hasOwn(properties ?? {}, key) && !patterns.some(pattern => pattern.test(key)),
+  )
+  if (impossibleRequiredKey) {
     rejectSchema('unsatisfiableRequired')
   }
 }
@@ -209,4 +218,14 @@ function checkNumericBounds(schema: JsonObject): void {
   if (lower > upper || equalBoundsExcludeValue) {
     rejectSchema('unsatisfiableBounds')
   }
+}
+
+/** Distinguish preflight rule failures from exceptions raised during conversion or compilation. */
+class SchemaParameterError extends HarnessSdkError {
+  constructor(rule: string) { super('INVALID_PARAMS', 'Unsupported agent output schema', false, false, { rule }) }
+}
+
+/** Stop preflight with the rule code compilePortableSchema can carry through sanitization. */
+function rejectSchema(rule: string): never {
+  throw new SchemaParameterError(rule)
 }

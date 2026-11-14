@@ -28,8 +28,7 @@ export function validatePlan(plan: ModulePlan, files: readonly string[]): void {
 /**
  * Reserve an ID in validatePlan's set of lowercase keys. IDs are 1–80 ASCII characters
  * and start with a letter or digit. Later characters can also be underscores or hyphens.
- * Throw on an unsafe or repeated ID so runModules can use the original spelling in patch names
- * without collisions on case-insensitive filesystems.
+ * Throw on an unsafe or repeated ID so runModules can report each assignment using a unique ID.
  */
 function claimModuleId(id: string, claimedIds: Set<string>): void {
   const key = id.toLowerCase()

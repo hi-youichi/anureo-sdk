@@ -11,11 +11,25 @@ let journalPublishes = 0
 mock.module('node:fs/promises', () => ({ ...fs, rename: renameAtCrashBoundary }))
 const { workflow, agent } = await import('../index')
 
-const adapter = createScriptedAdapter()
+const adapter = createScriptedAdapter({
+  async execute(call) {
+    if (phase === 'after-later-result' && call.method === 'input/submit' && 'input' in call.params
+      && call.params.input.some(part => part.type === 'text' && part.text === 'work')) {
+      // Hold the first call at started while the second reaches durable completion.
+      await new Promise<never>(() => {})
+    }
+    return undefined
+  },
+})
 const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: 'crash-fixture' } })
 try {
-  await workflow({ directory, name: 'crash-test', revision: '1', input: {}, runId: 'crashed' }, async () =>
-    agent('work', { client, cwd: directory }))
+  await workflow({ directory, name: 'crash-test', revision: '1', input: {}, runId: 'crashed' }, async () => {
+    const first = agent('work', { client, cwd: directory })
+    if (phase !== 'after-later-result') return first
+    await agent('later', { client, cwd: directory })
+    process.kill(process.pid, 'SIGKILL')
+    return first
+  })
 } finally {
   await client.dispose()
 }

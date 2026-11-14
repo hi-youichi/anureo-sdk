@@ -19,3 +19,7 @@ Give the package README a dedicated **Code structure** section after the API ove
 `@anureo/workflow` composes independent agent sessions and application code in ordinary TypeScript functions using `agent`, `parallel`, and `pipeline`.
 
 See the [workflow authoring guide](docs/workflow/SKILL.md) for composition patterns, failure handling, and recovery; the [primitives reference](docs/workflow/README.md) for API contracts; and the [package guide](packages/workflow/README.md) for usage examples.
+
+# npm releases
+
+For each npm release, increment only the patch version by exactly one. For example, release `0.3.1` after `0.3.0`.

@@ -109,15 +109,21 @@ test('sync and async refinements and formats validate locally and sanitize custo
 })
 
 test('definite generated contradictions and external references are rejected', () => {
-  for (const schema of [
-    z.object({ a: z.string().meta({ minLength: 5, maxLength: 1 }) }),
-    z.object({ a: z.number().meta({ minimum: 5, maximum: 1 }) }),
-    z.object({ a: z.number().meta({ minimum: 1, exclusiveMaximum: 1 }) }),
-    z.object({ a: z.array(z.string()).meta({ minItems: 3, maxItems: 1 }) }),
-    z.object({ a: z.string().meta({ $ref: 'https://private.example/schema' }) }),
-    z.object({ a: z.string() }).meta({ required: ['missing'] }),
-    z.object({}).meta({ required: ['missing'], patternProperties: { '^allowed$': { type: 'string' } } }),
-  ]) expect(() => prepareOutputSchema(schema)).toThrow(expect.objectContaining({ code: 'INVALID_PARAMS' }))
+  const cases: Array<{ schema: z.ZodObject; rule: string }> = [
+    { schema: z.object({ a: z.string().meta({ minLength: 5, maxLength: 1 }) }), rule: 'unsatisfiableBounds' },
+    { schema: z.object({ a: z.number().meta({ minimum: 5, maximum: 1 }) }), rule: 'unsatisfiableBounds' },
+    { schema: z.object({ a: z.number().meta({ minimum: 1, exclusiveMaximum: 1 }) }), rule: 'unsatisfiableBounds' },
+    { schema: z.object({ a: z.array(z.string()).meta({ minItems: 3, maxItems: 1 }) }), rule: 'unsatisfiableBounds' },
+    { schema: z.object({ a: z.string().meta({ $ref: 'https://private.example/schema' }) }), rule: 'externalOrAsyncSchema' },
+    { schema: z.object({ a: z.string() }).meta({ required: ['missing'] }), rule: 'optionalProperty' },
+    {
+      schema: z.object({}).meta({ required: ['missing'], patternProperties: { '^allowed$': { type: 'string' } } }),
+      rule: 'unsatisfiableRequired',
+    },
+  ]
+  for (const { schema, rule } of cases) {
+    expect(() => prepareOutputSchema(schema)).toThrow(expect.objectContaining({ code: 'INVALID_PARAMS', details: { rule } }))
+  }
   // Numeric bounds do not contradict a string instance.
   expect(prepareOutputSchema(z.object({ a: z.string().meta({ minimum: 5, maximum: 1 }) })).schema.type).toBe('object')
   expect(prepareOutputSchema(z.object({}).meta({ required: ['allowed'], patternProperties: { '^allowed$': { type: 'string' } } })).schema.type).toBe('object')
@@ -131,6 +137,11 @@ test('user schema callbacks cannot expose their exception or claim execution unc
   } catch (cause) {
     failure = cause
   }
-  expect(failure).toMatchObject({ code: 'INVALID_PARAMS', retryable: false, outcomeUnknown: false })
+  expect(failure).toMatchObject({
+    code: 'INVALID_PARAMS',
+    retryable: false,
+    outcomeUnknown: false,
+    details: { rule: 'invalidOrUnrepresentableSchema' },
+  })
   expect(String(failure)).not.toContain('private value')
 })

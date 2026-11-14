@@ -1,6 +1,6 @@
 // Exercises public sequencing, checkpoints and failure gates through refactorCode.
 import { expect, test } from 'bun:test'
-import { mkdir, readFile, rename, stat, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createClient, HarnessSdkError, type StructuredOutputToolDefinition } from '@anureo/sdk'
 import { createPiAdapter } from '@anureo/adapter-pi'
@@ -125,6 +125,9 @@ test('prompts name the problem catalog, the graph guide and the mode', async () 
     expect(prompt).toContain('MODE: READ ONLY')
     expect(prompt).toContain('Graph artifact:')
     expect(prompt).toContain('local_name')
+    expect(prompt).toContain('Optimize for the cost of understanding and changing the code.')
+    expect(prompt.replace(/\s+/g, ' ')).toContain('verify call targets, imports, aliases, re-exports and callback registration/invocation in source')
+    expect(prompt).toContain('Missing edges do not prove absence of calls')
   }
   expect(design).toContain('Wrong dependency direction')
   expect(design).toContain('Import cycles between files')
@@ -165,8 +168,8 @@ test.each([
   expect(context.prompts.some(prompt => prompt.startsWith(MODULE))).toBe(false)
 })
 
-/** Inject an unknown SDK outcome after a real edit; planning must stop while the partial diff survives. */
-test('a failed design step stops before planning and records its partial edit', async () => {
+/** Inject an unknown SDK outcome after a real edit; planning stops and the target retains its original contents. */
+test('a failed design step stops before planning and records its observed edit', async () => {
   const context = await fixture(async (_prompt, cwd) => {
     await writeFile(join(cwd, 'a.ts'), 'export const value = 2\n')
     return new HarnessSdkError('RECEIPT_LOST', 'Unknown', false, true)
@@ -174,12 +177,12 @@ test('a failed design step stops before planning and records its partial edit', 
   const report = await refactorCode({ ...context, checks: [] })
   expect(report.status).toBe('incomplete')
   expect(report.design).toMatchObject({ status: 'failed', changedFiles: ['a.ts'], failure: { code: 'RECEIPT_LOST', outcomeUnknown: true } })
-  expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toBe('export const value = 2\n')
+  expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toBe('export const value = 1\n')
   expect(context.prompts).toHaveLength(1)
   expect(formatReport(report)).toContain('execution outcome is unknown')
 })
 
-test('a failed module preserves its patch and blocks integration after siblings finish', async () => {
+test('a failed module leaves the target untouched for its assignment while siblings merge', async () => {
   const context = await fixture(async (prompt, cwd) => {
     if (prompt.startsWith('PLAN')) return plan
     const module = moduleOf(prompt)
@@ -190,29 +193,38 @@ test('a failed module preserves its patch and blocks integration after siblings 
   const report = await refactorCode({ ...context, checks: [] })
   expect(report.status).toBe('incomplete')
   expect(report.modules[0]?.step).toMatchObject({ status: 'failed', changedFiles: ['a.ts'] })
-  expect(report.modules[1]?.step).toMatchObject({ status: 'failed', error: 'Integration blocked by failed module a', changedFiles: ['b.ts'] })
-  for (const result of report.modules) {
-    expect(await readFile(result.step!.patch!, 'utf8')).toContain('+export const value = 2')
-    expect(await readFile(join(context.cwd, `${result.module.id}.ts`), 'utf8')).toContain('value = 1')
-  }
+  expect(report.modules[1]?.step).toMatchObject({ status: 'applied', changedFiles: ['b.ts'] })
+  expect(await readdir(report.directory)).not.toContain('module-a.patch')
+  expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toContain('value = 1')
+  expect(await readFile(join(context.cwd, 'b.ts'), 'utf8')).toContain('value = 2')
   expect((await git(context.cwd, 'worktree', 'list', '--porcelain')).match(/^worktree /gm)).toHaveLength(1)
 })
 
-test('competing additions report a conflict and keep the earlier patch applied', async () => {
+test('verified work merges while an earlier agent is still running, and competing additions fail', async () => {
+  const merged = Promise.withResolvers<void>()
   const context = await fixture(async (prompt, cwd) => {
     if (prompt.startsWith('PLAN')) return plan
     const module = moduleOf(prompt)
     if (!module) return unchanged
+    if (module === 'a') {
+      await merged.promise
+      expect(await readFile(join(context.cwd, 'b.ts'), 'utf8')).toContain('value = 2')
+      expect(await readFile(join(cwd, 'b.ts'), 'utf8')).toContain('value = 1')
+    }
     await writeFile(join(cwd, `${module}.ts`), 'export const value = 2\n')
     await writeFile(join(cwd, 'shared.ts'), `export const owner = '${module}'\n`)
     return edited()
   })
-  const report = await refactorCode({ ...context, checks: [] })
+  const report = await refactorCode({
+    ...context, concurrency: 2,
+    checks: [{ executable: process.execPath, args: ['-e', 'if (!(await Bun.file("shared.ts").text()).includes("owner")) process.exit(1)'] }],
+    onProgress: event => { if (event === 'module/b: applied') merged.resolve() },
+  })
   expect(report.status).toBe('incomplete')
-  expect(report.modules[0]?.step?.status).toBe('applied')
-  expect(report.modules[1]?.step).toMatchObject({ status: 'failed', error: 'Source changed during refactor: shared.ts' })
-  expect(await readFile(join(context.cwd, 'shared.ts'), 'utf8')).toContain("owner = 'a'")
-  expect(await readFile(join(context.cwd, 'b.ts'), 'utf8')).toContain('value = 1')
+  expect(report.modules[0]?.step).toMatchObject({ status: 'failed', error: 'Source changed during refactor: shared.ts' })
+  expect(report.modules[1]?.step).toMatchObject({ status: 'applied', checks: [{ status: 'passed' }] })
+  expect(await readFile(join(context.cwd, 'shared.ts'), 'utf8')).toContain("owner = 'b'")
+  expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toContain('value = 1')
 })
 
 test('edits to another module and review-only writes stay out of the target checkout', async () => {
@@ -233,8 +245,7 @@ test('edits to another module and review-only writes stay out of the target chec
   }
 })
 
-/** Fail a check after the first patch applies so the second patch exercises the integration gate. */
-test('failed validation retains its output and stops later integration', async () => {
+test('failed validation retains its output and prevents unverified changes from reaching the target', async () => {
   const context = await fixture(async (prompt, cwd) => {
     if (prompt.startsWith('PLAN')) return plan
     const module = moduleOf(prompt)
@@ -243,22 +254,17 @@ test('failed validation retains its output and stops later integration', async (
     return edited()
   })
   const report = await refactorCode({ ...context, checks: [
-    { executable: process.execPath, args: ['-e', 'console.error("validation-broken"); process.exit(7)'] },
-    { executable: process.execPath, args: ['-e', 'Bun.write("later-check-ran", "unexpected")'] },
+    { executable: process.execPath, args: ['-e', 'if ((await Bun.file("a.ts").text()).includes("value = 2")) { console.error("validation-broken"); process.exit(7) }'] },
+    { executable: process.execPath, args: ['-e', 'if (!(await Bun.file("b.ts").text()).includes("value = 2")) process.exit(8)'] },
   ] })
   expect(report.status).toBe('incomplete')
-  expect(report.modules[0]?.step?.checks[0]).toMatchObject({ status: 'failed', output: expect.stringContaining('validation-broken') })
-  expect(report.modules).toHaveLength(2)
-  expect(report.modules[0]?.step?.checks).toHaveLength(1)
-  expect(report.modules[1]?.step).toMatchObject({
+  expect(report.modules[0]?.step).toMatchObject({
     status: 'failed',
-    error: 'Integration blocked by failed module a',
-    changedFiles: ['b.ts'],
-    checks: [],
+    checks: [{ status: 'failed', output: expect.stringContaining('validation-broken') }],
   })
-  expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toBe('export const value = 2\n')
-  expect(await readFile(join(context.cwd, 'b.ts'), 'utf8')).toBe('export const value = 1\n')
-  expect(await stat(join(context.cwd, 'later-check-ran')).catch(() => null)).toBeNull()
+  expect(report.modules[1]?.step).toMatchObject({ status: 'applied', checks: [{ status: 'passed' }, { status: 'passed' }] })
+  expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toBe('export const value = 1\n')
+  expect(await readFile(join(context.cwd, 'b.ts'), 'utf8')).toBe('export const value = 2\n')
 })
 
 test('the plan checkpoint is published before either module starts', async () => {
@@ -317,6 +323,37 @@ test('default validation discovers root package scripts and stops on a failing t
   const report = await refactorCode(context)
   expect(report.status).toBe('incomplete')
   expect(report.modules[0]?.step?.checks).toMatchObject([{ command: 'bun run typecheck', status: 'failed' }])
+})
+
+test('validation resolves installed workspace links to edited files in the agent worktree', async () => {
+  const context = await fixture(async (prompt, cwd) => {
+    if (prompt.startsWith('PLAN')) return plan
+    if (moduleOf(prompt) !== 'a') return unchanged
+    await writeFile(join(cwd, 'a.ts'), 'export const value = 2\n')
+    return edited()
+  })
+  await mkdir(join(context.cwd, 'node_modules'))
+  await symlink(context.cwd, join(context.cwd, 'node_modules', 'workspace'), 'junction')
+  await writeFile(join(context.cwd, '.gitignore'), '.anureo/\nnode_modules/\n')
+  const report = await refactorCode({ ...context, checks: [
+    { executable: process.execPath, args: ['-e', 'if ((await import("workspace/a.ts")).value !== 2) process.exit(9)'] },
+  ] })
+  expect(report.modules[0]?.step).toMatchObject({ status: 'applied', checks: [{ status: 'passed' }] })
+  expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toContain('value = 2')
+})
+
+test('a passing command that rewrites agent source prevents the merge', async () => {
+  const context = await fixture(async (prompt, cwd) => {
+    if (prompt.startsWith('PLAN')) return plan
+    if (moduleOf(prompt) !== 'a') return unchanged
+    await writeFile(join(cwd, 'a.ts'), 'export const value = 2\n')
+    return edited()
+  })
+  const report = await refactorCode({ ...context, checks: [
+    { executable: process.execPath, args: ['-e', 'await Bun.write("a.ts", "export const value = 3\\n")'] },
+  ] })
+  expect(report.modules[0]?.step).toMatchObject({ status: 'failed', error: 'Validation modified source files: a.ts' })
+  expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toContain('value = 1')
 })
 
 /** Move/add files during design so the host diff and post-design inventory use observed paths. */

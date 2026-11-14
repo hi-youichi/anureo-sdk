@@ -38,7 +38,7 @@ export const workSchema = z.strictObject({
 export type ModulePlan = z.infer<typeof modulePlanSchema>
 
 /** Read a planned module from the report's plan or a ModuleResult. Its ID identifies the module in
- * progress events and patch filenames. Its file list describes the original assignment. Use
+ * progress events and reports. Its file list describes the original assignment. Use
  * StepResult.changedFiles for the paths the host observed the agent change. */
 export type RefactorModule = ModulePlan['modules'][number]
 

@@ -30,7 +30,9 @@ export function freezeJson<T>(value: T): T {
   return value
 }
 
-/** Hash canonical JSON as lowercase SHA-256 hex; unsupported values throw as in canonicalJson. */
+/** Hash canonical JSON as lowercase SHA-256 hex. record and verifyRecord agree on this encoding
+ * for record payloads, and FileRunHandle.finish and loadSourceJournal use it for result.json.
+ * Unsupported values throw as in canonicalJson. */
 export function digest(value: unknown): string {
   return createHash('sha256').update(canonicalJson(value)).digest('hex')
 }

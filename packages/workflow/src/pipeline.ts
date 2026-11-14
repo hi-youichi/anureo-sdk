@@ -1,20 +1,21 @@
 /**
- * Run each input through sequential stages, letting items advance independently without a stage barrier.
- * Each stage receives the awaited input or prior result, the original unawaited input entry and its
- * zero-based index. Inline stages infer their input types through six stages. Longer chains can
- * use typed functions that accept the preceding stage's awaited, non-null result.
+ * Run each input through sequential stages at its own pace. Each stage receives the awaited input
+ * or prior result, the original array entry as supplied and its zero-based index in the snapshot.
+ * Inline stages infer their input types through six stages. Longer chains can use typed functions
+ * that accept the preceding stage's awaited result with `null` excluded.
  *
  * The promise resolves after all item chains settle and returns their final values in input order.
- * A null input or stage result skips the remaining stages for that item. A rejected input, thrown
- * stage error or rejected stage result also skips the remaining stages and yields null for that item.
- * Sibling chains continue after a failure. Other falsy values advance normally. With zero stages,
- * return awaited inputs with rejections as null.
+ * An input or stage that resolves to `null` or rejects ends that item's chain with `null`.
+ * A synchronous stage throw has the same effect. Sibling chains continue after a failure,
+ * and other falsy values advance normally. With zero stages, return awaited inputs with
+ * rejections as `null`.
  *
- * Handle input and stage failures before they reach the pipeline if you need the original cause.
- * Arrange any concurrency limits, cancellation, retries and resource cleanup for input work and stages.
+ * Handle input and stage failures before they reach the pipeline to retain the original cause.
+ * The caller owns concurrency limits, cancellation, retries and resource cleanup for input
+ * work and stages. Return the work each stage needs the pipeline to await.
  *
- * A non-array input rejects with TypeError. The function snapshots the array and resolves to []
- * for an empty snapshot. For nonempty input, a non-function stage rejects with TypeError before
+ * A non-array input rejects with `TypeError`. The function snapshots the array and resolves to `[]`
+ * for an empty snapshot. For nonempty input, a non-function stage rejects with `TypeError` before
  * item processing starts.
  */
 export function pipeline<Input>(items: readonly Input[]): Promise<(Awaited<Input> | null)[]>
@@ -39,7 +40,10 @@ export function pipeline<A, B, C, D, E, F, G>(
   third: Stage<C, A, D>, fourth: Stage<D, A, E>,
   fifth: Stage<E, A, F>, sixth: Stage<F, A, G>,
 ): Promise<(Awaited<G> | null)[]>
-/** Use a chain of typed stages of any length, with each stage checked against its predecessor. */
+/**
+ * Run a nonempty chain of typed stages, checking each stage against its predecessor. Resolve
+ * with the last stage's awaited results in input order, using `null` for failed or skipped items.
+ */
 export function pipeline<Input, Outputs extends readonly unknown[]>(
   items: readonly Input[],
   ...stages: Stages<Input, Outputs> & { 0: Stage<Input, Input, unknown> }
@@ -53,15 +57,18 @@ export async function pipeline(
   if (!inputs.length) return []
   if (stages.some(stage => typeof stage !== 'function')) throw new TypeError('pipeline stages must be functions')
   // The overloads check compatibility between adjacent stages. The runner only needs their order.
-  const itemStages = stages as unknown as readonly Stage<unknown, unknown, unknown>[]
-  const results = await Promise.allSettled(
-    inputs.map((originalItem, index) => runItem(originalItem, index, itemStages)),
+  const orderedStages = stages as unknown as readonly Stage<unknown, unknown, unknown>[]
+  const settledItems = await Promise.allSettled(
+    inputs.map((originalItem, index) => runItem(originalItem, index, orderedStages)),
   )
-  return results.map(result => result.status === 'fulfilled' ? result.value : null)
+  return settledItems.map(result => result.status === 'fulfilled' ? result.value : null)
 }
 
-/** Run one item chain with its original entry and index. A null value ends the chain early.
- * Input and stage errors reject the chain so pipeline can preserve its slot as null. */
+/**
+ * Advance one pipeline item by awaiting its input and each stage in turn. Pass the original
+ * entry and snapshot index to every stage, and return early on `null`. Input rejections and
+ * stage errors reject this chain so `pipeline` can collect `null` at the item's original position.
+ */
 async function runItem(
   originalItem: unknown,
   index: number,
@@ -69,7 +76,7 @@ async function runItem(
 ): Promise<unknown> {
   let value = await originalItem
   for (const stage of stages) {
-    if (value === null) break
+    if (value === null) return null
     value = await stage(value, originalItem, index)
   }
   return value

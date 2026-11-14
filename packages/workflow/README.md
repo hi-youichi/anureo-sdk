@@ -1,28 +1,16 @@
 # @anureo/workflow
 
-Directly imported primitives for ordinary TypeScript workflows:
-`agent`, `parallel`, `pipeline`, and optional `workflow`. The host creates SDK Clients, imports its
-workflow functions, awaits their results, and handles errors with normal TS.
-
-See the [workflow authoring reference](../../docs/workflow/SKILL.md) for current
-APIs, composition patterns, failure handling, and application-owned recovery.
-
-The [Workflow primitives reference](../../docs/workflow/README.md) defines
-parameters and result semantics for `agent`, `parallel`, and `pipeline`,
-and records current support.
-
-See the [composition comparison](../../draft/docs/workflow-composition-differences.md)
-and [alignment plan](../../draft/docs/workflow-composition-plan.md) for Claude Code
-semantics, the implemented changes, and retained host differences (Chinese).
-
-This workspace package uses the revised native lifecycle API and is pending
-publication with that revision. Requires Node.js 22+; TypeScript loading and
-compilation are provided by your project (for example, Bun, tsx, or tsc).
+`@anureo/workflow` runs Anureo SDK agents from ordinary TypeScript functions. Use
+`agent` for one prompt, `parallel` for independent callbacks, `pipeline` for
+per-item stages, and `workflow` when you need a disk-backed run and agent replay.
+The package exposes one entry point, `@anureo/workflow`. Its Node.js engine
+requirement is 22 or newer, and applications supply their TypeScript tooling.
 
 ## Usage
 
-Create an initialized Client using `createClient` and your chosen adapter as
-described in the [SDK README](../../README.md). A workflow is just a function:
+This function accepts an initialized SDK Client and reviews files in two stages
+before running two synthesis tasks concurrently. The application creates and owns
+the Client. See the [SDK README](../../README.md) for Client setup.
 
 ```ts
 import type { Client } from '@anureo/sdk'
@@ -45,39 +33,43 @@ export async function reviewFiles(client: Client, files: readonly string[], cwd:
 }
 ```
 
-In this example, `pipeline` and `parallel` convert internal `agent` rejections to
-`null`; `pipeline` also skips the affected item's remaining stages. The two
-explicit checks then throw summary errors for `null` results, so those errors do
-not preserve the original agent failure classification.
+`pipeline` and `parallel` turn rejected agent calls into `null` at the affected
+positions. The two guards report those positions as batch-level errors. Keep the
+Client usable until `reviewFiles` settles, then release it when the application
+has finished using it.
 
-Import `reviewFiles` from another TS file and call it with a Client. Calls do not
-require workflow registration, source-string execution, ambient context, or runtime setup.
-Use [durable workflow steps](../../docs/workflow/persistence.md) when a function
-needs a persisted run ID and recoverable results.
+See the [workflow authoring guide](../../docs/workflow/SKILL.md) for composition and
+recovery patterns and the [primitives reference](../../docs/workflow/README.md) for API contracts.
 
 ## agent
 
 ```ts
+import type { Client } from '@anureo/sdk'
 import { z } from 'zod'
 import { agent } from '@anureo/workflow'
 
-const options = { client, cwd: process.cwd() }
-const text: string | null = await agent('Inspect the authentication module.', options)
-const findings = await agent('List authentication issues.', {
-  ...options,
-  schema: z.strictObject({ issues: z.array(z.string()) }),
-})
-// findings: { issues: string[] } | null
-if (findings !== null) console.log(findings.issues)
+export function listIssues(client: Client, cwd: string) {
+  return agent('List the authentication module’s issues.', {
+    client,
+    cwd,
+    schema: z.strictObject({ issues: z.array(z.string()) }),
+  })
+}
+// listIssues returns Promise<{ issues: string[] } | null>.
 ```
 
-Each call owns a fresh Session, submits once, waits for its native terminal
-result, and releases its resources. `client` and `cwd` are required; `model` and
-`instructions` are optional. The caller owns the borrowed Client.
+For fresh execution, `agent` opens a Session, submits one prompt, awaits the native
+terminal result, and attempts to close and dispose the Session before settling.
+The root exports `AgentOptions` for callers building options. Supply an initialized
+`client` and a `cwd`. You can also supply `model`, `instructions`, and `permissionMode`
+for session creation. The caller owns the Client.
+Omit `schema` to receive the final text, which can be empty, or `null`.
 
 `schema` accepts a Zod 4 object schema. The library converts it to draft-07 JSON
-Schema, requires effective session `turn.outputSchema` support, validates the raw JSON
-result, then validates it with the original Zod schema and returns `z.output<S>`.
+Schema, validates the raw JSON result, then validates it with the original Zod schema
+and returns `z.output<S>`. By default, schema mode requires effective session
+`turn.outputSchema` support. Set `outputFallback: 'json-text'` to include the schema
+in the prompt when the session lacks that capability.
 This package depends on Zod 4.6.7. Applications that import Zod to author schemas
 should also declare it as their own dependency. Schema-associated types infer business fields;
 there is no unbound result-type generic or raw JSON Schema overload.
@@ -89,11 +81,11 @@ Defaults do not fill omitted model answers. Async refinements are supported
 locally; their failures reject without replaying input. See the
 [full schema and failure contract](../../docs/workflow/README.md#schema-mode).
 
-Confirmed native failed terminals for authentication, usage/rate limits, and
-service unavailability return `null`. Other failures and ordinary interruptions
-reject. Trusted adapters may explicitly report user skip or classifier startup
-denial; bundled adapters do not infer these reasons. Unknown execution outcomes
-retain `outcomeUnknown: true` and always reject. No input is automatically retried.
+Confirmed native failed terminals for authentication, usage or rate limits, and
+service unavailability can return `null`. Explicit user skip on interruption and
+tagged startup denial can also return `null`. Other failures and ordinary
+interruptions reject. Unknown execution outcomes reject with `outcomeUnknown: true`.
+The caller decides whether and when to retry.
 
 Cleanup is attempted for successful, failed and discarded executions. A cleanup
 failure rejects with `RESOURCE_RELEASE_FAILED`, or preserves a primary execution
@@ -111,12 +103,12 @@ CLIs and real model requests.
 input-ordered results. Callbacks may return ordinary values or Promises; inline
 heterogeneous tuples preserve each result's type. An empty batch returns `[]`.
 
-The array and every entry are validated before any callback starts. The call
-waits for all callbacks to settle and uses `null` at each failed position,
-including synchronous throws. Result types include `null` at every position.
-Invalid arguments still reject the call. Use `value !== null` to filter failures
-without dropping valid `0`, `false`, or empty-string results.
-There is no implicit interruption, shared scheduler, or concurrency limit.
+`parallel` snapshots the array and validates every entry before any callback
+starts. Invalid arguments reject with `TypeError`. The promise waits for all
+callbacks to settle. A synchronous throw, a rejected promise, or a `null` return
+all produce `null` at that position. Use `value !== null` to retain other falsy
+values, and handle errors inside callbacks if you need their original causes.
+The caller manages concurrency limits, cancellation, and callback resources.
 
 ## pipeline
 
@@ -137,23 +129,58 @@ stage inputs are compile-time errors. A `null` input or stage result skips that
 item's remaining stages. An item failure also skips its remaining stages and
 becomes `null`. The returned Promise waits for all item chains to settle; its
 result type always includes `null`. Stage input types exclude only `null`, so
-`undefined` and other falsy values continue normally. Invalid composition
-arguments still reject the call.
+`undefined` and other falsy values continue normally. A non-array input or a
+non-function stage on nonempty input rejects with `TypeError`. The caller manages
+concurrency limits, cancellation, and resources used by input work or stages.
 
 ## Durable workflow
 
-`workflow(options, body)` saves an initial manifest before passing explicit
-`runId` and `input` to the body. Every `agent()` call made inside the body is
-journaled automatically: identical calls on a `resumeFrom` run return their
-saved results without opening new sessions, and any changed call invalidates
-the calls after it. Existing three-primitive functions keep their independent
-behavior, and `agent()` outside `workflow()` is unchanged.
+`workflow(options, body)` creates a new file-backed run and saves its initial
+manifest before calling `body({ runId, input })`. Supply strict JSON for the input
+and the awaited body result. Set `directory` to the storage root and `name` and
+`revision` to identify compatible runs. `runId` defaults to a new UUID. The body
+receives a deeply frozen input copy. The root exports `WorkflowOptions`,
+`WorkflowContext`, and `WorkflowResult` for typing the options, callback context,
+and published result.
 
-The [persistence reference](../../docs/workflow/persistence.md) defines the
-journal contract, cache keys, error handling and file guarantees.
-Try `bun run example:workflow-persistence` and then repeat with its printed run
-ID: the resumed run opens zero new sessions. This example uses a scripted
-backend and makes no model requests.
+To resume, set `resumeFrom` to an inactive source run with the same name and
+revision. The body runs again from the beginning in a new run. After schema
+validation, journaled calls reserve keys in invocation order using their prompt,
+options, and predecessor. Eligible saved results are reused without opening a
+Session. A changed key ends replay for later calls. A matching call left at a
+started record can rerun while later calls remain eligible. A prior terminal
+failure with an unknown outcome requires reconciliation before that call can run.
+The body owns any side effects that may repeat during resume.
+
+The promise drains registered agent calls, publishes a JSON copy of the body result, and
+releases the writer lock before resolving with `{ runId, status, result }`.
+A registered agent rejection or drop can produce `status: 'incomplete'` if the
+body still returns a publishable result. Body errors, fatal agent failures, and
+storage failures reject. Keep Clients usable until settlement and await any
+other background work inside the body. See the [persistence reference](../../docs/workflow/persistence.md)
+for cache keys, failure recovery, and file guarantees.
+
+## Code structure
+
+- [Package entry](src/index.ts) exposes the four application primitives and links their public
+  types directly to the modules that define them. [TypeScript configuration](tsconfig.json)
+  checks `src`, including tests, with Bun and Node types. The [package manifest](package.json)
+  declares the root entry and the no-emit build and typecheck scripts.
+- [Agent calls](src/agent.ts) choose between fresh execution and journal replay, and record
+  the outcome of journaled calls. [Fresh execution](src/agent-execution.ts) owns the SDK
+  session from creation through release. [Output schemas](src/output-schema.ts) prepare the
+  request schema and validate fresh and replayed results.
+- [Parallel](src/parallel.ts) starts independent callbacks. [Pipeline](src/pipeline.ts)
+  advances each input through its own typed stage chain.
+- [Workflow](src/workflow.ts) opens the run, invokes the body, drains registered agent work,
+  and publishes the result or failure before releasing the run. [Workflow types](src/workflow-types.ts)
+  define the application contract. [Run state](src/workflow-state.ts) gives nested agent calls
+  access to the active run and tracks admission, pending work and sticky failures.
+- [Persistence](src/persistence/) holds the [target writer](src/persistence/store.ts), the
+  [source reader](src/persistence/replay.ts), and the [journal](src/persistence/journal.ts).
+  [Checkpoint records](src/persistence/records.ts) define the shared file layout and schemas.
+  [Checkpoint file I/O](src/persistence/checkpoint-files.ts) owns atomic publication and
+  checked reads. [Canonical JSON](src/persistence/json.ts) supplies copying and hashing rules.
 
 ## Examples
 
@@ -167,7 +194,6 @@ For `[2, 3, 4]`, the pipeline asks the model to double then square each value, e
 `[16, 36, 64]`. Two parallel agent calls then calculate the sum `116` and maximum `64`.
 The eight agent calls each use an independent Session.
 
-The [migration plan](../../draft/docs/workflow-primitives-plan.md) records the removed
-framework and the [development record](../../draft/docs/development.md#workflow-agent-zod)
-contains current verification evidence. The package has only its root entry;
-there is no `/mcp` subentry.
+Run `bun run example:workflow-persistence` and repeat with the printed run ID to
+replay the saved agent results. The example uses a scripted backend, and the
+resumed run opens zero new sessions.

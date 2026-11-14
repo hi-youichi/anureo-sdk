@@ -1,15 +1,15 @@
 // Materializes Git-visible source and transfers edits between independent worktrees.
-import { copyFile, cp, mkdir, mkdtemp, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { copyFile, cp, link, lstat, mkdir, mkdtemp, readdir, readlink, realpath, rename, rm, rmdir, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative, sep } from 'node:path'
+import { dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { inspectGitPath, isSnapshotPath } from './git-path'
 import { fileFingerprint } from './git-tree'
-import { git, gitFiles, gitProcessOptions } from './git'
-import { exec } from './process'
+import { git, gitFiles } from './git'
 
-/** Phase-owned snapshot shared by planning, agent checkouts and patch integration. */
+/** Phase-owned snapshot shared by planning, agent checkouts and integration. */
 export interface WorktreeBaseline {
-  /** Canonical Git repository root, used for registry updates and patch application. */
+  /** Canonical Git repository root, used for registry updates and integration. */
   root: string
   /** Target directory relative to the root, empty when the target is the root. */
   scope: string
@@ -32,7 +32,7 @@ export interface AgentWorktree {
   cwd: string
   /** Full checkout root used to detect changes outside the scope and unregister the checkout. */
   root: string
-  /** Scratch parent containing the checkout and any patch staging files. */
+  /** Scratch parent containing the checkout. */
   directory: string
 }
 
@@ -83,7 +83,7 @@ export async function createAgentWorktree(baseline: WorktreeBaseline): Promise<A
   }
 }
 
-/** Release a checkout after the session and any patch capture settle. Unregister it through Git
+/** Release a checkout after the session and any integration settle. Unregister it through Git
  * before deleting its scratch directory. Failures reject with RESOURCE_RELEASE_FAILED and the
  * original cause. runAgentWork records the cleanup failure on the step, while inAgentWorktree
  * propagates it to planning. */
@@ -98,45 +98,121 @@ export async function removeAgentWorktree(baseline: WorktreeBaseline, worktree: 
   }
 }
 
-/** Compare only the supplied scope-relative paths against the frozen baseline and return Git patch bytes.
- * For observed edits in edit mode, runAgentWork persists those bytes before removing the checkout,
- * even if the agent failed.
- * Requires a fresh checkout scratch directory for the before/after trees. Copy/diff failures and
- * empty output reject. The caller owns scratch cleanup through removeAgentWorktree. */
-export async function captureWorktreePatch(
-  baseline: WorktreeBaseline, worktree: AgentWorktree, files: readonly string[],
-): Promise<Buffer> {
-  const before = join(worktree.directory, 'before')
-  const after = join(worktree.directory, 'after')
-  const source = join(baseline.source, baseline.scope)
-  await mkdir(before)
-  await mkdir(after)
-  for (const file of files) {
-    await copyEntry(source, before, file)
-    await copyEntry(worktree.cwd, after, file)
-  }
-  const patch = await diffPatchTrees(worktree.directory)
-  if (!patch.length) throw new Error('Git could not represent the observed worktree changes')
-  return patch
-}
-
-/** Apply a saved patch to the scoped working files after checking the supplied paths against the
- * baseline, including ignored local paths. The caller must pair the patch with its observed path
- * list and coordinate writers through the check and apply. Fingerprint errors, mismatches and
- * Git failures reject. integrateAgentWork records failures on the step and only runs checks after
- * a successful apply to a successful step. */
-export async function applyWorktreePatch(
-  baseline: WorktreeBaseline, files: readonly string[], patchPath: string,
-): Promise<void> {
-  const target = join(baseline.root, baseline.scope)
-  const source = join(baseline.source, baseline.scope)
-  for (const file of files) {
-    if (await fileFingerprint(target, file) !== await fileFingerprint(source, file)) {
-      throw new Error(`Source changed during refactor: ${file}`)
+/** Copy installed dependencies for validation. Preserve local workspace links within the checkout. */
+export async function prepareCheckDependencies(baseline: WorktreeBaseline, worktree: AgentWorktree): Promise<void> {
+  const directories = ['']
+  for (const directory of directories) {
+    for (const entry of await readdir(join(baseline.source, directory), { withFileTypes: true })) {
+      if (entry.isDirectory() && entry.name !== 'node_modules') directories.push(join(directory, entry.name))
+    }
+    const modulePath = join(directory, 'node_modules')
+    const from = join(baseline.root, modulePath)
+    const to = join(worktree.root, modulePath)
+    const installed = await lstat(from).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code !== 'ENOENT') throw cause
+    })
+    if (!installed) continue
+    if (installed.isSymbolicLink()) {
+      await mkdir(dirname(to), { recursive: true })
+      await symlink(rebaseDependencyLink(await realpath(from), baseline.root, worktree.root), to, 'junction')
+    } else if (installed.isDirectory()) {
+      await cp(from, to, { recursive: true, verbatimSymlinks: true, mode: constants.COPYFILE_FICLONE })
+      await rebaseDependencyLinks(to, baseline.root, worktree.root)
     }
   }
-  const scope = baseline.scope ? ['--directory=' + baseline.scope.split(sep).join('/')] : []
-  await git(baseline.root, 'apply', '-p2', ...scope, '--whitespace=nowarn', patchPath)
+}
+
+async function rebaseDependencyLinks(directory: string, source: string, target: string): Promise<void> {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name)
+    if (entry.isDirectory()) await rebaseDependencyLinks(path, source, target)
+    else if (entry.isSymbolicLink()) {
+      const link = await readlink(path)
+      if (!isAbsolute(link)) continue
+      const absolute = await realpath(path).catch((cause: NodeJS.ErrnoException) => {
+        if (cause.code !== 'ENOENT' && cause.code !== 'ELOOP') throw cause
+        return link
+      })
+      const rebased = rebaseDependencyLink(absolute, source, target)
+      if (rebased === absolute) continue
+      await rm(path)
+      await symlink(rebased, path)
+    }
+  }
+}
+
+function rebaseDependencyLink(link: string, source: string, target: string): string {
+  const inside = relative(source, link)
+  return inside === '..' || inside.startsWith('..' + sep) || isAbsolute(inside) ? link : join(target, inside)
+}
+
+/** Transfer verified files directly from a live checkout. The caller serializes integration.
+ * Check every destination against its baseline before writing. Stage replacement contents on
+ * the target filesystem and back up originals so a failed transfer can roll back. */
+export async function mergeWorktree(
+  baseline: WorktreeBaseline, worktree: AgentWorktree, files: readonly string[],
+): Promise<void> {
+  const target = join(baseline.root, baseline.scope)
+  const original = join(baseline.source, baseline.scope)
+  const entries = await Promise.all(files.map(async file => {
+    const before = await inspectGitPath(target, file)
+    if (await fileFingerprint(target, file) !== await fileFingerprint(original, file)) {
+      throw new Error(`Source changed during refactor: ${file}`)
+    }
+    const after = await inspectGitPath(worktree.cwd, file)
+    if (after.linkedAncestor || (after.info && !after.info.isFile()) || (before.info && !before.info.isFile())) {
+      throw new Error(`Refactor merge requires regular files: ${file}`)
+    }
+    return { file, path: before.path, existed: !!before.info, replacement: !!after.info }
+  }))
+
+  const directory = await mkdtemp(join(target, '.anureo', 'refactor', 'merge-'))
+  const staged = join(directory, 'staged')
+  const applied: { path: string; backup?: string; installed: boolean }[] = []
+  const createdDirectories: string[] = []
+  let keepRecovery = false
+  try {
+    for (const entry of entries) {
+      if (entry.replacement) await copyEntry(worktree.cwd, staged, entry.file)
+    }
+    for (const [index, entry] of entries.entries()) {
+      if (await fileFingerprint(target, entry.file) !== await fileFingerprint(original, entry.file)) {
+        throw new Error(`Source changed during refactor: ${entry.file}`)
+      }
+      const backup = entry.existed ? join(directory, String(index)) : undefined
+      if (backup) await rename(entry.path, backup)
+      const write = { path: entry.path, backup, installed: false }
+      applied.push(write)
+      if (entry.replacement) {
+        const parent = dirname(entry.path)
+        const firstCreated = await mkdir(parent, { recursive: true })
+        if (firstCreated) {
+          for (let path = parent; path !== dirname(firstCreated); path = dirname(path)) createdDirectories.push(path)
+        }
+        await link(join(staged, entry.file), entry.path)
+        write.installed = true
+      }
+    }
+  } catch (cause) {
+    try {
+      for (let index = applied.length - 1; index >= 0; index--) {
+        const entry = applied[index]!
+        if (entry.backup) await rename(entry.backup, entry.path)
+        else if (entry.installed) await rm(entry.path, { force: true })
+      }
+      for (const path of [...new Set(createdDirectories)].sort((a, b) => b.length - a.length)) {
+        await rmdir(path)
+      }
+    } catch (rollbackError) {
+      keepRecovery = true
+      throw Object.assign(new AggregateError([cause, rollbackError], `Could not roll back refactor merge. Recovery files: ${directory}`), {
+        code: 'RESOURCE_RELEASE_FAILED',
+      })
+    }
+    throw cause
+  } finally {
+    if (!keepRecovery) await rm(directory, { recursive: true, force: true })
+  }
 }
 
 /** Allocate a scratch directory under the canonical temporary root. Callers own removal. */
@@ -208,19 +284,4 @@ async function copyEntry(from: string, to: string, file: string): Promise<void> 
   else if (info.isSymbolicLink()) await symlink(await readlink(path), destination)
   else if (info.isDirectory()) await mkdir(destination, { recursive: true, mode: info.mode })
   else throw new Error(`Unsupported Git path: ${file}`)
-}
-
-/** Diff the before/after trees for captureWorktreePatch. Git status 1 denotes a difference and
- * returns the buffered patch bytes. Other process failures propagate. */
-async function diffPatchTrees(cwd: string): Promise<Buffer> {
-  try {
-    const { stdout } = await exec('git', ['diff', '--no-index', '--no-renames', '--no-ext-diff',
-      '--no-textconv', '--no-color', '--binary', '--src-prefix=a/', '--dst-prefix=b/', '--', 'before', 'after'],
-    { ...gitProcessOptions(), cwd, encoding: 'buffer' })
-    return stdout
-  } catch (cause) {
-    const error = cause as { code?: unknown; stdout?: unknown }
-    if (error.code === 1 && Buffer.isBuffer(error.stdout)) return error.stdout
-    throw cause
-  }
 }

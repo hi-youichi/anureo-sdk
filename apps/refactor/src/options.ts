@@ -15,7 +15,7 @@ export interface RefactorOptions {
   model?: string
   /** Maximum module tasks active at once, as a positive safe integer. Omit to run all concurrently. */
   concurrency?: number
-  /** Ask agents to avoid edits and skip patch integration and host checks. Backend enforcement
+  /** Ask agents to avoid edits and skip integration and host checks. Backend enforcement
    * depends on readPermissionMode. The host fails steps that modify their review worktree. */
   reviewOnly?: boolean
   /** Backend-specific permission mode for planning and review-only sessions. Omit for the backend default. */
@@ -33,7 +33,7 @@ export interface RefactorOptions {
    * subprocess and repographEntry. A rejection is recorded as a run failure. The loader owns
    * temporary resources and must clean them up before settling. */
   graphLoader?: GraphLoader
-  /** Commands run serially in the target after successful patch integration. The first failure
+  /** Commands run serially in each edited worktree before integration. The first failure
    * stops later checks. An empty list disables checks. Omission discovers typecheck then test in
    * the target's own package.json. Blank executables or NUL bytes reject before the run, including
    * in reviewOnly mode, which skips execution. */

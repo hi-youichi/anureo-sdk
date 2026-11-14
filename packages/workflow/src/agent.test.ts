@@ -18,8 +18,9 @@ async function complete(sink: SessionEventSink, turnId: string, text: string) {
 }
 
 /**
- * Supply a scripted adapter execute hook. For a submit, publish the start and await the test's
- * events before replying with the same turn ID. Other calls fall through to the default adapter.
+ * Supply the execute hook awaited by the scripted backend. For a submit, publish the start and
+ * await the test's event callback before replying with the same turn ID. A callback rejection
+ * fails the dispatch. Other calls fall through to the default adapter.
  */
 function scriptSubmission(
   publish: (submission: { sink: SessionEventSink; turnId: string; submissionId: string }) => Promise<void>,
@@ -151,7 +152,8 @@ test('cleanup failure cannot hide the primary uncertain execution failure', asyn
   expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
 })
 
-/** Use the scripted adapter to publish final text and a terminal before the submit receipt. */
+/** Register a scripted client that publishes final text and a terminal before the submit receipt.
+ * Disable the advertised output-schema route to exercise fallback against the same terminal. */
 function terminalFixture(
   status: 'failed' | 'interrupted' | 'completed',
   { error, text = 'partial', outputSchema = true }: { error?: HarnessError; text?: string; outputSchema?: boolean } = {},
@@ -266,6 +268,17 @@ test('explicit skip metadata survives terminal-before-reply and startup denial r
   await expect(agent('denied', { client: denied.client, cwd: '.' })).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
 })
 
+test.each(['failed', 'interrupted'] as const)('tagged startup denial in a %s terminal returns null after cleanup', async status => {
+  const { client, adapter } = await terminalFixture(status, { error: {
+    code: 'AGENT_STARTUP_BLOCKED', message: 'blocked', retryable: false, outcomeUnknown: false,
+    details: { workflowDisposition: 'startup_blocked' },
+  } })
+  expect(await agent('blocked', { client, cwd: '.' })).toBeNull()
+  expect(adapter.calls.filter(call => call.method === 'input/submit')).toHaveLength(1)
+  expect(adapter.calls.some(call => call.method === 'session/close')).toBe(true)
+  expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
+})
+
 test('a null candidate cannot hide cleanup failure', async () => {
   const submit = scriptSubmission(async ({ sink, turnId }) => {
     await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: { code: 'RATE_LIMITED', message: 'rate limit', retryable: true, outcomeUnknown: false } } })
@@ -296,7 +309,7 @@ test('empty text and multiple final text items retain SDK aggregation', async ()
   expect(await agent('two', { client, cwd: '.' })).toBe('first\nlast')
 })
 
-// Compiled by package typecheck; never invoke real clients from type assertions.
+/** Exercise root overload inference and rejected assignments during package typecheck. */
 function agentTypes(client: Client, dynamic: AgentOptions<z.ZodObject<{ count: z.ZodNumber }>>) {
   const base = { client, cwd: '.' }
   const schema = z.object({ count: z.number() })

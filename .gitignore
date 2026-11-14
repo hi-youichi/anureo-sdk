@@ -10,3 +10,9 @@ coverage/
 .idea
 
 draft
+.claude
+!/.claude/
+/.claude/*
+!/.claude/skills/
+/.claude/skills/*
+!/.claude/skills/openspec-authoring-setup.md

@@ -5,7 +5,7 @@ import { message } from './errors'
 import { exec } from './process'
 import type { CheckResult } from './results'
 
-/** Configure validation after an applied patch. Strings go to the platform shell. Objects
+/** Configure validation in the agent checkout. Strings go to the platform shell. Objects
  * launch the named executable directly with literal arguments, defaulting to no arguments. */
 export type CheckCommand = string | { executable: string; args?: readonly string[] }
 
@@ -44,7 +44,7 @@ export async function defaultChecks(cwd: string): Promise<CheckCommand[]> {
 }
 
 /** Execute validation commands serially, appending bounded output to the caller's results array.
- * integrateAgentWork awaits this after applying a patch and converts rejection into a failed step.
+ * runAgentWork awaits this before merging and records rejection as a failed step.
  * Commands may modify files or start other processes.
  * Resolves void after all checks; the first failed command is recorded before rejection and stops
  * later commands. Each process has a five-minute timeout and an eight-MiB

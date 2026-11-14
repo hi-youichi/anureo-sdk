@@ -308,7 +308,7 @@ test('strict JSON rejects lossy inputs and canonical hashes ignore object insert
 })
 
 test('real process death at durable boundaries replays committed agent work only', async () => {
-  for (const phase of ['before-started', 'after-execute', 'before-final']) {
+  for (const phase of ['before-started', 'after-execute', 'before-final', 'after-later-result']) {
     const options = await setup()
     const child = Bun.spawn([process.execPath, fileURLToPath(new URL('./fixtures/workflow-crash.ts', import.meta.url)),
       options.directory, phase], { stdout: 'ignore', stderr: 'pipe' })
@@ -319,10 +319,20 @@ test('real process death at durable boundaries replays committed agent work only
     const adapter = createScriptedAdapter()
     const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: 'crash-fixture' } })
     clients.push(client)
-    const result = await workflow({ ...options, name: 'crash-test', resumeFrom: 'crashed' }, () =>
-      agent('work', { client, cwd: options.directory }))
-    expect(result.result).toBe('work')
+    const result = await workflow({ ...options, name: 'crash-test', resumeFrom: 'crashed' }, async () => {
+      const first = agent('work', { client, cwd: options.directory })
+      // An unfinished first key permits a rerun without invalidating the second key's saved result.
+      return phase === 'after-later-result'
+        ? Promise.all([first, agent('later', { client, cwd: options.directory })])
+        : first
+    })
+    expect(result.result).toEqual(phase === 'after-later-result' ? ['work', 'later'] : 'work')
     expect(adapter.opened).toHaveLength(phase === 'before-final' ? 0 : 1)
+    if (phase === 'after-later-result') {
+      const submissions = adapter.calls.filter(call => call.method === 'input/submit')
+      expect(submissions).toHaveLength(1)
+      expect(submissions[0]?.params).toMatchObject({ input: [{ type: 'text', text: 'work' }] })
+    }
     await client.dispose()
   }
 }, 15000)

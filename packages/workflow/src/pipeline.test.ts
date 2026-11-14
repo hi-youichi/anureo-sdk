@@ -85,6 +85,24 @@ test('passes the previous result, original item and index to every stage', async
   expect(result).toEqual([{ length: 5, item: 'first', index: 0 }, { length: 6, item: 'second', index: 1 }])
 })
 
+test('snapshots input entries and indices before starting any item chain', async () => {
+  const resolved = Promise.resolve('first')
+  const first: PromiseLike<string> = {
+    get then() {
+      // Awaiting this entry reads `then` while the other item chains are still being started.
+      items.splice(1, 1, Promise.resolve('replacement'))
+      return resolved.then.bind(resolved)
+    },
+  }
+  const second = Promise.resolve('second')
+  const items = [first, second]
+  const results = await pipeline(items, (value, original, index) => ({ value, original, index }))
+
+  expect(results.map(result => result && [result.value, result.index])).toEqual([['first', 0], ['second', 1]])
+  expect(results[0]?.original).toBe(first)
+  expect(results[1]?.original).toBe(second)
+})
+
 test('null input or stage results skip later stages while other falsy values continue', async () => {
   const entered: unknown[] = []
   const next: unknown[] = []

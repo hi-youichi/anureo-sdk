@@ -27,7 +27,7 @@ In both branches, never create the root as a side effect: do not run `openspec i
 
 `<capability-path>` is the spec directory relative to `specs/` (for example, `user-auth` or `identity/user-auth`). Preserve the full path from each delta spec when resolving its main spec.
 
-**Input**: Optionally specify a change name. If omitted, check if it can be inferred from conversation context. If vague or ambiguous you MUST prompt for available changes.
+Accept an optional change name. Use the selection step when the caller omits it.
 
 **Steps**
 
@@ -108,7 +108,9 @@ In both branches, never create the root as a side effect: do not run `openspec i
 
    **If `totalTasks` is zero:** Proceed without a task-related warning.
 
-4. **Assess delta spec sync state**
+4. **Resolve spec sync before archiving**
+
+   **Assess the deltas**
 
    Use `artifactPaths.specs.existingOutputPaths` from status JSON as the only
    delta-spec source. If the `specs` entry is missing or
@@ -125,7 +127,8 @@ In both branches, never create the root as a side effect: do not run `openspec i
    - Determine what changes would be applied (adds, modifications, removals, renames)
    - Continue assessing the remaining capabilities even when one is sync-blocked. Show a combined summary before prompting.
 
-   **Prompt options:**
+   **Ask whether to sync**
+
    - If any capability is sync-blocked: explain why and offer only "Archive without syncing", "Cancel"
    - Otherwise, if changes needed: "Sync now (recommended)", "Archive without syncing"
    - Otherwise, if already synced: "Archive now", "Sync anyway", "Cancel"
@@ -133,8 +136,10 @@ In both branches, never create the root as a side effect: do not run `openspec i
    Route on the answer:
    - "Cancel" — stop, do not archive
    - "Archive without syncing" or "Archive now" — proceed to archive
-   - "Sync now" or "Sync anyway" — sync, then verify (below). Do not start any sync while a capability is sync-blocked; explain the blocker and repeat the available choices.
+   - "Sync now" or "Sync anyway" — run and verify the sync below. Do not start any sync while a capability is sync-blocked. Explain the blocker and repeat the available choices.
    - Anything else — ask again rather than archiving
+
+   **Run the selected sync**
 
    Before a selected sync writes any main spec, run
    `openspec instructions specs --change "<name>" --json` once with the same
@@ -145,26 +150,28 @@ In both branches, never create the root as a side effect: do not run `openspec i
    form of main specs produced by this merge; do not use them as archive guidance,
    change CLI behavior, or copy the rule text into any output file.
 
-   Then run the `openspec-sync-specs` workflow inline (agent-driven intelligent merge) for change '<name>', passing the delta spec analysis and the fetched specs-rule snapshot from above, and wait for it to finish. The inline sync must reuse that snapshot without fetching `specs` instructions again. Do not delegate it to a background task — step 5 would move `changeRoot` out from under a sync that is still reading it, leaving the change archived and the main specs never updated. If your agent can only run it by delegation, delegate synchronously and wait for the result.
+   Run the [sync workflow](../openspec-sync-specs/SKILL.md) for the same change and selected root. Pass the assessed delta paths from `existingOutputPaths`, the delta analysis, and the fetched specs-rule snapshot. Sync must reuse that snapshot and complete in the current conversation before the archive can continue. If delegation is the only way to run it, wait for the delegated result. Sync still needs `changeRoot` to read the delta files, so moving it while sync is running could leave the main specs out of date.
 
    If the sync reports any stop or blocking condition, treat the sync as failed.
    Stop the archive immediately. Do not perform the post-sync content comparison and do not move its `changeRoot`.
    Nothing has moved, so the user can fix the blocking condition or re-run the sync.
 
-   After the sync writes each main spec, verify its structure against the canonical sync contract:
+   **Verify the sync result**
+
+   After sync reports success, verify the structure of each main spec it wrote:
    - A new main spec starts with a `# <capability> Specification` title. An existing main spec keeps its title exactly as it is.
    - Preserve existing `## Purpose` sections completely untouched for established main specs.
    - For a new main spec, copy the delta `## Purpose` verbatim. Warn only if the purpose text is shorter than standard validation expects. Do not regenerate or rewrite existing authored purpose. If no usable `## Purpose` is provided, use the existing TBD Purpose behavior and warning.
    - Verify that no delta-style section headers (`## ADDED Requirements`, `## MODIFIED Requirements`, `## REMOVED Requirements`, `## RENAMED Requirements`) remain in the main spec, adhering strictly to the sync workflow formatting rules.
    - Requirement blocks the sync wrote or changed use `### Requirement:` headings, and their scenarios use `#### Scenario:` headings, under the spec's `## Requirements` section. Leave content the delta does not mention exactly as it is.
 
-   Then re-run the comparison from the top of this step, including the explicitly retired, missing-spec case, against every capability that has a delta spec in `artifactPaths.specs.existingOutputPaths` — not only the ones the sync reports it touched. A successful sync leaves nothing left to apply, so each capability must now read as already synced:
+   Then repeat **Assess the deltas**, including the explicitly retired, missing-spec case, for every capability in `artifactPaths.specs.existingOutputPaths`. A successful sync leaves each capability already synced:
    - ADDED requirements present
    - MODIFIED requirements carrying the scenario and description changes named in the delta, with their other scenarios intact
    - REMOVED requirements gone — and where this sync retired a capability (removed its last requirement, leaving `## Requirements` empty), its main spec deleted rather than left empty.
    - RENAMED requirements present under the new name and absent under the old one
 
-   If the sync failed, or any capability does not match, report what differs and stop — do not archive. Nothing has moved and `changeRoot` is intact, so the user can fix the mismatch or re-run the sync and start the archive again.
+   If any capability does not match, report the difference and stop before moving `changeRoot`. The user can fix the mismatch or rerun sync before starting archive again.
 
 5. **Perform the archive**
 
@@ -189,7 +196,7 @@ In both branches, never create the root as a side effect: do not run `openspec i
    - Change name
    - Schema that was used
    - Archive location
-   - Whether specs were synced (if applicable)
+   - Spec sync status (synced, sync skipped, or no delta specs)
    - Note about any warnings (incomplete artifacts/tasks)
 
 **Output On Success**
@@ -199,11 +206,13 @@ In both branches, never create the root as a side effect: do not run `openspec i
 
 **Change:** <change-name>
 **Schema:** <schema-name>
-**Archived to:** the archive path derived from `planningHome.changesDir`/<target-name>/
+**Archived to:** <planningHome.changesDir>/archive/<target-name>/
 **Specs:** <"✓ Synced to main specs" only if the step 4 verification passed; otherwise "No delta specs" or "Sync skipped">
 
 <"All artifacts complete. All tasks complete." — or, if archived with warnings, list them instead (e.g. "Archived with 2 incomplete tasks")>
 ```
+
+Use `Archive Complete (with warnings)` when there are warnings. If the user chose to skip sync, say so explicitly. If the archive target already exists, use `Archive Failed`, report the change and target path, and give the available options (rename the existing archive, delete it if it is a duplicate, or archive on a different date).
 
 **Guardrails**
 - Announce the selected change; prompt for selection when it is ambiguous
@@ -211,7 +220,6 @@ In both branches, never create the root as a side effect: do not run `openspec i
 - Don't block archive on warnings - just inform and confirm
 - Preserve .openspec.yaml when moving to archive (it moves with the directory)
 - Show clear summary of what happened
-- If sync is requested, run the `openspec-sync-specs` workflow inline (agent-driven)
 - Never archive while a spec sync is still in flight — run the sync inline and verify the main specs before moving `changeRoot`
 - If delta specs exist, always run the sync assessment and show the combined summary before prompting
 - Apply relevant runtime context and report conflicts; operation guidance remains advisory
