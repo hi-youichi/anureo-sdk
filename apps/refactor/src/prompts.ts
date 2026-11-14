@@ -1,4 +1,5 @@
 // Constructs phase prompts from host context; it must not dispatch agents, read artifacts or enforce permissions.
+import type { CheckCommand } from './checks'
 import type { RefactorModule } from './schema'
 
 /** Internal input from runDesign before planning; the builder only renders the supplied context. */
@@ -22,7 +23,7 @@ export function planPrompt(files: string[], version: string): string {
   return `PLAN REFACTOR MODULES
 Inspect source, package boundaries, entry points, callers and tests. Split this inventory
 into cohesive semantic modules small enough for one agent to review and refactor.
-Assign every listed source file exactly once. Use stable short alphanumeric/hyphen IDs.
+Assign every listed source file exactly once. Use stable short lowercase alphanumeric/hyphen IDs.
 Describe responsibilities, not just directory names. Do not review or edit yet.
 Inventory: ${JSON.stringify(files)}
 Source version: ${version}
@@ -30,15 +31,15 @@ Read only; do not modify files or run mutating commands.
 ${rules}`
 }
 
-/** Build cross-file design instructions for runDesign to pass to runStep before planning.
+/** Build cross-file design instructions for runDesign to pass to runAgentWork before planning.
  * The caller supplies the graph artifact and snapshot; mode only changes instructions, not permissions.
  * Construction performs no I/O; JSON serialization errors throw synchronously. */
 export function designPrompt(input: DesignPromptInput): string
 /** Preserve positional calls for existing consumers; true requests read-only agent instructions.
  * Returns the same pure prompt as the named form, including its JSON serialization errors. */
-export function designPrompt(files: string[], graphFile: string, version: string, checks: readonly string[], readOnly: boolean): string
+export function designPrompt(files: string[], graphFile: string, version: string, checks: readonly CheckCommand[], readOnly: boolean): string
 /** Build the same design prompt for either call form without opening artifacts or executing checks. */
-export function designPrompt(...args: [DesignPromptInput] | [string[], string, string, readonly string[], boolean]): string {
+export function designPrompt(...args: [DesignPromptInput] | [string[], string, string, readonly CheckCommand[], boolean]): string {
   const input: DesignPromptInput = args.length === 1 ? args[0] : {
     files: args[0], graphFile: args[1], version: args[2], checks: args[3],
     mode: args[4] ? 'read-only' : 'edit',
@@ -46,13 +47,13 @@ export function designPrompt(...args: [DesignPromptInput] | [string[], string, s
   const { files, graphFile, version } = input
   return `DESIGN MODULE BOUNDARIES
 Source version: ${version}
-Graph artifact: ${graphFile}
 Inventory: ${JSON.stringify(files)}
-${graphGuide}
+${graphInstructions(graphFile)}
 ${modeInstructions(input.mode)}
 You own the design BETWEEN files and modules; later agents each clean up one module's internals.
-Build the file-level import graph from IMPORTS edges and the cross-file call graph from CALLS
-edges, read the files involved, and find and fix these problems:
+Use the inventory as the scope for existing source edits. Read surrounding files for context as needed.
+Trace imports and cross-file calls, using IMPORTS and CALLS edges where available. Read the files
+involved and find and fix these problems:
 1. Wrong dependency direction: a leaf or presentation file (report, format, util, test helper)
    imports a type or function from the orchestrator/entry file. Move the shared type or helper
    down into a file both sides depend on; the orchestrator then imports it, not the reverse.
@@ -82,15 +83,15 @@ ${validationInstructions(input)}${output}
 ${rules}`
 }
 
-/** Build instructions for runModules to pass to runStep for one validated module assignment.
+/** Build instructions for runModules to pass to runAgentWork for one validated module assignment.
  * The caller supplies the graph, snapshot and completed design summary; mode does not enforce permissions.
  * Construction performs no I/O; JSON serialization errors throw synchronously. */
 export function modulePrompt(input: ModulePromptInput): string
 /** Preserve positional calls for existing consumers; true requests read-only agent instructions.
  * Returns the same pure prompt as the named form, including its JSON serialization errors. */
-export function modulePrompt(module: RefactorModule, graphFile: string, version: string, checks: readonly string[], readOnly: boolean, design: string): string
+export function modulePrompt(module: RefactorModule, graphFile: string, version: string, checks: readonly CheckCommand[], readOnly: boolean, design: string): string
 /** Build the same module prompt for either call form without opening artifacts or executing checks. */
-export function modulePrompt(...args: [ModulePromptInput] | [RefactorModule, string, string, readonly string[], boolean, string]): string {
+export function modulePrompt(...args: [ModulePromptInput] | [RefactorModule, string, string, readonly CheckCommand[], boolean, string]): string {
   const input: ModulePromptInput = args.length === 1 ? args[0] : {
     module: args[0], graphFile: args[1], version: args[2], checks: args[3],
     mode: args[4] ? 'read-only' : 'edit', design: args[5],
@@ -99,13 +100,12 @@ export function modulePrompt(...args: [ModulePromptInput] | [RefactorModule, str
   return `REFACTOR MODULE
 Module: ${JSON.stringify(module)}
 Source version: ${version}
-Graph artifact: ${graphFile}
 Cross-module design step already done in this run: ${design}
-${graphGuide}
+${graphInstructions(graphFile)}
 ${modeInstructions(input.mode)}
-Review this module's files and then fix what you find, in one pass. Start from the graph:
-list each function of the module with its lines, cognitive, param_count, callers and callees,
-then read the largest or most connected ones and the callers that matter. Before writing a function's
+${input.isolated ? 'Other modules run concurrently. Edit only the files assigned to this module and any new source files it needs. Defer changes to existing files outside the assignment.\n' : ''}Review this module's files and then fix what you find, in one pass. Identify its functions, callers
+and callees from the source, using graph metrics where available to find the largest or most
+connected functions. Read those functions and the callers that matter. Before writing a function's
 doc comment, read its implementation and the production call sites needed to explain its role.
 Follow results and failures far enough to establish the caller-visible outcome; for callbacks,
 inspect registration and invocation. Keep this investigation within the permitted scope. Look for:
@@ -140,13 +140,15 @@ ${rules}`
 /** Host-supplied execution context for pure design/module prompt construction; no artifacts are opened. */
 interface PromptContext {
   /** Path to the host-exported graph for the current phase. */
-  graphFile: string
+  graphFile: string | null
   /** Snapshot identifier used to tie instructions to the current source tree. */
   version: string
   /** Host-selected commands to request in edit mode; this builder never executes them. */
-  checks: readonly string[]
+  checks: readonly CheckCommand[]
   /** Agent instruction only; read-only filesystem access must be enforced by the caller. */
   mode: 'read-only' | 'edit'
+  /** The host integrates work from a private checkout and runs the configured checks thereupon. */
+  isolated?: boolean
 }
 
 /** Appended to every phase so planning and editing share the same scope and behavior constraints. */
@@ -266,12 +268,18 @@ Before returning, check the actual file and class declarations against this orde
 or export lists. In read-only mode, propose the reordering without editing files.`
 
 /** Explains graph limitations to design and module agents so edge absence is not treated as proof. */
+function graphInstructions(file: string | null): string {
+  if (file === null) return 'Static graph unavailable. Read source directly to trace declarations, imports and callers.'
+  return `Graph artifact: ${JSON.stringify(file)}\n${graphGuide}`
+}
+
 const graphGuide = `The graph artifact is a repograph export: {nodes[{id,name,filePath,labels,startLine,endLine,properties}],
 edges[{source,target,type,properties}]}. Node properties carry metrics (lines, complexity, cognitive,
 param_count, param_names, is_test); CALLS edges carry the call line; IMPORTS edges carry the imported
-name (local_name). Query it with jq or a short script kept outside the repository, and resolve node
-IDs to names. CALLS edges are deduplicated per caller/callee pair, so read the source to see repetition.
-Missing static edges do not prove absence of calls.`
+name (local_name). Resolve absolute graph paths relative to the graph's repositoryPath and inspect
+the corresponding files in your own checkout. Use available tools to resolve node IDs to names. CALLS edges are deduplicated
+per caller/callee pair, so read the source to see repetition. Inspect source directly for files
+without indexed symbols and for relationships with insufficient graph evidence.`
 
 /** Render the requested mode for design/module agents without enforcing access or changing state. */
 const modeInstructions = (mode: PromptContext['mode']) => mode === 'read-only'
@@ -286,7 +294,10 @@ is already well organized and say why. Do not split or move code merely because 
 
 /** Render checks for editing agents only; suppressing them in review mode avoids requesting writes.
  * designPrompt and modulePrompt append this text; neither runs commands or mutates input. */
-function validationInstructions({ checks, mode }: PromptContext): string {
+function validationInstructions({ checks, mode, isolated }: PromptContext): string {
   if (mode === 'read-only' || checks.length === 0) return ''
-  return `Validation commands: ${JSON.stringify(checks)}. Run them before returning and fix failures. The host reruns them.\n`
+  if (isolated) return `Validation commands: ${JSON.stringify(checks)}. The host runs them in the target checkout after integrating your edits.\n`
+  return `Validation commands: ${JSON.stringify(checks)}. Run them before returning and fix failures.
+Object entries specify an executable and literal arguments. String entries use the platform shell.
+The host reruns them.\n`
 }

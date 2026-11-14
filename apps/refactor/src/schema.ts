@@ -17,9 +17,9 @@ export const modulePlanSchema = z.strictObject({
   })).min(1),
 })
 
-/** Internal work shape passed by runStep to the workflow agent for design/module response validation.
+/** Internal work shape passed by runAgentWork to the workflow agent for design/module response validation.
  * Strings must be nonempty without trimming; empty change and deferral lists are valid. Parsing rejects
- * unknown keys at either object level without I/O. runStep records observed edits, status and checks
+ * unknown keys at either object level without I/O. The host records observed edits, status and checks
  * separately so agent claims cannot replace execution facts. */
 export const workSchema = z.strictObject({
   summary: z.string().min(1),

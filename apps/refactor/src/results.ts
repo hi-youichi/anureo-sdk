@@ -1,7 +1,7 @@
 // Defines host-observed refactor results; it must not execute work, persist reports or render output.
 import type { ModulePlan, RefactorModule, Work } from './schema'
 
-/** Host-recorded result of one shell validation command, consumed by reports and formatters.
+/** Host-recorded result of one validation command, consumed by reports and formatters.
  * These result types describe observations only; constructing them performs no validation or I/O. */
 export interface CheckResult {
   command: string
@@ -19,14 +19,15 @@ export interface Failure {
   cleanupFailed: boolean
 }
 /** Agent-authored work plus host observations from one design or module session.
- * Orchestration fills this record before checkpoint publication; partial edits survive failures.
+ * Orchestration fills this record before checkpoint publication.
  * Inherited summary, changes and deferred fields are agent claims, not host validation results. */
 export interface StepResult extends Work {
   /** Based on real file changes and execution/check failures, rather than the agent's claims. */
   status: 'applied' | 'unchanged' | 'failed'
-  /** Sorted Git-visible paths changed from the step baseline. Successful steps snapshot before
-   * checks; failed steps resnapshot after the error to include partial agent/check edits. */
+  /** Sorted Git-visible paths changed by the isolated agent within the target directory. */
   changedFiles: string[]
+  /** Absolute path to the captured patch, including edits awaiting integration after a failure. */
+  patch?: string
   /** Executed checks in command order; a failure stops subsequent checks. */
   checks: CheckResult[]
   /** Display text for the caught step error, or null when no error was caught. */
@@ -37,8 +38,16 @@ export interface StepResult extends Work {
 /** Planned module paired with its editing outcome, appended by orchestration before dispatch. */
 export interface ModuleResult {
   module: RefactorModule
-  /** Null until a step returns, including when export or dispatch fails first. */
+  /** Null until a step returns. */
   step: StepResult | null
+}
+/** Observed graph data for one phase, scoped to the source paths available at export time. */
+export interface GraphCoverage {
+  phase: string
+  status: 'available' | 'unavailable' | 'disabled'
+  /** Paths with no indexed declaration nodes. Even indexed files can have unresolved relationships. */
+  filesWithoutSymbols: string[]
+  error?: string
 }
 /** Mutable host run record populated under the writer lock, published at checkpoints and finalized.
  * Library callers receive it only after final publication and lock cleanup succeed; live observers
@@ -52,14 +61,16 @@ export interface RefactorReport {
   directory: string
   /** Completed means every phase returned successfully; deferred work may still be listed. */
   status: 'completed' | 'incomplete'
-  /** Agents were asked to avoid edits; the host does not enforce read-only permissions for editing steps. */
+  /** Agents were asked to avoid edits and host validation commands were disabled. */
   reviewOnly: boolean
   /** Cross-module design step, run before modules are planned. */
   design: StepResult | null
   /** Validated module assignments, or null until planning succeeds. */
   plan: ModulePlan | null
-  /** Modules reached in plan order; later modules are absent after an earlier failure. */
+  /** Concurrent module outcomes in plan order. */
   modules: ModuleResult[]
+  /** Graph availability and file coverage for the exports attempted during the run. */
+  graphCoverage: GraphCoverage[]
   /** Run-level errors; individual step errors also appear on their StepResult. */
   errors: string[]
   /** Classification of the run-level error, independently of any failed step's classification.

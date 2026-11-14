@@ -1,13 +1,14 @@
 // Publishes the supported library surface; it must not implement phases or serve internal imports.
-/** Run design, planning and serial module phases under the writer lock; may edit files and spawn
- * processes. Resolve a completed/incomplete report after final publication and lock cleanup;
- * preflight, lock, publication and cleanup failures reject. Partial edits remain on failure,
- * and the caller retains client ownership. */
+/** Run design and planning before dispatching concurrent module agents in separate Git worktrees.
+ * Integrate their patches in plan order and validate against the target. Resolve a completed or
+ * incomplete report after publishing results and releasing the writer lock. The caller owns the
+ * client. See refactorCode for rejection conditions. */
 export { refactorCode } from './refactor'
 /** Caller-owned client and run settings; constructing options does not start or validate a run. */
 export type { RefactorOptions } from './options'
+export type { CheckCommand } from './checks'
 /** Host observations returned to callers, including partial edits and ordered validation outcomes. */
-export type { RefactorReport, ModuleResult, StepResult, CheckResult, Failure } from './results'
+export type { RefactorReport, GraphCoverage, ModuleResult, StepResult, CheckResult, Failure } from './results'
 /** Agent response shapes; work summaries, changes and deferrals are agent claims, distinct from
  * host-observed step results. Types alone do not validate external output or module assignments. */
 export type { ModulePlan, RefactorModule, Work } from './schema'

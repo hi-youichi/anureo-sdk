@@ -49,15 +49,22 @@
         "anureo-refactor": "./bin/anureo-refactor.ts",
       },
       "dependencies": {
+        "@anureo/adapter-acp": "workspace:*",
+        "@anureo/adapter-ahp": "workspace:*",
+        "@anureo/adapter-claude": "workspace:*",
         "@anureo/adapter-codex": "workspace:*",
+        "@anureo/adapter-hermes": "workspace:*",
+        "@anureo/adapter-pi": "workspace:*",
         "@anureo/sdk": "workspace:*",
         "@anureo/workflow": "workspace:*",
-        "@youichi/repograph": "0.1.1",
         "zod": "4.6.7",
       },
       "devDependencies": {
         "@anureo/conformance": "workspace:*",
         "@anureo/protocol": "workspace:*",
+      },
+      "optionalDependencies": {
+        "@youichi/repograph": "0.1.1",
       },
     },
     "packages/adapter/acp": {

@@ -7,7 +7,7 @@ import type { ReviewProgress } from './progress'
 export const DEFAULT_REVIEW_CONCURRENCY = 8
 
 /** Configure reviewCode with a borrowed initialized client. The caller disposes the client after
- * completion; reviewCode owns per-agent sessions and durable workflow records, retaining partial edits on failure. */
+ * completion; reviewCode owns per-agent sessions, durable workflow records and temporary worktrees. */
 export interface ReviewOptions {
   /** Initialized client borrowed for the run; await completion or rejection before disposing it. */
   client: Client
@@ -27,8 +27,8 @@ export interface ReviewOptions {
   maxModules?: number
   /** Fix each module's findings as soon as its review completes, then re-review
    * the selected scope if any fix was applied, after all fixes settle. Defaults to false.
-   * Fix agents require a usable Git work tree. Inspect edits after completion or rejection;
-   * failures can leave partial changes that the caller must retain or revert. */
+   * Requires a usable Git work tree. Each agent receives a separate temporary checkout.
+   * Validated fixes are applied to the original work tree and remain if a later step fails. */
   fix?: boolean
   /** Harness-specific session permission mode for fix edits and checks; omission uses the session default. */
   fixPermissionMode?: string

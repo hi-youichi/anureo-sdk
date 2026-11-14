@@ -56,7 +56,7 @@ function createReport(options: RefactorOptions, root: string): RefactorReport {
   const runId = randomUUID()
   return {
     runId, cwd: options.cwd, directory: join(root, runId), status: 'incomplete', reviewOnly: options.reviewOnly ?? false,
-    design: null, plan: null, modules: [], errors: [], failure: null, progressErrors: [],
+    design: null, plan: null, modules: [], graphCoverage: [], errors: [], failure: null, progressErrors: [],
   }
 }
 

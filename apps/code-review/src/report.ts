@@ -79,6 +79,6 @@ function appendFix(lines: string[], fix: FixReport): void {
   if (fix.changedFiles.length > 0) lines.push(`Changed files: ${fix.changedFiles.join(', ')}`)
   if (fix.error) {
     appendFailure(lines, { error: fix.error, prefix: 'Fix failed: ',
-      unknownOutcomeMessage: 'Fix execution outcome is unknown; the working tree may contain partial changes.' })
+      unknownOutcomeMessage: 'The backend could not confirm the fix agent outcome.' })
   }
 }

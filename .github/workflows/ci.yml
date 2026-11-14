@@ -30,3 +30,7 @@ jobs:
       - run: bun run typecheck
       - run: bun run typecheck:tooling
       - run: bun run test
+      - name: Verify native refactor graph exports
+        env:
+          REPOGRAPH_INTEGRATION: '1'
+        run: bun test apps/refactor/tests/graph.integration.test.ts

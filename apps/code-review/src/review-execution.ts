@@ -6,6 +6,7 @@ import { reviewFailure } from './errors'
 import { buildReviewPrompt } from './prompts'
 import type { AngleReview, ModuleReview } from './results'
 import { reviewOutputSchema, type ReviewModule } from './schema'
+import { withAgentWorktree } from './worktree'
 import { validateFindings, validateOutput } from './validation'
 
 /** Internal normalized run inputs supplied by reviewCode to angle execution and fix scheduling.
@@ -14,6 +15,7 @@ export interface ReviewExecutionOptions {
   client: Client
   /** Canonical absolute source directory established by prepareReview. */
   cwd: string
+  repositoryRoot?: string
   /** Absolute workflow storage root excluded from source validation. */
   directory: string
   model?: string
@@ -92,11 +94,14 @@ async function reviewAngle({ options, module, angle, phase, original }: AngleRev
   const prompt = buildReviewPrompt({ ...options, phase, module, angle, original })
   let result: AngleReview
   try {
-    const output = await agent(prompt, {
-      client: options.client, cwd: options.cwd, model: options.model, schema: reviewOutputSchema,
-    })
-    if (output === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Review agent returned no result')
-    const findings = await validateOutput(() => validateFindings(options.cwd, module, output.findings, options.directory))
+    const findings = await withAgentWorktree({ root: options.repositoryRoot, cwd: options.cwd, directory: options.directory },
+      async (cwd, directory) => {
+        const output = await agent(prompt, {
+          client: options.client, cwd, model: options.model, schema: reviewOutputSchema,
+        })
+        if (output === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Review agent returned no result')
+        return validateOutput(() => validateFindings(cwd, module, output.findings, directory))
+      })
     result = { angle, status: 'completed', findings }
   } catch (cause) {
     result = { angle, status: 'failed', error: reviewFailure(cause) }

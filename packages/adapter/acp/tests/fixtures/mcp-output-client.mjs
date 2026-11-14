@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline'
  * fake-acp's output scenarios await one scripted MCP result submission before replying to session/prompt.
  * Reject protocol/tool failures and always await owned stdio-child cleanup; HTTP has no owned child.
  */
-export async function submitOutput(server, prompt) {
+export async function submitOutput(server, prompt, answer) {
   const connection = server.type === 'http' ? { rpc: createHttpRpc(server) } : createStdioConnection(server)
   const { rpc } = connection
   try {
@@ -14,7 +14,7 @@ export async function submitOutput(server, prompt) {
     const text = prompt.filter(block => block.type === 'text').map(block => block.text).join('\n')
     const outputId = text.match(/outputId: (anureo_output_[a-f0-9]{48})/)?.[1]
     const schema = JSON.parse(text.split('JSON Schema: ').at(-1))
-    const value = schema.properties?.sum ? { sum: 42 } : { label: 'second' }
+    const value = answer ? answer(text) : schema.properties?.sum ? { sum: 42 } : { label: 'second' }
     if ((await rpc('tools/call', { name: 'submit_result', arguments: { outputId, value } })).isError) throw new Error('output rejected')
   } finally {
     if (connection.child) await closeChild(connection.child)

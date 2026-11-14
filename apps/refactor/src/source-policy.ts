@@ -1,55 +1,37 @@
-// Defines eligible source paths and filesystem safety; it must not snapshot Git or validate agent plans.
-import { lstat } from 'node:fs/promises'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+// Selects the paths and text eligible for review and editing.
+import { readFile } from 'node:fs/promises'
+import { posix } from 'node:path'
+import { inspectGitPath } from './git-tree'
 
-/** Test a repository-relative slash path against inventory policy without accessing the filesystem.
- * inventory supplies this predicate to its snapshot-path filter, then awaits validateSourcePath
- * for each retained path before dispatch. This predicate alone does not validate syntax or safety. */
-export function isSource(file: string): boolean {
-  return sourceExtension.test(file) && !file.split('/').some(part => excluded.has(part)) && !file.endsWith('.d.ts')
+/** Test a Git-relative path against scope rules. Inventory checks safety and text content separately. */
+export function isSource(file: string, include: readonly string[] = [], exclude: readonly string[] = []): boolean {
+  if (isExcluded(file)) return false
+  if (exclude.some(pattern => posix.matchesGlob(file, pattern))) return false
+  if (include.length) return include.some(pattern => posix.matchesGlob(file, pattern))
+  return !supportingFile.test(posix.basename(file))
 }
 
-/** Check a source path beneath inventory's already-resolved cwd, reading each existing ancestor in order.
- * Rejects invalid syntax, excluded files, escapes, symlinks and existing non-file targets; missing paths
- * are allowed. inventory awaits this check; rejection prevents dispatch from that inventory.
- * No files are changed; other lstat failures propagate. Checking every ancestor prevents
- * a symlink hiding an escape, but does not protect against concurrent replacement after inspection. */
-export async function validateSourcePath(cwd: string, file: string): Promise<void> {
-  const target = resolveSourcePath(cwd, file)
-  let parent = cwd
-  for (const part of file.split('/')) {
-    parent = resolve(parent, part)
-    const info = await lstat(parent).catch((cause: NodeJS.ErrnoException) => {
-      if (cause.code === 'ENOENT') return null
-      throw cause
-    })
-    if (info?.isSymbolicLink()) throw new Error(`Symlink source paths are unsupported: ${file}`)
-    if (parent === target && info && !info.isFile()) throw new Error(`Source is not a regular file: ${file}`)
-  }
+/** Select editable text after path validation. Recognize UTF-8 and BOM-marked UTF-16. */
+export async function isTextSource(cwd: string, file: string): Promise<boolean> {
+  if (isExcluded(file)) throw new Error(`Invalid source path: ${file}`)
+  const { path, info, linkedAncestor } = await inspectGitPath(cwd, file)
+  if (linkedAncestor || info?.isSymbolicLink()) throw new Error(`Symlink source paths are unsupported: ${file}`)
+  if (!info?.isFile()) return false
+  const content = await readFile(path)
+  let encoding = 'utf-8'
+  if (content[0] === 0xff && content[1] === 0xfe) encoding = 'utf-16le'
+  if (content[0] === 0xfe && content[1] === 0xff) encoding = 'utf-16be'
+  try {
+    const text = new TextDecoder(encoding, { fatal: true }).decode(content)
+    return !/[\x00-\x08\x0b\x0e-\x1f]/.test(text)
+  } catch { return false }
 }
 
-/** Exclude non-source trees so indexing and agent scope do not absorb dependencies or their own output. */
+/** Exclude dependency, build, documentation and run artifacts from the editable scope. */
 const excluded = new Set(['.git', '.anureo', '.repograph', 'node_modules', 'dist', 'build', 'coverage', 'vendor', 'generated', 'draft', 'docs'])
-/** Supported source suffixes; .d.ts paths are excluded separately because they are not edit targets. */
-const sourceExtension = /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|swift|c|cc|cpp|h|hpp|cs|rb|php|vue|svelte|sh|sql)$/i
+/** Repository metadata and conventional standalone prose. Explicit includes can select these files. */
+const supportingFile = /^(?:\.(?:gitignore|gitattributes|gitmodules|editorconfig)|package(?:-lock)?\.json|(?:bun|yarn|Cargo|uv|poetry)\.lockb?|pnpm-lock\.ya?ml|(?:README|LICENSE|LICENCE|COPYING|NOTICE|CHANGELOG|CONTRIBUTING|AGENTS)(?:\.(?:md|txt|rst|adoc))?)$/i
 
-/** Resolve an eligible, syntactically safe slash path beneath cwd for validateSourcePath.
- * Rejects invalid source paths and lexical escapes before any filesystem access; does not follow
- * symlinks. The caller must still inspect existing ancestors before trusting the returned path. */
-function resolveSourcePath(cwd: string, file: string): string {
-  if (!hasSafePathSyntax(file) || !isSource(file)) {
-    throw new Error(`Invalid source path: ${file}`)
-  }
-  const target = resolve(cwd, file)
-  const local = relative(cwd, target)
-  if (local.startsWith(`..${sep}`) || isAbsolute(local)) throw new Error(`Source path escapes repository: ${file}`)
-  return target
-}
-
-/** Require a relative slash path with no empty or dot segments before resolving it beneath cwd.
- * Keep syntax separate from source eligibility so malformed paths are rejected before filesystem I/O. */
-function hasSafePathSyntax(file: string): boolean {
-  return !isAbsolute(file)
-    && !file.includes('\\')
-    && !file.split('/').some(part => !part || part === '.' || part === '..')
+function isExcluded(file: string): boolean {
+  return file.split('/').some(part => excluded.has(part.toLowerCase()))
 }

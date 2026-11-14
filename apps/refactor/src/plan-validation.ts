@@ -1,7 +1,7 @@
 // Validates planned IDs and exact inventory coverage; it must not discover files, parse schemas or run agents.
 import type { ModulePlan } from './schema'
 
-/** Require safe unique module IDs and exactly one assignment of every supplied inventory path.
+/** Require filesystem-safe unique module IDs and exactly one assignment of each supplied path.
  * plan in refactor.ts calls this after schema parsing; a thrown Error stops module preparation.
  * Paths are compared literally, without normalization. Throws at the first invalid/duplicate ID or
  * extra/duplicate file in plan order, then reports omissions in inventory order; no mutation or I/O. */
@@ -10,10 +10,11 @@ export function validatePlan(plan: ModulePlan, files: readonly string[]): void {
   const assigned = new Set<string>()
   const ids = new Set<string>()
   for (const module of plan.modules) {
-    if (!isSafeModuleId(module.id) || ids.has(module.id)) {
+    const artifactId = module.id.toLowerCase()
+    if (!isSafeModuleId(module.id) || ids.has(artifactId)) {
       throw new Error(`Invalid or duplicate module id: ${module.id}`)
     }
-    ids.add(module.id)
+    ids.add(artifactId)
     for (const file of module.files) {
       if (!expected.has(file) || assigned.has(file)) {
         throw new Error(`Unlisted or duplicate module file: ${file}`)

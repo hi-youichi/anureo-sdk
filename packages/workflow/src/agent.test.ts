@@ -148,9 +148,9 @@ test('cleanup failure cannot hide the primary uncertain execution failure', asyn
 /** Script a retained terminal before submit's reply, including partial text on failed/interrupted turns. */
 async function terminalFixture(
   status: 'failed' | 'interrupted' | 'completed',
-  { error, text = 'partial' }: { error?: HarnessError; text?: string } = {},
+  { error, text = 'partial', outputSchema = true }: { error?: HarnessError; text?: string; outputSchema?: boolean } = {},
 ) {
-  return fixture({ execute: async (call, sink) => {
+  return fixture({ ...(outputSchema ? {} : { capabilities: { input: { delivery: ['native'] }, turn: { inputModalities: ['text'], outputSchema: false } } }), execute: async (call, sink) => {
     if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
     const turnId = randomUUID()
     await sink.emit({ type: 'turn/started', payload: { turnId } })
@@ -182,6 +182,22 @@ test('schema preflight rejects before opening, while absent backend support rele
   await expect(agent('unsupported', { client: unsupported.client, cwd: '.', schema: z.object({ a: z.string() }) })).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' })
   expect(unsupported.adapter.calls.some(call => call.method === 'input/submit')).toBe(false)
   expect([...unsupported.adapter.backends.values()][0]?.disposeCount).toBe(1)
+})
+
+test.each([
+  { text: '{"count":3}', error: null },
+  { text: '{"count":3,"extra":true}', error: 'AGENT_STRUCTURED_OUTPUT_INVALID' },
+  { text: 'plain text', error: 'AGENT_STRUCTURED_OUTPUT_NOT_JSON' },
+])('JSON text fallback submits once and validates the terminal text ($error)', async ({ text, error }) => {
+  const { client, adapter } = await terminalFixture('completed', { text, outputSchema: false })
+  const result = agent('Plan the work', { client, cwd: '.', schema: z.strictObject({ count: z.number() }), outputFallback: 'json-text' })
+  if (error) await expect(result).rejects.toMatchObject({ code: error })
+  else await expect(result).resolves.toEqual({ count: 3 })
+  const calls = adapter.calls.filter(call => call.method === 'input/submit')
+  expect(calls).toHaveLength(1)
+  expect(calls[0]?.params).not.toHaveProperty('outputSchema')
+  expect(calls[0]?.params).toMatchObject({ input: [{ text: expect.stringContaining('JSON Schema') }] })
+  expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
 })
 
 test('session cleanup waits for asynchronous local output validation', async () => {

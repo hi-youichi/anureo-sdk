@@ -2,8 +2,12 @@
 // It never opens a network connection and does not read credentials or project files.
 import { createInterface } from 'node:readline';
 import { appendFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
-const schemaProbe = process.env.FAKE_SCHEMA_PROBE === '1';
+const answer = process.env.FAKE_STRUCTURED_ANSWER
+  ? (await import(pathToFileURL(process.env.FAKE_STRUCTURED_ANSWER).href)).answer
+  : undefined;
+const schemaProbe = process.env.FAKE_SCHEMA_PROBE === '1' || !!answer;
 // Configuring a catalog log also enables dynamic catalog probe responses.
 const catalogProbe = Boolean(process.env.FAKE_CATALOG_LOG);
 /** Read either CLI spelling so schema probes preserve the SDK's fresh/resume session identity. */
@@ -33,10 +37,13 @@ for await (const line of input) {
       commands: [], models, output_style: 'default', available_output_styles: ['default'],
     } } });
   } else if (frame.type === 'user') {
+    const input = frame.message?.content;
+    const prompt = typeof input === 'string' ? input : input?.filter(block => block.type === 'text').map(block => block.text).join('\n');
+    const structured_output = schemaProbe && outputSchema ? answer?.(prompt) ?? { answer: outputSchema.properties?.answer?.const ?? 42 } : undefined;
     send({ type: 'system', subtype: 'init', session_id: sessionId, uuid: '00000000-0000-4000-8000-000000000002', cwd: process.cwd(), tools: [], mcp_servers: [], model: 'fake-probe', permissionMode: 'default', slash_commands: [], output_style: 'default', apiKeySource: 'none', claude_code_version: 'fake-transport-probe' });
     send({ type: 'assistant', user_message_uuid: frame.uuid, session_id: sessionId, uuid: '00000000-0000-4000-8000-000000000003', parent_tool_use_id: null, message: {
       id: 'probe-message', type: 'message', role: 'assistant', model: 'fake-probe', content: [{ type: 'text', text: 'external executable probe passed' }], stop_reason: 'end_turn', stop_sequence: null, usage,
     } });
-    send({ type: 'result', user_message_uuid: frame.uuid, subtype: 'success', session_id: sessionId, uuid: '00000000-0000-4000-8000-000000000004', is_error: false, duration_ms: 1, duration_api_ms: 0, num_turns: 1, result: 'external executable probe passed', ...(schemaProbe && outputSchema ? { structured_output: { answer: outputSchema.properties?.answer?.const ?? 42 } } : {}), stop_reason: 'end_turn', usage, modelUsage: {}, permission_denials: [], total_cost_usd: 0 });
+    send({ type: 'result', user_message_uuid: frame.uuid, subtype: 'success', session_id: sessionId, uuid: '00000000-0000-4000-8000-000000000004', is_error: false, duration_ms: 1, duration_api_ms: 0, num_turns: 1, result: 'external executable probe passed', ...(structured_output ? { structured_output } : {}), stop_reason: 'end_turn', usage, modelUsage: {}, permission_denials: [], total_cost_usd: 0 });
   }
 }

@@ -48,9 +48,9 @@ Options:
   --module <id>          Select an analyzed module ID (repeatable)
   --angle <id>           Select a built-in angle (repeatable): ${defaultAngles.map(angle => angle.id).join(', ')}
   --focus <text>          Additional focus for module analysis and review
-  --fix                  Fix each module's findings directly once its review
-                         completes, then re-review the selected scope after all
-                         fixes finish; existing uncommitted changes are allowed
+  --fix                  Run each agent in a temporary Git worktree, apply
+                         validated edits, then re-review the selected scope.
+                         Existing uncommitted changes are included.
   --workflow-dir <path>   Durable run storage (default: <directory>/${DEFAULT_WORKFLOW_DIRECTORY})
   --json                 Print the structured report as JSON
   --help, -h             Show this help

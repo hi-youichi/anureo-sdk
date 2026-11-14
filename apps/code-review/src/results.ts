@@ -3,16 +3,15 @@ import type { ReviewAngle } from './angles'
 import type { ReviewFailure } from './errors'
 import type { Finding, ModulePlan, ReviewModule } from './schema'
 
-/** Host-observed fix outcome. Failed fixes can retain partial edits; changedFiles contains only
- * allowed modifications observed by Git reconciliation, while error can describe scope violations. */
+/** Fix outcome including validated changes applied to the original work tree. */
 export interface FixReport {
   /** 'not-needed' means no findings; 'skipped' covers incomplete reviews, a prior fix failure or no
    * observed edits. 'applied' means edits passed scope reconciliation, not that findings were resolved. */
   status: 'not-needed' | 'skipped' | 'applied' | 'failed'
   /** Agent summary after successful reconciliation, or an explanation of a skipped/failed fix. */
   summary: string
-  /** Sorted paths relative to the review directory, observed since this fix's baseline. On failure,
-   * this is best-effort and can omit changes when reconciliation fails; no edits are rolled back. */
+  /** Sorted paths relative to the review directory, applied to the original work tree.
+   * These can be present if failure occurred after integration, such as during cleanup. */
   changedFiles: string[]
   /** Normalized failure for 'failed'; null for other statuses. */
   error: ReviewFailure | null

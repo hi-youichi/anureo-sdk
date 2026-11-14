@@ -1,10 +1,10 @@
 // Normalizes caught errors for reports and presentation; it must not choose recovery or cleanup actions.
 import type { Failure } from './results'
 
-/** Internal display conversion used by runStep, executeRun, runChecks and CLI diagnostics.
+/** Internal display conversion used by agent work, run lifecycle, checks and CLI diagnostics.
  * Uses Error.message or String conversion; custom conversion/accessors can still throw. */
 export function message(cause: unknown): string { return cause instanceof Error ? cause.message : String(cause) }
-/** Internal classification recorded by runStep and executeRun alongside their caught error text.
+/** Internal classification recorded by agent work and run lifecycle alongside caught error text.
  * Returns signals from object values, or null code and false flags for primitives and functions.
  * Cleanup recognizes the resource-release code, explicit true flag or nonempty cleanup-error array;
  * execution uncertainty requires explicit true and remains independent. Custom accessors can throw. */

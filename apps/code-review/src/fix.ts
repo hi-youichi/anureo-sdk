@@ -1,19 +1,19 @@
 // Executes eligible fixes and reports outcomes using fix-tree's Git reconciliation.
 import { HarnessSdkError, type Client } from '@anureo/sdk'
+import { relative, resolve, sep } from 'node:path'
 import { agent } from '@anureo/workflow'
 import { reviewFailure } from './errors'
 import { fixResultSchema } from './schema'
 import { buildFixPrompt } from './prompts'
 import type { FixReport, ModuleReview } from './results'
-import { captureWorkingTreeBaseline, inspectWorkingTreeChanges, type WorkingTreeBaseline } from './fix-tree'
+import { captureWorkingTreeBaseline, inspectWorkingTreeChanges } from './fix-tree'
+import { applyFixPatch, capturePatchBaseline } from './fix-patch'
+import { reviewGit, reviewRepositoryRoot, withAgentWorktree } from './worktree'
 
 export type { FixReport } from './results'
 
-/** Apply findings from complete reviews, or skip agent work for incomplete/no-finding inputs.
- * Internal entry called by createFixRunner in reviewCode's writer queue; it uses failed reports to
- * stop later writers. Resolves after agent cleanup and tree reconciliation, retaining partial edits
- * on failure. The caller owns the client, writer serialization and any subsequent verification or
- * rollback. Baseline/agent/scope failures become failed reports; observer exceptions can reject. */
+/** Isolate a module's fix and apply its validated patch to the original work tree.
+ * Incomplete reviews and empty findings skip worktree creation. */
 export async function fixFindings(options: FixOptions): Promise<FixReport> {
   const { modules } = options
   if (modules.some(module => module.angles.some(angle => angle.status !== 'completed'))) {
@@ -39,6 +39,7 @@ interface FixOptions {
   client: Client
   /** Canonical absolute review directory; module file paths are validated relative to it. */
   cwd: string
+  repositoryRoot?: string
   /** Absolute workflow storage directory, excluded from Git change discovery. */
   directory: string
   modules: readonly ModuleReview[]
@@ -52,30 +53,35 @@ interface FixOptions {
 
 type ReconciledFix = Pick<FixReport, 'summary' | 'changedFiles'>
 
-/** Establish the baseline before agent dispatch; setup failure leaves no usable baseline for recovery. */
 async function applyFix(options: FixOptions, prompt: string, files: readonly string[]): Promise<FixReport> {
-  let baseline: WorkingTreeBaseline
-  try {
-    baseline = await captureWorkingTreeBaseline(options.cwd, files, options.directory)
-  } catch (cause) {
-    return recoverFixFailure({ options, cause })
-  }
-  return executeFix(options, prompt, baseline)
-}
-
-/** Await agent execution/cleanup and reconcile before publishing success. Keep the reconciled
- * outcome for recovery if a terminal observer throws and a later tree read also fails. */
-async function executeFix(options: FixOptions, prompt: string, baseline: WorkingTreeBaseline): Promise<FixReport> {
   let outcome: ReconciledFix | undefined
   try {
-    const output = await agent(prompt, {
-      client: options.client, cwd: options.cwd, model: options.model,
-      // An absent permissionMode selects the session default.
-      ...(options.permissionMode !== undefined ? { permissionMode: options.permissionMode } : {}),
-      schema: fixResultSchema,
+    const root = options.repositoryRoot ?? await reviewRepositoryRoot(options.cwd)
+    await withAgentWorktree({ root, cwd: options.cwd, directory: options.directory }, async (cwd, _directory, checkout) => {
+      if (!checkout) throw new Error('Fix worktree was not created')
+      const allowed = files.map(file => relative(root, resolve(options.cwd, file)).split(sep).join('/'))
+      const baseline = await captureWorkingTreeBaseline(checkout.root, allowed)
+      await capturePatchBaseline(checkout, allowed)
+      const head = await reviewGit(checkout.root, 'rev-parse', 'HEAD')
+      const index = await reviewGit(checkout.root, 'ls-files', '--stage', '-z')
+      const output = await agent(prompt, {
+        client: options.client, cwd, model: options.model, schema: fixResultSchema,
+        ...(options.permissionMode !== undefined ? { permissionMode: options.permissionMode } : {}),
+      })
+      if (output === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Fix agent returned no result')
+      if (await reviewGit(checkout.root, 'rev-parse', 'HEAD') !== head
+          || await reviewGit(checkout.root, 'ls-files', '--stage', '-z') !== index) {
+        throw new HarnessSdkError('REVIEW_FIX_SCOPE', 'Fix changed Git HEAD or the index in its worktree')
+      }
+      const { changedFiles, violations } = await inspectWorkingTreeChanges(baseline)
+      if (violations.length > 0) {
+        throw new HarnessSdkError('REVIEW_FIX_SCOPE', `Fix changed paths outside the selected source files: ${violations.join(', ')}`)
+      }
+      if (changedFiles.length > 0) await applyFixPatch(root, checkout, changedFiles)
+      outcome = { summary: output.summary,
+        changedFiles: changedFiles.map(file => relative(options.cwd, resolve(root, file)).split(sep).join('/')) }
     })
-    if (output === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Fix agent returned no result')
-    outcome = await reconcileFix(baseline, output.summary)
+    if (!outcome) throw new Error('Fix worktree did not produce an outcome')
     if (outcome.changedFiles.length === 0) {
       options.onProgress?.('skipped')
       return { status: 'skipped', ...outcome, error: null }
@@ -83,38 +89,8 @@ async function executeFix(options: FixOptions, prompt: string, baseline: Working
     options.onProgress?.('completed')
     return { status: 'applied', ...outcome, error: null }
   } catch (cause) {
-    return recoverFixFailure({ options, cause, baseline, outcome })
+    options.onProgress?.('failed')
+    return { status: 'failed', summary: outcome?.summary ?? 'Fix failed.',
+      changedFiles: outcome?.changedFiles ?? [], error: reviewFailure(cause) }
   }
-}
-
-/** Accept only observed allowed modifications, ignoring the agent's advisory changedFiles list.
- * Scope violations reject without undoing edits; executeFix routes them through failure recovery. */
-async function reconcileFix(baseline: WorkingTreeBaseline, summary: string): Promise<ReconciledFix> {
-  const { changedFiles, violations } = await inspectWorkingTreeChanges(baseline)
-  if (violations.length > 0) {
-    throw new HarnessSdkError('REVIEW_FIX_SCOPE',
-      `Fix changed paths outside the selected source files; inspect the working tree and revert with git: ${violations.join(', ')}`)
-  }
-  return { summary, changedFiles }
-}
-
-/** Preserve the original fix failure while best-effort reconciliation reports partial allowed edits
- * and scope violations. Read failures leave earlier observations intact; this never rolls back files.
- * Emit 'failed' after reconciliation; an exception from that observer rejects instead of returning. */
-async function recoverFixFailure({ options, cause, baseline, outcome }: {
-  options: FixOptions
-  cause: unknown
-  baseline?: WorkingTreeBaseline
-  outcome?: ReconciledFix
-}): Promise<FixReport> {
-  let error = reviewFailure(cause)
-  // Report partial edits after failure, but never replace the original execution error.
-  const changes = baseline ? await inspectWorkingTreeChanges(baseline).catch(() => null) : null
-  if (changes && changes.violations.length > 0 && cause instanceof HarnessSdkError && cause.code !== 'REVIEW_FIX_SCOPE') {
-    error = { ...error, message: `${error.message}; out-of-scope changes: ${changes.violations.join(', ')}` }
-  }
-  const result: FixReport = { status: 'failed', summary: outcome?.summary || 'Fix failed.',
-    changedFiles: changes?.changedFiles ?? outcome?.changedFiles ?? [], error }
-  options.onProgress?.('failed')
-  return result
 }

@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test'
 import { realpath } from 'node:fs/promises'
+import { join } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 import { createScriptedAdapter } from '@anureo/conformance'
 import type { ApprovalOption } from '@anureo/protocol'
@@ -148,7 +149,7 @@ test.each([false, true])('CLI prints JSON separately from progress, disposes cli
 test('CLI accepts a custom workflow directory and includes its run identity in the report', async () => {
   const { client, cwd } = await fixture()
   const io = output()
-  const directory = `${cwd}/saved-runs`
+  const directory = join(cwd, 'saved-runs')
   expect(await runCli([cwd, '--workflow-dir', directory, '--json'], { ...io, createClient: async () => client })).toBe(0)
   const report = JSON.parse(io.read().stdout)
   expect(report.workflowDirectory).toBe(directory)

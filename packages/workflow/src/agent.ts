@@ -22,6 +22,8 @@ export interface AgentOptions<S extends z.ZodObject = z.ZodObject> {
   permissionMode?: string
   /** Zod object with closed objects and required JSON fields; conversions are rejected before opening. */
   schema?: S
+  /** With a schema, request JSON as terminal text when the session lacks schema support. */
+  outputFallback?: 'json-text'
 }
 
 /**
@@ -71,6 +73,7 @@ function canonicalOptions(options: AgentOptions, schema: JsonObject | undefined)
     instructions: options.instructions ?? null,
     permissionMode: options.permissionMode ?? null,
     schema: schema ?? null,
+    ...(options.outputFallback ? { outputFallback: options.outputFallback } : {}),
     cwd: options.cwd,
     client: options.client.identity,
   }
@@ -135,7 +138,7 @@ async function executeAgent(prompt: string, options: AgentOptions): Promise<stri
   const output = schema === undefined ? undefined : prepareOutputSchema(schema)
   const session = await openAgentSession({ client, cwd, model, instructions, permissionMode })
   if (!session) return null // A failed open never hands session ownership to this call.
-  const outcome = await observeAgentTurn({ session, prompt, output })
+  const outcome = await observeAgentTurn({ session, prompt, output, outputFallback: options.outputFallback })
   const cleanupErrors = await releaseAgentSession(session)
   return settleAgentOutcome(outcome, cleanupErrors)
 }
@@ -155,14 +158,19 @@ function openAgentSession({ client, cwd, model, instructions, permissionMode }: 
  * Submit once and await terminal evidence plus local validation. Capture execution failures so
  * executeAgent can release the session before exposing the outcome; this phase never retries or closes it.
  */
-async function observeAgentTurn({ session, prompt, output }: {
+async function observeAgentTurn({ session, prompt, output, outputFallback }: {
   session: Session
   prompt: string
   output: AgentOutputSchema | undefined
+  outputFallback: AgentOptions['outputFallback']
 }): Promise<AgentOutcome> {
   try {
-    if (output && !session.capabilities.turn?.outputSchema) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Session does not support structured output')
-    const turn = await session.submit({ input: prompt, ...(output ? { outputSchema: output.schema } : {}) }, { timeoutMs: LONG_OBSERVATION_TIMEOUT_MS })
+    const structuredOutput = output && session.capabilities.turn?.outputSchema
+    if (output && !structuredOutput) {
+      if (outputFallback !== 'json-text') throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Session does not support structured output')
+      prompt += `\n\nReturn the final answer as a single JSON object that matches this JSON Schema. Do not include Markdown fences or surrounding prose.\n${JSON.stringify(output.schema)}`
+    }
+    const turn = await session.submit({ input: prompt, ...(structuredOutput ? { outputSchema: output.schema } : {}) }, { timeoutMs: LONG_OBSERVATION_TIMEOUT_MS })
     const result = await turn.result({ timeoutMs: LONG_OBSERVATION_TIMEOUT_MS })
     if (result.status === 'completed') {
       return { status: 'completed', value: output ? await output.parse(result.text) : result.text }

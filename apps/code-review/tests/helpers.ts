@@ -49,7 +49,7 @@ export const finding = {
  * Setup failures reject. This module's afterEach disposes clients and removes directories; tests must
  * settle their runs first. Hooks customize adapter capabilities/session opening, not turn execution. */
 export async function fixture(
-  respond: (prompt: string) => unknown | Promise<unknown> = prompt => isAnalysis(prompt) ? plan : { findings: [] },
+  respond: (prompt: string, sessionCwd: string) => unknown | Promise<unknown> = prompt => isAnalysis(prompt) ? plan : { findings: [] },
   hooks: Omit<FakeAdapterOptions, 'execute'> = {},
 ) {
   const cwd = await mkdtemp(join(tmpdir(), 'anureo-review-'))
@@ -58,12 +58,14 @@ export async function fixture(
   const prompts: string[] = []
   const adapter = createScriptedAdapter({ ...hooks, execute: async (call, sink) => {
     if (call.method !== 'input/submit' || !('submissionId' in call.params) || !('input' in call.params)) return undefined
-    const { submissionId, input } = call.params
+    const { submissionId, input, sessionId } = call.params
     const prompt = input.filter(part => part.type === 'text').map(part => part.text).join('\n')
     prompts.push(prompt)
     const turnId = randomUUID()
     await sink.emit({ type: 'turn/started', payload: { turnId } })
-    const output = await respond(prompt)
+    const session = adapter.opened.find(open => open.binding.sessionId === sessionId)
+    if (!session) throw new Error('Fixture submission has no session')
+    const output = await respond(prompt, session.cwd)
     if (output instanceof HarnessSdkError) {
       await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: {
         code: output.code, message: output.message, retryable: output.retryable, outcomeUnknown: output.outcomeUnknown,

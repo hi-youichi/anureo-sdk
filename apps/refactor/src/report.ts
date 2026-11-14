@@ -1,4 +1,5 @@
 // Renders host-observed reports as text; it must not run refactors or persist their state.
+import { join } from 'node:path'
 import type { RefactorReport, StepResult } from './results'
 
 /** Render a structured run as newline-terminated text for CLI/library presentation.
@@ -8,13 +9,18 @@ import type { RefactorReport, StepResult } from './results'
  * formatting it has no expected errors, I/O or mutation. */
 export function formatReport(report: RefactorReport): string {
   const lines = [
-    `Refactor: ${report.status}${report.reviewOnly ? ' (read-only prompt)' : ''}`,
+    `Refactor: ${report.status}${report.reviewOnly ? ' (review only)' : ''}`,
     `Directory: ${report.cwd}`,
-    `Report: ${report.directory}/report.json`,
+    `Report: ${join(report.directory, 'report.json')}`,
   ]
   if (report.design) {
     lines.push('', 'Cross-module design')
     appendStep(lines, report.design)
+  }
+  for (const graph of report.graphCoverage ?? []) {
+    const missing = graph.filesWithoutSymbols
+    lines.push('', `Graph (${graph.phase}): ${graph.status}${graph.error ? ` — ${graph.error}` : ''}`)
+    if (missing.length) lines.push(`Files without indexed symbols: ${missing.join(', ')}`)
   }
   lines.push('', report.plan?.summary ?? 'Module planning did not complete.')
   for (const item of report.modules) {
@@ -34,6 +40,7 @@ function appendStep(lines: string[], step: StepResult): void {
   if (step.failure?.outcomeUnknown) lines.push('Agent execution outcome is unknown; inspect source and backend execution before starting another run.')
   for (const change of step.changes) lines.push(`- ${change}`)
   if (step.changedFiles.length) lines.push(`Changed files: ${step.changedFiles.join(', ')}`)
+  if (step.status === 'failed' && step.patch) lines.push(`Patch: ${step.patch}`)
   for (const item of step.deferred) lines.push(`Deferred ${item.title}: ${item.reason}`)
   for (const check of step.checks) lines.push(`Check ${check.status}: ${check.command}`)
   if (step.status === 'applied' && !step.checks.length) lines.push('No validation commands ran; runtime behavior was not tested.')

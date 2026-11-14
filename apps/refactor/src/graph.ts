@@ -18,10 +18,10 @@ export type RepositoryGraph = z.infer<typeof graphSchema>
  * finish before settling. Orchestration serializes calls under its run lock. */
 export type GraphLoader = (cwd: string) => Promise<RepositoryGraph>
 
-/** Package-internal default for loadGraph and CLI help, resolved relative to this package at import
- * time; a missing installation throws during module initialization. The pinned release places its
- * CLI beside its exported library entry. Resolution starts no process; loadGraph accepts an override. */
-export const defaultRepographEntry = join(dirname(createRequire(import.meta.url).resolve('@youichi/repograph')), 'cli.js')
+/** Resolve the optional exporter only when requested. */
+export function resolveRepographEntry(): string {
+  return join(dirname(createRequire(import.meta.url).resolve('@youichi/repograph')), 'cli.js')
+}
 
 /** Export an absolute target directory through the supplied absolute CLI entry, defaulting to the
  * installed npm package, and return a validated graph. Both paths are passed unchanged to a child
@@ -31,7 +31,7 @@ export const defaultRepographEntry = join(dirname(createRequire(import.meta.url)
  * while retaining the path-derived external index for reuse. Process, parse, schema,
  * repository identity, endpoint and filesystem failures reject. Cleanup is awaited on success
  * and failure; a cleanup failure takes precedence over an earlier error. */
-export async function loadGraph(cwd: string, entry = defaultRepographEntry): Promise<RepositoryGraph> {
+export async function loadGraph(cwd: string, entry = resolveRepographEntry()): Promise<RepositoryGraph> {
   const temporary = await mkdtemp(join(tmpdir(), 'anureo-refactor-graph-'))
   try {
     const graph = await exportRepositoryGraph({ cwd, entry, temporary })
@@ -42,12 +42,11 @@ export async function loadGraph(cwd: string, entry = defaultRepographEntry): Pro
   }
 }
 
-/** Shape of the repograph `--kind all` export that this package relies on. Unknown extra fields
- * are dropped by zod, so every field an agent should see in the graph artifact is listed here. */
+/** Validate the core export fields and retain language-specific node metadata. */
 const graphSchema = z.object({
   schemaVersion: z.literal(1), repositoryPath: z.string(), kind: z.literal('all'),
   indexReport: z.record(z.string(), z.unknown()),
-  nodes: z.array(z.object({
+  nodes: z.array(z.looseObject({
     id: z.string(), name: z.string(), filePath: z.string(), labels: z.array(z.string()),
     startLine: z.number().nullable(), endLine: z.number().nullable(),
     // Upstream metrics (lines, complexity, cognitive, param_count, is_test...). Agents read them

@@ -12,6 +12,7 @@ import { modulePlanSchema, type ModulePlan, type ReviewModule } from './schema'
 import { validateOutput, validatePlan } from './validation'
 import { readGitStateFingerprint } from './git-state'
 import { validateReviewOptions, type ReviewOptions } from './options'
+import { reviewRepositoryRoot, withAgentWorktree } from './worktree'
 import type { FixReport, ModuleOutcome, ModuleReview, ReviewReport } from './results'
 
 // Preserve direct source imports while shared contracts have independent owners.
@@ -22,10 +23,10 @@ export type { ReviewProgress } from './progress'
 export type { AngleReview, ModuleReview, ModuleOutcome, ReviewReport } from './results'
 
 /** Analyze source modules, review selected angles and optionally fix and recheck the final tree.
- * Resolves after workflow persistence and agent cleanup; requested fixes can leave partial edits.
+ * Resolves after workflow persistence and agent cleanup; successful fixes are applied to the original work tree.
  * Invalid preflight, analysis and workflow failures reject; returned angle/fix failures retain
  * incomplete coverage. Synchronous observer exceptions are collected in progressErrors.
- * Await completion or rejection before disposing the supplied client; inspect any partial fix edits. */
+ * Await completion or rejection before disposing the supplied client. */
 export async function reviewCode(options: ReviewOptions): Promise<ReviewReport> {
   const progressErrors: ReviewFailure[] = []
   const prepared = await prepareReview({ ...options, onProgress: event => {
@@ -36,7 +37,7 @@ export async function reviewCode(options: ReviewOptions): Promise<ReviewReport> 
   // Bump revision when the persisted input/checkpoint contract changes.
   // sourceVersion carries the Git state fingerprint; backendConfiguration remains reserved.
   const completed = await workflow({
-    name: 'code-review', revision: '7', directory: execution.directory, input: prepared.workflowInput,
+    name: 'code-review', revision: '8', directory: execution.directory, input: prepared.workflowInput,
   }, async (run): Promise<ReviewReport> => {
     execution.onProgress?.({ stage: 'workflow', status: 'started', runId: run.runId, directory: execution.directory })
     const plan = await analyzeModules(execution, prepared.analysisPrompt)
@@ -70,7 +71,7 @@ async function verifyFinalTree({ execution, outcomes, schedule }: {
   outcomes: ModuleOutcome[]
   schedule: Schedule
 }): Promise<void> {
-  if (!outcomes.some(outcome => outcome.fix?.status === 'applied')) return
+  if (!outcomes.some(outcome => outcome.fix && outcome.fix.changedFiles.length > 0)) return
   const finalExecution = { ...execution, sourceVersion: await readGitStateFingerprint(execution.cwd) }
   const verifications = await parallel(outcomes.map(outcome => () => reviewModule({
     options: finalExecution, module: outcome.review.module, phase: 'verification', schedule, previous: outcome.review,
@@ -99,12 +100,13 @@ async function prepareReview(options: ReviewOptions) {
   const { fixRequested, concurrency, maxModules, moduleIds, angles } = selection
   const cwd = await realpath(resolve(options.cwd))
   if (!(await stat(cwd)).isDirectory()) throw new Error(`Review directory is not a directory: ${cwd}`)
+  const repositoryRoot = fixRequested ? await reviewRepositoryRoot(cwd) : undefined
   const version = await readGitStateFingerprint(cwd)
   const analysisPrompt = buildAnalysisPrompt({ focus: options.focus, sourceVersion: version })
   const directory = resolve(options.workflowDirectory ?? resolve(cwd, DEFAULT_WORKFLOW_DIRECTORY))
   const execution: ReviewExecutionOptions = {
     client: options.client, cwd, directory, model: options.model, focus: options.focus,
-    sourceVersion: version, angles, concurrency, onProgress: options.onProgress,
+    sourceVersion: version, repositoryRoot, angles, concurrency, onProgress: options.onProgress,
   }
   return { ...selection, execution, analysisPrompt, workflowInput: {
     cwd, model: options.model ?? null, focus: options.focus ?? null, concurrency,
@@ -118,11 +120,17 @@ async function prepareReview(options: ReviewOptions) {
  * output and agent/validation failures reject the workflow before module dispatch. */
 async function analyzeModules(execution: ReviewExecutionOptions, prompt: string): Promise<ModulePlan> {
   execution.onProgress?.({ stage: 'analysis', status: 'started' })
-  const analysis = await agent(prompt, {
-    client: execution.client, cwd: execution.cwd, model: execution.model, schema: modulePlanSchema,
-  })
-  if (analysis === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Module analysis failed: agent returned no result')
-  const plan = await validateOutput(() => validatePlan(execution.cwd, analysis, execution.directory))
+  const plan = await withAgentWorktree({ root: execution.repositoryRoot, cwd: execution.cwd, directory: execution.directory },
+    async (cwd, directory) => {
+      const analysis = await agent(prompt, {
+        client: execution.client, cwd, model: execution.model, schema: modulePlanSchema,
+      })
+      if (analysis === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Module analysis failed: agent returned no result')
+      const localPlan = await validateOutput(() => validatePlan(cwd, analysis, directory))
+      return execution.repositoryRoot
+        ? validateOutput(() => validatePlan(execution.cwd, localPlan, execution.directory))
+        : localPlan
+    })
   execution.onProgress?.({ stage: 'analysis', status: 'completed' })
   return plan
 }
@@ -139,12 +147,12 @@ function createFixRunner(execution: ReviewExecutionOptions, schedule: Schedule, 
         execution.onProgress?.({ stage: 'fix', status, moduleId: review.module.id })
       if (stoppedBy !== undefined) {
         onProgress('skipped')
-        return { status: 'skipped', summary: `Fix skipped because module ${stoppedBy}'s fix failed. Inspect the working tree before continuing.`,
+        return { status: 'skipped', summary: `Fix skipped because module ${stoppedBy}'s fix failed. Previously applied fixes remain in the original work tree.`,
           changedFiles: [], error: null }
       }
       const fix = await schedule(async () => fixFindings({
         sourceVersion: await readGitStateFingerprint(execution.cwd),
-        client: execution.client, cwd: execution.cwd, directory: execution.directory, modules: [review], model: execution.model,
+        client: execution.client, cwd: execution.cwd, directory: execution.directory, repositoryRoot: execution.repositoryRoot, modules: [review], model: execution.model,
         ...(permissionMode !== undefined ? { permissionMode } : {}), onProgress,
       }))
       if (fix.status === 'failed') stoppedBy = review.module.id

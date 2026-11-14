@@ -237,7 +237,7 @@ test('persists the run, validated analysis, every angle result, and the final re
   const report = await reviewCode({ client, cwd, workflowDirectory: directory })
   const path = join(report.workflowDirectory, report.runId)
   const manifest = JSON.parse(await readFile(join(path, 'run.json'), 'utf8'))
-  expect(manifest.identity).toMatchObject({ name: 'code-review', revision: '7', runId: report.runId })
+  expect(manifest.identity).toMatchObject({ name: 'code-review', revision: '8', runId: report.runId })
   expect(manifest.identity.input.analysisPrompt).toBe(prompts[0])
   expect(manifest.identity.input.concurrency).toBe(8)
   expect(manifest.status).toBe('completed')

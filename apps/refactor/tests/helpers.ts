@@ -46,7 +46,9 @@ export function graph(cwd: string): RepositoryGraph {
  * as agent output. Tests make edits themselves so host snapshots can verify them independently.
  * Returns the cwd, client, adapter, prompt log and an in-memory graph loader; setup failures reject.
  * Shared afterEach disposes registered clients and removes registered directories, even if setup fails. */
-export async function fixture(respond: (prompt: string) => unknown | Promise<unknown> = prompt => prompt.startsWith('PLAN') ? plan : unchanged) {
+type Responder = (prompt: string, cwd: string) => unknown | Promise<unknown>
+
+export async function fixture(respond: Responder = prompt => prompt.startsWith('PLAN') ? plan : unchanged) {
   const cwd = await temporary()
   await Promise.all(['a.ts', 'b.ts'].map(file => writeFile(join(cwd, file), 'export const value = 1\n')))
   await writeFile(join(cwd, '.gitignore'), '.anureo/\n')
@@ -73,17 +75,19 @@ afterEach(async () => {
  * and emit start before awaiting respond. A returned HarnessSdkError becomes a failed terminal event;
  * other values become final JSON followed by completion. Thrown responder/serialization/event errors
  * reject submission; non-submission calls fall through to the adapter defaults. */
-function respondingAdapter(respond: (prompt: string) => unknown | Promise<unknown>, prompts: string[]) {
+function respondingAdapter(respond: Responder, prompts: string[]) {
+  const directories = new Map<string, string>()
   return createScriptedAdapter({
+    onOpen: async params => { directories.set(params.binding.sessionId, params.cwd) },
     /** Handle submissions in SDK event order, awaiting the test responder before completing each turn. */
     execute: async (call, sink) => {
       if (call.method !== 'input/submit' || !('input' in call.params) || !('submissionId' in call.params)) return undefined
-      const { input, submissionId } = call.params
+      const { input, submissionId, sessionId } = call.params
       const prompt = input.filter(part => part.type === 'text').map(part => part.text).join('\n')
       prompts.push(prompt)
       const turnId = randomUUID()
       await sink.emit({ type: 'turn/started', payload: { turnId } })
-      const result = await respond(prompt)
+      const result = await respond(prompt, directories.get(sessionId)!)
       if (result instanceof HarnessSdkError) {
         await sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: {
           code: result.code, message: result.message, retryable: result.retryable, outcomeUnknown: result.outcomeUnknown,
