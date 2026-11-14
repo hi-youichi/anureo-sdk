@@ -8,6 +8,14 @@ marked **BREAKING**.
 
 ## Unreleased
 
+## [0.3.1] - 2026-11-14
+
+- Run refactor checks in isolated worktrees before transferring verified edits
+  to the target. Transfer module edits in readiness order and checkpoint each
+  module as it finishes.
+- Consolidate workflow agent execution and checkpoint handling, and clarify the
+  public workflow API guide.
+
 ## [0.3.0] - 2026-11-14
 
 - Publish the Hermes and Pi adapters, workflow primitives, and the code-review
@@ -165,5 +173,6 @@ packages this codebase was extracted from): package names, the `x-anureo/`
 extension prefix, the `Ahp*` / `createAhpAdapter` naming, and the schema
 `$id` changed; old-brand extension names are not compatible.
 
+[0.3.1]: https://www.npmjs.com/package/@anureo/sdk/v/0.3.1
 [0.3.0]: https://www.npmjs.com/package/@anureo/sdk/v/0.3.0
 [0.2.0]: https://github.com/hi-youichi/anureo-sdk/releases/tag/v0.2.0

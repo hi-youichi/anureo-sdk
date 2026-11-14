@@ -1,6 +1,6 @@
 {
   "name": "@anureo/refactor",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Graph-assisted code refactoring with parallel agents in separate Git worktrees",
   "license": "Apache-2.0",
   "repository": {

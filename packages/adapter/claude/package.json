@@ -1,7 +1,7 @@
 {
   "name": "@anureo/adapter-claude",
   "description": "Anureo SDK adapter for the official Claude Agent SDK",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "license": "Apache-2.0",
   "keywords": [
     "anureo",
