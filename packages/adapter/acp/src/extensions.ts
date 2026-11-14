@@ -5,6 +5,8 @@ import { record } from './mapping';
 export type ExtensionKey = 'fork' | 'revert' | 'steer' | 'history' | 'goalSet' | 'goalClear' | 'compact' | 'review';
 /** Negotiated features shared by AcpAdapter and its backend sessions. */
 export interface Extensions {
+  /** Negotiated AHP extension version, independent of method availability. */
+  version?: 1 | 2;
   /** Accepted private method names, which the adapter can withdraw after a native rejection. */
   methods: Partial<Record<ExtensionKey, string>>;
   /** Supported fork boundaries when a private fork method is present. */
@@ -30,7 +32,8 @@ export function extensions(response: unknown): Extensions {
   const methods: Extensions['methods'] = {};
   const result: Extensions = { methods, fork: [], revert: [], subagents: false, instructions: false, userInput: false, dynamicTool: false };
   if (extension.version !== 1 && !(extension.version === 2 && extension.turnCorrelation === true)) return result;
-  result.nativeLifecycle = extension.version === 2 && extension.turnCorrelation === true;
+  result.version = extension.version;
+  result.nativeLifecycle = result.version === 2;
   const names = record(extension.methods);
   for (const key of extensionKeys) {
     const name = names[key];

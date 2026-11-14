@@ -7,8 +7,8 @@ import type { AhpTransport } from "./wire";
  * the socket is open, before AHP negotiation. The owner must close the returned transport.
  * Accept wss: or loopback ws: and reject parsed credentials or nonempty query/fragment components.
  * Address, construction and queue setup failures reject setup. An error or close before open
- * rejects with RPC_CONNECTION_FAILED. At the deadline the socket is closed before reporting
- * RPC_TIMEOUT, so a synchronous close event may report RPC_CONNECTION_FAILED first.
+ * rejects with RPC_CONNECTION_FAILED. An expired handshake rejects with RPC_TIMEOUT.
+ * After a setup failure, the helper attempts to close the socket before returning the error.
  * Native error and close events end reads. Non-text or rejected frames also initiate socket close.
  * Buffer up to 2048 incoming frames and drain buffered frames before reporting read failure.
  * Send resolves after socket.send accepts data. Close resolves after initiating native closure.
@@ -26,10 +26,21 @@ export async function createWebSocketTransport(url: string, options: {
 } = {}): Promise<AhpTransport> {
   validateWebSocketAddress(url);
   if (!options.factory && typeof WebSocket === "undefined") throw new HarnessSdkError("WEBSOCKET_FACTORY_REQUIRED");
+  const maxBufferedBytes = options.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES;
+  const queue = new BoundedEventQueue<string>({
+    maxFrameBytes: options.maxFrameBytes,
+    maxBytes: maxBufferedBytes,
+    maxEvents: 2048,
+  }, frame => new TextEncoder().encode(frame).byteLength);
   const socket = options.factory ? options.factory(url) : new WebSocket(url);
-  const transport = createSocketTransport(socket, options);
-  await waitForConnection(socket, options.timeoutMs ?? 30_000);
-  return transport;
+  try {
+    const transport = createSocketTransport(socket, queue, maxBufferedBytes);
+    await waitForConnection(socket, options.timeoutMs ?? 30_000);
+    return transport;
+  } catch (cause) {
+    try { socket.close(); } catch {}
+    throw cause;
+  }
 }
 
 const DEFAULT_MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
@@ -51,14 +62,9 @@ function validateWebSocketAddress(url: string): void {
 
 /**
  * Set up framed reads and local close state before createWebSocketTransport waits for open,
- * so early frames and failures are retained. Invalid queue budgets throw during construction.
+ * so early frames and failures are retained.
  */
-function createSocketTransport(socket: WebSocket, options: { maxFrameBytes?: number; maxBufferedBytes?: number }): AhpTransport {
-  const queue = new BoundedEventQueue<string>({
-    maxFrameBytes: options.maxFrameBytes,
-    maxBytes: options.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES,
-    maxEvents: 2048,
-  }, frame => new TextEncoder().encode(frame).byteLength);
+function createSocketTransport(socket: WebSocket, queue: BoundedEventQueue<string>, maxBufferedBytes: number): AhpTransport {
   let closed = false;
   /** Message events admit text frames. Failure ends the queue with the cause before native close can fire. */
   const receiveFrame = (event: MessageEvent<unknown>) => {
@@ -89,7 +95,7 @@ function createSocketTransport(socket: WebSocket, options: { maxFrameBytes?: num
       if (closed || socket.readyState !== 1) {
         throw new HarnessSdkError("RPC_CONNECTION_CLOSED", "RPC_CONNECTION_CLOSED", false, true);
       }
-      if (socket.bufferedAmount > (options.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES)) {
+      if (socket.bufferedAmount > maxBufferedBytes) {
         throw new HarnessSdkError("BACKPRESSURE_EXCEEDED");
       }
       socket.send(message);
@@ -106,13 +112,12 @@ function createSocketTransport(socket: WebSocket, options: { maxFrameBytes?: num
 
 /**
  * Await socket readiness for createWebSocketTransport, accepting an already-open factory socket.
- * Open/error/close settle setup and remove the temporary listeners. The timer initiates close
- * before rejecting, preserving native error/close ordering.
+ * Open, error, close and timeout settle setup and remove the temporary listeners.
  */
 function waitForConnection(socket: WebSocket, timeoutMs: number): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
-      socket.close();
+      removeHandshakeListeners();
       reject(new HarnessSdkError("RPC_TIMEOUT"));
     }, timeoutMs);
     /** Detach setup callbacks and clear the deadline when a socket event settles setup. */

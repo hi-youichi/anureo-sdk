@@ -3,13 +3,13 @@ import { validatePlan } from '../src/plan-validation'
 import { designPrompt, modulePrompt, planPrompt } from '../src/prompts'
 import { plan } from './helpers'
 
-/** Compare both prompt APIs across modes and check lists so migrating callers cannot alter instructions. */
+/** Verify the runner's prompt inputs across modes and check lists. */
 test.each([
   { readOnly: false, checks: [] },
   { readOnly: false, checks: ['bun test', 'bun run typecheck'] },
   { readOnly: true, checks: [] },
   { readOnly: true, checks: ['bun test', 'bun run typecheck'] },
-])('named and positional prompts agree for readOnly=$readOnly checks=$checks', ({ readOnly, checks }) => {
+])('prompts describe the mode and host validation for readOnly=$readOnly checks=$checks', ({ readOnly, checks }) => {
   const files = plan.modules.flatMap(module => module.files)
   const module = plan.modules[0]!
   const context = { graphFile: 'graph.json', version: 'snapshot', checks, mode: readOnly ? 'read-only' as const : 'edit' as const }
@@ -17,22 +17,18 @@ test.each([
     designPrompt({ ...context, files }),
     modulePrompt({ ...context, module, design: 'Reviewed boundaries' }),
   ]
-  expect(prompts).toEqual([
-    designPrompt(files, context.graphFile, context.version, checks, readOnly),
-    modulePrompt(module, context.graphFile, context.version, checks, readOnly, 'Reviewed boundaries'),
-  ])
   for (const prompt of prompts) {
     expect(prompt).toContain(readOnly ? 'MODE: READ ONLY' : 'MODE: EDIT')
     expect(prompt.includes('Validation commands:')).toBe(!readOnly && checks.length > 0)
     if (!readOnly && checks.length > 0) {
-      expect(prompt).toContain(`Validation commands: ${JSON.stringify(checks)}. Run them before returning and fix failures.`)
+      expect(prompt).toContain(`Validation commands: ${JSON.stringify(checks)}. The host runs them on the combined tree before merging your edits.`)
     }
   }
 })
 
 /** Preserve the alternatives and their evidence requirements even when a graph is unavailable. */
 test.each(['read-only', 'edit'] as const)('structural decisions compare keeping, consolidation and extraction in %s mode', mode => {
-  const context = { graphFile: null, version: 'snapshot', checks: [], mode, isolated: true }
+  const context = { graphFile: null, version: 'snapshot', checks: [], mode }
   const design = designPrompt({ ...context, files: ['api.ts', 'types.ts'] })
   const module = modulePrompt({ ...context, module: plan.modules[0]!, design: 'Keep the shared policy owner' })
   for (const prompt of [design, module]) {
@@ -128,11 +124,11 @@ test.each(['read-only', 'edit'] as const)('declaration ordering reaches both pha
   expect(prompts[1]).toContain('public class methods hidden below internal implementation helpers')
 })
 
-/** Verify that phase-specific scope survives shared guidance and that isolated checks stay with the host. */
+/** Verify that phase-specific scope survives shared guidance and checks stay with the host. */
 test('documentation scope is phase-specific and planning remains inventory-only', () => {
   const files = ['api.ts']
   const context = {
-    graphFile: 'graph.json', version: 'snapshot', mode: 'edit' as const, isolated: true,
+    graphFile: 'graph.json', version: 'snapshot', mode: 'edit' as const,
     checks: [{ executable: 'bun', args: ['run', 'typecheck'] }],
   }
   const design = designPrompt({ ...context, files })
@@ -150,13 +146,13 @@ test('documentation scope is phase-specific and planning remains inventory-only'
   expect(planning).toContain('Plan against the existing inventory')
   expect(planning).toContain('Assign every listed source file exactly once')
   expect(planning).toContain('Do not review or edit yet')
-  const hostChecks = `Validation commands: ${JSON.stringify(context.checks)}. The host runs them in your worktree before merging your edits.`
+  const hostChecks = `Validation commands: ${JSON.stringify(context.checks)}. The host runs them on the combined tree before merging your edits.`
   for (const prompt of [design, module]) {
     expect(prompt).toContain(hostChecks)
     expect(prompt).not.toContain('Run them before returning')
   }
-  expect(module).toContain('Other modules run concurrently.')
-  expect(design).not.toContain('Other modules run concurrently.')
+  expect(module).toContain('Other modules may run concurrently.')
+  expect(design).not.toContain('Other modules may run concurrently.')
 })
 
 /** Module IDs keep the existing alphabet and length boundaries, including uppercase letters and underscores. */
@@ -168,21 +164,17 @@ test.each(['a', 'A_0-module', 'a'.repeat(80)])('accepts safe module ID %s', id =
 /** Reject path components and out-of-policy IDs before their values can reach reports. */
 test.each(['', '../escape', 'a/b', 'a\\b', '_module', '-module', 'a.b', 'a b', 'a'.repeat(81)])('rejects unsafe module ID %s', id => {
   const candidate = { ...plan, modules: [{ ...plan.modules[0]!, id }] }
-  expect(() => validatePlan(candidate, ['a.ts'])).toThrow(`Invalid or duplicate module id: ${id}`)
+  expect(() => validatePlan(candidate, ['a.ts'])).toThrow(`modules[0].id: ${JSON.stringify(id)} must start with an ASCII letter or digit`)
 })
 
-/** Plans fail in traversal order, with omissions delayed until all explicit assignments are checked. */
-test('plan validation preserves error precedence and inventory ordering', () => {
+test('plan validation reports all issues in traversal and inventory order', () => {
   const first = plan.modules[0]!
   const second = plan.modules[1]!
-  expect(() => validatePlan({ ...plan, modules: [first, { ...second, id: first.id, files: ['extra.ts'] }] }, ['a.ts', 'b.ts']))
-    .toThrow('Invalid or duplicate module id: a')
-  expect(() => validatePlan({ ...plan, modules: [first, { ...second, id: first.id.toUpperCase(), files: ['extra.ts'] }] }, ['a.ts', 'b.ts']))
-    .toThrow('Invalid or duplicate module id: A')
-  expect(() => validatePlan({ ...plan, modules: [{ ...first, files: ['extra.ts'] }, { ...second, id: '../unsafe' }] }, ['a.ts', 'b.ts']))
-    .toThrow('Unlisted or duplicate module file: extra.ts')
-  expect(() => validatePlan({ ...plan, modules: [first, { ...second, files: ['a.ts'] }] }, ['a.ts', 'b.ts']))
-    .toThrow('Unlisted or duplicate module file: a.ts')
-  expect(() => validatePlan({ ...plan, modules: [first] }, ['c.ts', 'a.ts', 'b.ts']))
-    .toThrow('Module plan omitted source files: c.ts, b.ts')
+  const candidate = { ...plan, modules: [first, { ...second, id: 'A', files: ['extra.ts', 'a.ts'] }] }
+  expect(() => validatePlan(candidate, ['c.ts', 'a.ts', 'b.ts'])).toThrow([
+    'modules[1].id: "A" duplicates modules[0].id ignoring case',
+    'modules[1].files[0]: "extra.ts" is absent from the inventory',
+    'modules[1].files[1]: "a.ts" was already assigned at modules[0].files[0]',
+    'Module plan omitted source files: "c.ts", "b.ts"',
+  ].join('\n'))
 })

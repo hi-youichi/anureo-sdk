@@ -122,11 +122,12 @@ export function describe(value: unknown, expected: { instanceId: string; profile
 export function receipt(value: unknown, profileId: string, sessionId: string): Receipt {
   const data = object(value), ref = object(data.ref)
   if (ref.profile_id !== profileId || ref.session_id !== sessionId) throw new HarnessSdkError('SESSION_BINDING_MISMATCH')
-  if (!['queued', 'started', 'unknown', 'terminal'].includes(String(data.status))) throw protocolError()
+  const status = data.status
+  if (status !== 'queued' && status !== 'started' && status !== 'unknown' && status !== 'terminal') throw protocolError()
   const generation = data.execution_generation == null ? undefined : integer(data.execution_generation)
-  if (data.status === 'started' && generation === undefined) throw protocolError()
+  if (status === 'started' && generation === undefined) throw protocolError()
   return {
-    id: identity(data.admission_id), sequence: integer(data.sequence), status: data.status as Receipt['status'],
+    id: identity(data.admission_id), sequence: integer(data.sequence), status,
     outcome: data.outcome == null ? null : text(data.outcome), epoch: integer(data.authority_epoch), generation,
     ...(data.input_id !== undefined ? { inputId: identity(data.input_id) } : {}),
     ...(data.steering === true ? { steering: true } : {}),
@@ -158,14 +159,17 @@ export function event(value: unknown): NativeEvent {
   }
 }
 
-/** Map a gateway rejection for HermesRpc.receiveResponse without retaining native error messages or data. */
+/** Map a gateway error for HermesRpc.receiveResponse without retaining native error messages or data. */
 export class HermesRpcError extends HarnessSdkError {
-  /** Map an explicit rejection to a known-outcome failure; only storage_unavailable is retryable. Array-shaped error data throws PROTOCOL_ERROR. */
-  constructor(error: NativeObject) {
+  /** Require a valid error envelope and preserve uncertainty for storage or internal failures after a mutation. */
+  constructor(error: NativeObject, mutation: boolean) {
+    if (!Number.isSafeInteger(error.code) || typeof error.message !== 'string') throw protocolError()
     const reason = error.data && typeof error.data === 'object' ? object(error.data).reason : undefined
-    const code = typeof reason === 'string' ? REASONS[reason] : undefined
+    const code = typeof reason === 'string' && Object.hasOwn(REASONS, reason) ? REASONS[reason] : undefined
+    const outcomeUnknown = mutation && (reason === 'storage_unavailable' || error.code === -32603)
     super(code ?? (error.code === -32601 ? 'METHOD_NOT_FOUND' : error.code === -32602 ? 'INVALID_PARAMS' : 'NATIVE_RPC_ERROR'),
-      'Hermes gateway refused the request', reason === 'storage_unavailable', false)
+      outcomeUnknown ? 'Hermes gateway request failed' : 'Hermes gateway refused the request',
+      reason === 'storage_unavailable' && !outcomeUnknown, outcomeUnknown)
   }
 }
 

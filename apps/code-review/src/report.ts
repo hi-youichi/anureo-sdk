@@ -7,10 +7,11 @@ import type { AngleReview, FixReport, ModuleOutcome, ReviewReport } from './resu
 export function formatReport(report: ReviewReport): string {
   const lines = [
     `Code review: ${report.status}`,
-    `Run: ${report.runId}`,
-    `Workflow storage: ${report.workflowDirectory}`,
-    `Directory: ${report.cwd}`,
-    `Scope: ${report.scope.moduleIds.length} of ${report.plan.modules.length} planned modules; angles: ${report.scope.angleIds.join(', ')}`,
+    `Run: ${inlineText(report.runId)}`,
+    `Workflow storage: ${inlineText(report.workflowDirectory)}`,
+    `Directory: ${inlineText(report.cwd)}`,
+    `Scope: ${report.scope.moduleIds.length} of ${report.plan.modules.length} planned modules; angles: ${report.scope.angleIds.map(inlineText).join(', ')}`,
+    `Findings counted: ${report.findingCount}${report.status === 'incomplete' ? ' (partial coverage)' : ''}`,
     '', report.plan.summary,
   ]
   for (const outcome of report.modules) {
@@ -22,13 +23,23 @@ export function formatReport(report: ReviewReport): string {
       appendFailure(lines, { error, prefix: '- ' })
     }
   }
-  return `${lines.join('\n')}\n`
+  return `${lines.map(line => line.replace(/\r\n/g, '\n')).join('\n')}\n`
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, escapeCharacter)
+}
+
+/** Keep a title, ID or path on the line where it is displayed. */
+function inlineText(text: string): string {
+  return text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, escapeCharacter)
+}
+
+function escapeCharacter(character: string): string {
+  return `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`
 }
 
 /** Keep the original review, fix and final verification together under the module heading. */
 function appendModuleOutcome(lines: string[], outcome: ModuleOutcome): void {
   const { review } = outcome
-  lines.push('', `## ${review.module.name} (${review.module.id})`)
+  lines.push('', `## ${inlineText(review.module.name)} (${inlineText(review.module.id)})`)
   appendAngleReviews(lines, review.angles, '###')
   if (outcome.fix) appendFix(lines, outcome.fix)
   if (outcome.verification) {
@@ -40,7 +51,7 @@ function appendModuleOutcome(lines: string[], outcome: ModuleOutcome): void {
 /** Render angle outcomes in report order with caller-selected heading depth, retaining failures. */
 function appendAngleReviews(lines: string[], angles: readonly AngleReview[], headingPrefix: string): void {
   for (const result of angles) {
-    lines.push('', `${headingPrefix} ${result.angle.title}`)
+    lines.push('', `${headingPrefix} ${inlineText(result.angle.title)}`)
     appendAngleResult(lines, result)
   }
 }
@@ -60,7 +71,7 @@ function appendAngleResult(lines: string[], result: AngleReview): void {
   const indent = (text: string) => text.replace(/\n/g, '\n  ')
   for (const finding of result.findings) {
     lines.push(
-      `- [${finding.severity}] ${finding.title} (${finding.file}:${finding.lineStart}-${finding.lineEnd})`,
+      `- [${finding.severity}] ${inlineText(finding.title)} (${inlineText(finding.file)}:${finding.lineStart}-${finding.lineEnd})`,
       `  ${indent(finding.body)}`,
       `  Suggestion: ${indent(finding.suggestion)}`,
     )
@@ -70,7 +81,7 @@ function appendAngleResult(lines: string[], result: AngleReview): void {
 /** Show recorded edits even if a later failure made the fix incomplete. */
 function appendFix(lines: string[], fix: FixReport): void {
   lines.push('', `### Fix: ${fix.status}`, fix.summary)
-  if (fix.changedFiles.length > 0) lines.push(`Changed files: ${fix.changedFiles.join(', ')}`)
+  if (fix.changedFiles.length > 0) lines.push(`Changed files: ${fix.changedFiles.map(inlineText).join(', ')}`)
   if (fix.error) {
     appendFailure(lines, { error: fix.error, prefix: 'Fix failed: ',
       unknownOutcomeMessage: 'The backend could not confirm the fix agent outcome.' })

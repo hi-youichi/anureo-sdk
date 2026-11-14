@@ -56,8 +56,9 @@ test('older SDKs without reinitialize rebuild a fresh directory Query to refresh
   } })
   try {
     expect((await session.listModels())[0]?.value).toBe('model-1')
-    expect((await session.listModels())[0]?.value).toBe('model-2')
-    expect([queries, closes]).toEqual([2, 1])
+    const reads = await Promise.all([session.listModels(), session.listModels()])
+    expect(reads.map(models => models[0]?.value)).toEqual(['model-2', 'model-3'])
+    expect([queries, closes]).toEqual([3, 2])
   } finally { await session.dispose() }
 })
 

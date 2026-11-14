@@ -22,7 +22,7 @@ export type ValidationIssue = Pick<ErrorObject, 'instancePath' | 'keyword' | 'me
 /** Report a definite, non-retryable validation failure with limited schema diagnostics. */
 export class ProtocolValidationError extends Error {
   /** Supply a non-sensitive message. Only the path, keyword and message are copied from each issue. */
-  constructor(message: string, issues: readonly ErrorObject[] = []) {
+  constructor(message: string, issues: readonly ValidationIssue[] = []) {
     super(message)
     this.name = 'ProtocolValidationError'
     // Never copy data/params into diagnostics: these can contain secret answers.
@@ -31,7 +31,7 @@ export class ProtocolValidationError extends Error {
   readonly code = 'INVALID_PARAMS'
   readonly retryable = false
   readonly outcomeUnknown = false
-  /** Diagnostics supplied by the check. Envelope and interaction assertions leave this empty. */
+  /** Diagnostics supplied by the check when available. */
   readonly issues: ValidationIssue[]
 }
 /**
@@ -67,9 +67,9 @@ export function validateResult<M extends AhpMethod>(method: M, value: unknown): 
   return validateDefinition<AhpResultMap[M]>(AHP_METHOD_DEFINITIONS[method][1], value)
 }
 /**
- * Assert the result shape for a known method or throw ProtocolValidationError. The caller owns
- * request/result identity and lifecycle checks. Session.validateNativeResult treats a failure
- * as an unknown native outcome and starts observation teardown.
+ * Assert the result shape for a known method or throw ProtocolValidationError with INVALID_PARAMS.
+ * The caller owns request/result identity and lifecycle checks. Session.validateNativeResult
+ * translates a failure into an unknown native outcome and starts observation teardown.
  */
 export function assertResult<M extends AhpMethod>(method: M, value: unknown): asserts value is AhpResultMap[M] {
   assertDefinition<AhpResultMap[M]>(AHP_METHOD_DEFINITIONS[method][1], value)
@@ -133,10 +133,13 @@ export function supportsExtension(capabilities: Capabilities, name: string, vers
 
 /**
  * Test a value against a caller-supplied draft 2020-12 schema without mutation or format checks.
- * Return false for both a mismatch and schema compilation/validation errors.
+ * Return false for asynchronous schemas, mismatches and schema compilation/validation errors.
  */
 export function validateJsonSchema(schemaValue: JsonSchema, value: unknown): boolean {
-  try { return !!ajv.compile(schemaValue)(value) } catch { return false }
+  try {
+    const check = new Ajv2020(validationOptions).compile(schemaValue)
+    return !('$async' in check) && check(value) === true
+  } catch { return false }
 }
 /**
  * Test an answer against an already-valid request without settling the interaction. The kinds must
@@ -146,18 +149,23 @@ export function validateJsonSchema(schemaValue: JsonSchema, value: unknown): boo
  * response. Return false for invalid responses or failing embedded schemas.
  */
 export function validateInteractionResponse(request: InteractionRequested, response: unknown): response is InteractionResponse {
-  if (!validateDefinition<InteractionResponse>('InteractionResponse', response) || request.kind !== response.kind) return false
+  return interactionResponseIssues(request, response) === undefined
+}
+
+/** Return undefined for a valid response, or diagnostics for a failed validation. */
+function interactionResponseIssues(request: InteractionRequested, response: unknown): ValidationIssue[] | undefined {
+  if (!validateDefinition<InteractionResponse>('InteractionResponse', response) || request.kind !== response.kind) return []
   switch (response.kind) {
     case 'approval':
-      return request.kind === 'approval' && request.options.some(option => option.id === response.optionId)
+      return request.kind === 'approval' && request.options.some(option => option.id === response.optionId) ? undefined : []
     case 'userInput':
-      return request.kind === 'userInput' && validatesUserInput(request, response)
+      return request.kind === 'userInput' ? userInputIssues(request, response) : []
     case 'elicitation':
-      if (request.kind !== 'elicitation') return false
-      if (response.action !== 'accept' || request.schema === undefined) return true
-      return validateJsonSchema(request.schema, response.content)
+      if (request.kind !== 'elicitation') return []
+      if (response.action !== 'accept' || request.schema === undefined) return undefined
+      return validateJsonSchema(request.schema, response.content) ? undefined : []
     case 'dynamicTool':
-      return request.kind === 'dynamicTool' && (request.schema === undefined || validateJsonSchema(request.schema, response))
+      return request.kind === 'dynamicTool' && (request.schema === undefined || validateJsonSchema(request.schema, response)) ? undefined : []
   }
 }
 /**
@@ -166,7 +174,8 @@ export function validateInteractionResponse(request: InteractionRequested, respo
  * native delivery. A mismatch rejects the response attempt without settling the interaction.
  */
 export function assertInteractionResponse(request: InteractionRequested, response: unknown): asserts response is InteractionResponse {
-  if (!validateInteractionResponse(request, response)) throw new ProtocolValidationError('Invalid interaction response')
+  const issues = interactionResponseIssues(request, response)
+  if (issues) throw new ProtocolValidationError('Invalid interaction response', issues)
 }
 
 /** Encode the full session/execution/item tuple as an unambiguous key, even when IDs contain separators. */
@@ -174,7 +183,8 @@ export function itemIdentity(sessionId: string, turnId: string, itemId: string):
   return JSON.stringify([sessionId, turnId, itemId])
 }
 
-const ajv = new Ajv2020({ strict: false, allErrors: true, validateFormats: false })
+const validationOptions = { strict: false, allErrors: true, validateFormats: false } as const
+const ajv = new Ajv2020(validationOptions)
 ajv.addSchema(schema)
 const validators = new Map<string, ValidateFunction>()
 
@@ -188,13 +198,22 @@ function validator(name: string): ValidateFunction {
   return value
 }
 
-/** Check the embedded answers schema before evaluating the individual questions. */
-function validatesUserInput(
+/** Check the embedded schema and collect question failures without retaining submitted answers. */
+function userInputIssues(
   request: Extract<InteractionRequested, { kind: 'userInput' }>,
   response: Extract<InteractionResponse, { kind: 'userInput' }>,
-): boolean {
-  if (request.schema !== undefined && !validateJsonSchema(request.schema, response.answers)) return false
-  return request.questions.every(question => validatesQuestionAnswer(question, response.answers[question.id]))
+): ValidationIssue[] | undefined {
+  const schemaValid = request.schema === undefined || validateJsonSchema(request.schema, response.answers)
+  const issues: ValidationIssue[] = []
+  for (const question of request.questions) {
+    const answer = Object.hasOwn(response.answers, question.id) ? response.answers[question.id] : undefined
+    if (validatesQuestionAnswer(question, answer)) continue
+    const instancePath = '/answers/' + question.id.replace(/~/g, '~0').replace(/\//g, '~1')
+    issues.push(answer === undefined
+      ? { instancePath, keyword: 'required', message: 'Supply an answer to this question' }
+      : { instancePath, keyword: 'optionId', message: 'Select only offered option IDs' })
+  }
+  return schemaValid && issues.length === 0 ? undefined : issues
 }
 
 /** Check required answers and offered IDs. Missing or empty options permit any JSON answer. */

@@ -16,12 +16,16 @@ export function compileOutputSchema(source: JsonSchema) {
   const validate = compileValidator(schema)
   /**
    * Check a value without coercion or default insertion. Throw STRUCTURED_OUTPUT_INVALID with at
-   * most sixteen path/keyword issues on mismatch. OutputSession.submitCandidate converts failures
+   * most sixteen issues with paths, keywords and any required field names. OutputSession.submitCandidate converts failures
    * into retry decisions. OutputSession.publishOutput converts them into failed terminals before serialization.
    */
   const check = (value: unknown): void => {
     if (validate(value)) return
-    const issues = validate.errors?.slice(0, 16).map(error => ({ path: error.instancePath, code: error.keyword })) ?? []
+    const issues = validate.errors?.slice(0, 16).map(error => ({
+      path: error.instancePath,
+      code: error.keyword,
+      ...(error.keyword === 'required' ? { missingProperty: error.params.missingProperty } : {}),
+    })) ?? []
     throw new HarnessSdkError('STRUCTURED_OUTPUT_INVALID', 'Output does not match its schema', false, false, { issues })
   }
   return {
@@ -52,7 +56,7 @@ function compileValidator(schema: JsonSchema) {
   try {
     validateSchemaNode(schema, 0)
     const engine = schemaEngine(schema)
-    const ajv = new engine({ allErrors: true, strict: false, validateFormats: false, multipleOfPrecision: 6, logger: false })
+    const ajv = new engine({ allErrors: true, ownProperties: true, strict: false, validateFormats: false, multipleOfPrecision: 6, logger: false })
     return ajv.compile(schema)
   } catch (cause) {
     if (cause instanceof HarnessSdkError) throw cause

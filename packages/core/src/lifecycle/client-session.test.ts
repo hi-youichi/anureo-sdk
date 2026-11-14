@@ -1,7 +1,8 @@
 // Exercises cooperating client/session lifecycle contracts; must not replace production admission or cleanup policy.
 import { expect, test } from 'bun:test';
-import { createClient, HarnessSdkError, type ClientOptions, type HarnessAdapter, type SessionEventSink, type SessionMethod } from '../index';
-import { AHP_PROTOCOL_CONTRACT, type AhpEvent, type AhpRequestMap, type AhpResultMap, type Capabilities } from '@anureo/protocol';
+import sdkPackage from '../../package.json' with { type: 'json' };
+import { Client, createClient, HarnessSdkError, type ClientOptions, type HarnessAdapter, type SessionEventSink, type SessionMethod } from '../index';
+import { AHP_PROTOCOL_CONTRACT, AHP_PROTOCOL_VERSION, type AhpEvent, type AhpRequestMap, type AhpResultMap, type Capabilities } from '@anureo/protocol';
 import { deferred } from './deferred';
 
 /** Fixture close receipt keeps native stop unconfirmed so tests cannot mistake observation teardown for execution completion. */
@@ -17,7 +18,7 @@ const capabilities: Capabilities = {
 /** fixture supplies this callback to its backend execute port, recording dispatch before the test controls events, receipt or rejection. */
 type Run = (method: SessionMethod, params: AhpRequestMap[SessionMethod], sink: SessionEventSink) => Promise<unknown>;
 /** Build a public client/session around Run and return native dispatch, event and release probes. Client invokes the fixture adapter ports; setup failures reject. Tests own gates/readers and must await client.dispose in finally; the fixture starts no processes. */
-async function fixture(run: Run, options: Partial<ClientOptions> = {}) {
+async function fixture(run: Run, options: Partial<ClientOptions> = {}, wait?: { timeoutMs: number }) {
   // Native open assigns the sink before session creation resolves or any test can dispatch.
   let sink!: SessionEventSink, disposals = 0;
   const calls: Array<{ method: SessionMethod; params: AhpRequestMap[SessionMethod] }> = [];
@@ -37,7 +38,7 @@ async function fixture(run: Run, options: Partial<ClientOptions> = {}) {
     /** Client.dispose reaches this through the output wrapper after session cleanup; the fixture owns no adapter resources. */
     async dispose() {},
   };
-  const client = await createClient({ adapter, identity: { adapterId: 'fixture', runtimeConfigId: 'local' }, ...options });
+  const client = await createClient({ adapter, identity: { adapterId: 'fixture', runtimeConfigId: 'local' }, ...options }, wait);
   return { client, adapter, session: await client.sessions.create({ cwd: process.cwd() }), calls,
     /** Tests read the captured forwarding sink after open resolves, including for events after a caller wait ends. */
     get sink() { return sink; },
@@ -164,6 +165,24 @@ test('completed snapshots rotate while newly pending submissions do not pin olde
   }, { limits: { maxExecutions: 1, maxSubmissions: 2 } });
   try {
     for (let i = 0; i < 6; i++) expect((await (await f.session.submit({ input: 'x' })).result()).status).toBe('completed');
+    expect(f.session.snapshot.status).toBe('ready');
+  } finally { await f.client.dispose(); }
+});
+
+test('result byte pressure reclaims a completed execution while its Turn stays readable', async () => {
+  let n = 0;
+  const f = await fixture((_m, p, sink) => startWithReceipt(sink, {
+    submissionId: asSubmitParams(p).submissionId, turnId: `turn-${++n}`,
+  }), { limits: { maxResultBytes: 160 } });
+  try {
+    const first = await f.session.submit({ input: 'first' });
+    const firstText = 'a'.repeat(50);
+    const secondText = 'b'.repeat(50);
+    await completed(f.sink, first.id, firstText);
+    const second = await f.session.submit({ input: 'second' });
+    await completed(f.sink, second.id, secondText);
+    expect(await first.result()).toMatchObject({ text: firstText });
+    expect(await second.result()).toMatchObject({ text: secondText });
     expect(f.session.snapshot.status).toBe('ready');
   } finally { await f.client.dispose(); }
 });
@@ -372,6 +391,20 @@ test('invalid timeout parameters and mismatched session bindings never dispatch 
   }finally{await f.client.dispose();}
 });
 
+test('an invalid default request timeout prevents submit and close dispatch unless overridden', async () => {
+  const f = await fixture(async (method, params, sink) => method === 'input/submit'
+    ? startWithReceipt(sink, { submissionId: asSubmitParams(params).submissionId, turnId: 'actual' })
+    : closeResult, { runtime: { requestTimeoutMs: 0 } }, { timeoutMs: 1000 });
+  try {
+    await expect(f.session.submit({ input: 'x' })).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    await expect(f.session.close()).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    expect(f.calls).toHaveLength(0);
+    expect((await f.session.submit({ input: 'x' }, { timeoutMs: 1000 })).id).toBe('actual');
+    expect(await f.session.close({ timeoutMs: 1000 })).toEqual(closeResult);
+    expect(f.calls.map(call => call.method)).toEqual(['input/submit', 'session/close']);
+  } finally { await f.client.dispose(); }
+});
+
 /** Replay the same raw request concurrently, then vary payload and submission reservation independently. Require one native attempt plus distinct request/submission conflict errors; finally dispose the fixture. */
 test('raw requests dedupe and reject conflicting submission identity',async()=>{
   const f = await fixture((_m, p, sink) =>
@@ -383,6 +416,34 @@ test('raw requests dedupe and reject conflicting submission identity',async()=>{
     await expect(f.session.request('input/submit',{...p,input:[{type:'text',text:'b'}]})).rejects.toMatchObject({code:'REQUEST_ID_CONFLICT'});
     await expect(f.session.request('input/submit',{...p,requestId:'other'})).rejects.toMatchObject({code:'SUBMISSION_ID_CONFLICT'});
   }finally{await f.client.dispose();}
+});
+
+test('evicting a dispatch receipt does not allow a still-unbound submission to replay natively', async () => {
+  const f = await fixture(async (method, params) => method === 'input/submit'
+    ? { submissionId: asSubmitParams(params).submissionId, disposition: 'dispatched' }
+    : { maintenanceId: 'compact', status: 'completed' }, { runtime: { requestCacheSize: 1 } });
+  try {
+    const params: AhpRequestMap['input/submit'] = {
+      sessionId: f.session.id, requestId: 'request', submissionId: 'input', delivery: 'native', input: [{ type: 'text', text: 'a' }],
+    };
+    await expect(f.session.request('input/submit', params)).resolves.toMatchObject({ disposition: 'dispatched' });
+    await f.session.request('compact/start', { sessionId: f.session.id, requestId: 'other' });
+    await expect(f.session.request('input/submit', params)).rejects.toMatchObject({ code: 'SUBMISSION_ID_CONFLICT' });
+    expect(f.calls.map(call => call.method)).toEqual(['input/submit', 'compact/start']);
+  } finally { await f.client.dispose(); }
+});
+
+test('a replay preserves the retained dispatch error after the session requires recovery', async () => {
+  const failure = new HarnessSdkError('RESULT_UNKNOWN', 'Review outcome is unknown', false, true);
+  const f = await fixture(async () => { throw failure; });
+  try {
+    const params = { sessionId: f.session.id, requestId: 'review', submissionId: 'submission', target: {} };
+    await expect(f.session.request('review/start', params)).rejects.toBe(failure);
+    expect(f.session.snapshot.status).toBe('recoveryRequired');
+    await expect(f.session.request('review/start', params)).rejects.toBe(failure);
+    await expect(f.session.request('review/start', { ...params, requestId: 'other' })).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(f.calls).toHaveLength(1);
+  } finally { await f.client.dispose(); }
 });
 
 /** Abandon one wait while its native request fills the cache; identical replay must survive pressure, and only a settled outcome may make room for new work. */
@@ -553,6 +614,38 @@ test('submission rejection diagnostics redact marked answers and authentication 
   } finally { await f.client.dispose(); }
 });
 
+for (const diagnostics of [false, true]) test(`unknown submission status permits late binding (diagnostics=${diagnostics})`, async () => {
+  const sent = deferred<string>();
+  const f = await fixture(async (_method, params) => {
+    const { submissionId } = asSubmitParams(params);
+    sent.resolve(submissionId);
+    return { submissionId, disposition: 'dispatched' };
+  });
+  try {
+    const waiting = f.session.submit({ input: 'work' });
+    void waiting.catch(() => {});
+    const submissionId = await sent.promise;
+    const error = { code: 'NATIVE_UNKNOWN', message: 'Unknown outcome', retryable: false, outcomeUnknown: false };
+    await f.sink.emit({ type: 'submission/status', payload: { submissionId, status: 'unknown', ...(diagnostics ? { error } : {}) } });
+    await expect(waiting).rejects.toMatchObject({ code: diagnostics ? error.code : 'RESULT_UNKNOWN', outcomeUnknown: true });
+    await startAndBind(f.sink, { submissionId, turnId: 'late' });
+    await completed(f.sink, 'late');
+    expect(f.session.snapshot.status).toBe('ready');
+  } finally { await f.client.dispose(); }
+});
+
+test('a foreign config receipt cannot change the session binding', async () => {
+  const f = await fixture(async () => ({
+    ...f.session.snapshot, binding: { ...f.session.binding, sessionId: 'foreign' },
+  }));
+  try {
+    const binding = f.session.binding;
+    const params = { sessionId: binding.sessionId, requestId: 'config', patch: { model: 'model' } };
+    await expect(f.session.request('session/config/set', params)).rejects.toMatchObject({ code: 'PROTOCOL_ERROR', outcomeUnknown: true });
+    expect(f.session.binding).toEqual(binding);
+  } finally { await f.client.dispose(); }
+});
+
 /** Pass malformed JavaScript values through a deliberate type assertion. submit must reject INVALID_PARAMS before the adapter is called; finally dispose the fixture. */
 test('malformed JavaScript input fails with typed validation before native dispatch', async () => {
   const f = await fixture(async () => closeResult);
@@ -588,6 +681,36 @@ for (const cleanupFails of [false, true]) test(`failed client initialization pre
   } finally { await f.client.dispose(); }
 });
 
+test('concurrent initialization shares negotiation across independent waits', async () => {
+  const f = await fixture(async () => closeResult);
+  const enter = deferred<void>(), release = deferred<void>();
+  const initialize = f.adapter.initialize.bind(f.adapter);
+  let negotiations = 0;
+  const client = new Client({ identity: f.client.identity, adapter: {
+    ...f.adapter,
+    async initialize(params) {
+      enter.resolve();
+      expect(params.protocolVersions).toEqual([AHP_PROTOCOL_VERSION]);
+      expect(params.clientInfo.version).toBe(sdkPackage.version);
+      negotiations++;
+      await release.promise;
+      return initialize(params);
+    },
+  } });
+  try {
+    const controller = new AbortController();
+    const abandoned = client.initialize({ signal: controller.signal });
+    const remaining = client.initialize();
+    await enter.promise;
+    controller.abort();
+    await expect(abandoned).rejects.toMatchObject({ code: 'REQUEST_ABORTED' });
+    expect(negotiations).toBe(1);
+    release.resolve();
+    await remaining;
+    await client.sessions.create({ cwd: process.cwd() });
+  } finally { release.resolve(); await client.dispose(); await f.client.dispose(); }
+});
+
 /** Count opens while checking wait, shape, identity and capability precedence. Rejections must acquire no backend, and one valid fork must still open afterward; finally dispose the client. */
 test('open admission rejects invalid bindings and fork modes before native dispatch', async () => {
   const f = await fixture(async () => closeResult);
@@ -599,7 +722,7 @@ test('open admission rejects invalid bindings and fork modes before native dispa
   const foreign = { ...reference, binding: { ...reference.binding, runtimeConfigId: 'foreign' } };
   try {
     const abort = new AbortController(); abort.abort();
-    const malformedForeignFork = { ...foreign, mode: 'fork' as const, requestId: 'malformed-foreign-fork' };
+    const malformedForeignFork = { ...foreign, mode: 'fork' as const, requestId: 'malformed-foreign-fork' } as Parameters<typeof f.client.openSession>[0];
     // Each request violates several rules: caller-wait checks must win before shape/binding/capability admission.
     await expect(f.client.openSession(malformedForeignFork, { signal: abort.signal, timeoutMs: 0 })).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
     await expect(f.client.openSession(malformedForeignFork, { signal: abort.signal })).rejects.toMatchObject({ code: 'REQUEST_ABORTED' });
@@ -610,7 +733,7 @@ test('open admission rejects invalid bindings and fork modes before native dispa
     })).rejects.toMatchObject({ code: 'SESSION_BINDING_MISMATCH' });
     await expect(f.client.sessions.resume(foreign)).rejects.toMatchObject({ code: 'SESSION_BINDING_MISMATCH' });
     await expect(f.client.sessions.fork(foreign, { boundary: { turnId: 'turn', relation: 'before' } })).rejects.toMatchObject({ code: 'SESSION_BINDING_MISMATCH' });
-    await expect(f.client.openSession({ ...reference, mode: 'fork', requestId: 'missing-fork' })).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    await expect(f.client.openSession({ ...reference, mode: 'fork', requestId: 'missing-fork' } as Parameters<typeof f.client.openSession>[0])).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
     await expect(f.client.sessions.fork(reference, { boundary: { turnId: 'turn', relation: 'through' } })).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
     expect(opens).toBe(0);
     const fork = await f.client.sessions.fork(reference, { boundary: { turnId: 'turn', relation: 'before' } });
@@ -645,6 +768,56 @@ test('aborting an open observer still releases a late native backend without reo
     await f.client.dispose();
     expect(opens).toBe(1); expect(releases).toBe(1);
   } finally { release.resolve(); await f.client.dispose(); }
+});
+
+test('an active snapshot over the execution limit releases the failed attachment before returning', async () => {
+  const f = await fixture(async () => closeResult, { limits: { maxExecutions: 1 } });
+  const nativeOpen = f.adapter.openSession;
+  f.adapter.openSession = async (params, sink) => ({
+    ...await nativeOpen(params, sink),
+    state: { binding: params.binding, capabilities, capabilityRevision: 1, config: {}, status: 'running', activeTurnIds: ['one', 'two'] },
+  });
+  try {
+    await expect(f.client.sessions.create({ cwd: process.cwd() })).rejects.toMatchObject({ code: 'BACKPRESSURE_EXCEEDED' });
+    expect(f.disposals).toBe(1);
+  } finally { await f.client.dispose(); }
+  expect(f.disposals).toBe(2);
+});
+
+test('closing during local teardown awaits native interaction cancellation before releasing the backend', async () => {
+  const f = await fixture(async () => closeResult, { interactions: { userInput: undefined } });
+  const entered = deferred<void>(), release = deferred<void>();
+  try {
+    const interaction = f.sink.requestInteraction({ kind: 'userInput', interactionId: 'pending', questions: [{ id: 'q', prompt: 'Question' }] }, async response => {
+      expect(response).toBeNull();
+      entered.resolve();
+      await release.promise;
+    });
+    void interaction.catch(() => {});
+    const teardown = f.session.dispose();
+    await entered.promise;
+    await expect(f.session.close({ timeoutMs: 5 })).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT' });
+    expect(f.disposals).toBe(0);
+    const closing = f.session.close();
+    release.resolve();
+    await expect(interaction).rejects.toMatchObject({ code: 'INTERACTION_CANCELLED' });
+    await teardown;
+    expect(await closing).toEqual(closeResult);
+    expect(f.disposals).toBe(1);
+  } finally { release.resolve(); await f.client.dispose(); }
+});
+
+test('client disposal skips sessions whose backend was already released', async () => {
+  const f = await fixture(async () => closeResult);
+  try {
+    await f.session.close();
+    const dispose = f.session.dispose.bind(f.session);
+    let revisits = 0;
+    f.session.dispose = () => { revisits++; return dispose(); };
+    await f.client.dispose();
+    expect(revisits).toBe(0);
+    expect(f.disposals).toBe(1);
+  } finally { await f.client.dispose(); }
 });
 
 /** Delay an owned session release and call client disposal twice. Admission must close immediately, both callers must share teardown, and adapter release must follow sessions; finally release the gate and client. */

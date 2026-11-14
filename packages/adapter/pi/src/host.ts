@@ -5,7 +5,6 @@
 import type { AgentSession, AgentSessionEvent, SessionManager, ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import type { StructuredOutputToolDefinition } from '@anureo/sdk'
 import { Type } from 'typebox'
-import { join } from 'node:path'
 
 /** Normalized message blocks; tool arguments remain unredacted until adapter mapping. */
 export type PiHostContent =
@@ -150,7 +149,7 @@ export interface PiSessionHost {
   fork(entryId: string | null): Promise<PiSessionHost>
   /** Whether sessions are persisted so resume and fork can work. */
   readonly persistent: boolean
-  /** Release observation and native resources once. Embedded disposal requests abort without awaiting idle. */
+  /** Release native resources once. Embedded disposal waits for prompt admission and extension shutdown. */
   dispose(): Promise<void>
 }
 
@@ -243,7 +242,7 @@ export function toHostEvent(event: AgentSessionEvent): PiHostEvent | undefined {
  * Open an embedded Pi session with native resources and credentials. Persisted resume requires a
  * discoverable sessionId or rejects SESSION_NOT_FOUND. An unknown nonempty model reference
  * rejects MODEL_NOT_FOUND. Native loading and setup failures also reject. Await disposal of each
- * returned host. Abort first when native idle completion is required before releasing observation.
+ * returned host.
  */
 export const createPiHost: PiHostFactory = async (open: PiHostOpenOptions) => {
   const pi = await import('@earendil-works/pi-coding-agent')
@@ -282,6 +281,13 @@ function messageUpdateToHost(event: Extract<AgentSessionEvent, { type: 'message_
 }
 
 type HostMessageUpdate = Extract<PiHostEvent, { type: 'message_update' }>
+type HostSettlement = Extract<PiHostEvent, { type: 'settled' }>
+
+interface HostPrompt {
+  admission: Promise<PiPromptDisposition>
+  started: boolean
+  settlement?: HostSettlement
+}
 
 /** Select a native manager before opening resources. Persisted resume throws if the ID cannot be found. */
 function openSessionManager(pi: PiSdk, open: PiHostOpenOptions): SessionManager {
@@ -308,42 +314,53 @@ class DefaultPiHost implements PiSessionHost {
   get sessionId(): string { return this.session.sessionId }
   get model(): string | undefined { const model = this.session.model; return model ? `${model.provider}/${model.id}` : undefined }
   get thinkingLevel(): string { return this.session.thinkingLevel }
-  get busy(): boolean { return !this.session.isIdle }
+  get busy(): boolean { return this.promptRun?.started === true || !this.session.isIdle }
   subscribe(listener: (event: PiHostEvent) => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   /**
    * PiBackendSession.submit awaits the native preflight disposition to return its receipt.
    * A native prompt that resolves without a preflight callback is reported as handled. If Pi
    * rejects after invoking the callback, the error goes to listeners as a run failure.
    */
-  prompt(text: string, images?: PiHostImage[]): Promise<PiPromptDisposition> {
-    return new Promise<PiPromptDisposition>((resolve, reject) => {
-      let reportedPreflight = false
-      const run = this.session.prompt(text, {
-        ...(images ? { images: hostImages(images) } : {}),
-        source: 'rpc',
-        preflightResult: disposition => {
-          reportedPreflight = true
-          resolve(disposition)
-        },
-      })
-      run.then(() => { if (!reportedPreflight) resolve('handled') }, cause => {
-        if (!reportedPreflight) reject(cause)
-        else this.emit({ type: 'error', message: cause instanceof Error ? cause.message : 'Pi run failed' })
-      })
+  async prompt(text: string, images?: PiHostImage[]): Promise<PiPromptDisposition> {
+    if (this.disposal) throw new Error('SESSION_CLOSED')
+    if (this.promptRun) throw new Error('PI_PROMPT_BUSY')
+    const admission = Promise.withResolvers<PiPromptDisposition>()
+    const run: HostPrompt = { admission: admission.promise, started: false }
+    this.promptRun = run
+    void this.session.prompt(text, {
+      ...(images ? { images: hostImages(images) } : {}),
+      source: 'rpc',
+      preflightResult: disposition => {
+        run.started = disposition === 'started'
+        if (run.started && this.disposal) this.abortOnClose()
+        admission.resolve(disposition)
+      },
+    }).then(() => {
+      this.promptRun = undefined
+      admission.resolve('handled')
+      if (run.settlement) this.emit(run.settlement)
+    }, cause => {
+      this.promptRun = undefined
+      if (run.started) this.emit({ type: 'error', message: cause instanceof Error ? cause.message : 'Pi run failed' })
+      else admission.reject(cause)
     })
+    return admission.promise
   }
   steer(text: string, images?: PiHostImage[]): Promise<PiInputDisposition> { return this.session.steer(text, images ? hostImages(images) : undefined, { source: 'rpc' }) }
   followUp(text: string, images?: PiHostImage[]): Promise<PiInputDisposition> { return this.session.followUp(text, images ? hostImages(images) : undefined, { source: 'rpc' }) }
   abort(): Promise<void> { return this.session.abort() }
   /**
-   * Supply models to createPiCatalogSession and PiBackendSession.setConfig. For reasoning
-   * models, an explicit null in Pi's level map removes that level from the supported list.
+   * Supply models to createPiCatalogSession and PiBackendSession.setConfig.
+   * Pi requires an explicit mapping for extended levels and treats null as disabled.
    */
   async listModels(): Promise<PiHostModel[]> {
     const models = await this.session.modelRuntime.getAvailable()
     return models.map(model => ({
       ref: `${model.provider}/${model.id}`, name: model.name ?? model.id, reasoning: model.reasoning,
-      thinkingLevels: model.reasoning ? ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].filter(level => (model.thinkingLevelMap as Record<string, unknown> | undefined)?.[level] !== null) : ['off'],
+      thinkingLevels: model.reasoning ? (['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const).filter(level => {
+        const mapped = model.thinkingLevelMap?.[level]
+        return level === 'xhigh' || level === 'max' ? mapped != null : mapped !== null
+      }) : ['off'],
       contextWindow: model.contextWindow,
     }))
   }
@@ -362,7 +379,7 @@ class DefaultPiHost implements PiSessionHost {
   setActiveTools(names: string[]): void { this.extensions.setActiveTools([...new Set([...names, ...(this.outputTool ? [this.outputTool] : [])])]) }
   /** Replace or disable the submission tool while retaining permission tools; disabling is allowed during terminal cleanup. */
   async setOutputTool(tool?: StructuredOutputToolDefinition): Promise<void> {
-    if (this.disposed) return
+    if (this.disposal) return
     if (tool && this.busy) throw new Error('STRUCTURED_OUTPUT_BUSY')
     this.outputCalls.clear()
     const active = this.extensions.getActiveTools().filter(name => name !== this.outputTool)
@@ -380,9 +397,15 @@ class DefaultPiHost implements PiSessionHost {
   entries(): PiHostEntry[] { return this.session.sessionManager.getBranch().map(entryToHost) }
   /** Await native manual compaction and expose only its optional textual summary. */
   async compact(instructions?: string): Promise<{ summary?: string }> {
-    const result = await this.session.compact(instructions)
-    const summary = record(result).summary
-    return typeof summary === 'string' ? { summary } : {}
+    if (this.compacting) throw new Error('PI_COMPACTION_BUSY')
+    this.compacting = true
+    try {
+      const result = await this.session.compact(instructions)
+      const summary = record(result).summary
+      return typeof summary === 'string' ? { summary } : {}
+    } finally {
+      this.compacting = false
+    }
   }
   /**
    * PiBackendSession.forkHost passes a verified leaf and uses the returned host for the new SDK
@@ -401,15 +424,25 @@ class DefaultPiHost implements PiSessionHost {
     }
     return createHostFromManager({ pi: this.pi, open: { ...this.open, mode: 'resume' }, sessionManager: forked, persistent: true })
   }
-  /** Detach observers and clear cached arguments before Pi disposal. Repeated calls skip cleanup. */
-  async dispose(): Promise<void> {
-    if (this.disposed) return
-    this.disposed = true
-    this.unsubscribe?.()
-    this.unsubscribe = undefined
-    this.listeners.clear()
-    this.outputCalls.clear()
-    this.session.dispose()
+  dispose(): Promise<void> {
+    return this.disposal ??= Promise.resolve().then(async () => {
+      try {
+        if (!this.session.isIdle) this.abortOnClose()
+        // Pi still reports idle when an input hook is pending. Keep the session
+        // alive until preflight rejects, handles the input, or starts an abortable run.
+        await this.promptRun?.admission.catch(() => {})
+        await this.session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' })
+      } finally {
+        this.unsubscribe()
+        this.listeners.clear()
+        this.outputCalls.clear()
+        this.session.dispose()
+      }
+    })
+  }
+
+  private abortOnClose(): void {
+    void this.session.abort().catch(() => {})
   }
   readonly persistent: boolean
   private readonly session: AgentSession
@@ -417,8 +450,10 @@ class DefaultPiHost implements PiSessionHost {
   private readonly open: PiHostOpenOptions
   private readonly extensions: ExtensionAPI
   private readonly listeners = new Set<(event: PiHostEvent) => void>()
-  private unsubscribe?: () => void
-  private disposed = false
+  private readonly unsubscribe: () => void
+  private promptRun?: HostPrompt
+  private compacting = false
+  private disposal?: Promise<void>
   private outputTool?: string
   private readonly outputCalls = new Map<string, unknown>()
 
@@ -432,6 +467,11 @@ class DefaultPiHost implements PiSessionHost {
     }
     if (event.type === 'tool_execution_end') this.outputCalls.delete(event.toolCallId)
     const mapped = toHostEvent(event)
+    // Pi emits settlement from a finally block, even when the prompt will reject.
+    if (mapped?.type === 'settled' && this.promptRun?.started) {
+      this.promptRun.settlement = mapped
+      return
+    }
     if (mapped) this.emit(mapped)
   }
 
@@ -452,20 +492,19 @@ async function createHostFromManager({ pi, open, sessionManager, persistent }: {
   pi: PiSdk; open: PiHostOpenOptions; sessionManager: SessionManager; persistent: boolean
 }): Promise<PiSessionHost> {
   const agentDir = open.agentDir ?? pi.getAgentDir()
-  const settingsManager = pi.SettingsManager.create(open.cwd, agentDir)
-  const modelRuntime = await pi.ModelRuntime.create({ authPath: join(agentDir, 'auth.json'), modelsPath: join(agentDir, 'models.json') })
-  const model = open.model ? resolveModel(modelRuntime, open.model) : undefined
-  if (open.model && !model) throw new Error('MODEL_NOT_FOUND')
   let extensions: ExtensionAPI | undefined
-  const loader = new pi.DefaultResourceLoader({
-    cwd: open.cwd, agentDir, settingsManager,
-    disabledBuiltinExtensions: ['mcp'],
-    extensionFactories: [api => { extensions = api }],
-    ...(open.instructions ? { appendSystemPrompt: [open.instructions] } : {}),
+  const services = await pi.createAgentSessionServices({
+    cwd: open.cwd, agentDir,
+    resourceLoaderOptions: {
+      disabledBuiltinExtensions: ['mcp'],
+      extensionFactories: [api => { extensions = api }],
+      ...(open.instructions ? { appendSystemPrompt: [open.instructions] } : {}),
+    },
   })
-  await loader.reload()
-  const { session } = await pi.createAgentSession({
-    cwd: open.cwd, agentDir, sessionManager, settingsManager, modelRuntime, resourceLoader: loader,
+  const model = open.model ? resolveModel(services.modelRuntime, open.model) : undefined
+  if (open.model && !model) throw new Error('MODEL_NOT_FOUND')
+  const { session } = await pi.createAgentSessionFromServices({
+    services, sessionManager,
     ...(model ? { model } : {}),
     ...(open.thinkingLevel ? { thinkingLevel: open.thinkingLevel as Parameters<AgentSession['setThinkingLevel']>[0] } : {}),
   })

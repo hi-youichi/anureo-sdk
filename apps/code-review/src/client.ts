@@ -1,4 +1,5 @@
-// CLI-owned backend construction and fix-session permission policy.
+// CLI-owned backend construction and session permission policy.
+import { basename, resolve } from 'node:path'
 import { createClaudeAdapter } from '@anureo/adapter-claude'
 import { createCodexAdapter } from '@anureo/adapter-codex'
 import { createHermesAdapter } from '@anureo/adapter-hermes'
@@ -15,12 +16,14 @@ export type ReviewHarness = (typeof reviewHarnesses)[number]
  * failures reject.
  *
  * Defaults to Codex, which uses cwd for its initial process launch. An override replaces the
- * built-in adapter. Keep harness aligned with that adapter because the SDK uses it in session bindings.
+ * built-in adapter. Keep harness aligned with that adapter because the SDK uses it in session bindings
+ * and applies the CLI's Pi permission policy.
  * The SDK handles approval requests using the narrowest advertised allow option and attempts
  * cancellation when none is offered. */
 export async function createReviewClient(cwd: string, harness: ReviewHarness = 'codex', override?: HarnessAdapter): Promise<Client> {
+  const adapter = override ?? harnessConfig[harness].adapter(cwd)
   return createClient({
-    adapter: override ?? harnessConfig[harness].adapter(cwd),
+    adapter: harness === 'pi' ? withPiReviewPermissions(adapter) : adapter,
     identity: { adapterId: harness, runtimeConfigId: 'code-review' },
     interactions: {
       approval: approveWithNarrowestScope,
@@ -29,10 +32,21 @@ export async function createReviewClient(cwd: string, harness: ReviewHarness = '
 }
 
 /** Select the CLI fix agent's session permission mode for source edits and project checks.
- * reviewAndPrintReport passes this to reviewCode only for --fix; undefined (Hermes/Pi) leaves
+ * reviewAndPrintReport passes this to reviewCode only for --fix; undefined (Hermes) leaves
  * fix sessions at backend defaults. Internal CLI policy. */
 export function fixPermissionMode(harness: ReviewHarness): string | undefined {
   return harnessConfig[harness].fix
+}
+
+/** The CLI uses Pi's read-only tools for analysis, review and verification. The fix agent
+ * supplies an explicit mode through the review API. */
+function withPiReviewPermissions(adapter: HarnessAdapter): HarnessAdapter {
+  return {
+    initialize: params => adapter.initialize(params),
+    openSession: (params, sink) => adapter.openSession({ ...params, permissionMode: params.permissionMode ?? 'read-only' }, sink),
+    outputBridgeTransport: adapter.outputBridgeTransport?.bind(adapter),
+    dispose: () => adapter.dispose(),
+  }
 }
 
 /** Include a configured executable for Claude or Hermes. Trim only for the presence check so the
@@ -46,7 +60,10 @@ function optionalCommand(name: 'CLAUDE_BIN' | 'HERMES_BIN'): { command?: string 
  * Claude/Hermes use their raw override only when nonblank, otherwise their adapter defaults. */
 const harnessConfig = {
   codex: {
-    adapter: (cwd: string) => createCodexAdapter({ command: process.env.CODEX_BIN?.trim() || 'codex', cwd }),
+    adapter: (cwd: string) => {
+      const executable = process.env.CODEX_BIN?.trim() || 'codex'
+      return createCodexAdapter({ command: basename(executable) === executable ? executable : resolve(cwd, executable), cwd })
+    },
     fix: 'agent',
   },
   claude: {
@@ -57,5 +74,5 @@ const harnessConfig = {
     adapter: () => createHermesAdapter(optionalCommand('HERMES_BIN')),
     fix: undefined,
   },
-  pi: { adapter: () => createPiAdapter(), fix: undefined },
+  pi: { adapter: () => createPiAdapter(), fix: 'agent-full-access' },
 } satisfies Record<ReviewHarness, { adapter: (cwd: string) => HarnessAdapter; fix: string | undefined }>

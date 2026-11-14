@@ -1,8 +1,9 @@
 import { expect, test } from 'bun:test'
 import { collect, fixture, observe, request, types, until } from './test-helpers'
-import { fakeFactory } from './fake-host'
-import { createClient } from '@anureo/sdk'
+import { FakePiHost, fakeFactory } from './fake-host'
+import { createClient, type SessionEventSink } from '@anureo/sdk'
 import { createPiAdapter } from '../src/index'
+import type { PiHostMessage } from '../src/host'
 
 test('a prompt streams items in order and completes only when Pi settles', async () => {
   const f = await fixture()
@@ -91,6 +92,28 @@ test('native delivery steers an active turn and joins it; afterTurn uses follow-
   } finally { await f.dispose() }
 })
 
+test('a delayed queue receipt binds to the turn that consumed the input', async () => {
+  const f = await fixture()
+  try {
+    f.host.script = async host => { await host.hold(); host.user('follow-up'); await host.assistant('end') }
+    const first = await f.session.submit({ input: 'one' })
+    const followUp = f.host.followUp.bind(f.host)
+    const receipt = Promise.withResolvers<void>()
+    f.host.followUp = async text => {
+      const disposition = await followUp(text)
+      await receipt.promise
+      return disposition
+    }
+    const joined = observe(f.session.submit({ input: 'follow-up', delivery: 'afterTurn' }, { timeoutMs: 2000 }))
+    await until(() => f.host.followed.length === 1)
+    f.host.release!()
+    expect((await first.result()).status).toBe('completed')
+    receipt.resolve()
+    expect((await joined).id).toBe(first.id)
+    expect(f.events.filter(e => e.type === 'turn/started')).toHaveLength(1)
+  } finally { await f.dispose() }
+})
+
 test('input consumed by an extension is accepted without being reported as queued agent input', async () => {
   const f = await fixture()
   try {
@@ -98,10 +121,11 @@ test('input consumed by an extension is accepted without being reported as queue
     const first = await observe(f.session.submit({ input: 'one' }))
     await until(() => f.events.some(e => e.type === 'turn/started'))
     f.host.steerDisposition = 'handled'
-    const handled = f.session.submit({ input: '/ext cmd' }, { timeoutMs: 100 })
-    await expect(handled).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT' }) // no execution to bind: nothing invented
-    expect(f.events.filter(e => e.type === 'submission/bound')).toHaveLength(1)
+    expect(await request(f.session, 'input/submit', {
+      submissionId: 'extension-input', input: [{ type: 'text', text: '/ext cmd' }], delivery: 'native',
+    })).toEqual({ submissionId: 'extension-input', accepted: true, disposition: 'accepted' })
     f.host.release!(); await first.result()
+    expect(f.events.filter(e => e.type === 'submission/bound')).toHaveLength(1)
   } finally { await f.dispose() }
 })
 
@@ -151,12 +175,14 @@ test('a prompt handled by an extension releases the idle reservation without sta
   const f = await fixture()
   try {
     f.host.promptDisposition = 'handled'
-    const turn = f.session.submit({ input: '/command' }, { timeoutMs: 100 })
-    await expect(turn).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT' })
+    expect(await request(f.session, 'input/submit', {
+      submissionId: 'extension-input', input: [{ type: 'text', text: '/command' }], delivery: 'native',
+    })).toEqual({ submissionId: 'extension-input', accepted: true, disposition: 'accepted' })
     expect(f.events.some(e => e.type === 'turn/started')).toBe(false)
     f.host.promptDisposition = 'started'
     const next = await f.session.submit({ input: 'next' }, { timeoutMs: 2000 })
     expect((await next.result()).text).toBe('done: next')
+    expect(f.events.filter(e => e.type === 'submission/bound').map(e => e.payload.submissionId)).not.toContain('extension-input')
   } finally { await f.dispose() }
 })
 
@@ -257,6 +283,52 @@ test('resume reopens a persisted session with its history', async () => {
   } finally { await f.dispose() }
 })
 
+test('history and a through fork include a queued follow-up after an assistant stop', async () => {
+  const f = await fixture()
+  try {
+    f.host.script = async (host, text) => {
+      await host.assistant(`done: ${text}`)
+      if (text !== 'one') return
+      await host.hold()
+      host.user('follow-up')
+      await host.assistant('follow-up answer')
+    }
+    const first = await f.session.submit({ input: 'one' })
+    await until(() => !!f.host.release)
+    expect((await f.session.submit({ input: 'follow-up', delivery: 'afterTurn' })).id).toBe(first.id)
+    f.host.release!()
+    await first.result()
+    await (await f.session.submit({ input: 'two' })).result()
+    const history = (await request(f.session, 'history/read', {})).items
+    expect(history.map(entry => entry.turnId).slice(0, 4)).toEqual(Array(4).fill(first.id))
+    const forked = await f.client.sessions.fork(f.session.reference, { boundary: { turnId: first.id, relation: 'through' } })
+    expect((await request(forked, 'history/read', {})).items).toEqual(history.slice(0, 4))
+  } finally { await f.dispose() }
+})
+
+test('a fresh adapter can fork by the turn ID returned from persisted history', async () => {
+  const fake = fakeFactory()
+  const connect = () => createClient({ adapter: createPiAdapter({ version: '1.5.2', createHost: fake.factory }), identity: { adapterId: 'pi', runtimeConfigId: 'test' } })
+  const original = await connect()
+  const reference = await (async () => {
+    try {
+      const session = await original.sessions.create({ cwd: process.cwd() })
+      await (await session.submit({ input: 'first' })).result()
+      await (await session.submit({ input: 'second' })).result()
+      return session.reference
+    } finally { await original.dispose() }
+  })()
+  const fresh = await connect()
+  try {
+    const resumed = await fresh.sessions.resume(reference)
+    const history = (await request(resumed, 'history/read', {})).items
+    const turnId = history[0]!.turnId
+    expect(turnId).toBe('native:e1')
+    const forked = await fresh.sessions.fork(reference, { boundary: { turnId, relation: 'through' } })
+    expect((await request(forked, 'history/read', {})).items).toEqual(history.slice(0, 2))
+  } finally { await fresh.dispose() }
+})
+
 test('compaction surfaces as notices outside a turn and as items inside one, and leaves the session usable', async () => {
   const f = await fixture()
   try {
@@ -280,6 +352,35 @@ test('configured secrets are redacted from events and history', async () => {
     expect(JSON.stringify(f.events)).not.toContain('TOPSECRET')
     expect(JSON.stringify(history)).not.toContain('TOPSECRET')
     expect(JSON.stringify(f.events)).toContain('[REDACTED]')
+  } finally { await f.dispose() }
+})
+
+test('configured secrets split across text and thinking deltas stay private', async () => {
+  const f = await fixture({ secrets: ['TOPSECRET'] })
+  try {
+    f.host.script = async host => {
+      const message: PiHostMessage = {
+        role: 'assistant', stopReason: 'stop',
+        content: [{ type: 'thinking', thinking: 'key TOPSECRET' }, { type: 'text', text: 'key TOPSECRET' }],
+      }
+      host.emit({ type: 'message_start', message })
+      for (const [index, kind] of (['thinking', 'text'] as const).entries()) {
+        const update = { kind, index }
+        host.emit({ type: 'message_update', message, update: { ...update, phase: 'start' } })
+        host.emit({ type: 'message_update', message, update: { ...update, phase: 'delta', delta: 'key TOP' } })
+        host.emit({ type: 'message_update', message, update: { ...update, phase: 'delta', delta: 'SECRET' } })
+        host.emit({ type: 'message_update', message, update: { ...update, phase: 'end' } })
+      }
+      host.append(message)
+      host.emit({ type: 'message_end', message })
+    }
+    const result = await (await f.session.submit({ input: 'go' })).result()
+    for (const kind of ['text', 'reasoningSummary']) {
+      const deltas = f.events.flatMap(e => e.type === 'item/delta' && e.payload.kind === kind ? [e.payload.text] : [])
+      expect(deltas.join('')).toBe('key [REDACTED]')
+    }
+    expect(result.text).toBe('key [REDACTED]')
+    expect(result.items.find(item => item.type === 'reasoning')).toMatchObject({ text: 'key [REDACTED]' })
   } finally { await f.dispose() }
 })
 
@@ -311,6 +412,83 @@ test('adapter disposal disposes every open host', async () => {
   await f.client.dispose()
   expect(f.hosts.every(host => host.disposed)).toBe(true)
   expect(f.hosts.every(host => host.listeners.size === 0)).toBe(true)
+  expect(f.adapter.turnMaps.size).toBe(0)
   void other
   await f.dispose().catch(() => {})
 })
+
+test('disposing an adapter during direct open releases the late host', async () => {
+  const host = new FakePiHost({ mode: 'new', cwd: process.cwd(), persist: true })
+  const gate = Promise.withResolvers<FakePiHost>()
+  const adapter = createPiAdapter({ version: '1.5.2', createHost: () => gate.promise })
+  const opening = adapter.openSession({
+    mode: 'new', cwd: process.cwd(), requestId: 'open',
+    binding: { sessionId: 's', adapterId: 'pi', runtimeConfigId: 'test' },
+  }, unusedSink())
+  await adapter.dispose()
+  gate.resolve(host)
+  await expect(opening).rejects.toMatchObject({ code: 'RUNTIME_DISPOSED' })
+  expect(host.disposed).toBe(true)
+  expect(host.listeners.size).toBe(0)
+  expect(adapter.turnMaps.size).toBe(0)
+})
+
+test('non-resumable sessions do not retain turn maps in the adapter', async () => {
+  const f = await fixture({ persistSessions: false })
+  try {
+    const turn = await f.session.submit({ input: 'transient' })
+    await turn.result()
+    expect((await request(f.session, 'history/read', {})).items[0]?.turnId).toBe(turn.id)
+    await f.session.close()
+    expect(f.adapter.turnMaps.size).toBe(0)
+  } finally { await f.dispose() }
+})
+
+for (const overflow of ['event count', 'event size'] as const) test(`native callback ${overflow} can fail observation while publication is stalled`, async () => {
+  const host = new FakePiHost({ mode: 'new', cwd: process.cwd(), persist: false })
+  const adapter = createPiAdapter({ createHost: async () => host })
+  const stalled = Promise.withResolvers<void>()
+  const publishing = Promise.withResolvers<void>()
+  const failure = Promise.withResolvers<unknown>()
+  const emitted: string[] = []
+  const sink = unusedSink()
+  sink.emit = async event => {
+    emitted.push(event.type)
+    publishing.resolve()
+    await stalled.promise
+  }
+  sink.fail = async error => { failure.resolve(error) }
+  try {
+    await adapter.openSession({
+      mode: 'new', cwd: process.cwd(), requestId: 'open',
+      binding: { sessionId: 's', adapterId: 'pi', runtimeConfigId: 'test' },
+    }, sink)
+    host.emit({ type: 'agent_start' })
+    await publishing.promise
+    if (overflow === 'event count') {
+      for (let i = 0; i < 2049; i++) host.emit({ type: 'session_name', name: 'burst' })
+    } else {
+      const args = { bytes: new Uint8Array(8 * 1024 * 1024), opaque: 1n }
+      host.emit({ type: 'tool_start', id: 'oversized', name: 'read', args })
+    }
+    host.emit({ type: 'settled', aborted: false })
+    expect(await failure.promise).toMatchObject({ code: 'BACKPRESSURE_EXCEEDED', outcomeUnknown: true })
+    stalled.resolve()
+    await new Promise<void>(resolve => setImmediate(resolve))
+    expect(emitted).toEqual(['turn/started'])
+  } finally {
+    stalled.resolve()
+    await adapter.dispose()
+  }
+})
+
+function unusedSink(): SessionEventSink {
+  return {
+    bindSubmission: async () => {},
+    emit: async () => {},
+    tryEmit: () => true,
+    requestInteraction: async () => { throw new Error('Unexpected interaction') },
+    resolveInteraction: async () => {},
+    fail: async () => {},
+  }
+}

@@ -1,6 +1,6 @@
-import { HarnessSdkError } from '@anureo/sdk'
+import { HarnessSdkError, sdkError } from '@anureo/sdk'
 import { spawnHarnessProcess, type HarnessProcess } from '@anureo/sdk/process'
-import type { HermesAdapterOptions } from './options'
+import { DEFAULT_TIMEOUT_MS, type HermesAdapterOptions } from './options'
 import { array, GATEWAY_PROTOCOL, identity, object, protocolError } from './native'
 
 /** Validated CLI evidence for one local WebSocket connection. */
@@ -27,22 +27,30 @@ export type AttachMode = 'start' | 'attach' | 'recover'
  */
 export async function attachGateway(options: HermesAdapterOptions, mode: AttachMode, signal?: AbortSignal): Promise<GatewayGrant> {
   if (signal?.aborted) throw new HarnessSdkError('RUNTIME_DISPOSED')
-  const args = attachArguments(options, mode)
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const args = attachArguments(options, mode, timeoutMs)
   const child = await (options.processFactory ?? spawnHarnessProcess)({
     command: options.command ?? 'hermes',
     args,
-    env: options.env,
+    env: options.env && { ...options.env },
   })
   const stderr = drainAttachStderr(child.stderr, options)
+  let attachFailure: HarnessSdkError | undefined
   try {
-    return await waitForGrant(child, options.timeoutMs ?? 30_000, signal)
+    return await waitForGrant(child, timeoutMs, signal)
   } catch (cause) {
     // Attach has not submitted any work, even when its read/validation fails.
-    if (cause instanceof HarnessSdkError) throw new HarnessSdkError(cause.code, cause.message, cause.retryable, false)
-    throw new HarnessSdkError('PROTOCOL_ERROR', 'Invalid Hermes attach response')
+    attachFailure = cause instanceof HarnessSdkError
+      ? new HarnessSdkError(cause.code, cause.message, cause.retryable, false)
+      : new HarnessSdkError('PROTOCOL_ERROR', 'Invalid Hermes attach response')
+    throw attachFailure
   } finally {
-    await child.dispose()
-    await stderr
+    try { await child.dispose() }
+    catch (cause) {
+      if (!attachFailure) throw cause
+      throw new HarnessSdkError(attachFailure.code, attachFailure.message, attachFailure.retryable, false,
+        { cleanupCode: sdkError(cause, 'RESOURCE_RELEASE_FAILED').code })
+    } finally { await stderr }
   }
 }
 
@@ -71,14 +79,17 @@ export function validateGrant(value: unknown): GatewayGrant {
   }
 }
 
-/** Leave owner policy implicit for attach-only and round up for the CLI's whole-second timeout. */
-function attachArguments(options: HermesAdapterOptions, mode: AttachMode): string[] {
+/** Leave time for ticket minting after startup and for discovery before recovery. */
+function attachArguments(options: HermesAdapterOptions, mode: AttachMode, timeoutMs: number): string[] {
+  const reserveMs = mode === 'recover' ? 10_000 : mode === 'start' ? 5_000 : 0
+  // Keep a startup budget even when the caller's deadline is shorter than the reserve.
+  const cliTimeoutMs = Math.max(1, timeoutMs - Math.min(reserveMs, timeoutMs / 2))
   return [
     ...(options.args ?? []),
     ...(options.profile ? ['-p', options.profile] : []),
     'gateway', 'attach', '--json',
     ...(mode === 'attach' ? [] : [`--${mode}`]),
-    '--timeout', String(Math.max(1, Math.ceil((options.timeoutMs ?? 30_000) / 1000))),
+    '--timeout', String(cliTimeoutMs / 1000),
   ]
 }
 

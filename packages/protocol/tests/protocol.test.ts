@@ -177,6 +177,30 @@ describe('interactions and private payload projection', () => {
     expect(validateInteractionResponse(request, { kind: 'userInput', answers: { choice: ['a', 'other'] } })).toBe(false)
     expect(validateInteractionResponse(request, { kind: 'userInput', answers: { choice: ['a', 1] } })).toBe(false)
   })
+  test('required question answers must be own properties', () => {
+    const request: InteractionRequested = {
+      interactionId: 'questions', kind: 'userInput', questions: [{ id: 'constructor', prompt: 'Answer' }],
+    }
+    expect(validateInteractionResponse(request, { kind: 'userInput', answers: {} })).toBe(false)
+    expect(validateInteractionResponse(request, { kind: 'userInput', answers: { constructor: 'supplied' } })).toBe(true)
+  })
+  test('question diagnostics include all failing answer paths without submitted values', () => {
+    const request: InteractionRequested = {
+      interactionId: 'questions', kind: 'userInput', questions: [
+        { id: 'missing/~answer', prompt: 'Answer' },
+        { id: 'choice', prompt: 'Choose', options: [{ id: 'a', label: 'A' }] },
+      ],
+      schema: { required: ['missing/~answer'] },
+    }
+    const response = { kind: 'userInput', answers: { choice: 'private-value' } }
+    expect(() => assertInteractionResponse(request, response)).toThrow(expect.objectContaining({
+      code: 'INVALID_PARAMS', outcomeUnknown: false,
+      issues: [
+        { instancePath: '/answers/missing~1~0answer', keyword: 'required', message: 'Supply an answer to this question' },
+        { instancePath: '/answers/choice', keyword: 'optionId', message: 'Select only offered option IDs' },
+      ],
+    }))
+  })
   test('resolved unknown is explicit and schema-valid', () => {
     expect(validateEvent({ ...envelope, type: 'interaction/resolved', payload: { interactionId: 'i', outcome: 'unknown' } })).toBe(true)
     expect(validateEvent({ ...envelope, type: 'interaction/resolved', payload: { interactionId: 'i', outcome: 'approvedProbably' } })).toBe(false)
@@ -192,6 +216,38 @@ describe('interactions and private payload projection', () => {
     expect(event.payload.privatePayload?.token).toBe('credential')
     expect(validateEvent(safe)).toBe(true)
     expect(publicInteraction({ ...approval, privatePayload: { password: 'secret' } }).privatePayload).toBeUndefined()
+  })
+  test('public interaction schemas preserve constraints and redact annotations', () => {
+    const request = {
+      interactionId: 'form', kind: 'elicitation', mode: 'form',
+      schema: {
+        type: 'object',
+        properties: {
+          password: { $ref: '#/$defs/credentials' },
+          link: { const: 'https://example.test/?part=constraint', description: 'See https://example.test/?part=annotation' },
+          privatePayload: false,
+        },
+        required: ['password', 'link'],
+        $defs: { credentials: {
+          type: 'string', writeOnly: true, default: 'private-default', examples: ['private-example'],
+          privatePayload: { token: 'private-schema-token' },
+        } },
+      },
+      privatePayload: { token: 'private-token' },
+    } as const satisfies InteractionRequested
+    const safe: InteractionRequested = publicEvent({ ...envelope, type: 'interaction/requested', payload: request }).payload
+    expect(safe).toEqual(publicInteraction(request))
+    expect(safe.schema).toEqual({
+      ...request.schema,
+      properties: { ...request.schema.properties, link: { ...request.schema.properties.link, description: 'See https://example.test/' } },
+      $defs: { credentials: {
+        type: 'string', writeOnly: true, default: '[redacted]', examples: ['[redacted]'], privatePayloadAvailable: true,
+      } },
+    })
+    expect(safe.privatePayload).toBeUndefined()
+    expect(validateInteractionResponse(safe, { kind: 'elicitation', action: 'accept',
+      content: { password: 'answer', link: request.schema.properties.link.const },
+    })).toBe(true)
   })
 })
 
@@ -238,6 +294,19 @@ test('result assertions, public values and broken schemas fail closed', () => {
     token: '[redacted]',
     nested: [{ apiKey: '[redacted]', url: 'https://x.test/a', plainUrl: 'https://x.test/b', redirect: 'Open https://x.test/c now' }],
   })
+})
+
+test('caller schemas compile independently and only synchronous validation is supported', () => {
+  const form = { $id: 'https://example.test/form', type: 'object', required: ['count'] }
+  expect(validateJsonSchema(form, { count: 1 })).toBe(true)
+  expect(validateJsonSchema({ ...form }, { count: 2 })).toBe(true)
+  expect(validateJsonSchema({ ...form }, {})).toBe(false)
+  const request: InteractionRequested = {
+    interactionId: 'async-form', kind: 'elicitation', mode: 'form',
+    schema: { ...form, $id: 'https://example.test/async-form', $async: true },
+  }
+  expect(validateInteractionResponse(request, { kind: 'elicitation', action: 'accept', content: {} })).toBe(false)
+  expect(validateInteractionResponse(request, { kind: 'elicitation', action: 'accept', content: { count: 1 } })).toBe(false)
 })
 
 test('file-change source material is optional and validates every discriminated variant', () => {

@@ -50,7 +50,9 @@ export interface ReviewReport {
   /** Canonical absolute directory reviewed by the agents. */
   cwd: string
   /** 'incomplete' when any recorded angle or fix failed, or the workflow reports incomplete
-   * execution. A 'completed' report can still contain findings or skipped fixes. */
+   * execution. A 'completed' report can still contain findings or skipped fixes.
+   * In durable storage, run.json tracks workflow execution. Read result.json for
+   * review coverage, including source validation and fix failures. */
   status: 'completed' | 'incomplete'
   /** Full validated analysis plan, including modules omitted by selection or limits. */
   plan: ModulePlan

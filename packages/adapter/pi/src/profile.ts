@@ -2,6 +2,9 @@
 import type { Capabilities } from '@anureo/protocol'
 import { PERMISSION_MODES } from './mapping'
 
+const PERSISTED_SESSION_MIN_VERSION = '1.5.2'
+const [minMajor, minMinor, minPatch] = PERSISTED_SESSION_MIN_VERSION.split('.').map(Number)
+
 /** Exact Pi release strings verified for resume, fork and compaction. */
 export const VERIFIED_PI_VERSIONS = ['1.5.2'] as const
 /** Capabilities selected from a trusted Pi version, before persistence settings are applied. */
@@ -24,7 +27,7 @@ export interface PiProfile {
  */
 export function resolvePiProfile(version?: string): PiProfile {
   if (version && supportsResumeForkAndCompaction(version)) {
-    return { since: '1.5.2', resume: true, fork: true, compact: true, verified: (VERIFIED_PI_VERSIONS as readonly string[]).includes(version) }
+    return { since: PERSISTED_SESSION_MIN_VERSION, resume: true, fork: true, compact: true, verified: (VERIFIED_PI_VERSIONS as readonly string[]).includes(version) }
   }
   return { since: '0.0.0', resume: false, fork: false, compact: false, verified: false }
 }
@@ -57,5 +60,5 @@ function supportsResumeForkAndCompaction(version: string): boolean {
   if (!match) return false
   const [, major, minor, patch] = match
   const minorVersion = Number(minor)
-  return Number(major) === 1 && (minorVersion > 5 || (minorVersion === 5 && Number(patch) >= 2))
+  return Number(major) === minMajor && (minorVersion > minMinor || (minorVersion === minMinor && Number(patch) >= minPatch))
 }

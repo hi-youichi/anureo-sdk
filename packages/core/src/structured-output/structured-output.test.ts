@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
+import { tmpdir } from 'node:os'
 import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
@@ -274,8 +275,8 @@ for (const status of ['failed', 'interrupted'] as const) test(`an accepted MCP v
   expect(result.text).toBe('')
 })
 
-test('missing output and exhausted correction budget become failed turns without replay', async () => {
-  for (const attempts of [0, 3]) {
+test('missing output and rejected corrections become failed turns without replay', async () => {
+  for (const attempts of [0, 1, 3]) {
     const f = await fixture(async (input, sink, config) => {
       const mcp = await connect(config!)
       try {
@@ -283,7 +284,11 @@ test('missing output and exhausted correction budget become failed turns without
         await final(sink, 'turn-1')
       } finally { await mcp.close() }
     })
-    expect(await (await f.session.submit({ input: 'work', outputSchema: SCHEMA })).result()).toMatchObject({ status: 'failed', error: { code: attempts ? 'STRUCTURED_OUTPUT_RETRIES_EXCEEDED' : 'STRUCTURED_OUTPUT_MISSING' } })
+    const code = attempts === 3 ? 'STRUCTURED_OUTPUT_RETRIES_EXCEEDED' : attempts ? 'STRUCTURED_OUTPUT_INVALID' : 'STRUCTURED_OUTPUT_MISSING'
+    expect(await (await f.session.submit({ input: 'work', outputSchema: SCHEMA })).result()).toMatchObject({
+      status: 'failed',
+      error: { code, ...(attempts ? { details: { issues: [{ path: '', code: 'required', missingProperty: 'sum' }] } } : {}) },
+    })
     expect(f.calls).toBe(1)
   }
 })
@@ -312,6 +317,42 @@ test('native schema validation normalizes finals and rejects malformed JSON with
     expect(result.status).toBe(text === '{"sum":42}' ? 'completed' : 'failed')
     if (result.status === 'failed') expect(result.error.code).toBe(text === '{}' ? 'STRUCTURED_OUTPUT_INVALID' : 'STRUCTURED_OUTPUT_NOT_JSON')
   }
+})
+
+for (const accepted of [true, false]) test(`native schema ${accepted ? 'binding' : 'rejection'} releases held events for an ordinary turn`, async () => {
+  const pending = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+  const f = await fixture(async (input, sink) => {
+    if (!input.outputSchema) return
+    pending.resolve()
+    await release.promise
+    if (!accepted) throw new HarnessSdkError('INVALID_PARAMS')
+    await final(sink, 'turn-2', '{"sum":42}')
+  }, 'native')
+  const ordinary = await f.session.submit({ input: 'ordinary' })
+  const structured = f.session.submit({ input: 'structured', outputSchema: SCHEMA })
+  void structured.catch(() => {})
+  try {
+    await pending.promise
+    await final(f.sink, ordinary.id)
+    release.resolve()
+    if (accepted) expect(await (await structured).result({ timeoutMs: 500 })).toMatchObject({ status: 'completed', text: '{"sum":42}' })
+    else await expect(structured).rejects.toMatchObject({ code: 'INVALID_PARAMS' })
+    expect(await ordinary.result({ timeoutMs: 500 })).toMatchObject({ status: 'completed', text: 'Task done' })
+  } finally { release.resolve() }
+})
+
+test('native JSON assembly uses the latest message phase', async () => {
+  const f = await fixture(async (_input, sink) => {
+    const scope = { turnId: 'turn-1' }
+    const item = { id: 'progress', type: 'agentMessage' as const, phase: 'final' as const, text: 'Working' }
+    await sink.emit({ type: 'item/started', payload: { item } }, scope)
+    await sink.emit({ type: 'item/completed', payload: { item: { ...item, phase: 'commentary' } } }, scope)
+    const progress = { ...item, id: 'patched-progress' }
+    await sink.emit({ type: 'item/started', payload: { item: progress } }, scope)
+    await sink.emit({ type: 'item/delta', payload: { itemId: progress.id, kind: 'patch', value: { ...progress, phase: 'commentary' } } }, scope)
+    await final(sink, scope.turnId, '{"sum":42}')
+  }, 'native')
+  expect(await (await f.session.submit({ input: 'work', outputSchema: SCHEMA })).result()).toMatchObject({ status: 'completed', text: '{"sum":42}' })
 })
 
 test('invalid schema rejects before backend input and leaves the lane usable', async () => {
@@ -343,7 +384,7 @@ test('the packaged stdio entry runs on Node from an unrelated cwd and exits when
   disposals.push(() => manager.dispose())
   const lease = await manager.create('stdio', async () => ({ content: [{ type: 'text', text: 'accepted' }] }))
   if (lease.config.type !== 'stdio') throw new Error('stdio required')
-  const transport = new StdioClientTransport({ command: 'node', args: lease.config.args, env: { ...process.env, ...lease.config.env } as Record<string, string>, cwd: '/tmp', stderr: 'pipe' })
+  const transport = new StdioClientTransport({ command: 'node', args: lease.config.args, env: { ...process.env, ...lease.config.env } as Record<string, string>, cwd: tmpdir(), stderr: 'pipe' })
   const client = new McpClient({ name: 'node-consumer', version: '1' })
   const closed = Promise.withResolvers<void>()
   try {

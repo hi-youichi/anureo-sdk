@@ -38,7 +38,7 @@ async function setup({ scenario = 'normal', version = '0.164.0', timeoutMs = 100
   const identity = { adapterId: 'codex', runtimeConfigId: 'codex-test' }
   const adapter = createCodexAdapter({
     command: process.execPath,
-    args: [fileURLToPath(new URL('./fake-app-server.mjs', import.meta.url))],
+    args: [fileURLToPath(new URL(scenario === 'turns-paged' ? './native-lifecycle-fixture.mjs' : './fake-app-server.mjs', import.meta.url))],
     version,
     env: { ...process.env, FAKE_SCENARIO: scenario, FAKE_LOG_FILE: log },
     timeoutMs: bootstrapTimeoutMs,
@@ -258,7 +258,7 @@ describe('native interactions', () => {
     scenario: string
     response: InteractionResponse
     nativeRequestId: string | number
-    expectedResult?: JsonObject
+    expectedResult: JsonObject
   }> = [
     {
       scenario: 'approval',
@@ -270,6 +270,7 @@ describe('native interactions', () => {
       scenario: 'fileapproval',
       response: { kind: 'approval', optionId: 'decline' },
       nativeRequestId: 'server-request',
+      expectedResult: { decision: 'decline' },
     },
     {
       scenario: 'permission',
@@ -287,11 +288,13 @@ describe('native interactions', () => {
       scenario: 'elicitation',
       response: { kind: 'elicitation', action: 'cancel' },
       nativeRequestId: 'server-request',
+      expectedResult: { action: 'cancel', content: null },
     },
     {
       scenario: 'dynamic',
       response: { kind: 'dynamicTool', content: [{ type: 'text', text: 'tool output' }] },
       nativeRequestId: 'server-request',
+      expectedResult: { success: true, contentItems: [{ type: 'inputText', text: 'tool output' }] },
     },
   ]
   /** Await the requested interaction before answering through the SDK, then check fake wire correlation after completion; setup owns cleanup. */
@@ -306,7 +309,7 @@ describe('native interactions', () => {
     const reply = calls.find(call => call.id === nativeRequestId && !call.method)
     expect(reply).toBeDefined()
     expect(s.events.filter(event => event.type === 'interaction/resolved')).toHaveLength(1)
-    if (expectedResult !== undefined) expect(reply?.result).toEqual(expectedResult)
+    expect(reply?.result).toEqual(expectedResult)
   })
   /** Run the fake future-method case through completion: rejecting an unknown request must never expose an approval surface. */
   test('unknown native request receives method-not-found, never approval', async () => {
@@ -339,6 +342,12 @@ describe('versioned controls and history', () => {
     expect(two.items[0]?.nativeTurnId).toBe('native-turn-2'); expect(two.nextCursor).toBeNull()
     expect((await s.calls()).filter(call => call.method === 'thread/items/list')).toHaveLength(2)
     expect(await rejectionOf(s.session.request('history/read', { requestId: 'badcursor', sessionId: 'session', cursor: 'bad' }))).toMatchObject({ code: 'CURSOR_INVALID' })
+    const malformed = [{}, { offset: 0 }, { token: one.snapshotToken, offset: -1 }]
+    const cursors = ['', ...malformed.map(value => Buffer.from(JSON.stringify(value)).toString('base64url'))]
+    for (const [i, cursor] of cursors.entries()) {
+      expect(await rejectionOf(s.session.request('history/read', { requestId: `malformed-cursor-${i}`, sessionId: 'session', cursor }))).toMatchObject({ code: 'CURSOR_INVALID' })
+    }
+    expect((await s.calls()).filter(call => call.method === 'thread/items/list')).toHaveLength(2)
   })
   /** Call an absent fake method twice around a successful turn: only definite method absence may revoke the capability and suppress later probes. */
   test('revokes an absent optional history method while keeping the new session usable for its first turn', async () => {
@@ -629,14 +638,14 @@ describe('native error paths and edge boundaries', () => {
   /** Revert after fake execution and inspect both turn-list pages; the boundary decision must include authoritative evidence beyond the first page. */
   test('paged native turn lists drive through-boundary reverts', async () => {
     const s = await setup({ scenario: 'turns-paged' })
-    await s.session.submit(start)
+    await s.session.submit({ input: 'join' })
     await s.waitFor(() => s.events.some(event => event.type === 'turn/completed'))
-    await s.session.request('session/revert', { requestId: 'revert', sessionId: 'session', boundary: { turnId: 'native-turn-1', nativeTurnId: 'native-turn-1', relation: 'through' }, scope: 'conversation' })
+    await s.session.request('session/revert', { requestId: 'revert', sessionId: 'session', boundary: { turnId: 'actual', nativeTurnId: 'actual', relation: 'through' }, scope: 'conversation' })
     const calls = await s.calls()
     const pages = calls.filter(call => call.method === 'thread/turns/list')
     expect(pages).toHaveLength(2)
     expect(pages[1]?.params).toMatchObject({ cursor: 'page-two' })
-    expect(calls.some(call => call.method === 'thread/revert')).toBe(true)
+    expect(calls.find(call => call.method === 'thread/revert')?.params).toEqual({ threadId: 'thread', beforeTurnId: 'next-turn' })
   })
   /** Use a fake repeated cursor to require protocol rejection instead of unbounded model pagination; setup owns the probe environment. */
   test('repeating native model cursors fail closed', async () => {

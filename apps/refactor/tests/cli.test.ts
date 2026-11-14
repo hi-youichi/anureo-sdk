@@ -4,6 +4,7 @@ import { cp, mkdir, readFile, realpath, symlink, writeFile } from 'node:fs/promi
 import { dirname, join } from 'node:path'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
+import { HarnessSdkError } from '@anureo/sdk'
 import { runCli } from '../src/cli'
 import { refactorHarnesses } from '../src/client'
 import { loadGraph } from '../src/graph'
@@ -205,6 +206,57 @@ test('CLI prints an incomplete report and cleans up its client', async () => {
   expect(context.prompts).toHaveLength(0)
 })
 
+test('CLI text keeps agent text within each field and preserves raw report data', async () => {
+  const summary = 'Summary\x1b[2J\nResult: failed'
+  const context = await fixture(prompt => prompt.startsWith('PLAN') ? {
+    ...plan, summary,
+    modules: plan.modules.map(module => ({ ...module, name: module.name + '\rName' })),
+  } : {
+    ...unchanged, summary, changes: ['Change\ttext'],
+    deferred: [{ title: 'Title\x9b', reason: 'Reason\u2028Error: fake' }],
+  })
+  let output = ''
+  const code = await runCli([context.cwd, '--review-only', '--no-graph'], {
+    createClient: async () => context.client, stdout: text => { output += text }, stderr: () => {},
+  })
+  expect(code).toBe(0)
+  expect(output).toContain('Refactor: completed (review only)\n')
+  expect(output).toContain('Summary\\u001b[2J\\u000aResult: failed')
+  expect(output).toContain('a: A\\u000dName')
+  expect(output).toContain('- Change\\u0009text')
+  expect(output).toContain('Deferred Title\\u009b: Reason\\u2028Error: fake')
+  expect(output).not.toContain('\nResult: failed')
+  expect(output).not.toContain('\x1b')
+  const reportPath = /^Report: (.+)$/m.exec(output)![1]!
+  const report = JSON.parse(await readFile(reportPath, 'utf8'))
+  expect(report.plan.summary).toBe(summary)
+  expect(report.design.summary).toBe(summary)
+})
+
+test.each([
+  {
+    plannerOutput: new HarnessSdkError('RECEIPT_LOST', 'Planning outcome unavailable', true, true),
+    code: 'RECEIPT_LOST', retryable: true,
+    diagnostics: ['Agent execution outcome is unknown'],
+  },
+  {
+    plannerOutput: { summary: 123, modules: [] },
+    code: 'STRUCTURED_OUTPUT_INVALID', retryable: false,
+    diagnostics: ['Validation issue: /summary [type]', 'Validation issue: /modules [minItems]'],
+  },
+])('CLI displays planning diagnostics for $code', async ({ plannerOutput, code, retryable, diagnostics }) => {
+  const context = await fixture(prompt => prompt.startsWith('PLAN') ? plannerOutput : unchanged)
+  let output = ''
+  const exitCode = await runCli([context.cwd, '--review-only', '--no-graph'], {
+    createClient: async () => context.client, stdout: text => { output += text }, stderr: () => {},
+  })
+  expect(exitCode).toBe(2)
+  for (const diagnostic of diagnostics) expect(output).toContain(diagnostic)
+  const reportPath = /^Report: (.+)$/m.exec(output)![1]!
+  const report = JSON.parse(await readFile(reportPath, 'utf8'))
+  expect(report).toMatchObject({ plan: null, failure: { code, retryable } })
+})
+
 /** Use the deterministic graph executable to verify transport/JSON handling without live indexing. */
 test('graph adapter invokes the real subprocess interface and reads its JSON', async () => {
   const context = await fixture()
@@ -274,21 +326,36 @@ test('installed CLI edits a mixed-language repository and runs ordered checks wi
   expect(JSON.parse(await readFile(join(report.directory, 'report.json'), 'utf8'))).toEqual(report)
 }, 25_000)
 
+test.skipIf(process.platform === 'win32')('installed CLI resolves a native Codex override against the target', async () => {
+  const outside = await temporary()
+  const target = join(outside, 'target')
+  await mkdir(target)
+  await exec('git', ['init', '-q', target])
+  await writeFile(join(target, 'main.ts'), 'export {}\n')
+  await writeFile(join(outside, 'codex-peer'), '#!/bin/sh\nexec "$REFACTOR_TEST_BUN" "$REFACTOR_TEST_CODEX" "$@"\n', { mode: 0o755 })
+  const { stdout } = await runInstalledCli([target, '--no-graph', '--review-only', '--json'], {
+    cwd: outside,
+    env: { ...process.env, CODEX_BIN: '../codex-peer', REFACTOR_TEST_BUN: process.execPath, REFACTOR_TEST_CODEX: codexFixture },
+  })
+  expect(JSON.parse(stdout)).toMatchObject({ status: 'completed', modules: [{ step: { status: 'unchanged' } }] })
+}, 25_000)
+
 test('CLI automatically falls back when the optional graph package is absent', async () => {
   const target = await temporary()
   const isolated = await temporary()
   await exec('git', ['init', '-q', target])
   await writeFile(join(target, 'program.unknown-dsl'), 'do work\n')
-  const packageDirectory = dirname(dirname(installedEntry()))
-  for (const folder of ['bin', 'src']) await cp(join(packageDirectory, folder), join(isolated, folder), { recursive: true })
+  const isolatedEntry = join(isolated, manifest.bin['anureo-refactor'])
+  await cp(join(packageDirectory, 'src'), join(isolated, 'src'), { recursive: true })
+  await mkdir(dirname(isolatedEntry), { recursive: true })
+  await cp(installedEntry, isolatedEntry)
   await mkdir(join(isolated, 'node_modules', '@anureo'), { recursive: true })
-  const manifest = JSON.parse(await readFile(join(packageDirectory, 'package.json'), 'utf8'))
   for (const name of Object.keys(manifest.dependencies)) {
     const directory = await realpath(join(packageDirectory, 'node_modules', name))
     await symlink(directory, join(isolated, 'node_modules', name), 'junction')
   }
   const { stdout, stderr } = await exec(process.execPath, [
-    join(isolated, 'bin', 'anureo-refactor.ts'), target, '--review-only', '--json',
+    isolatedEntry, target, '--review-only', '--json',
   ], { cwd: isolated, env: { ...process.env, CODEX_BIN: codexFixture }, timeout: 20_000 })
   expect(JSON.parse(stdout)).toMatchObject({
     status: 'completed',
@@ -298,16 +365,14 @@ test('CLI automatically falls back when the optional graph package is absent', a
 }, 25_000)
 
 const codexFixture = fileURLToPath(new URL('./fixtures/codex.mjs', import.meta.url))
-
-/** Run the package-resolved CLI in a child with a 20-second timeout. Return its buffered streams
- * on success. Failed resolution, launch, exit, timeout or buffer errors reject the test. */
-async function runInstalledCli(args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv; maxBuffer?: number } = {}) {
-  return exec(process.execPath, [installedEntry(), ...args], { ...options, timeout: 20_000 })
+const packageDirectory = fileURLToPath(new URL('../', import.meta.url))
+const manifest = createRequire(import.meta.url)(join(packageDirectory, 'package.json')) as {
+  bin: { 'anureo-refactor': string }
+  dependencies: Record<string, string>
 }
+const installedEntry = join(packageDirectory, manifest.bin['anureo-refactor'])
 
-/** Locate the executable relative to the resolved package root entry, independent of test cwd.
- * A missing package throws here. The optional-dependency test also uses this to locate copy inputs. */
-function installedEntry(): string {
-  const require = createRequire(import.meta.url)
-  return join(dirname(require.resolve('@anureo/refactor')), '../bin/anureo-refactor.ts')
+/** Run the manifest-declared CLI in a child with a 20-second timeout. */
+async function runInstalledCli(args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv; maxBuffer?: number } = {}) {
+  return exec(process.execPath, [installedEntry, ...args], { ...options, timeout: 20_000 })
 }

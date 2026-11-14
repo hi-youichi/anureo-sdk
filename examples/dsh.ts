@@ -27,9 +27,9 @@ const client = await createClient({
      * interaction/requested. The SDK delivers the selected option to ACP or cancels
      * a still-actionable request if either choice is missing or the terminal question
      * rejects. The script owns the terminal and closes it in the session cleanup block
-     * after successful client initialization. A pending question ignores the SDK's abort signal.
+     * after successful client initialization. The SDK's abort signal cancels a pending question.
      */
-    approval: async (request) => {
+    approval: async (request, { signal }) => {
       const allow = request.options.find((option) => option.semantic === 'allowOnce')
         ?? request.options.find((option) => option.id === 'allow-once')
       const deny = request.options.find((option) => option.semantic === 'deny')
@@ -41,7 +41,7 @@ const client = await createClient({
         process.stdout.write(`  no terminal attached; choosing ${deny.id}\n`)
         return { kind: 'approval', optionId: deny.id }
       }
-      const answer = (await terminal.question('Allow once? [y/N] ')).trim().toLowerCase()
+      const answer = (await terminal.question('Allow once? [y/N] ', { signal })).trim().toLowerCase()
       return { kind: 'approval', optionId: answer === 'y' ? allow.id : deny.id }
     },
   },

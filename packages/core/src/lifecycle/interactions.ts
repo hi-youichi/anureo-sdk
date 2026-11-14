@@ -16,8 +16,8 @@ export class InteractionRegistry {
    * Configure settlement publication and synchronous pre-response checks without starting native
    * work. Session supplies a publisher that aborts the host handler and awaits publication of
    * interaction/resolved while observation is open. It also supplies SecretRedactor.rememberResponse
-   * to register secrets before delivery. respond runs the check for every validated attempt, including
-   * replays, and propagates a throw before delivery. Settlement awaits publication without a deadline.
+   * to register secrets before delivery. respond runs the check for validated, actionable answers
+   * and matching replays. A thrown check prevents delivery. Settlement awaits publication without a deadline.
    */
   constructor(
     private readonly publish: (result: InteractionResult) => Promise<void>,
@@ -53,9 +53,9 @@ export class InteractionRegistry {
    * capacity and invalid/elapsed lifetimes throw synchronously. A request-cloning failure rejects
    * the returned promise after the expiry timer is scheduled. On success, the promise resolves
    * with the answer after native delivery and result publication.
-   * Cancellation and peer settlement reject it after publication is attempted. If native delivery
-   * fails and publishing its unknown outcome also fails, this waiter stays unresolved; respond
-   * rejects the publication failure instead.
+   * Cancellation, peer settlement and native delivery failure reject it after publication is attempted.
+   * If publishing the unknown delivery outcome fails, respond rejects with the publication error
+   * and this waiter rejects with the delivery error.
    * Session.requestInteraction adopts this promise after publishing interaction/requested and
    * scheduling any host handler. Adapters supply the responder through that sink method and own
    * the native resources it uses.
@@ -68,7 +68,9 @@ export class InteractionRegistry {
     this.evictOldestResolvedRecord();
     const result = new Promise<InteractionResponse>((resolve, reject) => {
       // Expiry has no caller to receive cancellation failure. Settlement owns the request waiter.
-      const timer = setTimeout(() => { void this.cancel(request.interactionId, "timeout", "expired").catch(() => {}); }, ttl);
+      const timer = setTimeout(() => {
+        void this.cancelOne(request.interactionId, { reason: "timeout", outcome: "expired", force: false }).catch(() => {});
+      }, ttl);
       timer.unref?.();
       this.records.set(request.interactionId, { request: structuredClone(request), responder, state: "pending", timer, resolve, reject });
     });
@@ -78,7 +80,7 @@ export class InteractionRegistry {
   }
   /**
    * Deliver an answer or replay the retained operation for the same request ID and serialized
-   * response. Validation and the synchronous pre-response hook run before any replay or delivery.
+   * response. Validation precedes admission, and the synchronous pre-response hook runs before replay or delivery.
    * Missing IDs reject with INTERACTION_EXPIRED. Conflicting answers to settling or resolved
    * requests reject with INTERACTION_ALREADY_RESOLVED. The operation clears expiry, retains
    * capacity during native delivery, and settles after the publication it initiates. If another
@@ -91,12 +93,15 @@ export class InteractionRegistry {
     const record = this.records.get(id);
     if (!record) throw new HarnessSdkError("INTERACTION_EXPIRED");
     assertInteractionResponse(record.request, response);
-    this.beforeResponse?.(record.request, response);
     const fingerprint = responseFingerprint(response);
     const replay = record.responseReplay;
-    if (replay && replay.requestId === requestId && replay.fingerprint === fingerprint) {
-      return replay.operation;
+    const matchesReplay = replay && replay.requestId === requestId && replay.fingerprint === fingerprint;
+    if (!matchesReplay && record.state !== "pending") {
+      throw new HarnessSdkError("INTERACTION_ALREADY_RESOLVED");
     }
+    this.beforeResponse?.(record.request, response);
+    if (matchesReplay) return replay.operation;
+    // A synchronous privacy hook can reenter and settle the request.
     if (record.state !== "pending") throw new HarnessSdkError("INTERACTION_ALREADY_RESOLVED");
     // The responder can reenter synchronously. Mark the request settling before invoking it.
     startSettlement(record);
@@ -105,23 +110,28 @@ export class InteractionRegistry {
     return operation;
   }
   /**
-   * Cancel or expire an unresolved request, notifying native once when pending. The reason and
-   * outcome both default to "cancelled". Missing IDs reject with INTERACTION_EXPIRED. Resolved IDs
-   * and in-flight settlement with reason "cancelled" reject with INTERACTION_ALREADY_RESOLVED.
-   * Other reasons mark in-flight settlement unknown without another native call. Native notification
-   * failure or timeout also changes the outcome to unknown.
+   * Cancel a pending request, notifying native once. The reason and outcome default to "cancelled".
+   * Missing IDs reject with INTERACTION_EXPIRED. Settling or resolved IDs reject with
+   * INTERACTION_ALREADY_RESOLVED regardless of the reason. Native notification failure or timeout
+   * changes the outcome to unknown. Supersession during notification rejects with RESULT_UNKNOWN.
    * Await publication, reject begin's waiter with INTERACTION_CANCELLED or RESULT_UNKNOWN, and
    * return the outcome. If publication fails, the cancellation caller receives that failure and
    * the original waiter still receives its lifecycle error. Session.invokeRequest returns this
-   * promise for manual cancellation. Session.startInteractionHandler and the expiry timer observe
-   * and suppress its rejection. cancelAll collects its outcome during teardown.
+   * promise for manual cancellation. Session.startInteractionHandler observes and suppresses
+   * its rejection when cleaning up after handler failure.
    */
-  async cancel(id: string, reason = "cancelled", outcome: CancellationOutcome = "cancelled"): Promise<InteractionResult> {
+  cancel(id: string, reason = "cancelled", outcome: CancellationOutcome = "cancelled"): Promise<InteractionResult> {
+    return this.cancelOne(id, { reason, outcome, force: false });
+  }
+
+  private async cancelOne(id: string, { reason, outcome, force }: {
+    reason: string; outcome: CancellationOutcome; force: boolean;
+  }): Promise<InteractionResult> {
     const record = this.records.get(id);
     if (!record) throw new HarnessSdkError("INTERACTION_EXPIRED");
     if (record.state === "resolved") throw new HarnessSdkError("INTERACTION_ALREADY_RESOLVED");
     if (record.state === "pending") return this.cancelPending({ id, record, reason, outcome });
-    if (reason === "cancelled") throw new HarnessSdkError("INTERACTION_ALREADY_RESOLVED");
+    if (!force) throw new HarnessSdkError("INTERACTION_ALREADY_RESOLVED");
     record.state = "resolved";
     clearTimeout(record.timer);
     const result: InteractionResult = { interactionId: id, outcome: "unknown", reason };
@@ -131,15 +141,15 @@ export class InteractionRegistry {
   /**
    * Attempt concurrent cancellation of unresolved interactions, optionally limited to turnId; await
    * every attempt and suppress individual failures. Session.fail, Session.finishClose and
-   * Session.dispose await this before releasing the backend. Use a reason other than "cancelled"
-   * to settle in-flight requests. The literal reason "connection_lost" requests an unknown outcome.
+   * Session.dispose await this before releasing the backend. In-flight settlements end as unknown
+   * without another native call. The reason "connection_lost" also requests unknown for pending interactions.
    */
   async cancelAll(reason: string, turnId?: string): Promise<void> {
     const ids = [...this.records]
       .filter(([, record]) => record.state !== "resolved" && (turnId === undefined || record.request.turnId === turnId))
       .map(([id]) => id);
     const outcome = reason === "connection_lost" ? "unknown" : "cancelled";
-    await Promise.allSettled(ids.map((id) => this.cancel(id, reason, outcome)));
+    await Promise.allSettled(ids.map((id) => this.cancelOne(id, { reason, outcome, force: true })));
   }
   /**
    * Publish native-side settlement without calling the responder; ignore unknown/resolved IDs
@@ -185,9 +195,8 @@ export class InteractionRegistry {
   /**
    * respond caches this operation after admission. Bound native delivery without retrying it, then
    * publish before resolving begin's waiter. If delivery succeeds after another settlement resolves
-   * the record, reject with RESULT_UNKNOWN without publishing again. Normalize delivery/publication
-   * failures for both callers. If publishing the unknown outcome itself fails, that failure escapes
-   * before the original waiter is rejected. Cancellation uses publishRejectedSettlement's finally instead.
+   * the record, reject with RESULT_UNKNOWN without publishing again. If unknown-outcome publication
+   * fails, respond receives that failure and the original waiter receives the normalized delivery error.
    */
   private async deliverResponse({ id, record, response }: {
     id: string; record: RecordState; response: InteractionResponse;
@@ -206,17 +215,20 @@ export class InteractionRegistry {
       const error = sdkError(cause, "RESULT_UNKNOWN", true);
       if (record.state !== "resolved") {
         record.state = "resolved";
-        await this.publish({ interactionId: id, outcome: "unknown", reason: error.code });
+        await this.publishRejectedSettlement({
+          record, result: { interactionId: id, outcome: "unknown", reason: error.code }, error,
+        });
+      } else {
+        record.reject(error);
       }
-      record.reject(error);
       throw error;
     }
   }
   /**
-   * cancel calls only for an actionable record. Hold capacity and clear expiry before notifying native;
+   * cancelOne calls only for an actionable record. Hold capacity and clear expiry before notifying native;
    * timeout or notification failure changes the requested outcome to unknown. Release capacity before
-   * publication, then reject begin's waiter even if publication fails. Once started, this attempt
-   * still publishes after its native wait, even if teardown or peer settlement has already published.
+   * publication, then reject begin's waiter even if publication fails. If another settlement wins
+   * during the native wait, reject this cancellation with RESULT_UNKNOWN.
    */
   private async cancelPending({ id, record, reason, outcome }: {
     id: string; record: RecordState; reason: string; outcome: CancellationOutcome;
@@ -227,6 +239,7 @@ export class InteractionRegistry {
     } catch {
       outcome = "unknown";
     }
+    if (record.state === "resolved") throw endedInFlight();
     record.state = "resolved";
     const result: InteractionResult = { interactionId: id, outcome, reason };
     const outcomeUnknown = outcome === "unknown";
@@ -243,8 +256,7 @@ export class InteractionRegistry {
   }
   /**
    * Wait for publication before rejecting begin's waiter with its lifecycle error. A publication
-   * failure still reaches cancel, cancelPending or resolveExternally. Those callers clear expiry
-   * and release capacity before entering this step.
+   * failure still reaches the caller. Callers clear expiry and release capacity before entering this step.
    */
   private async publishRejectedSettlement({ record, result, error }: {
     record: RecordState; result: InteractionResult; error: HarnessSdkError;
@@ -260,7 +272,7 @@ export class InteractionRegistry {
    * completion and native resource cleanup.
    */
   private notifyNative(record: RecordState, ...args: Parameters<NativeInteractionResponder>): Promise<void> {
-    return waitForRequest(() => record.responder(...args), { timeoutMs: this.limits.responseTimeoutMs ?? 30_000 });
+    return waitForRequest(() => record.responder(...args), { timeoutMs: this.limits.responseTimeoutMs });
   }
 }
 
@@ -285,7 +297,7 @@ function startSettlement(record: RecordState): void {
   clearTimeout(record.timer);
 }
 
-/** Share the unknown-outcome error between in-flight teardown and a superseded response delivery. */
+/** Share the unknown-outcome error between in-flight teardown and superseded native notification. */
 function endedInFlight(): HarnessSdkError {
   return new HarnessSdkError("RESULT_UNKNOWN", "Interaction ended while response was in flight", false, true);
 }

@@ -39,15 +39,7 @@ ${rules}`
 /** Build cross-file design instructions for runDesign to pass to runAgentWork before planning.
  * Supply the snapshot inventory and its graph path, or null to request direct source inspection.
  * runAgentWork configures session permissions separately. JSON serialization errors throw synchronously. */
-export function designPrompt(input: DesignPromptInput): string
-/** Build the same design instructions from positional arguments. Passing true for readOnly requests
- * read-only instructions. JSON serialization errors throw synchronously. */
-export function designPrompt(files: string[], graphFile: string, version: string, checks: readonly CheckCommand[], readOnly: boolean): string
-export function designPrompt(...args: [DesignPromptInput] | [string[], string, string, readonly CheckCommand[], boolean]): string {
-  const input: DesignPromptInput = args.length === 1 ? args[0] : {
-    files: args[0], graphFile: args[1], version: args[2], checks: args[3],
-    mode: args[4] ? 'read-only' : 'edit',
-  }
+export function designPrompt(input: DesignPromptInput): string {
   const { files, graphFile, version } = input
   return `DESIGN MODULE BOUNDARIES
 Source version: ${version}
@@ -93,15 +85,7 @@ ${workResponseInstructions(input)}`
 /** Build instructions for runModules to pass to runAgentWork for one validated assignment.
  * Supply the module snapshot, its graph path or null, and the completed design summary.
  * runAgentWork configures session permissions separately. JSON serialization errors throw synchronously. */
-export function modulePrompt(input: ModulePromptInput): string
-/** Build the same module instructions from positional arguments. Passing true for readOnly requests
- * read-only instructions. JSON serialization errors throw synchronously. */
-export function modulePrompt(module: RefactorModule, graphFile: string, version: string, checks: readonly CheckCommand[], readOnly: boolean, design: string): string
-export function modulePrompt(...args: [ModulePromptInput] | [RefactorModule, string, string, readonly CheckCommand[], boolean, string]): string {
-  const input: ModulePromptInput = args.length === 1 ? args[0] : {
-    module: args[0], graphFile: args[1], version: args[2], checks: args[3],
-    mode: args[4] ? 'read-only' : 'edit', design: args[5],
-  }
+export function modulePrompt(input: ModulePromptInput): string {
   const { module, graphFile, version, design } = input
   return `REFACTOR MODULE
 Module: ${JSON.stringify(module)}
@@ -113,7 +97,9 @@ ${structureGuide}
 Read the design summary before changing structure. Preserve its justified boundary decisions, and
 explain any revision supported by new source evidence. In read-only mode, evaluate proposed boundaries
 against the existing files and describe resulting edits as proposals.
-${input.isolated ? 'Other modules run concurrently. Edit only the files assigned to this module and any new source files it needs. Defer changes to existing files outside the assignment.\n' : ''}Review this module's files and then fix what you find, in one pass. Identify its functions, callers
+Other modules may run concurrently. Edit only the files assigned to this module and any new source
+files it needs. Defer changes to existing files outside the assignment.
+Review this module's files and then fix what you find, in one pass. Identify its functions, callers
 and callees from the source, using graph metrics where available to find the largest or most
 connected functions. Read those functions and the callers that matter. Before writing a function's
 doc comment, read its implementation and the production call sites needed to explain its role.
@@ -153,8 +139,6 @@ interface PromptContext {
   checks: readonly CheckCommand[]
   /** Instruction mode. The caller configures the agent session's permissions. */
   mode: 'read-only' | 'edit'
-  /** True tells module agents to edit only assigned existing files and leaves edit checks to the host. */
-  isolated?: boolean
 }
 
 /**
@@ -343,14 +327,8 @@ is already well organized and say why. Support structural changes with the maint
 before/after reading and editing paths, and ownership decisions. Distinguish source reasoning from
 checks actually run, and report unresolved evidence limits in "deferred".`
 
-/** Omit checks for review-only runs and empty command lists. For isolated edits, announce host
- * checks before integration. Otherwise ask the agent to run the checks before returning. A rendered
- * section ends with a newline so the response guidance starts on its own line. Serializing
- * commands can throw synchronously. */
-function validationInstructions({ checks, mode, isolated }: PromptContext): string {
+/** Announce host checks for edits when commands are configured. */
+function validationInstructions({ checks, mode }: PromptContext): string {
   if (mode === 'read-only' || checks.length === 0) return ''
-  if (isolated) return `Validation commands: ${JSON.stringify(checks)}. The host runs them in your worktree before merging your edits.\n`
-  return `Validation commands: ${JSON.stringify(checks)}. Run them before returning and fix failures.
-Object entries specify an executable and literal arguments. String entries use the platform shell.
-The host reruns them.\n`
+  return `Validation commands: ${JSON.stringify(checks)}. The host runs them on the combined tree before merging your edits.\n`
 }

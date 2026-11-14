@@ -1,5 +1,6 @@
 import { createInterface } from "node:readline";
 import { readFileSync } from "node:fs";
+import { AHP_PROTOCOL_CONTRACT, type InitializeResult } from "@anureo/protocol";
 import type { NativeFixtureFrame, WireFlavor } from "../src/fixtures";
 
 /**
@@ -8,21 +9,23 @@ import type { NativeFixtureFrame, WireFlavor } from "../src/fixtures";
  * ACP and AHP add a default JSON-RPC version. Codex preserves the supplied envelope.
  * HARNESS_FIXTURE_SCRIPT is the path to a JSON array of NativeFixtureFrame steps.
  * An unset or empty path selects default replies only. Script loading and processing
- * failures reject the executable's top-level await. Malformed input JSON gets a parse-error reply.
- * Resolve on input EOF or after writing FIXTURE_RESPONSE_MISMATCH to stderr and setting
- * exit code 2. The parent owns stdin closure, output draining and process disposal.
+ * failures reject the executable's top-level await. Invalid input gets a JSON-RPC error reply.
+ * Resolve on input EOF or a response mismatch. A mismatch writes FIXTURE_RESPONSE_MISMATCH
+ * to stderr and EOF with unconsumed steps writes FIXTURE_SCRIPT_INCOMPLETE. Both set exit code 2.
+ * The parent owns stdin closure, output draining and process disposal.
  * The promise can resolve with stdout writes still pending. Set HARNESS_FIXTURE_READY
  * to "1" to get the HARNESS_FIXTURE_READY marker on stderr after the first read is armed.
  */
 export async function runWireFake(flavor: Exclude<WireFlavor, "claude">): Promise<void> {
   const scriptPath = process.env.HARNESS_FIXTURE_SCRIPT;
-  const frames: NativeFixtureFrame[] = scriptPath ? JSON.parse(readFileSync(scriptPath, "utf8")) : [];
+  const frames: unknown = scriptPath ? JSON.parse(readFileSync(scriptPath, "utf8")) : [];
+  if (!Array.isArray(frames)) throw new TypeError("HARNESS_FIXTURE_SCRIPT must contain a JSON array of fixture steps");
   const send: WireSender = (message) => {
     const envelope = flavor === "codex" ? message : { jsonrpc: "2.0", ...message };
     process.stdout.write(`${JSON.stringify(envelope)}\n`);
   };
-  const handleRequest = createRequestHandler({ flavor, frames, send });
-  await readWireRequests({ send, handleRequest });
+  const handler = createRequestHandler({ flavor, frames, send });
+  await readWireRequests({ send, ...handler });
 }
 
 interface WireMessage {
@@ -33,15 +36,18 @@ interface WireMessage {
   error?: unknown;
 }
 type WireSender = (message: Record<string, unknown>) => void;
-type RequestHandler = (request: WireMessage) => "continue" | "stop";
+interface RequestHandler {
+  handleRequest(request: WireMessage): "continue" | "stop";
+  hasPendingFrames(): boolean;
+}
 
 /**
- * Read ahead for runWireFake and dispatch parsed messages in order. A syntax error sends
- * a parse reply without advancing the script. EOF or a handler stop ends dispatch.
+ * Read ahead for runWireFake and dispatch parsed messages in order. Invalid messages
+ * receive error replies without advancing the script. EOF or a handler stop ends dispatch.
  * Handler exceptions reject the run. The parent remains responsible for ending stdin,
  * including after a stop with a read already pending.
  */
-async function readWireRequests({ send, handleRequest }: { send: WireSender; handleRequest: RequestHandler }): Promise<void> {
+async function readWireRequests({ send, handleRequest, hasPendingFrames }: RequestHandler & { send: WireSender }): Promise<void> {
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   const iterator = lines[Symbol.asyncIterator]();
   // Arm the first input read before advertising readiness. This avoids racing cold
@@ -50,17 +56,27 @@ async function readWireRequests({ send, handleRequest }: { send: WireSender; han
   if (process.env.HARNESS_FIXTURE_READY === "1") process.stderr.write("HARNESS_FIXTURE_READY\n");
   for (;;) {
     const entry = await pendingLineRead;
-    if (entry.done) return;
+    if (entry.done) {
+      if (hasPendingFrames()) {
+        process.stderr.write("FIXTURE_SCRIPT_INCOMPLETE\n");
+        process.exitCode = 2;
+      }
+      return;
+    }
     const line = entry.value;
     pendingLineRead = iterator.next();
-    let request: WireMessage;
+    let request: unknown;
     try {
       request = JSON.parse(line);
     } catch {
       send({ id: null, error: { code: -32700, message: "Parse error" } });
       continue;
     }
-    if (handleRequest(request) === "stop") return;
+    if (!request || typeof request !== "object" || Array.isArray(request)) {
+      send({ id: null, error: { code: -32600, message: "Invalid Request" } });
+      continue;
+    }
+    if (handleRequest(request as WireMessage) === "stop") return;
   }
 }
 
@@ -76,14 +92,18 @@ function createRequestHandler({ flavor, frames, send }: {
   send: WireSender;
 }): RequestHandler {
   let position = 0;
-  return (request) => {
+  let nextSessionId = 0;
+  const allocateSessionId = () => `fake-acp-session-${++nextSessionId}`;
+  function handleRequest(request: WireMessage): "continue" | "stop" {
     const frame = frames[position];
     if (!frame || (frame.waitForMethod !== undefined && frame.waitForMethod !== request.method)) {
-      sendDefaultResponse({ flavor, request, send });
+      sendDefaultResponse({ flavor, request, send, allocateSessionId });
       return "continue";
     }
-    if (frame.expectedResponse && !matchesExpectedResponse(request, frame.expectedResponse)) {
+    const fields = frame.expectedResponse && differingResponseFields(request, frame.expectedResponse);
+    if (fields?.length) {
       process.stderr.write("FIXTURE_RESPONSE_MISMATCH\n");
+      process.stderr.write(`Fixture step ${position + 1} differs in ${fields.join(", ")}\n`);
       process.exitCode = 2;
       return "stop";
     }
@@ -92,12 +112,16 @@ function createRequestHandler({ flavor, frames, send }: {
       send(substituteFixtureValue(message, request) as Record<string, unknown>);
     }
     return "continue";
-  };
+  }
+  return { handleRequest, hasPendingFrames: () => position < frames.length };
 }
 
 /** Compare peer replies exactly as authored, including result property order in their JSON encoding. */
-function matchesExpectedResponse(request: WireMessage, expected: NonNullable<NativeFixtureFrame["expectedResponse"]>): boolean {
-  return request.id === expected.id && JSON.stringify(request.result) === JSON.stringify(expected.result);
+function differingResponseFields(request: WireMessage, expected: NonNullable<NativeFixtureFrame["expectedResponse"]>): string[] {
+  const fields: string[] = [];
+  if (request.id !== expected.id) fields.push("id");
+  if (JSON.stringify(request.result) !== JSON.stringify(expected.result)) fields.push("result JSON");
+  return fields;
 }
 
 /**
@@ -120,10 +144,11 @@ function substituteFixtureValue(value: unknown, request: WireMessage): unknown {
  * Prompt updates precede the terminal reply so the parent receives fixture text before end_turn.
  * Unknown request methods receive -32601.
  */
-function sendDefaultResponse({ flavor, request, send }: {
+function sendDefaultResponse({ flavor, request, send, allocateSessionId }: {
   flavor: Exclude<WireFlavor, "claude">;
   request: WireMessage;
   send: WireSender;
+  allocateSessionId: () => string;
 }): void {
   if (request.id === undefined || !request.method) return;
   switch (request.method) {
@@ -131,7 +156,7 @@ function sendDefaultResponse({ flavor, request, send }: {
       send({ id: request.id, result: createInitializeResult(flavor) });
       return;
     case "session/new":
-      send({ id: request.id, result: { sessionId: "fake-acp-session" } });
+      send({ id: request.id, result: { sessionId: flavor === "acp" ? allocateSessionId() : "fake-acp-session" } });
       return;
     case "session/prompt":
       send({
@@ -168,7 +193,8 @@ function createInitializeResult(flavor: Exclude<WireFlavor, "claude">) {
   }
   return {
     protocolVersion: 1,
+    protocolContract: AHP_PROTOCOL_CONTRACT,
     runtime: { name: "fake-ahp", version: "1", adapter: "reference" },
     capabilities: {},
-  };
+  } satisfies InitializeResult;
 }

@@ -33,7 +33,7 @@ export interface RefactorOptions {
    * subprocess and repographEntry. A rejection is recorded as a run failure. The loader owns
    * temporary resources and must clean them up before settling. */
   graphLoader?: GraphLoader
-  /** Commands run serially in each edited worktree before integration. The first failure
+  /** Commands run serially on the prospective combined tree before integration. The first failure
    * stops later checks. An empty list disables checks. Omission discovers typecheck then test in
    * the target's own package.json. Blank executables or NUL bytes reject before the run, including
    * in reviewOnly mode, which skips execution. */

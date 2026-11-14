@@ -1,8 +1,8 @@
 // Records graph coverage and writes the graph supplied to each refactor phase.
 import { writeFile } from 'node:fs/promises'
-import { isAbsolute, join, relative, sep } from 'node:path'
+import { join, relative, resolve, sep } from 'node:path'
 import { message } from './errors'
-import { loadGraph, type RepositoryGraph } from './graph'
+import { GraphCleanupError, loadGraph, RepographNotInstalledError, type RepositoryGraph } from './graph'
 import type { RefactorOptions } from './options'
 import type { GraphCoverage, RefactorReport } from './results'
 
@@ -11,20 +11,22 @@ export interface GraphArtifactContext {
   options: Pick<RefactorOptions, 'cwd' | 'noGraph' | 'graphLoader' | 'repographEntry'>
   report: Pick<RefactorReport, 'directory' | 'graphCoverage'>
   progress: (event: string) => void
-  /** Cached default-exporter failure. A later phase records its own coverage without retrying. */
+  /** Cached optional-package lookup failure. */
   graphError?: string
 }
 
 /** Record coverage for the phase's Git-relative source paths and return the written graph path.
  * runDesign calls this before the design agent starts. prepareModules calls it after planning when
  * design changed files, then passes the result to runModules for the module prompts. Disabled or
- * unavailable default exports return null for source inspection. The first default-exporter failure
- * is recorded before progress is reported. Configured exporter failures and artifact serialization
- * or write failures reject and stop the pending agent work. Coverage records export availability
- * before serialization so the report retains coverage even if the artifact cannot be written.
+ * unavailable default exports return null for source inspection. Configured exporter failures,
+ * cleanup failures and artifact serialization or write failures stop the pending agent work.
+ * Coverage records export availability before serialization so the report retains coverage even
+ * if the artifact cannot be written.
  * Callers supply the existing report directory and serialize writes under the run lock. */
 export async function exportGraph(context: GraphArtifactContext, phase: string, files: string[]): Promise<string | null> {
   const { options, report, progress } = context
+  // The shared storage directory can have custom ignore rules. Always ignore this run's output.
+  await writeFile(join(report.directory, '.gitignore'), '*\n')
   if (options.noGraph) {
     report.graphCoverage.push({ phase, status: 'disabled', filesWithoutSymbols: files })
     return null
@@ -39,8 +41,8 @@ export async function exportGraph(context: GraphArtifactContext, phase: string, 
   } catch (cause) {
     const error = message(cause)
     recordUnavailable(report.graphCoverage, { phase, files, error })
-    if (options.graphLoader || options.repographEntry) throw cause
-    context.graphError = error
+    if (options.graphLoader || options.repographEntry || cause instanceof GraphCleanupError) throw cause
+    if (cause instanceof RepographNotInstalledError) context.graphError = error
     progress(`graph/${phase}: unavailable; continuing with source`)
     return null
   }
@@ -58,13 +60,14 @@ function recordUnavailable(coverage: GraphCoverage[], { phase, files, error }: {
 
 /** Return inventory paths in input order that lack indexed symbols. Container labels alone
  * establish that a path was seen, so exportGraph counts a node only if it has a non-container
- * label. Convert absolute paths to target-relative paths and use slash separators to match Git. */
+ * label. Resolve relative paths at the graph root and accept both spellings of the target. */
 function filesWithoutSymbols(graph: RepositoryGraph, cwd: string, files: string[]): string[] {
   const containerLabel = /^(file|folder|directory|package|project|module)$/i
   const symbols = graph.nodes.filter(node => node.labels.some(label => !containerLabel.test(label)))
-  const indexed = new Set(symbols.map(({ filePath }) => {
-    const targetPath = isAbsolute(filePath) ? relative(cwd, filePath) : filePath
-    return targetPath.split(sep).join('/')
+  const roots = new Set([graph.repositoryPath, cwd])
+  const indexed = new Set(symbols.flatMap(({ filePath }) => {
+    const absolutePath = resolve(graph.repositoryPath, filePath)
+    return Array.from(roots, root => relative(root, absolutePath).split(sep).join('/'))
   }))
   return files.filter(file => !indexed.has(file))
 }

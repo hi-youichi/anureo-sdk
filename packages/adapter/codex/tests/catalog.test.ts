@@ -198,6 +198,27 @@ test('cancellation from the models phase observer skips the native query', async
   expect(f.children[0]?.disposals).toBe(1)
 })
 
+test('disposal from the models phase observer skips the native query', async () => {
+  const f = scriptedCatalog(() => ({ result: { data: [] } }))
+  try {
+    await f.session.prepare()
+    await expect(f.session.listModels({
+      onPhase: event => { if (event.outcome === 'started') void f.session.dispose() },
+    })).rejects.toMatchObject({ code: 'CONNECTION_CLOSED' })
+    expect(f.calls.filter(call => call.method === 'model/list')).toHaveLength(0)
+  } finally { await f.session.dispose() }
+  expect(f.children[0]?.disposals).toBe(1)
+})
+
+test('catalog bounds empty pages with distinct continuation cursors', async () => {
+  let pages = 0
+  const f = scriptedCatalog(() => ({ result: { data: [], nextCursor: String(++pages) } }))
+  try {
+    await expect(f.session.listModels()).rejects.toMatchObject({ code: 'MODEL_LIMIT_EXCEEDED' })
+    expect(pages).toBe(10_001)
+  } finally { await f.session.dispose() }
+})
+
 /** Concurrent callers must observe one launch failure; explicit disposal after retry must also allow a new preparation instead of permanently closing the catalog. */
 test('failed preparation and explicit disposal both allow a fresh connection', async () => {
   let launches = 0

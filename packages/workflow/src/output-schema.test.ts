@@ -68,11 +68,23 @@ test('raw JSON is validated before Zod can strip extra fields or supply defaults
     code: 'AGENT_STRUCTURED_OUTPUT_INVALID',
     retryable: false,
     outcomeUnknown: false,
-    details: { issues: [{ path: '', code: 'required' }] },
+    details: { issues: [{ path: '/count', code: 'required' }] },
   })
   for (const text of ['{"count":4,"extra":1}', '{"count":"4"}', 'null', '[]']) {
     await expect(output.parse(text)).rejects.toMatchObject({ code: 'AGENT_STRUCTURED_OUTPUT_INVALID', retryable: false, outcomeUnknown: false })
   }
+})
+
+test('raw JSON issues identify missing and extra fields with escaped pointer segments', async () => {
+  const output = prepareOutputSchema(z.object({ nested: z.object({ 'a/b': z.number(), 'a~b': z.number() }) }))
+  await expect(output.parse('{"nested":{"extra~/":"private value"}}')).rejects.toMatchObject({
+    code: 'AGENT_STRUCTURED_OUTPUT_INVALID',
+    details: { issues: [
+      { path: '/nested/a~1b', code: 'required' },
+      { path: '/nested/a~0b', code: 'required' },
+      { path: '/nested/extra~0~1', code: 'additionalProperties' },
+    ] },
+  })
 })
 
 test('missing and malformed output remain distinct failures without recovering prose', async () => {

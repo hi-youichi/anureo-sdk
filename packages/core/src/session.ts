@@ -1,5 +1,5 @@
 // Coordinates dispatch, ordered observation and teardown for one native session.
-import { assertResult, assertEvent, publicInteraction, publicValue, supportsExtension,
+import { assertRequest, assertResult, assertEvent, publicInteraction, publicValue, supportsExtension,
   type AhpEvent, type AhpEventPayload, type AhpRequestMap, type AhpResultMap, type Capabilities,
   type InteractionRequested, type InteractionResponse, type SessionBinding, type SessionOpenParams, type SessionState } from '@anureo/protocol';
 import { HarnessSdkError, sdkError } from './errors';
@@ -17,7 +17,7 @@ import type { EventSubscriptionOptions, RequestOptions, TurnResult } from './typ
 import { deferred } from './lifecycle/deferred';
 import { immutable } from './lifecycle/immutable';
 import { inputBlocks } from './lifecycle/input';
-import { positive } from './lifecycle/limits';
+import { DEFAULT_MAX_RESULT_BYTES, positive } from './lifecycle/limits';
 import { combined, observationClosed } from './lifecycle/errors';
 
 /**
@@ -31,7 +31,7 @@ export class Session implements SessionEventSink {
    * attachment safely. Clone initial state, allocate stream identity and install privacy/interaction
    * hooks without acquiring a backend. ID generation or cloning can throw; Client owns later disposal.
    */
-  constructor(private readonly params: SessionOpenParams, private readonly options: ClientOptions, capabilities: Capabilities, private readonly createId: () => string) {
+  constructor(private readonly params: SessionOpenParams, private readonly options: ClientOptions, capabilities: Capabilities, private readonly createId: () => string, private readonly releaseOwnership?: (session: Session) => void) {
     this.streamId = createId();
     this.state = { binding: immutable(params.binding), capabilities: immutable(capabilities), capabilityRevision: 1, config: structuredClone(params.config ?? {}), status: 'opening', activeTurnIds: [], ...(params.model ? { model: params.model } : {}) };
     this.secrets = new SecretRedactor(value => options.runtime?.onMarkedSecret?.(this.binding, value));
@@ -78,20 +78,22 @@ export class Session implements SessionEventSink {
   projectOutput(text: string): string { return this.secrets.text(text); }
   /**
    * Attach the backend, restore active observations and publish initial state. Client.attachSession
-   * awaits this before returning a session to the host. Dispose a mismatched or already-closed
-   * attachment before rejecting. Adoption or publication failure rejects to Client.open, which
+   * awaits this before returning a session to the host. Dispose a late attachment if already closed.
+   * Binding, adoption or publication failure rejects to Client.open, which
    * owns session cleanup.
    */
   async attach(backend: BackendSession): Promise<void> {
-    if (!matchesBinding(backend.binding, this.binding)) { await backend.dispose(); throw new HarnessSdkError('SESSION_BINDING_MISMATCH'); }
     if (this.closed) { await backend.dispose(); throw this.observationFailure ?? new HarnessSdkError('SESSION_CLOSED'); }
-    if (backend.state) {
-      if (!matchesBinding(backend.state.binding, this.binding)) { await backend.dispose(); throw new HarnessSdkError('SESSION_BINDING_MISMATCH'); }
-      this.adoptState(backend.state);
-      for (const id of backend.state.activeTurnIds) this.context(id).started = true;
-    }
     this.backend = backend;
-    this.state.binding = immutable(backend.binding);
+    const binding = backend.binding;
+    if (!matchesBinding(binding, this.binding)) throw new HarnessSdkError('SESSION_BINDING_MISMATCH');
+    const state = backend.state;
+    if (state) {
+      if (!matchesBinding(state.binding, this.binding)) throw new HarnessSdkError('SESSION_BINDING_MISMATCH');
+      this.adoptState(state);
+      for (const id of state.activeTurnIds) this.context(id).started = true;
+    }
+    this.state.binding = immutable(binding);
     this.state.capabilities = immutable(backend.capabilities);
     this.updateStatus();
     await this.emit({ type: 'session/state', payload: this.state });
@@ -191,8 +193,8 @@ export class Session implements SessionEventSink {
   }
   /**
    * Dispatch a typed session request and await its receipt. Matching method/request IDs replay the
-   * cached outcome while retained; changed params or a submission reserved by another request reject
-   * with a conflict. session/close instead shares its existing close work regardless of request ID.
+   * cached outcome while retained. Changed params or a new dispatch for a reserved submission ID
+   * reject with a conflict. session/close shares its existing close work regardless of request ID.
    * Hosts and context's Turn control callbacks use this entry. Ordinary calls validate
    * wait options before dispatch and return a caller-scoped receipt wait; session/close validates the
    * request first and uses closeRequest's shared teardown. Validation, dispatch and wait failures reject;
@@ -239,13 +241,14 @@ export class Session implements SessionEventSink {
    * OutputSession forwards adapter observation loss here; emit, tryEmit, rejectNativeResult and cached
    * bookkeeping also invoke it. Idempotently end observation with a safe unknown-outcome SDK error,
    * await interaction cancellation, then attempt backend release while suppressing release-promise
-   * rejection. A synchronous disposal throw rejects this call. Native execution stop stays unconfirmed;
+   * rejection. Native execution stop stays unconfirmed;
    * the first caller can await cleanup without initiating a native interrupt; later calls return early.
    */
   async fail(cause: unknown): Promise<void> {
     if (this.closed) return;
+    const cancellation = this.cancelInteractions('connection_lost');
     this.endObservation(new HarnessSdkError(sdkError(cause).code, 'Session observation failed', false, true, { source: 'sdk' }));
-    await this.interactions.cancelAll('connection_lost');
+    await cancellation;
     await this.disposeBackend().catch(() => {});
   }
   /**
@@ -265,12 +268,10 @@ export class Session implements SessionEventSink {
    * caller-owned and execution stop remains unconfirmed; repeated disposal never repeats owned work.
    */
   dispose(): Promise<void> {
-    /** dispose starts this owned teardown once; repeated calls share its completion/rejection while Client waits before releasing the adapter. */
-    return this.disposal ??= (async () => {
-      const cause = observationClosed(); this.endObservation(cause);
-      await this.interactions.cancelAll('runtime_disposed');
-      await this.disposeBackend();
-    })();
+    if (this.disposal) return this.disposal;
+    this.disposal = this.cancelInteractions('runtime_disposed').then(() => this.disposeBackend());
+    this.endObservation(observationClosed());
+    return this.disposal;
   }
   private backend?: BackendSession;
   private observationFailure?: unknown;
@@ -279,6 +280,7 @@ export class Session implements SessionEventSink {
   private closing?: Promise<AhpResultMap['session/close']>;
   private closeReceipt?: AhpResultMap['session/close'];
   private disposal?: Promise<void>;
+  private interactionCancellation?: Promise<void>;
   private backendDisposal?: Promise<void>;
   private readonly ended = deferred<never>();
   private seq = 0;
@@ -330,7 +332,7 @@ export class Session implements SessionEventSink {
     const completion = deferred<TurnResult>();
     const context: Execution = {
       id, completion, result: completion.promise, events: new EventHub(), started: false, terminal: false, items: new Map(),
-      accumulator: new ResultAccumulator(positive(this.options.limits?.maxResultBytes, 16 * 1024 * 1024), positive(this.options.limits?.maxItems, 2048)),
+      accumulator: new ResultAccumulator(positive(this.options.limits?.maxResultBytes, DEFAULT_MAX_RESULT_BYTES), positive(this.options.limits?.maxItems, 2048)),
       /**
        * context installs this port on the shared observation; Turn.steer invokes it explicitly.
        * Normalize input and await request with this execution's atomic target. Admission/dispatch/
@@ -347,14 +349,13 @@ export class Session implements SessionEventSink {
     this.executions.set(id, context); return context;
   }
   /**
-   * context calls under execution-count pressure. Remove at most the oldest eligible terminal
-   * execution, subtract its retained bytes and remove its acknowledged submissions. Older unbound
-   * inputs pin possible late results; returning without eviction makes context reject capacity instead
-   * of silently losing a future association. Existing Turn handles keep their shared context.
+   * Under count or byte pressure, remove the oldest eligible terminal execution, subtract its retained
+   * bytes and remove its acknowledged submissions. Older unbound inputs pin possible late results.
+   * Return false if nothing can be evicted. Existing Turn handles keep their shared context.
    */
-  private reclaimExecution(): void {
+  private reclaimExecution(except?: Execution): boolean {
     for (const [key, execution] of this.executions) {
-      if (!execution.terminal) continue;
+      if (!execution.terminal || execution === except) continue;
       const terminalSeq = execution.terminalSeq;
       // New inputs cannot need an already-ended execution; older unbound inputs may.
       const pinned = terminalSeq !== undefined && [...this.submissions.values()].some(submission =>
@@ -363,8 +364,9 @@ export class Session implements SessionEventSink {
       this.totalBytes -= execution.accumulator.size;
       this.executions.delete(key);
       for (const [id, record] of this.submissions) if (record.target === execution && record.acknowledged) this.submissions.delete(id);
-      break;
+      return true;
     }
+    return false;
   }
   /** emit and tryEmit share the configured count budget, which defaults to 2048 queued events. */
   private maxQueuedEvents(): number {
@@ -391,7 +393,7 @@ export class Session implements SessionEventSink {
     if (!admitted) return;
     // Privacy projection preserves protocol identities while redacting content.
     const publicPayload = this.secrets.event(admitted.payload, turnId);
-    const event: AhpEvent = { ...scope, ...(turnId ? { turnId } : {}), sessionId: this.id, streamId: this.streamId, seq: ++this.seq, timestamp: (this.options.runtime?.now ?? (() => new Date().toISOString()))(), ...publicPayload };
+    const event = { ...scope, ...(turnId ? { turnId } : {}), sessionId: this.id, streamId: this.streamId, seq: ++this.seq, timestamp: (this.options.runtime?.now ?? (() => new Date().toISOString()))(), ...publicPayload };
     assertEvent(event);
     if (admitted.execution) this.retainEvent(admitted.execution, event);
     this.updateStatus();
@@ -452,9 +454,11 @@ export class Session implements SessionEventSink {
     const submission = this.submissions.get(event.payload.submissionId);
     if (!submission) throw new HarnessSdkError('PROTOCOL_ERROR', 'Unknown submission status');
     if (event.payload.status === 'rejected' || event.payload.status === 'unknown') {
-      submission.definitivelyRejected = event.payload.status === 'rejected';
+      const outcomeUnknown = event.payload.status === 'unknown';
+      submission.definitivelyRejected = !outcomeUnknown;
       const error = event.payload.error;
-      submission.executionBinding.reject(error ? new HarnessSdkError(error.code, error.code, error.retryable, error.outcomeUnknown) : new HarnessSdkError('SUBMISSION_REJECTED'));
+      const code = error?.code ?? (outcomeUnknown ? 'RESULT_UNKNOWN' : 'SUBMISSION_REJECTED');
+      submission.executionBinding.reject(new HarnessSdkError(code, code, error?.retryable ?? false, outcomeUnknown));
     }
     return this.projectSubmissionStatus(event);
   }
@@ -521,7 +525,10 @@ export class Session implements SessionEventSink {
     const previous = execution.accumulator.size;
     execution.accumulator.accept(event);
     this.totalBytes += execution.accumulator.size - previous;
-    if (this.totalBytes > positive(this.options.limits?.maxResultBytes, 16 * 1024 * 1024)) throw new HarnessSdkError('RESULT_BUDGET_EXCEEDED');
+    const limit = positive(this.options.limits?.maxResultBytes, DEFAULT_MAX_RESULT_BYTES);
+    while (this.totalBytes > limit) {
+      if (!this.reclaimExecution(execution)) throw new HarnessSdkError('RESULT_BUDGET_EXCEEDED');
+    }
     if (event.type === 'turn/completed') {
       execution.terminal = true;
       execution.terminalSeq = this.seq;
@@ -595,6 +602,7 @@ export class Session implements SessionEventSink {
    * ID generation/cloning failures throw before dispatch; submit converts those throws to rejection.
    */
   private submitExecution({ method, options }: ExecutionSubmission, wait: RequestOptions): Promise<Turn> {
+    wait = this.effectiveWait(wait);
     const waitError = requestWaitError(wait);
     if (waitError) return Promise.reject(waitError);
     const submissionId = this.createId();
@@ -610,12 +618,11 @@ export class Session implements SessionEventSink {
       /** submitExecution observes rejection independently of its binding wait; preserve the cause, but leave admitted dispatches pinned until failure-status publication. */
       cause => this.rejectSubmission({ record, cause, dispatch: record.requestId ? 'pending' : 'acknowledged' }),
     );
-    return waitForRequest(async () => new Turn(await record.executionBinding.promise), wait, this.options.runtime?.requestTimeoutMs);
+    return waitForRequest(async () => new Turn(await record.executionBinding.promise), wait);
   }
   /**
-   * submitExecution checks before creating an association gate; dispatchOperation checks every
-   * dispatch, including replays. Lifecycle failures take precedence over protocol/capability errors.
-   * Callers return these throws as rejected promises before reserving native work.
+   * submitExecution checks before creating an association gate; dispatchOperation checks cache misses
+   * before reserving native work. Callers return these throws as rejected promises.
    */
   private validateRequestAdmission<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): void {
     this.assertCallable(method);
@@ -641,7 +648,10 @@ export class Session implements SessionEventSink {
    * never cancel the cached outcome or its bookkeeping.
    */
   private dispatchOperation<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
-    try { this.validateRequestAdmission(method, params); } catch (cause) { return Promise.reject(cause); }
+    try {
+      assertRequest(method, params);
+      if (params.sessionId !== this.id) throw new HarnessSdkError('SESSION_BINDING_MISMATCH');
+    } catch (cause) { return Promise.reject(cause); }
     if (Buffer.byteLength(JSON.stringify(params)) > (this.options.runtime?.queue?.maxFrameBytes ?? 8 * 1024 * 1024)) return Promise.reject(new HarnessSdkError('FRAME_TOO_LARGE'));
     params = structuredClone(params);
     const key = JSON.stringify([method, params.requestId]);
@@ -651,6 +661,7 @@ export class Session implements SessionEventSink {
       if (previous.fingerprint !== fingerprint) return Promise.reject(new HarnessSdkError('REQUEST_ID_CONFLICT'));
       return previous.result as Promise<AhpResultMap[M]>;
     }
+    try { this.validateRequestAdmission(method, params); } catch (cause) { return Promise.reject(cause); }
     if (!this.admitRequestCapacity()) return Promise.reject(new HarnessSdkError('BACKPRESSURE_EXCEEDED'));
     if (isSubmissionMethod(method)) {
       try { this.reserveSubmission(params as AhpRequestMap[SubmissionMethod]); }
@@ -681,7 +692,7 @@ export class Session implements SessionEventSink {
    */
   private reserveSubmission(params: AhpRequestMap[SubmissionMethod]): void {
     const existing = this.submissions.get(params.submissionId);
-    if (existing?.requestId && existing.requestId !== params.requestId) throw new HarnessSdkError('SUBMISSION_ID_CONFLICT');
+    if (existing?.requestId !== undefined) throw new HarnessSdkError('SUBMISSION_ID_CONFLICT');
     this.getOrCreateSubmission(params.submissionId).requestId = params.requestId;
   }
   /**
@@ -702,7 +713,7 @@ export class Session implements SessionEventSink {
       /** cacheRequestOutcome registers this on settlement; release cache capacity before success bookkeeping without changing the cached receipt if publication fails. */
       result => {
         entry.settled = true;
-        return this.onRequestSucceeded({ method, params, result });
+        return this.onRequestSucceeded({ method, result });
       },
       /** cacheRequestOutcome registers this on rejection; release cache capacity before recovery/status handling while submission reclamation still waits for failure publication. */
       cause => {
@@ -773,13 +784,16 @@ export class Session implements SessionEventSink {
   }
   /**
    * executeRequest calls before privacy projection or request-owned state changes. Validate protocol
-   * shape and submission/steer identities; malformed results call rejectNativeResult, which throws an
+   * shape and routing identities; malformed results call rejectNativeResult, which throws an
    * unknown-outcome protocol error and starts observation teardown. On success the assertion narrows
    * the native value for projection.
    */
   private validateNativeResult<M extends SessionMethod>(method: M, params: AhpRequestMap[M], result: unknown): asserts result is AhpResultMap[M] {
     try { assertResult(method, result); }
     catch { this.rejectNativeResult('Invalid native result'); }
+    if (method === 'session/config/set' && !matchesBinding((result as SessionState).binding, this.binding)) {
+      this.rejectNativeResult('Conflicting session binding');
+    }
     if (isSubmissionMethod(method) && (result as AhpResultMap['input/submit']).submissionId !== (params as AhpRequestMap['input/submit']).submissionId) {
       this.rejectNativeResult('Conflicting submission identity');
     }
@@ -803,16 +817,13 @@ export class Session implements SessionEventSink {
    * queued/dispatched disposition while observation remains open. A publication failure goes to the
    * cache's fail observer without replacing the receipt; non-submission outcomes need no bookkeeping.
    */
-  private async onRequestSucceeded<M extends SessionMethod>({ method, params, result }: { method: M; params: AhpRequestMap[M]; result: AhpResultMap[M] }): Promise<void> {
+  private async onRequestSucceeded<M extends SessionMethod>({ method, result }: { method: M; result: AhpResultMap[M] }): Promise<void> {
     if (!isSubmissionMethod(method)) return;
     const response = result as AhpResultMap['input/submit'] | AhpResultMap['turn/steer'];
     const record = this.submissions.get(response.submissionId);
     if (!record) return;
     record.acknowledged = true;
-    if ('turnId' in response) {
-      if (method === 'turn/steer' && response.turnId !== (params as AhpRequestMap['turn/steer']).expectedTurnId) throw new HarnessSdkError('PROTOCOL_ERROR', 'Wrong steer target');
-      await this.bindSubmission(response.submissionId, response.turnId);
-    }
+    if ('turnId' in response) await this.bindSubmission(response.submissionId, response.turnId);
     const disposition = 'disposition' in response ? response.disposition : undefined;
     if (!this.closed) await this.emit({ type: 'submission/status', payload: {
       submissionId: response.submissionId,
@@ -883,17 +894,19 @@ export class Session implements SessionEventSink {
    * operation starts. Later abort/deadline affects only the caller's wait.
    */
   private closeRequest(params: AhpRequestMap['session/close'], wait: RequestOptions): Promise<AhpResultMap['session/close']> {
+    wait = this.effectiveWait(wait);
     const waitError = requestWaitError(wait);
     if (waitError) return Promise.reject(waitError);
-    if (this.closed) return waitForRequest(() => this.closedReceipt(), wait, this.options.runtime?.requestTimeoutMs);
+    if (this.closed) return waitForRequest(() => this.closedReceipt(), wait);
     const closing = this.closing ?? this.startClose(params);
-    return waitForRequest(() => closing, wait, this.options.runtime?.requestTimeoutMs);
+    return waitForRequest(() => closing, wait);
   }
   /**
    * closeRequest asks for a receipt on an already-closed session. Await backend release and
    * propagate its failure before returning the stored native receipt or an unconfirmed stop.
    */
   private async closedReceipt(): Promise<AhpResultMap['session/close']> {
+    await this.interactionCancellation;
     await this.disposeBackend();
     return this.closeReceipt ?? { closed: true, observationClosed: true, executionStopped: 'unconfirmed' };
   }
@@ -927,24 +940,35 @@ export class Session implements SessionEventSink {
   private async finishClose(result: AhpResultMap['session/close']): Promise<AhpResultMap['session/close']> {
     this.closeReceipt = result;
     const causes: unknown[] = [];
-    try { await this.interactions.cancelAll('session_closed'); } catch (cause) { causes.push(cause); }
+    try { await this.cancelInteractions('session_closed'); } catch (cause) { causes.push(cause); }
     try { await this.disposeBackend(); } catch (cause) { causes.push(cause); }
     this.endObservation(observationClosed({ executionStopped: result.executionStopped }));
     if (causes.length) throw combined(causes);
     return result;
   }
   /**
-   * fail, closedReceipt, finishClose and dispose share the backend's returned release promise and its
-   * rejection; never infer native stop. A synchronous disposal throw escapes before promise caching.
-   * Before attachment the no-op promise does not own a backend arriving later: attach rejects/releases
-   * that backend when observation has already closed.
+   * Share cancellation across teardown paths. Install the promise before invoking native responders
+   * or aborting host handlers, either of which can call into Session again.
    */
-  private disposeBackend(): Promise<void> { return this.backendDisposal ??= this.backend?.dispose() ?? Promise.resolve(); }
+  private cancelInteractions(reason: string): Promise<void> {
+    return this.interactionCancellation ??= Promise.resolve().then(() => this.interactions.cancelAll(reason));
+  }
+  /** Share backend release and drop client ownership only after it succeeds. attach handles late backends. */
+  private disposeBackend(): Promise<void> {
+    return this.backendDisposal ??= Promise.resolve().then(async () => {
+      await this.backend?.dispose();
+      this.releaseOwnership?.(this);
+    });
+  }
+
+  private effectiveWait(wait: RequestOptions): RequestOptions {
+    return { signal: wait.signal, timeoutMs: wait.timeoutMs ?? this.options.runtime?.requestTimeoutMs };
+  }
 }
 
 /**
  * request, submitExecution and closeRequest reject with this failure before starting their waits.
- * An invalid explicit timeout takes precedence over an already-aborted signal.
+ * An invalid timeout supplied here takes precedence over an already-aborted signal.
  */
 function requestWaitError(wait: RequestOptions): HarnessSdkError | undefined {
   if (invalidWait(wait)) return new HarnessSdkError('INVALID_PARAMS');

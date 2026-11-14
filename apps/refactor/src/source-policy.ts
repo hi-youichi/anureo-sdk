@@ -1,7 +1,7 @@
 // Selects the paths and text eligible for review and editing.
 import { readFile } from 'node:fs/promises'
 import { posix } from 'node:path'
-import { inspectGitPath } from './git-path'
+import { inspectGitPath, isSnapshotPath } from './git-path'
 
 /** Match a Git-relative path against source scope rules without reading the filesystem.
  * Built-in path exclusions and explicit exclude globs take precedence over include globs.
@@ -27,14 +27,14 @@ export async function isTextSource(cwd: string, file: string): Promise<boolean> 
   return isSupportedText(await readFile(path))
 }
 
-/** Exclude dependency, build, documentation and run artifacts from the editable scope. */
-const excluded = new Set(['.git', '.anureo', '.repograph', 'node_modules', 'dist', 'build', 'coverage', 'vendor', 'generated', 'draft', 'docs'])
+/** Exclude additional directories from edits while retaining them in snapshots. */
+const sourceOnlyExclusions = new Set(['.repograph', 'node_modules', 'dist', 'build', 'coverage', 'vendor', 'generated', 'draft', 'docs'])
 /** Repository metadata and conventional standalone prose. Explicit includes can select these files. */
 const supportingFile = /^(?:\.(?:gitignore|gitattributes|gitmodules|editorconfig)|package(?:-lock)?\.json|(?:bun|yarn|Cargo|uv|poetry)\.lockb?|pnpm-lock\.ya?ml|(?:README|LICENSE|LICENCE|COPYING|NOTICE|CHANGELOG|CONTRIBUTING|AGENTS)(?:\.(?:md|txt|rst|adoc))?)$/i
 
 /** Match hard exclusions against any path component, regardless of case or glob settings. */
 function isExcluded(file: string): boolean {
-  return file.split('/').some(part => excluded.has(part.toLowerCase()))
+  return !isSnapshotPath(file) || file.split('/').some(part => sourceOnlyExclusions.has(part.toLowerCase()))
 }
 
 /** Default to UTF-8 unless a UTF-16 byte-order mark is present. Decode strictly so invalid

@@ -20,10 +20,9 @@ export function invalidWait(wait?: RequestOptions): boolean {
  * effective timeout rejects with INVALID_PARAMS. Rounding and timer range follow the host timer.
  * The operation is invoked synchronously once. Its value or original failure, including a
  * synchronous throw, settles the wait if it wins the race. Abort or expiry after invocation
- * rejects with REQUEST_ABORTED or REQUEST_TIMEOUT and outcomeUnknown=true. Keep options.signal
- * stable until settlement so the wait can remove its listener. Settlement clears the timer and
- * the operation's rejection remains observed. Callers own any native cancellation, resource
- * release or decision to retry.
+ * rejects with REQUEST_ABORTED or REQUEST_TIMEOUT and outcomeUnknown=true. Settlement clears
+ * the timer and abort listener, and the operation's rejection remains observed. Callers own any
+ * native cancellation, resource release or decision to retry.
  *
  * Turn.result returns this wait for the shared terminal snapshot. Session.submitExecution
  * returns it for execution binding after dispatch, and Session.closeRequest uses it to
@@ -50,6 +49,8 @@ function observeRequest<T>({ operation, options, timeoutMs }: {
 }): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let settled = false;
+    // A private signal follows cancellation even if a listener stops the caller's abort event.
+    const signal = options.signal && AbortSignal.any([options.signal]);
     /**
      * The operation continuations and abandon release wait resources before delivering the first
      * outcome. Later outcomes leave the original settlement intact.
@@ -58,7 +59,7 @@ function observeRequest<T>({ operation, options, timeoutMs }: {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      options.signal?.removeEventListener("abort", abort);
+      signal?.removeEventListener("abort", abort);
       callback();
     };
     /**
@@ -68,14 +69,13 @@ function observeRequest<T>({ operation, options, timeoutMs }: {
     const abandon = (code: "REQUEST_ABORTED" | "REQUEST_TIMEOUT") => {
       finish(() => reject(new HarnessSdkError(code, "Request outcome is unknown after dispatch", false, true)));
     };
-    /** The caller signal invokes this listener; finish removes this same reference on any settlement. */
     const abort = () => abandon("REQUEST_ABORTED");
     /** Forward invocation failures and promise rejections through the same cleanup. */
     const rejectOperation = (cause: unknown) => finish(() => reject(cause));
 
     const timer = setTimeout(() => abandon("REQUEST_TIMEOUT"), timeoutMs);
     // Install before invoking operation: it may synchronously trigger the caller's abort signal.
-    options.signal?.addEventListener("abort", abort, { once: true });
+    signal?.addEventListener("abort", abort, { once: true });
     // Keep the rejection handler attached after abandonment so late failures stay observed.
     try {
       operation().then((value) => finish(() => resolve(value)), rejectOperation);

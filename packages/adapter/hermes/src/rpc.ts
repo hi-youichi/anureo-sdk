@@ -1,6 +1,6 @@
 import { BoundedEventQueue, HarnessSdkError } from '@anureo/sdk'
 import type { GatewayGrant } from './attach'
-import type { HermesAdapterOptions } from './options'
+import { DEFAULT_TIMEOUT_MS, type HermesAdapterOptions } from './options'
 import { event, GATEWAY_PROTOCOL, HermesRpcError, object, protocolError, type NativeEvent, type NativeObject } from './native'
 
 /** Internal gateway-to-client request; probe handlers and HermesInteractions reply or reject using the same id. */
@@ -43,7 +43,7 @@ export class HermesRpc {
     } catch { throw new HarnessSdkError('HARNESS_UNAVAILABLE', 'Cannot connect to Hermes gateway', true) }
     const client = new HermesRpc(socket, handlers, options)
     try {
-      await waitForOpen(socket, options.timeoutMs ?? 30_000, signal)
+      await waitForOpen(socket, options.timeoutMs ?? DEFAULT_TIMEOUT_MS, signal)
       return client
     } catch (cause) {
       client.dispose()
@@ -67,7 +67,7 @@ export class HermesRpc {
       const timer = setTimeout(() => {
         this.pending.delete(id)
         reject(new HarnessSdkError('RPC_TIMEOUT', 'Hermes request timed out', false, mutation))
-      }, this.options.timeoutMs ?? 30_000)
+      }, this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS)
       this.pending.set(id, { resolve, reject, timer, mutation })
       try { this.send({ jsonrpc: '2.0', id, method, params }) }
       catch (cause) {
@@ -147,7 +147,7 @@ export class HermesRpc {
     const waiting = this.pending.get(id)
     if (!waiting) return
     // Invalid error data must leave the waiter visible so stop can reject it with the channel failure.
-    const nativeError = hasError ? new HermesRpcError(object(frame.error)) : undefined
+    const nativeError = hasError ? new HermesRpcError(object(frame.error), waiting.mutation) : undefined
     this.forgetRequest(id, waiting.timer)
     if (nativeError) waiting.reject(nativeError)
     else waiting.resolve(frame.result)

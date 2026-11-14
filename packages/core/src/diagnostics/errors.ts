@@ -19,7 +19,7 @@ export function safeCatalogErrorCode(cause: unknown): string {
  * Internal to diagnostics. reportCatalogFailure reads this value for the event's nativeRpcCode.
  * Return undefined for a missing or nonnumeric rpcCode. Preserve separate reads for the type
  * check and the returned value, which an accessor can observe. Property getters and proxy traps
- * can throw synchronously, preventing the report and replacing the phase rejection.
+ * can throw synchronously. reportCatalogFailure handles those failures.
  */
 export function readNativeRpcCode(cause: unknown): number | undefined {
   if (!cause || typeof cause !== 'object' || !('rpcCode' in cause)) return undefined

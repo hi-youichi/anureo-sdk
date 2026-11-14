@@ -3,19 +3,34 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
-type Schema = boolean | { [key: string]: unknown }
-type ProtocolSchema = { $defs: Record<string, Schema>; 'x-methods': Record<string, [string, string]> }
+type Schema = boolean | SchemaObject
+type SchemaObject = {
+  [key: string]: unknown
+  $ref?: string
+  properties?: Record<string, Schema>
+  oneOf?: Schema[]
+  anyOf?: Schema[]
+}
+type MethodTable = Record<string, [params: string, result: string]>
+type ProtocolSchema = {
+  $defs: Record<string, Schema>
+  'x-methods': MethodTable
+  'x-extension-methods'?: MethodTable
+}
 type GenerationOptions = { version: 'v1'; mode: 'check' | 'write' }
 type EmissionContext = {
   definitions: Record<string, Schema>
+  definitionName: string
   /** Omission keeps types inline; a string enables multiline union/object formatting. */
   indentation?: string
 }
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const definitionRef = /^#\/\$defs\/(\w+)$/
 
 /** Read and render before touching the target; IO, JSON and unsupported-schema failures reject the CLI run. */
 async function generate({ version, mode }: GenerationOptions): Promise<void> {
   const document = await readProtocolSchema(version)
+  assertRpcMethodCoverage(document)
   const output = renderTypes(document, version)
   await saveTypes(output, mode)
 }
@@ -26,13 +41,69 @@ async function readProtocolSchema(version: 'v1'): Promise<ProtocolSchema> {
   return JSON.parse(source) as ProtocolSchema
 }
 
+function schemaObject(value: Schema | undefined): SchemaObject | undefined {
+  return typeof value === 'object' && value !== null ? value : undefined
+}
+
+/** Check wire request dispatch and the allowed shapes of methodless success frames. */
+function assertRpcMethodCoverage(document: ProtocolSchema): void {
+  const definitions = document.$defs
+  const requestBranches = schemaObject(definitions.AhpRpcRequest)?.oneOf
+  const result = schemaObject(definitions.AhpRpcSuccess)?.properties?.result
+  const resultBranches = schemaObject(result)?.anyOf
+  if (!Array.isArray(requestBranches) || !Array.isArray(resultBranches)) {
+    throw new Error('Expected AhpRpcRequest.oneOf and AhpRpcSuccess.properties.result.anyOf')
+  }
+
+  const wireRequests = new Map<string, string>()
+  for (const branch of requestBranches) {
+    const ref = schemaObject(branch)?.$ref
+    const name = definitionRef.exec(ref ?? '')?.[1]
+    const wrapper = name === undefined ? undefined : schemaObject(definitions[name])
+    const method = schemaObject(wrapper?.properties?.method)?.const
+    const params = schemaObject(wrapper?.properties?.params)?.$ref
+    if (typeof method !== 'string' || typeof params !== 'string') {
+      throw new Error(`Invalid request wrapper in AhpRpcRequest.oneOf: ${ref ?? '(missing reference)'}`)
+    }
+    if (wireRequests.has(method)) throw new Error(`Duplicate RPC request wrapper for ${method}`)
+    wireRequests.set(method, params)
+  }
+
+  const wireResults = new Set(resultBranches.map(branch => {
+    const ref = schemaObject(branch)?.$ref
+    if (typeof ref !== 'string') throw new Error('Expected a result reference in AhpRpcSuccess.properties.result.anyOf')
+    return ref
+  }))
+  const expectedResults = new Set<string>()
+  const methods = [...Object.entries(document['x-methods']), ...Object.entries(document['x-extension-methods'] ?? {})]
+  for (const [method, [params, result]] of methods) {
+    if (wireRequests.get(method) !== `#/$defs/${params}`) {
+      throw new Error(`${method}: expected ${params} in the AhpRpcRequest wrapper`)
+    }
+    wireRequests.delete(method)
+    const resultRef = `#/$defs/${result}`
+    if (!wireResults.has(resultRef)) {
+      throw new Error(`${method}: add ${result} to AhpRpcSuccess.properties.result.anyOf`)
+    }
+    expectedResults.add(resultRef)
+  }
+  if (wireRequests.size) {
+    throw new Error(`AhpRpcRequest contains methods missing from the method tables: ${[...wireRequests.keys()].join(', ')}`)
+  }
+  const extraResults = [...wireResults].filter(ref => !expectedResults.has(ref))
+  if (extraResults.length) {
+    throw new Error(`AhpRpcSuccess contains results missing from the method tables: ${extraResults.join(', ')}`)
+  }
+}
+
 /** Render definitions and method maps in schema order, ending the generated source with a newline. */
 function renderTypes(document: ProtocolSchema, version: 'v1'): string {
   const definitions = document.$defs
   const aliases = Object.entries(definitions).map(([name, schema]) => {
+    const context = { definitions, definitionName: name }
     // Keep notification methods and the required item turnId intersections visible.
-    if (name === 'AhpEventNotification') return `export type ${name} =\n  ${emit(schema, { definitions, indentation: '  ' })};`
-    return `export type ${name} = ${emit(schema, { definitions })};`
+    if (name === 'AhpEventNotification') return `export type ${name} =\n  ${emit(schema, { ...context, indentation: '  ' })};`
+    return `export type ${name} = ${emit(schema, context)};`
   })
   const methods = Object.entries(document['x-methods'])
   const lines = [
@@ -65,18 +136,22 @@ async function saveTypes(output: string, mode: GenerationOptions['mode']): Promi
 function emit(value: Schema, context: EmissionContext): string {
   if (value === true) return 'unknown'
   if (value === false) return 'never'
+  const compositions = ['oneOf', 'anyOf', 'allOf'].filter(keyword => keyword in value)
+  if (compositions.length > 1 || ['if', 'then', 'else', 'not'].some(keyword => keyword in value) ||
+      (compositions.length > 0 && ['$ref', 'const', 'enum', 'type', 'properties', 'required', 'additionalProperties', 'items']
+        .some(keyword => keyword in value))) {
+    throw new Error(`Unsupported composition in $defs.${context.definitionName}`)
+  }
   if (typeof value.$ref === 'string') {
-    const name = /^#\/\$defs\/(\w+)$/.exec(value.$ref)?.[1]
-    if (name === undefined || !context.definitions[name]) throw new Error(`Unsupported reference ${value.$ref}`)
+    const name = definitionRef.exec(value.$ref)?.[1]
+    if (name === undefined || !Object.hasOwn(context.definitions, name)) throw new Error(`Unsupported reference ${value.$ref}`)
     return name
   }
   if ('const' in value) return JSON.stringify(value.const)
   if (Array.isArray(value.enum)) return value.enum.map(entry => JSON.stringify(entry)).join(' | ')
-  if (!value.type) {
-    if (Array.isArray(value.oneOf)) return emitComposition(value.oneOf, '|', context)
-    if (Array.isArray(value.anyOf)) return emitComposition(value.anyOf, '|', context)
-    if (Array.isArray(value.allOf)) return emitComposition(value.allOf, '&', context)
-  }
+  if (Array.isArray(value.oneOf)) return emitComposition(value.oneOf, '|', context)
+  if (Array.isArray(value.anyOf)) return emitComposition(value.anyOf, '|', context)
+  if (Array.isArray(value.allOf)) return emitComposition(value.allOf, '&', context)
   switch (value.type) {
     case 'string': return 'string'
     case 'integer': case 'number': return 'number'
@@ -96,10 +171,11 @@ function emitComposition(members: readonly Schema[], operator: '|' | '&', contex
 }
 
 /** Own object-field optionality, index signatures and nested indentation for recursive emission. */
-function emitObject(value: Exclude<Schema, boolean>, { definitions, indentation }: EmissionContext): string {
+function emitObject(value: SchemaObject, context: EmissionContext): string {
+  const { indentation } = context
   const required = new Set((value.required ?? []) as string[])
-  const properties = (value.properties ?? {}) as Record<string, Schema>
-  const nestedContext = { definitions, indentation: indentation === undefined ? undefined : `${indentation}    ` }
+  const properties = value.properties ?? {}
+  const nestedContext = { ...context, indentation: indentation === undefined ? undefined : `${indentation}    ` }
   const fields = Object.entries(properties).map(([key, prop]) => {
     const optional = required.has(key) ? '' : '?'
     return `${JSON.stringify(key)}${optional}: ${emit(prop, nestedContext)}`

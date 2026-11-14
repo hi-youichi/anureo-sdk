@@ -1,5 +1,7 @@
 import type { HarnessProcess, HarnessProcessOptions } from '@anureo/sdk/process'
 
+export const DEFAULT_TIMEOUT_MS = 30_000
+
 /**
  * Configure createHermesAdapter's local CLI attachment, gateway channel and session budgets.
  * Numeric values must be safe integers; limits and timeouts are positive except the explicitly
@@ -58,24 +60,37 @@ export interface HermesAdapterOptions {
   diagnostic?: (code: string) => void
 }
 
-/** Validate configuration synchronously; HermesAdapter's constructor converts failures to INVALID_PARAMS before starting resources. */
-export function validateOptions(options: HermesAdapterOptions): void {
-  for (const [key, value] of Object.entries(options)) {
+/** Collect configuration issues without retaining option values. */
+export function validateOptions(options: HermesAdapterOptions): string[] {
+  if (options === null) return ['options must be an object']
+  const issues: string[] = []
+  for (const key of ['timeoutMs', 'maxFrameBytes', 'maxBufferedBytes', 'maxEvents', 'maxPending',
+    'maxInteractions', 'maxExecutions', 'maxSubmissions', 'reconnectAttempts', 'reconnectDelayMs',
+    'maxOwnerRecoveriesPerMinute'] as const) {
+    const value = options[key]
     if (value === undefined) continue
-    if (key.endsWith('Ms') || key.startsWith('max') || key === 'reconnectAttempts') validateNumericOption(key, value)
+    const allowsZero = key === 'reconnectAttempts' || key === 'reconnectDelayMs' || key === 'maxOwnerRecoveriesPerMinute'
+    const isTimer = key === 'timeoutMs' || key === 'reconnectDelayMs'
+    if (!Number.isSafeInteger(value) || value < (allowsZero ? 0 : 1) || (isTimer && value > 2_147_483_647)) {
+      issues.push(`${key} must be a ${allowsZero ? 'nonnegative' : 'positive'} safe integer${isTimer ? ' at most 2147483647' : ''}`)
+    }
   }
   if (options.toolsets !== undefined && (!Array.isArray(options.toolsets)
-    || options.toolsets.some(value => typeof value !== 'string' || !value.trim() || value.includes('\0')))) throw new Error('Invalid Hermes toolsets')
-  if (options.startup !== undefined && !['start', 'attach'].includes(options.startup)) throw new Error('Invalid Hermes startup mode')
-  if (options.profile !== undefined && (!options.profile.trim() || options.profile.includes('\0'))) throw new Error('Invalid Hermes profile')
-  if (options.command !== undefined && (typeof options.command !== 'string' || !options.command || options.command.includes('\0'))) throw new Error('Invalid Hermes command')
+    || options.toolsets.some(value => typeof value !== 'string' || !value.trim() || value.includes('\0')))) {
+    issues.push('toolsets must be an array of nonblank strings without NUL')
+  }
+  if (options.startup !== undefined && options.startup !== 'start' && options.startup !== 'attach') {
+    issues.push('startup must be start or attach')
+  }
+  if (options.profile !== undefined && (typeof options.profile !== 'string' || !options.profile.trim() || options.profile.includes('\0'))) {
+    issues.push('profile must be a nonblank string without NUL')
+  }
+  if (options.command !== undefined && (typeof options.command !== 'string' || !options.command || options.command.includes('\0'))) {
+    issues.push('command must be a nonempty string without NUL')
+  }
   if (options.args !== undefined && (!Array.isArray(options.args)
-    || options.args.some(value => typeof value !== 'string' || value.includes('\0')))) throw new Error('Invalid Hermes arguments')
-}
-
-/** Allow zero only for recovery controls; keep configured millisecond values within the native timer range. */
-function validateNumericOption(key: string, value: unknown): void {
-  const minimum = ['reconnectAttempts', 'reconnectDelayMs', 'maxOwnerRecoveriesPerMinute'].includes(key) ? 0 : 1
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum) throw new Error(`Invalid Hermes option: ${key}`)
-  if (key.endsWith('Ms') && value > 2_147_483_647) throw new Error(`Invalid Hermes option: ${key}`)
+    || options.args.some(value => typeof value !== 'string' || value.includes('\0')))) {
+    issues.push('args must be an array of strings without NUL')
+  }
+  return issues
 }

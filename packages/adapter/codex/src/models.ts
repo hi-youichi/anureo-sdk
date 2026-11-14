@@ -24,7 +24,8 @@ export type CodexModel = {
  * Read model pages sequentially on an initialized client, retaining native order and hidden
  * entries. Catalog listModels and CodexNativeAdapter.listModels return this array to hosts.
  * A missing, empty or non-string next cursor ends pagination. Reject malformed pages or model
- * identities, repeated cursors, more than 10,000 models and RPC failures. The caller owns the client.
+ * identities, repeated cursors, more than 10,000 models or continuation cursors, and RPC failures.
+ * The caller owns the client.
  */
 export async function readCodexModels(client: CodexJsonlClient): Promise<CodexModel[]> {
   const models: CodexModel[] = []
@@ -37,8 +38,11 @@ export async function readCodexModels(client: CodexJsonlClient): Promise<CodexMo
     // Validate the complete page before the limit/cursor checks to preserve failure precedence.
     if (models.length > 10_000) throw new HarnessSdkError('MODEL_LIMIT_EXCEEDED')
     cursor = string(page.nextCursor)
-    if (cursor && seen.has(cursor)) throw new HarnessSdkError('PROTOCOL_ERROR', 'Repeated native model cursor')
-    if (cursor) seen.add(cursor)
+    if (cursor) {
+      if (seen.has(cursor)) throw new HarnessSdkError('PROTOCOL_ERROR', 'Repeated native model cursor')
+      if (seen.size >= 10_000) throw new HarnessSdkError('MODEL_LIMIT_EXCEEDED')
+      seen.add(cursor)
+    }
   } while (cursor)
   return models
 }

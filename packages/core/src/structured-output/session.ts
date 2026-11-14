@@ -4,7 +4,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { assertEvent, type AhpEventPayload, type AhpRequestMap, type AhpResultMap, type Capabilities, type HarnessError, type Item, type JsonSchema, type SessionOpenParams, type SessionState } from '@anureo/protocol'
 import { HarnessSdkError, sdkError } from '../errors'
 import { guardRequest } from '../requests/guard'
-import type { BackendSession, EventScope, HarnessAdapter, SessionEventSink, SessionMethod, StructuredOutputToolResult } from '../ports'
+import type { BackendSession, EventScope, HarnessAdapter, SessionEventSink, SessionMethod, StructuredOutputToolDefinition, StructuredOutputToolResult } from '../ports'
 import type { OutputBridgeManager, OutputBridgeLease } from './bridge'
 import { OUTPUT_SERVER_NAME, toolError } from './tool'
 import { compileOutputSchema } from './schema'
@@ -68,13 +68,14 @@ export class OutputSession implements BackendSession {
    * never release a live output lane.
    */
   async execute<M extends SessionMethod>(method: M, original: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
-    if (this.disposed || !this.backend) throw new HarnessSdkError('SESSION_CLOSED')
+    if (this.disposed || this.releasing || !this.backend) throw new HarnessSdkError('SESSION_CLOSED')
     const params = structuredClone(original)
     if (this.locked && ['input/submit', 'review/start', 'compact/start', 'session/config/set', 'session/revert'].includes(method)) throw new HarnessSdkError('STRUCTURED_OUTPUT_BUSY')
     let submissionId: string | undefined
     try {
       submissionId = requestSubmissionId(method, params)
       const prepared = await this.prepareSubmission(method, params, submissionId)
+      if (this.disposed || this.releasing) throw new HarnessSdkError('SESSION_CLOSED')
       const result = await this.dispatch(method, prepared, this.backend)
       if (submissionId && result && typeof result === 'object' && 'turnId' in result && typeof result.turnId === 'string') {
         const boundSubmissionId = submissionId
@@ -82,7 +83,7 @@ export class OutputSession implements BackendSession {
       }
       if (method === 'session/config/set') return this.redact(this.projectState(result as SessionState)) as AhpResultMap[M]
       if (method === 'history/read') return this.redact(result)
-      if (method === 'session/close') await this.release()
+      if (method === 'session/close') void this.release().catch(() => {})
       return result
     } catch (cause) { return this.rejectDispatch(cause, submissionId) }
   }
@@ -96,7 +97,7 @@ export class OutputSession implements BackendSession {
     return this.disposal ??= (async () => {
       this.disposed = true
       const results = await Promise.allSettled([this.release()])
-      results.push(...await Promise.allSettled([this.backend?.dispose()]))
+      results.push(...await Promise.allSettled([Promise.resolve().then(() => this.backend?.dispose())]))
       this.forget()
       checkRelease(results)
     })()
@@ -105,6 +106,8 @@ export class OutputSession implements BackendSession {
   private lease?: OutputBridgeLease
   private disposed = false
   private disposal?: Promise<void>
+  private releasing?: Promise<void>
+  private toolConfiguration = Promise.resolve()
   private chain = Promise.resolve()
   private queuedBytes = 0
   private queuedEvents = 0
@@ -187,7 +190,7 @@ export class OutputSession implements BackendSession {
    */
   private async rejectDispatch(cause: unknown, submissionId: string | undefined): Promise<never> {
     if (submissionId && !sdkError(cause).outcomeUnknown) {
-      try { await this.reject(submissionId) } catch (cleanup) {
+      try { await this.enqueue(() => this.reject(submissionId)) } catch (cleanup) {
         const error = sdkError(cause), release = sdkError(cleanup, 'RESOURCE_RELEASE_FAILED', true)
         throw new HarnessSdkError(error.code, error.message, error.retryable, error.outcomeUnknown,
           { ...error.details, cleanupErrors: [{ code: release.code, outcomeUnknown: release.outcomeUnknown }] })
@@ -258,15 +261,37 @@ export class OutputSession implements BackendSession {
   private async bind(submissionId: string, turnId: string): Promise<void> {
     this.unresolved.delete(submissionId)
     const output = this.outputs.get(submissionId)
-    if (output && this.associateOutput(output, turnId) === 'already-ended') return
+    if (output && this.associateOutput(output, turnId) === 'associated') await this.replayPending(turnId)
+    await this.flushUnclaimedTurns()
+  }
+  /** Drain unclaimed turn buckets after the last unbound output is resolved. Runs on the event queue. */
+  private async flushUnclaimedTurns(): Promise<void> {
+    for (const turnId of this.pending.keys()) {
+      if ([...this.outputs.values()].some(output => !output.turnId)) return
+      await this.replayPending(turnId)
+    }
+  }
+  /** Replay one detached bucket in order and release its reservations even if publication fails. */
+  private async replayPending(turnId: string): Promise<void> {
     // Receipt-only backends can bind after emitting all their execution events.
     const held = this.pending.get(turnId)
     if (!held) return
     this.pending.delete(turnId)
-    for (const envelope of held) {
-      this.heldCount--
-      this.heldBytes -= Buffer.byteLength(JSON.stringify(envelope.event))
-      await this.accept(envelope)
+    let next = 0
+    try {
+      while (next < held.length && !this.releasing && !this.disposed) {
+        const envelope = held[next++]!
+        this.heldCount--
+        this.heldBytes -= Buffer.byteLength(JSON.stringify(envelope.event))
+        await this.accept(envelope)
+      }
+    } finally {
+      if (!this.releasing && !this.disposed) {
+        for (; next < held.length; next++) {
+          this.heldCount--
+          this.heldBytes -= Buffer.byteLength(JSON.stringify(held[next]!.event))
+        }
+      }
     }
   }
   /**
@@ -438,7 +463,7 @@ export class OutputSession implements BackendSession {
     const item = event.payload.item
     if (item.type !== 'agentMessage') return event
     this.rememberText(output, item.id, item.text)
-    if (item.phase === 'final') output.finalIds.add(item.id)
+    this.rememberPhase(output, item.id, item.phase)
     if (output.mode === 'native' && event.type === 'item/completed' && item.phase === 'final') {
       const previous = output.finalItems.get(item.id)
       this.retain(output, Buffer.byteLength(JSON.stringify(item)) - (previous ? Buffer.byteLength(JSON.stringify(previous)) : 0))
@@ -461,10 +486,23 @@ export class OutputSession implements BackendSession {
     const value = event.payload.value
     if (event.payload.kind === 'patch' && value && typeof value === 'object' && !Array.isArray(value) && value.type === 'agentMessage') {
       this.rememberText(output, event.payload.itemId, String(value.text ?? ''))
-      if (value.phase === 'final') output.finalIds.add(event.payload.itemId)
+      this.rememberPhase(output, event.payload.itemId, value.phase)
       return { ...event, payload: { ...event.payload, value: { ...value, phase: 'commentary' } } }
     }
     return event
+  }
+  /** Keep candidate membership and withheld finals aligned with the latest message phase. */
+  private rememberPhase(output: Output, id: string, phase: unknown): void {
+    if (phase === 'final') {
+      output.finalIds.add(id)
+      return
+    }
+    output.finalIds.delete(id)
+    const previous = output.finalItems.get(id)
+    if (previous) {
+      this.retain(output, -Buffer.byteLength(JSON.stringify(previous)))
+      output.finalItems.delete(id)
+    }
   }
   /**
    * accept awaits this for a real turn/completed event and then publishes the returned terminal.
@@ -476,7 +514,7 @@ export class OutputSession implements BackendSession {
   private async completeTurn(event: Extract<AhpEventPayload, { type: 'turn/completed' }>, output: Output | undefined, turnId: string | undefined): Promise<AhpEventPayload> {
     if (output) {
       output.finished = true
-      if (output.mode === 'tool') await this.backend!.structuredOutputTool!.configure()
+      if (output.mode === 'tool') await this.configureTool()
     }
     if (output && event.payload.status === 'completed') event = await this.publishOutput(event, output, turnId)
     if (output && event.payload.status !== 'completed') await this.publishCommentaryFinals(output, turnId)
@@ -510,11 +548,11 @@ export class OutputSession implements BackendSession {
    * reject completeTurn directly, preserving their infrastructure-failure semantics.
    */
   private async publishOutput(event: Extract<AhpEventPayload, { type: 'turn/completed' }>, output: Output, turnId: string | undefined): Promise<Extract<AhpEventPayload, { type: 'turn/completed' }>> {
+    const rejected = output.error ?? (!output.hasValue ? output.lastInvalid : undefined)
+    if (rejected) return { ...event, payload: { ...event.payload, status: 'failed', error: rejected } }
     let text: string | undefined
     try {
-      if (output.error) throw new HarnessSdkError(output.error.code)
       const value = this.outputValue(output)
-      output.schema.check(value)
       const json = JSON.stringify(value)
       text = this.sink.projectOutput?.(this.redact(json)) ?? this.redact(json)
       try { output.schema.parse(text) } catch { throw new HarnessSdkError('STRUCTURED_OUTPUT_REDACTED') }
@@ -535,13 +573,16 @@ export class OutputSession implements BackendSession {
   }
   /**
    * publishOutput obtains its candidate here before final schema/privacy checks. Parse the
-   * joined native final texts, or return the first retained tool/MCP value. Missing values throw
-   * STRUCTURED_OUTPUT_MISSING or STRUCTURED_OUTPUT_INVALID according to prior schema attempts.
+   * joined native final texts, or check and return the first retained tool/MCP value.
+   * Missing values throw STRUCTURED_OUTPUT_MISSING.
    */
   private outputValue(output: Output): unknown {
     if (output.mode === 'native') return output.schema.parse([...output.finalIds].map(id => output.text.get(id) ?? '').join('\n'))
-    if (output.hasValue) return output.value
-    throw new HarnessSdkError(output.attempts ? 'STRUCTURED_OUTPUT_INVALID' : 'STRUCTURED_OUTPUT_MISSING')
+    if (output.hasValue) {
+      output.schema.check(output.value)
+      return output.value
+    }
+    throw new HarnessSdkError('STRUCTURED_OUTPUT_MISSING')
   }
   /**
    * completeTurn awaits this for non-success terminals, including failures from final validation.
@@ -594,8 +635,10 @@ export class OutputSession implements BackendSession {
     try { bytes = Buffer.byteLength(JSON.stringify(value)) } catch { return rejected('STRUCTURED_OUTPUT_INVALID') }
     if (bytes > (this.limits.maxResultBytes ?? 16 * 1024 * 1024)) return this.rejectCandidateBudget(output)
     try { output.schema.check(value) } catch (cause) {
-      if (++output.attempts >= 3) output.error = failure('STRUCTURED_OUTPUT_RETRIES_EXCEEDED')
-      return rejected(output.error?.code ?? 'STRUCTURED_OUTPUT_INVALID', sdkError(cause).details)
+      const exhausted = ++output.attempts >= 3
+      output.lastInvalid = failure(exhausted ? 'STRUCTURED_OUTPUT_RETRIES_EXCEEDED' : 'STRUCTURED_OUTPUT_INVALID', sdkError(cause).details)
+      if (exhausted) output.error = output.lastInvalid
+      return { accepted: false, error: output.lastInvalid }
     }
     try { this.retain(output, bytes) } catch { return this.rejectCandidateBudget(output) }
     output.value = structuredClone(value)
@@ -618,22 +661,22 @@ export class OutputSession implements BackendSession {
     const output = this.outputs.get(submissionId)
     if (output?.turnId) return // A rejection cannot undo an execution already observed.
     if (output) output.finished = true
-    if (output?.mode === 'tool') await this.backend!.structuredOutputTool!.configure()
+    if (output?.mode === 'tool') await this.configureTool()
     this.drop(submissionId)
     if (this.locked === output) this.locked = undefined
+    await this.flushUnclaimedTurns()
   }
   /**
    * execute awaits this after checking backend attachment and before native frame/capability checks.
-   * Transform schema-bearing input and record the captured input/review ID as unresolved only
-   * after preparation succeeds. Return params for native validation and dispatch. Setup
-   * failures reject execute, which still knows the original submission ID for definite-failure cleanup.
+   * Transform schema-bearing input and reserve the submission before returning params for dispatch.
+   * Setup failures reject execute, which knows the original submission ID for definite-failure cleanup.
    */
   private async prepareSubmission<M extends SessionMethod>(method: M, params: AhpRequestMap[M], submissionId: string | undefined): Promise<AhpRequestMap[M]> {
     if (method === 'input/submit') {
       const input = params as AhpRequestMap['input/submit']
       if (input.outputSchema !== undefined) params = await this.prepareOutput(input, input.outputSchema) as AhpRequestMap[M]
     }
-    if (submissionId !== undefined) this.unresolved.add(submissionId)
+    if (submissionId !== undefined && !this.disposed && !this.releasing) this.unresolved.add(submissionId)
     return params
   }
   /**
@@ -651,13 +694,21 @@ export class OutputSession implements BackendSession {
     if (output.mode === 'native') return input
     this.locked = output
     const prepared = fallbackInput(input, output)
-    if (output.mode === 'tool') await this.backend!.structuredOutputTool!.configure({
+    if (output.mode === 'tool') await this.configureTool({
       name: 'anureo_submit_result',
       description: 'Submit the final result for the current task. Correct validation errors and retry. Acceptance ends this execution.',
       schema: structuredClone(schema.schema),
       execute: value => this.enqueue(async () => this.submitCandidate(output, value)),
     })
     return prepared
+  }
+  /** Apply tool changes in request order, including removal after a pending installation. */
+  private configureTool(definition?: StructuredOutputToolDefinition): Promise<void> {
+    const tool = this.backend?.structuredOutputTool
+    if (!tool) return Promise.resolve()
+    const operation = this.toolConfiguration.then(() => tool.configure(definition))
+    this.toolConfiguration = operation.catch(() => {})
+    return operation
   }
   /**
    * prepareOutput calls this after capacity checking and schema compilation, before fallback setup.
@@ -689,13 +740,19 @@ export class OutputSession implements BackendSession {
     return output
   }
   /**
-   * execute awaits this after a native close receipt and dispose awaits it before backend
-   * disposal. Clear retention, associations and held-event accounting, detach the lease, then attempt
+   * execute starts this at native close receipt time and dispose awaits the same release
+   * before backend disposal.
+   */
+  private release(): Promise<void> {
+    return this.releasing ??= this.releaseOutputResources()
+  }
+  /**
+   * Clear retention, associations and held-event accounting, detach the lease, then attempt
    * lease disposal and native tool disabling together. Clear the lane before invoking either so
    * queued candidates expire at receipt time. Classify promise rejections after both settle.
    * Session still owns observation closure, and OutputSession.dispose owns backend release.
    */
-  private async release(): Promise<void> {
+  private async releaseOutputResources(): Promise<void> {
     this.outputs.clear()
     this.byTurn.clear()
     this.pending.clear()
@@ -708,7 +765,7 @@ export class OutputSession implements BackendSession {
     this.heldCount = 0
     const lease = this.lease
     this.lease = undefined
-    checkRelease(await Promise.allSettled([lease?.dispose(), this.backend?.structuredOutputTool?.configure()]))
+    checkRelease(await Promise.allSettled([lease?.dispose(), this.configureTool()]))
   }
 }
 
@@ -739,11 +796,13 @@ interface Output {
   value?: unknown
   /** Counts schema-invalid candidates only, up to the correction limit. */
   attempts: number
+  /** Most recent schema rejection, reported if native success supplies no accepted value. */
+  lastInvalid?: HarnessError
   /** Sticky admission failure that takes precedence over a successful native terminal. */
   error?: HarnessError
   /** Latest native text by item identity, assembled from snapshots and deltas for final parsing. */
   text: Map<string, string>
-  /** Message identities ever marked final, including streamed patches. */
+  /** Message identities currently marked final, including streamed patches. */
   finalIds: Set<string>
   /** Completed native finals withheld until terminal validation. */
   finalItems: Map<string, Extract<Item, { type: 'agentMessage' }>>

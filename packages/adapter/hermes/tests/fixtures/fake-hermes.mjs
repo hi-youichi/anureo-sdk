@@ -292,7 +292,12 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0,
       if (frame.method) {
         try {
           const result = await dispatchRequest(socket, frame.method, frame.params ?? {})
-          if (result !== NO_REPLY) reply(socket, frame.id, result)
+          if (frame.method === 'prompt.submit' && scenario === 'submit-storage-error') refuse(socket, frame.id, 'storage_unavailable')
+          else if (frame.method === 'prompt.submit' && scenario === 'submit-internal-error') {
+            send(socket, { jsonrpc: '2.0', id: frame.id, error: { code: -32603, message: 'internal error' } })
+          } else if (frame.method === 'prompt.submit' && scenario === 'submit-malformed-error') {
+            send(socket, { jsonrpc: '2.0', id: frame.id, error: {} })
+          } else if (result !== NO_REPLY) reply(socket, frame.id, result)
         } catch (cause) { refuse(socket, frame.id, typeof cause === 'string' ? cause : 'invalid_params') }
       } else {
         responses.push(frame)

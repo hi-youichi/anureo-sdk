@@ -8,6 +8,18 @@ marked **BREAKING**.
 
 ## Unreleased
 
+## [0.3.2] - 2026-11-15
+
+- **BREAKING** Workflow checkpoints now use format version 3. Runs created
+  with format version 2 require a fresh run when upgrading.
+- Harden session recovery across adapters by preserving native request outcomes,
+  handling late messages during cleanup, and keeping sibling sessions usable.
+- Improve workflow recovery by validating persisted records and preserving
+  execution and cleanup failures in diagnostics.
+- Strengthen isolated code-review and refactor checkouts, patch transfer,
+  source-state validation, and failure reporting.
+- Refine AHP schema generation and runtime validation.
+
 ## [0.3.1] - 2026-11-14
 
 - Run refactor checks in isolated worktrees before transferring verified edits

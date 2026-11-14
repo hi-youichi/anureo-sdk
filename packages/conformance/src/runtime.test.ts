@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createClient, HarnessSdkError, type RuntimeOptions } from "@anureo/sdk";
-import type { AhpEvent, GoalState, InputSubmitParams, InteractionRequested, InteractionResponse, SessionOpenParams, SessionState, TurnSteerParams } from "@anureo/protocol";
+import type { AhpEvent, GoalState, InteractionRequested, InteractionResponse, SessionOpenParams, SessionState } from "@anureo/protocol";
 import { createScriptedAdapter, FAKE_CAPABILITIES, type FakeAdapterOptions } from "./fake";
 
 const OPEN: SessionOpenParams = { requestId: "open", mode: "new", binding: { sessionId: "s", adapterId: "fake", runtimeConfigId: "r" }, cwd: "/tmp" };
@@ -67,19 +67,64 @@ test("immutable binding and unsupported capabilities never reach the backend", a
   await runtime.dispose();
 });
 
+test("scripted resume restores detached history and rejects unknown native references", async () => {
+  const { runtime, session, adapter } = await setup();
+  try {
+    const turn = await session.submit({ input: "saved" });
+    const original = adapter.backends.get(session.id)!;
+    const reference = session.reference;
+    await session.close();
+
+    await expect(runtime.sessions.resume({
+      ...reference, binding: { ...reference.binding, nativeRef: { provider: "scripted", value: "native:unknown" } },
+    })).rejects.toMatchObject({ code: "SESSION_NOT_FOUND" });
+    const resumed = await runtime.sessions.resume(reference);
+    const restored = adapter.backends.get(resumed.id)!;
+    const history = await resumed.request("history/read", { sessionId: resumed.id, requestId: "history" });
+    expect(history.items).toEqual([{ turnId: turn.id, item: (await turn.result()).items[0] }]);
+    expect(restored.history[0]!.item).not.toBe(original.history[0]!.item);
+    expect(resumed.binding).toEqual(reference.binding);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("scripted fork and revert through a boundary retain all its items", async () => {
+  const { runtime, session, adapter } = await setup();
+  try {
+    const turn = await session.submit({ input: "boundary" });
+    adapter.backends.get(session.id)!.history.push({
+      turnId: turn.id, item: { id: "another-item", type: "agentMessage", text: "second item" },
+    });
+    await session.submit({ input: "outside boundary" });
+    const boundary = { turnId: turn.id, relation: "through" } as const;
+
+    const fork = await runtime.sessions.fork(session.reference, { boundary });
+    const forkHistory = await fork.request("history/read", { sessionId: fork.id, requestId: "history" });
+    expect(forkHistory.items.map(entry => [entry.turnId, entry.item.id])).toEqual([
+      [turn.id, "native-reused"], [turn.id, "another-item"],
+    ]);
+    await session.request("session/revert", { sessionId: session.id, requestId: "revert", boundary, scope: "conversation" });
+    const reverted = await session.request("history/read", { sessionId: session.id, requestId: "history" });
+    expect(reverted.items).toEqual(forkHistory.items);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
 test("native admission owns overlap; exact steer and interrupt use the observed execution", async () => {
   const { runtime, session, adapter } = await setup({
     adapterOptions: {
       /** Keep admitted turns active so each control can target the observed native ID. */
       async execute(call, sink) {
         if (call.method === 'input/submit') {
-          const { submissionId } = call.params as InputSubmitParams;
+          const { submissionId } = call.params;
           const turnId = `native:${submissionId}`;
           await sink.emit({ type: 'turn/started', payload: { turnId } });
           return { submissionId, accepted: true, disposition: 'started', turnId };
         }
         if (call.method === 'turn/steer') {
-          const { submissionId, expectedTurnId } = call.params as TurnSteerParams;
+          const { submissionId, expectedTurnId } = call.params;
           return { submissionId, accepted: true, turnId: expectedTurnId };
         }
       },
@@ -99,8 +144,9 @@ test("native admission owns overlap; exact steer and interrupt use the observed 
 test("item IDs reused by different executions remain separate; duplicate native terminals are suppressed", async () => {
   const { runtime, session, sink } = await setup();
   const reader = session.events()[Symbol.asyncIterator]();
-  const first = await session.submit({ input: 'a' }), second = await session.submit({ input: 'b' });
+  const first = await session.submit({ input: 'a' });
   await sink.emit({ type: 'turn/completed', payload: { turnId: first.id, status: 'completed' } });
+  const second = await session.submit({ input: 'b' });
   const terminals: string[] = [], items: string[] = [];
   while (terminals.length < 2) { const event = (await reader.next()).value!; if(event.type === 'turn/completed') terminals.push(event.payload.turnId); if(event.type === 'item/completed') items.push(`${event.turnId}:${event.payload.item.id}`); }
   expect(terminals).toEqual([first.id, second.id]);
@@ -115,7 +161,7 @@ test("non-pausable source overflow fails observation without inventing a native 
       /** Leave the accepted turn active so overflow must fail observation of live work. */
       async execute(call, events) {
         if (call.method !== 'input/submit') return undefined;
-        const { submissionId } = call.params as InputSubmitParams;
+        const { submissionId } = call.params;
         await events.emit({ type: 'turn/started', payload: { turnId: 'active' } });
         return { submissionId, accepted: true, disposition: 'started', turnId: 'active' };
       },

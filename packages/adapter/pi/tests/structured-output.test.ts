@@ -104,6 +104,24 @@ test('Pi clears a rejected pre-dispatch tool and accepts a later schema', async 
   })
 })
 
+test('Pi releases unbound text and schema submissions handled by extensions', async () => {
+  const fake = directFactory(async (host, tool) => {
+    await requireOutputTool(tool).execute({ sum: 42 })
+    await host.assistant('done')
+  })
+  await withDirectClient(fake.factory, async client => {
+    const session = await client.sessions.create({ cwd: process.cwd() })
+    const host = fake.hosts[0]!
+    for (const outputSchema of [undefined, SCHEMA]) {
+      host.promptDisposition = 'handled'
+      await expect(session.submit({ input: '/command', outputSchema }, { timeoutMs: 1000 })).rejects.toMatchObject({ code: 'NATIVE_INPUT_NOT_EXECUTED' })
+      expect(fake.current).toBeUndefined()
+      host.promptDisposition = 'started'
+      expect((await (await session.submit({ input: 'retry', outputSchema: SCHEMA })).result()).text).toBe('{"sum":42}')
+    }
+  })
+})
+
 for (const attempts of [0, 3]) test(`Pi reports ${attempts ? 'invalid' : 'missing'} direct output without replay`, async () => {
   const fake = directFactory(async (host, tool) => {
     for (let n = 0; n < attempts; n++) await requireOutputTool(tool).execute({})

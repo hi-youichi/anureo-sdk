@@ -21,10 +21,10 @@ test('running Claude tools fail when is_error is true and complete when it is ab
 })
 
 
-test('pinned SDK structured hunks prove replacement positions; Write null on update never proves creation', () => {
+test('pinned SDK structured hunks prove replacement positions and Write reports updates without a diff', () => {
   const result = claudeFileChanges('Edit', { file_path: 'a', old_string: 'a', new_string: 'b', replace_all: true }, { filePath: 'a', structuredPatch: [{ oldStart: 57, oldLines: 1, newStart: 57, newLines: 1, lines: ['-a', '+b'] }] })![0]!
   expect(result).toMatchObject({ completeness: 'complete', materials: [{ patch: '@@ -57,1 +57,1 @@\n-a\n+b\n' }] })
-  expect(claudeFileChanges('Write', { file_path: 'a' }, { type: 'update', filePath: 'a', originalFile: null, content: 'large update', structuredPatch: [] })![0]!.operation).toBe('unknown')
+  expect(claudeFileChanges('Write', { file_path: 'a' }, { type: 'update', filePath: 'a', originalFile: null, content: 'large update', structuredPatch: [] })).toEqual([{ path: 'a', operation: 'modify', materials: [{ format: 'unavailable', reason: 'notProvided' }], completeness: 'partial' }])
   expect(claudeFileChanges('Write', { file_path: 'a' }, { type: 'create', filePath: 'a', originalFile: null, content: 'created', structuredPatch: [] })).toMatchObject([{ operation: 'add', materials: [{ scope: 'file', oldText: null }] }])
 })
 

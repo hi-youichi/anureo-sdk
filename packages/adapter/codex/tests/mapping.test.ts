@@ -47,6 +47,12 @@ describe('native item status vocabulary', () => {
 })
 
 describe('native userMessage content projection', () => {
+  test('absolute file mentions round-trip with their name and escaped path', () => {
+    const file = { type: 'file' as const, uri: 'file:///C:/work/notes%20%23.txt', name: 'Notes' }
+    const [item] = mapItems({ id: 'user', type: 'userMessage', content: nativeInput([file]) }, true, true)
+    if (item.type !== 'userMessage') throw new Error('unexpected item type')
+    expect(item.content).toEqual([file])
+  })
   /** Typed attachments and placeholders must preserve their positions without reading local image paths. */
   test('remote images, local images and unsupported blocks stay typed', () => {
     const [item] = mapItems({ id: 'u1', type: 'userMessage', content: [
@@ -147,8 +153,9 @@ test('native value helpers preserve unknown handling, cloning, redaction and JSO
 
 /** Usage cannot infer omitted totals, coerce strings or clamp invalid counters into apparently measured zeroes. */
 test('usage keeps only finite nonnegative counters and retains the requested scope', () => {
-  expect(mapUsage({ inputTokens: 0, outputTokens: 1.5, cachedInputTokens: '2', cacheCreationInputTokens: -1, totalTokens: Infinity }, 'session'))
+  expect(mapUsage({ inputTokens: 0, outputTokens: 1.5, cachedInputTokens: '2', cacheWriteInputTokens: -1, totalTokens: Infinity }, 'session'))
     .toEqual({ provider: 'codex', scope: 'session', source: 'native', input: 0, output: 1.5 })
+  expect(mapUsage({ cacheWriteInputTokens: 0 })).toMatchObject({ cacheWrite: 0 })
   for (const value of [null, [], { inputTokens: NaN }]) {
     expect(mapUsage(value)).toEqual({ provider: 'codex', scope: 'turn', source: 'native' })
   }

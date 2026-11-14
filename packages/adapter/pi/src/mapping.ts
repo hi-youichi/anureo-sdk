@@ -3,7 +3,10 @@ import { HarnessSdkError } from '@anureo/sdk'
 import type { PiHostContent, PiHostEntry, PiHostImage, PiHostMessage } from './host'
 
 /** Text and JSON projection shared by live item publication and history reconstruction. */
-export type Redactor = ReturnType<typeof createRedactor>
+export type Redactor = {
+  text(value: string): string
+  json(value: unknown): JsonValue
+}
 
 /**
  * Replace literal secrets in mapped content with `[REDACTED]`. The list is captured at creation,
@@ -13,7 +16,9 @@ export type Redactor = ReturnType<typeof createRedactor>
  * values and containers beyond depth 24 with null. Property access errors propagate to the caller.
  * PiAdapter captures this redactor at construction and shares it with its backends.
  */
-export function createRedactor(secrets: readonly string[] = []): { text(value: string): string; json(value: unknown): JsonValue } {
+export function createRedactor(secrets: readonly string[] = []): Redactor & {
+  delta(value: string): { text: string; pending: string }
+} {
   const values = [...new Set(secrets.filter(secret => secret.length > 0))].sort((a, b) => b.length - a.length)
   const text = (value: string) => values.reduce((out, secret) => out.split(secret).join('[REDACTED]'), value)
 
@@ -29,7 +34,26 @@ export function createRedactor(secrets: readonly string[] = []): { text(value: s
     }
     return null
   }
-  return { text, json: value => project(value, 0) }
+  /** Withhold any trailing prefix that could match a secret in the next chunk. */
+  const delta = (value: string) => {
+    if (!values.length) return { text: value, pending: '' }
+    const output: string[] = []
+    for (let offset = 0; offset < value.length;) {
+      const secret = values.find(secret => value.startsWith(secret, offset))
+      if (values.some(secret => secret.length > value.length - offset && secret.startsWith(value.slice(offset)))) {
+        return { text: output.join(''), pending: value.slice(offset) }
+      }
+      if (secret) {
+        output.push('[REDACTED]')
+        offset += secret.length
+      } else {
+        output.push(value.charAt(offset++))
+      }
+    }
+    return { text: output.join(''), pending: '' }
+  }
+
+  return { text, json: value => project(value, 0), delta }
 }
 
 /** Built-in tools selected for read-only sessions. The host retains its process rights. */
@@ -40,6 +64,10 @@ export const FULL_ACCESS_TOOLS = ['read', 'bash', 'edit', 'write', 'grep', 'find
 export const PERMISSION_MODES = ['read-only', 'agent-full-access'] as const
 /** Supported tool-allowlist policy, with no approval interaction. */
 export type PiPermissionMode = typeof PERMISSION_MODES[number]
+const TOOLS_BY_MODE = {
+  'read-only': READ_ONLY_TOOLS,
+  'agent-full-access': FULL_ACCESS_TOOLS,
+} satisfies Record<PiPermissionMode, readonly string[]>
 /**
  * Return a fresh Pi tool allowlist for a permission mode. Omission returns undefined so
  * PiBackendSession.hostOptions can retain host defaults and setConfig can skip changing tools.
@@ -47,8 +75,7 @@ export type PiPermissionMode = typeof PERMISSION_MODES[number]
  */
 export function permissionTools(mode: unknown): string[] | undefined {
   if (mode === undefined) return undefined
-  if (mode === 'read-only') return [...READ_ONLY_TOOLS]
-  if (mode === 'agent-full-access') return [...FULL_ACCESS_TOOLS]
+  if (typeof mode === 'string' && Object.hasOwn(TOOLS_BY_MODE, mode)) return [...TOOLS_BY_MODE[mode as PiPermissionMode]]
   throw new HarnessSdkError('INVALID_PARAMS', 'Unsupported Pi permission mode')
 }
 
@@ -164,15 +191,23 @@ export function piTurnError(message: PiHostMessage | undefined): HarnessError | 
  */
 export function turnStarts(entries: readonly PiHostEntry[], known: ReadonlyMap<string, string>): Set<string> {
   const starts = new Set<string>()
+  const seenTurns = new Set<string>()
   let previous: PiHostMessage | undefined
   for (const entry of entries) {
     if (entry.kind !== 'message' || !entry.message) continue
-    if (entry.message.role === 'user' && (known.has(entry.id) || canStartTurnAfter(previous))) {
-      starts.add(entry.id)
+    if (entry.message.role === 'user') {
+      const turnId = known.get(entry.id)
+      if (turnId === undefined ? canStartTurnAfter(previous) : !seenTurns.has(turnId)) starts.add(entry.id)
+      if (turnId !== undefined) seenTurns.add(turnId)
     }
     previous = entry.message
   }
   return starts
+}
+
+/** Use the same turn ID for history projection and fork boundary lookup. */
+export function historyTurnId(entryId: string, turns: ReadonlyMap<string, string>): string {
+  return turns.get(entryId) ?? `native:${entryId}`
 }
 
 /**
@@ -194,7 +229,7 @@ export function historyItems(redact: Redactor, entries: readonly PiHostEntry[], 
   for (const entry of entries) {
     if (starts.has(entry.id)) {
       nativeTurnId = entry.id
-      turnId = turns.get(entry.id) ?? `native:${entry.id}`
+      turnId = historyTurnId(entry.id, turns)
     }
     const base = { turnId, ...(nativeTurnId ? { nativeTurnId } : {}), nativeItemId: entry.id }
     for (const mapped of historyEntryItems({ redact, entry, base })) {
@@ -311,19 +346,23 @@ function historyEntryItems({ redact, entry, base }: { redact: Redactor; entry: P
   return assistantHistoryItems({ redact, message, content: message.content, base })
 }
 
-/** Keep native block indexes in text and reasoning ids. Text is final only on stop with no tool calls. */
+/** Classify completed assistant text consistently in live events and history. */
+export function assistantTextPhase(content: readonly PiHostContent[], stopReason: PiHostMessage['stopReason']): 'final' | 'commentary' {
+  return stopReason === 'stop' && !content.some(part => part.type === 'toolCall') ? 'final' : 'commentary'
+}
+
+/** Keep native block indexes in text and reasoning ids. */
 function assistantHistoryItems({ redact, message, content, base }: {
   redact: Redactor
   message: PiHostMessage
   content: PiHostContent[]
   base: HistoryBase
 }): HistoryItem[] {
-  const hasTools = content.some(part => part.type === 'toolCall')
+  const phase = assistantTextPhase(content, message.stopReason)
   return content.flatMap((part, index): HistoryItem[] => {
     const id = `${base.nativeItemId}:${index}`
     if (part.type === 'text') {
       const text = redact.text(part.text)
-      const phase = !hasTools && message.stopReason === 'stop' ? 'final' : 'commentary'
       return [{ ...base, item: { id, type: 'agentMessage', status: 'completed', text, phase } }]
     }
     if (part.type === 'thinking') return [{ ...base, item: { id, type: 'reasoning', status: 'completed', text: redact.text(part.thinking) } }]

@@ -18,9 +18,9 @@ export async function syncDirectory(path: string): Promise<void> {
  * its parent directory where supported. FileRunHandle and AgentJournal serialize their own
  * writes because a rename alone cannot prevent an older snapshot from overwriting a newer one.
  * The caller creates the parent. Invalid JSON rejects before any file I/O.
- * A directory flush can fail after replacement.
+ * The optional callback observes replacement before the directory flush, which can still fail.
  * If temporary-file cleanup fails, the rejection includes both failures. */
-export async function atomicPublish(path: string, value: unknown): Promise<void> {
+export async function atomicPublish(path: string, value: unknown, onReplace?: () => void): Promise<void> {
   const text = `${canonicalJson(value)}\n`
   const temporary = `${path}.${randomUUID()}.tmp`
   // An exclusive open establishes ownership. Cleanup must leave an existing file alone.
@@ -41,6 +41,7 @@ export async function atomicPublish(path: string, value: unknown): Promise<void>
     }
     throw cause
   }
+  onReplace?.()
   await syncDirectory(dirname(path))
 }
 

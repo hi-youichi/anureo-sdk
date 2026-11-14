@@ -1,4 +1,4 @@
-import type { Client, Input, Session, Turn } from '@anureo/sdk';
+import { HarnessSdkError, type Client, type Input, type Session, type Turn } from '@anureo/sdk';
 
 /** Native execution association, active observation closure, and independent observer ownership cases. */
 export type NativeScenario = 'overlap' | 'close-active' | 'observer-cancel';
@@ -91,32 +91,37 @@ async function checkOverlap(fixture: NativeFixture, first: Promise<Turn>): Promi
   const second = submitObserved(fixture.session, fixture.second);
   await fixture.release?.();
   const [firstTurn, secondTurn] = await Promise.all([first, second]);
-  if ((firstTurn.id === secondTurn.id) !== (fixture.relation === 'same')) throw new Error('EXECUTION_ASSOCIATION');
+  if ((firstTurn.id === secondTurn.id) !== (fixture.relation === 'same')) throw new HarnessSdkError('EXECUTION_ASSOCIATION');
   const [firstResult, secondResult] = await Promise.all([
     firstTurn.result({ timeoutMs: nativeWaitMs }),
     secondTurn.result({ timeoutMs: nativeWaitMs }),
   ]);
-  if (firstResult.status !== 'completed' || secondResult.status !== 'completed') throw new Error('NATIVE_TERMINAL');
-  if (firstTurn.id === secondTurn.id && JSON.stringify(firstResult) !== JSON.stringify(secondResult)) throw new Error('SHARED_RESULT');
+  if (firstResult.status !== 'completed' || secondResult.status !== 'completed') throw new HarnessSdkError('NATIVE_TERMINAL');
+  if (firstTurn.id === secondTurn.id && JSON.stringify(firstResult) !== JSON.stringify(secondResult)) throw new HarnessSdkError('SHARED_RESULT');
 }
 
 /** Closing an active session must end observation without synthesizing a native execution result. */
 async function checkActiveClose(fixture: NativeFixture, first: Promise<Turn>): Promise<void> {
   const turn = await first;
   const result = await fixture.session.close({ timeoutMs: nativeWaitMs });
-  if (!result.observationClosed) throw new Error('OBSERVATION_NOT_CLOSED');
+  if (!result.observationClosed) throw new HarnessSdkError('OBSERVATION_NOT_CLOSED');
   await assertObservationClosed(turn);
 }
 
-/** Dispose the original observer before the second submission. Its sibling must still receive the native completion after release. */
+/** Cancel the original result wait before the second submission and verify sibling completion after release. */
 async function checkObserverCancellation(fixture: NativeFixture, first: Promise<Turn>): Promise<void> {
   const firstTurn = await first;
   const siblingObserver = firstTurn.observe();
+  const cancelled = firstTurn.result({ timeoutMs: nativeWaitMs }).then<undefined, unknown>(() => undefined, cause => cause);
   await firstTurn.dispose();
+  const cause = await cancelled;
+  if (!cause || typeof cause !== 'object' || !('code' in cause) || cause.code !== 'REQUEST_ABORTED') {
+    throw new HarnessSdkError('OBSERVER_NOT_CANCELLED');
+  }
   const second = submitObserved(fixture.session, fixture.second);
   await fixture.release?.();
   await second;
-  if ((await siblingObserver.result({ timeoutMs: nativeWaitMs })).status !== 'completed') throw new Error('SIBLING_OBSERVER_CANCELLED');
+  if ((await siblingObserver.result({ timeoutMs: nativeWaitMs })).status !== 'completed') throw new HarnessSdkError('SIBLING_OBSERVER_CANCELLED');
 }
 
 /** Accept only observation closure; a native terminal or any other rejection fails the active-close case. */
@@ -127,5 +132,5 @@ async function assertObservationClosed(turn: Turn): Promise<void> {
     if (cause && typeof cause === 'object' && 'code' in cause && cause.code === 'OBSERVATION_CLOSED') return;
     throw cause;
   }
-  throw new Error('FALSE_TERMINAL');
+  throw new HarnessSdkError('FALSE_TERMINAL');
 }

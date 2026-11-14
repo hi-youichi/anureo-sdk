@@ -20,7 +20,7 @@ export type { CodexModel } from './models'
  */
 export function createCodexCatalogSession(options: CodexAdapterOptions) {
   let client: CodexJsonlClient | undefined
-  let preparationInFlight: Promise<void> | undefined
+  let preparationInFlight: Promise<CodexJsonlClient> | undefined
   let connectionCloseInFlight: Promise<void> | undefined
   let disposalInFlight: Promise<void> | undefined
 
@@ -31,17 +31,16 @@ export function createCodexCatalogSession(options: CodexAdapterOptions) {
    * Reject startup, cleanup or cancellation failures.
    */
   const prepare = (context: CatalogProbeOptions = {}): Promise<void> => {
-    return withAbortCleanup(context, async () => {
-      // Disposal's second close must finish before a replacement client can be published.
-      await disposalInFlight
-      await connectionCloseInFlight
-      if (preparationInFlight) {
-        await preparationInFlight
-        return
-      }
-      if (client) return
-      await (preparationInFlight ??= startConnection(context).finally(() => { preparationInFlight = undefined }))
-    })
+    return withAbortCleanup(context, async () => { await prepareConnection(context) })
+  }
+
+  async function prepareConnection(context: CatalogProbeOptions): Promise<CodexJsonlClient> {
+    // Disposal's second close must finish before a replacement client can be published.
+    await disposalInFlight
+    await connectionCloseInFlight
+    if (preparationInFlight) return preparationInFlight
+    if (client) return client
+    return preparationInFlight = startConnection(context).finally(() => { preparationInFlight = undefined })
   }
 
   /**
@@ -99,15 +98,18 @@ export function createCodexCatalogSession(options: CodexAdapterOptions) {
 
   /**
    * Keep cancellation active from preparation through the read. The models phase observer can
-   * run before the read begins, so look up the shared client when invoking the read itself.
+   * detach the prepared client before the read begins, so verify its identity at dispatch.
    */
   function query<T>(
     context: CatalogProbeOptions,
     work: (getClient: () => CodexJsonlClient) => Promise<T>,
   ): Promise<T> {
     return withAbortCleanup(context, async () => {
-      await prepare(context)
-      return await work(() => client!)
+      const prepared = await prepareConnection(context)
+      return await work(() => {
+        if (client !== prepared) throw new HarnessSdkError('CONNECTION_CLOSED')
+        return prepared
+      })
     })
   }
 
@@ -142,7 +144,7 @@ export function createCodexCatalogSession(options: CodexAdapterOptions) {
    * Spawn and handshake for prepare. On failure, close the published client and release any
    * process acquired during spawn. A cleanup rejection takes precedence over the startup cause.
    */
-  function startConnection(context: CatalogProbeOptions): Promise<void> {
+  function startConnection(context: CatalogProbeOptions): Promise<CodexJsonlClient> {
     let spawned: HarnessProcess | undefined
     return (async () => {
       const child = await catalogPhase(context, 'spawn', async () => {
@@ -157,13 +159,14 @@ export function createCodexCatalogSession(options: CodexAdapterOptions) {
       })
       if (context.signal?.aborted) {
         // A success observer can abort after the spawn phase's own cancellation check.
-        await child.dispose()
         throw new HarnessSdkError('RPC_ABORTED')
       }
 
       const connected = createCatalogClient(child, options, context)
       publishConnection(connected)
+      spawned = undefined
       await handshake(connected, context)
+      return connected
     })().catch(async cause => {
       await closeConnection()
       // A failed spawn phase may still have acquired a process before client publication.

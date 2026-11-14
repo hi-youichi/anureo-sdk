@@ -1,5 +1,5 @@
 // Projects ACP prompt input, session configuration and live updates for the adapter.
-import { acpFileChanges } from './file-changes';
+import { projectAcpToolContent } from './file-changes';
 import type {
   Capabilities, ConfigOption, InputBlock, Item, JsonObject, JsonValue,
   McpServer as SessionMcpServer, SessionState, SubagentItem, ToolCallItem,
@@ -79,12 +79,15 @@ export function configuration(data: Record<string, unknown>): { options: ConfigO
     keys.set(descriptor.id, nativeOption);
     if (descriptor.value !== undefined) values[descriptor.id] = descriptor.value;
   }
-  for (const item of Array.isArray(data.configOptions) ? data.configOptions : []) {
+  const nativeOptions = (Array.isArray(data.configOptions) ? data.configOptions : []).flatMap((item) => {
     const option = record(item);
     const descriptor = configOption(option);
-    if (!descriptor) continue;
+    return descriptor ? [{ option, descriptor }] : [];
+  });
+  const hasNativeModel = nativeOptions.some(({ descriptor }) => descriptor.id === 'model');
+  for (const { option, descriptor } of nativeOptions) {
     registerOption(descriptor, option);
-    if (option.category === 'model' && descriptor.id !== 'model') {
+    if (option.category === 'model' && !hasNativeModel && !keys.has('model')) {
       registerOption({ ...descriptor, id: 'model' }, option);
     }
   }
@@ -337,13 +340,14 @@ export class AcpUpdateMapper {
     if (kind === 'compaction_summary_chunk') summary += text(update.content);
     else if ('summary' in update) summary = text(update.summary);
     this.compaction.set(id, summary);
-    const terminal = update.status === 'completed' || update.status === 'failed' || update.status === 'cancelled';
+    const status = update.status === 'cancelled' ? 'interrupted'
+      : update.status === 'completed' || update.status === 'failed' ? update.status : 'running';
     await this.upsert({
       id,
       type: 'compaction',
       summary,
-      status: update.status === 'failed' ? 'failed' : update.status === 'cancelled' ? 'interrupted' : terminal ? 'completed' : 'running',
-    }, terminal ? 'completion' : 'snapshot');
+      status,
+    }, status === 'running' ? 'snapshot' : 'completion');
   }
   /** Merge negotiated subagent fields and publish a terminal snapshot when its native state ends. */
   private async updateSubagent(update: Record<string, unknown>): Promise<void> {
@@ -416,11 +420,11 @@ function selectValues(value: unknown): string[] {
 function userMessageBlock(value: unknown, chunk: string): InputBlock | undefined {
   const content = record(value);
   if (content.type === 'text') return { type: 'text', text: chunk };
-  if (content.type === 'image' && typeof content.data === 'string') {
+  if (content.type === 'image' && typeof content.data === 'string' && typeof content.mimeType === 'string') {
     return {
       type: 'image',
       data: content.data,
-      mimeType: typeof content.mimeType === 'string' ? content.mimeType : undefined,
+      mimeType: content.mimeType,
     };
   }
   if (content.type === 'resource_link' && typeof content.uri === 'string') {
@@ -439,7 +443,7 @@ const TOOL_KINDS: Record<string, ToolCallItem['kind']> = {
 
 /**
  * Build a new tool snapshot, retaining previous values for omitted fields. Defined content
- * replaces file materials. Defined rawOutput, including null, wins over content for output.
+ * replaces file materials. Non-null rawOutput wins over the fallback content projection.
  * Serialization failures propagate before the caller caches or publishes the snapshot.
  */
 function toolSnapshot(id: string, update: Record<string, unknown>, previous: ToolCallItem | undefined): ToolCallItem {
@@ -449,18 +453,19 @@ function toolSnapshot(id: string, update: Record<string, unknown>, previous: Too
   } else if (update.status === undefined) {
     status = previous?.status ?? 'running';
   }
+  const content = update.content !== undefined ? projectAcpToolContent(update.content) : undefined;
   const baseItem: ToolCallItem = {
     ...(previous ?? { id, type: 'toolCall', kind: 'other', title: 'ACP tool' }),
     ...(typeof update.title === 'string' ? { title: update.title } : {}),
     ...(typeof update.kind === 'string' ? { kind: TOOL_KINDS[update.kind] ?? 'other', nativeType: update.kind } : {}),
     status,
-    ...(update.content !== undefined ? { fileChanges: acpFileChanges(update.content) } : {}),
-    ...(update.rawInput !== undefined ? { input: safe(update.rawInput) } : {}),
+    ...(content ? { fileChanges: content.fileChanges } : {}),
+    ...(update.rawInput != null ? { input: safe(update.rawInput) } : {}),
   };
-  const outputPatch = update.rawOutput !== undefined
+  const outputPatch = update.rawOutput != null
     ? { output: safe(update.rawOutput) }
-    : update.content !== undefined
-      ? { output: safe(update.content) }
+    : content
+      ? { output: safe(content.output) }
       : {};
   return {
     ...baseItem,

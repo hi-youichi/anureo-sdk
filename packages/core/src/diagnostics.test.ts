@@ -64,12 +64,17 @@ test('safe codes prefer an existing code property and only fall back to Error me
   expect(safeCatalogErrorCode(new Error('private cause'))).toBe('CATALOG_QUERY_FAILED')
 })
 
-test.each(['code', 'rpcCode'])('diagnostic %s property failures replace the work rejection before terminal reporting', async property => {
+test.each(['code', 'rpcCode'])('diagnostic %s property failures preserve the work rejection and report safe fields', async property => {
   const events: CatalogProbeEvent[] = []
   const propertyFailure = new Error('getter failure')
-  const cause = { get [property]() { throw propertyFailure } }
-  await expect(catalogPhase({ onPhase: event => { events.push(event) } }, 'models', async () => { throw cause })).rejects.toBe(propertyFailure)
-  expect(events).toEqual([{ phase: 'models', outcome: 'started' }])
+  const cause = Object.defineProperty({ code: 'NATIVE_RPC_ERROR' }, property, {
+    get() { throw propertyFailure },
+  })
+  await expect(catalogPhase({ onPhase: event => { events.push(event) } }, 'models', async () => { throw cause })).rejects.toBe(cause)
+  expect(events).toEqual([
+    { phase: 'models', outcome: 'started' },
+    { phase: 'models', outcome: 'error', errorCode: property === 'code' ? 'CATALOG_QUERY_FAILED' : 'NATIVE_RPC_ERROR', durationMs: expect.any(Number) },
+  ])
 })
 
 test('native RPC accessors are read for classification and delivery without replacing the work failure', async () => {

@@ -297,7 +297,12 @@ async function disposeProcess({ child, pid, owned, timeoutMs, didExit, exited }:
  * has not been observed.
  */
 async function waitForTerminatedProcessExit(didExit: () => boolean, exited: Promise<ProcessExit>): Promise<void> {
-  await Promise.race([exited, delay(1000)]);
+  const timeout = new AbortController();
+  try {
+    await Promise.race([exited, delay(1000, undefined, { signal: timeout.signal })]);
+  } finally {
+    timeout.abort();
+  }
   if (!didExit()) throw new ProcessPortError('PROCESS_DISPOSE_FAILED', 'Harness process did not exit after termination');
 }
 

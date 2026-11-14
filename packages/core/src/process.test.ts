@@ -151,7 +151,7 @@ test('abruptly exited children retain their original PID for safe cleanup', asyn
   }
 });
 
-test('posix dispose rejects after retrying EPERM while the child remains alive', async () => {
+test('posix dispose waits for child exit after a transient EPERM and ESRCH', async () => {
   const child = await spawnHarnessProcess({ command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], shutdownTimeoutMs: 200 });
   const realKill = process.kill;
   const seen: Array<{ pid: number; signal: unknown }> = [];
@@ -174,6 +174,23 @@ test('posix dispose rejects after retrying EPERM while the child remains alive',
     await assert.rejects(child.write('after-failed-disposal'), (error: unknown) => error instanceof ProcessPortError && error.code === 'PROCESS_WRITE_FAILED');
     assert.equal(seen.filter((entry) => entry.pid < 0 && entry.signal === 'SIGTERM').length, 2);
     assert.ok(seen.some((entry) => entry.pid < 0 && entry.signal === 0));
+  } });
+});
+
+test('posix dispose retains EPERM when group signal retries are exhausted', async () => {
+  const child = await spawnHarnessProcess({ command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'] });
+  const denied = Object.assign(new Error('group signal denied'), { code: 'EPERM' });
+  let termAttempts = 0;
+  const mockKill: typeof process.kill = (pid, signal) => {
+    assert.equal(pid, -child.pid);
+    assert.equal(signal, 'SIGTERM');
+    termAttempts++;
+    throw denied;
+  };
+  await withPosixKillMock({ child, mockKill, check: async () => {
+    await assert.rejects(child.dispose(), (error: unknown) =>
+      error instanceof ProcessPortError && error.code === 'PROCESS_DISPOSE_FAILED' && error.nativeCode === 'EPERM');
+    assert.equal(termAttempts, 5);
   } });
 });
 

@@ -3,7 +3,8 @@ import { resolve } from 'node:path';
 import { createClient } from '@anureo/sdk';
 import type { AhpEvent, Capabilities } from '@anureo/protocol';
 import { createAcpAdapter, createDshAcpAdapter, type AcpAdapterOptions } from '../src/index';
-import { resolveConfigValue } from '../src/mapping';
+import { configuration, resolveConfigValue } from '../src/mapping';
+import { redactLine, StderrTail } from '../src/diagnostics';
 import { rejectionOf } from './test-helpers';
 
 const executable = resolve(import.meta.dirname, './fixtures/dsh-acp.mjs');
@@ -107,7 +108,7 @@ test('the permission policy answers without an AHP interaction and stays auditab
     const text = events
       .flatMap((event) => event.type === 'item/completed' && event.payload.item.type === 'agentMessage' ? [event.payload.item.text] : [])
       .join('');
-    expect(text).toContain('selected');
+    expect(text).toContain('selected:allow-once');
     expect(completed(events)?.payload).toMatchObject({ status: 'completed' });
   } finally { await f.close(); }
 });
@@ -125,6 +126,7 @@ test('a policy that declines to decide keeps the interactive approval path', asy
     }
     await f.untilTurnCompletes(turn.id);
     expect(f.events.some((event) => event.type === 'interaction/resolved')).toBe(true);
+    expect((await turn.result()).text).toContain('selected:reject-once');
   } finally { await f.close(); }
 });
 
@@ -169,11 +171,45 @@ test('model aliases resolve to the advertised wire value and unknown ones fail e
 test('the open path resolves a bare model before it reaches the backend', async () => {
   const { runtime } = await openFixtureClient();
   try {
-    const session = await runtime.sessions.create({ cwd: process.cwd(), model: 'deepseek-v4-flash' });
+    const session = await runtime.sessions.create({ cwd: process.cwd(), model: 'deepseek-v4-pro' });
     expect(session.binding.adapterId).toBe('dsh-acp');
+    expect(session.capabilities.config?.options.find(option => option.id === 'model')?.value).toBe('deepseek-official/deepseek-v4-pro');
     await session.close();
     expect(await rejectionOf(runtime.sessions.create({ cwd: process.cwd(), model: 'gpt-9' }))).toMatchObject({ code: 'INVALID_PARAMS' });
   } finally { await runtime.dispose(); }
+});
+
+test('the model descriptor, value, and native dispatch agree across multiple model options', () => {
+  const model = (id: string) => ({ id, type: 'select', category: 'model', currentValue: id, options: [{ value: id }] });
+  const first = model('first-model');
+  const second = model('second-model');
+  const native = model('model');
+  for (const [configOptions, expected] of [
+    [[first, second], first],
+    [[first, second, native], native],
+  ] as const) {
+    const { options, values, keys } = configuration({ configOptions });
+    expect(options.filter(option => option.id === 'model')).toMatchObject([
+      { value: expected.currentValue, schema: { enum: [expected.currentValue] } },
+    ]);
+    expect(values.model).toBe(expected.currentValue);
+    expect(keys.get('model')).toBe(expected);
+  }
+});
+
+test('stderr redacts complete oversized lines and discards oversized partial lines', () => {
+  const prefix = `fatal: https://account:${'x'.repeat(8192)}`;
+  const suffix = 'remaining-password@example.test';
+  expect(redactLine(prefix + suffix)).toBe('fatal: https://[redacted]@example.test');
+
+  const seen: string[] = [];
+  const tail = new StderrTail(4, line => seen.push(line));
+  tail.write(prefix);
+  tail.write(suffix);
+  tail.write('\nnext line\n');
+  tail.flush();
+  expect(seen).toEqual(['[stderr line truncated]', 'next line']);
+  expect(tail.text()).toBe(seen.join('\n'));
 });
 
 test('startup stderr is retained, redacted, and attached to the handshake failure', async () => {

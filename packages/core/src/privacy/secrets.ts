@@ -1,6 +1,6 @@
 // Registers explicitly marked secrets and projects public events, state and history.
 import { boundFileChangeItem } from "./file-change-limits";
-import type { Capabilities, AhpEventPayload, AhpMethod, AhpResultMap, FileChange, GoalState, HistoryPage, InputBlock, InteractionRequested, InteractionResponse, Item, JsonObject, JsonSchema, JsonValue, SessionState, ToolCallItem } from "@anureo/protocol";
+import type { Capabilities, AhpEventPayload, AhpMethod, AhpResultMap, FileChange, GoalState, HistoryPage, InputBlock, InteractionRequested, InteractionResponse, InteractionResult, Item, JsonObject, JsonSchema, JsonValue, SessionState, ToolCallItem } from "@anureo/protocol";
 import { assertDefinition } from "@anureo/protocol";
 import { HarnessSdkError } from "../errors";
 
@@ -26,13 +26,16 @@ export class SecretRedactor {
    * BACKPRESSURE_EXCEEDED. Hook exceptions also propagate, leaving earlier registrations intact.
    * Schema traversal stops beyond depth 32, with the request schema at depth zero.
    * Session installs this as InteractionRegistry's pre-response check. InteractionRegistry.respond
-   * invokes it after validation and rejects on failure before looking up a replay or starting native
+   * invokes it after validation and admission and rejects on failure before returning a replay or starting native
    * delivery. Direct consumers own validation and delivery.
    */
   rememberResponse(request: InteractionRequested, response: InteractionResponse): void {
     if (request.kind === "userInput" && response.kind === "userInput") {
       for (const question of request.questions) {
         if (question.secret) this.remember(response.answers[question.id]);
+      }
+      if (request.schema !== undefined) {
+        this.fromSchema(request.schema, response.answers, { root: request.schema, depth: 0 });
       }
     }
     if (request.kind === "elicitation" && response.kind === "elicitation" && response.content && request.schema !== undefined) {
@@ -52,7 +55,7 @@ export class SecretRedactor {
   /**
    * Project an ordered text chunk, withholding a possible trailing secret prefix until the next chunk.
    * Complete matches win even when a longer secret is incomplete. event scopes streams by turn/item
-   * and discards pending prefixes on item/completed, whose snapshot carries authoritative full text.
+   * and discards pending prefixes when a completion or patch supplies an authoritative snapshot.
    * Direct consumers must use distinct ordered keys; this method has no flush/reset operation, so
    * they must discard the redactor when they no longer need its retained prefixes and secrets.
    */
@@ -116,7 +119,7 @@ export class SecretRedactor {
     };
   }
   /**
-   * Project a validated configuration or goal result according to its method. Other results pass
+   * Project a validated configuration, goal or interaction result according to its method. Other results pass
    * through by identity. Session.projectRequestResult routes history to history() and calls this
    * for other projectable results. Session.executeRequest stores projected configuration or goal
    * state and validates and freezes the returned result. Direct callers own validation and storage.
@@ -124,6 +127,7 @@ export class SecretRedactor {
   result<M extends AhpMethod>(method: M, value: AhpResultMap[M]): AhpResultMap[M] {
     if (method === "session/config/set") return this.state(value as SessionState) as AhpResultMap[M];
     if (method === "goal/set" || method === "goal/clear") return this.goal(value as GoalState) as AhpResultMap[M];
+    if (method === "interaction/respond" || method === "interaction/cancel") return this.interactionResult(value as InteractionResult) as AhpResultMap[M];
     return value;
   }
   /**
@@ -196,7 +200,8 @@ export class SecretRedactor {
     }
   }
   /**
-   * Project validated events in publication order, clearing an item's buffered prefix on completion.
+   * Project validated events in publication order, clearing an item's buffered prefix on completion
+   * or snapshot replacement.
    * Supply turnId to isolate reused item IDs across turns. Omission uses an item-only stream key.
    * Session.publish invokes this after lifecycle admission and before retaining/publishing results.
    * An invalid Item-shaped patch throws ProtocolValidationError and rejects Session.emit, which
@@ -222,6 +227,7 @@ export class SecretRedactor {
       case "session/metadata": return { ...event, payload: this.json(event.payload as JsonObject) as typeof event.payload };
       case "session/state": return { ...event, payload: this.state(event.payload) };
       case "interaction/requested": return { ...event, payload: this.interaction(event.payload) };
+      case "interaction/resolved": return { ...event, payload: this.interactionResult(event.payload) };
       case "turn/completed": return {
         ...event,
         payload: {
@@ -249,6 +255,11 @@ export class SecretRedactor {
   private readonly values = new Set<string>();
   private readonly streams = new Map<string, string>();
   private secretBytes = 0;
+
+  private interactionResult(value: InteractionResult): InteractionResult {
+    return value.reason === undefined ? value : { ...value, reason: this.text(value.reason) };
+  }
+
   /**
    * rememberResponse and fromSchema call this before a response can be sent. Recursively retain marked
    * scalar values within session budgets; invoke the host hook before accepting each new value.
@@ -297,7 +308,7 @@ export class SecretRedactor {
     return target;
   }
   /**
-   * rememberResponse calls this for elicitation/dynamicTool schemas; recursive branches pass marked
+   * rememberResponse calls this for user-input, elicitation and dynamic-tool schemas; recursive branches pass marked
    * values to remember. Collect marked values through bounded local schema traversal, including
    * referenced and sibling rules; does not validate response values or fetch references. Visit
    * references before siblings because registration order determines host-hook and budget failures.
@@ -482,29 +493,31 @@ export class SecretRedactor {
   }
   /**
    * itemDelta calls this for JSON-valued payloads before Session retains or publishes the event.
-   * A patch object with type or fileChanges must pass Item validation before item projection.
-   * Item-shaped validation failures throw ProtocolValidationError. Other values receive ordinary
-   * JSON projection.
+   * A patch object with a type discriminator must pass Item validation before item projection.
+   * A projected snapshot replaces the previous content and discards any buffered prefix.
+   * Other values receive ordinary JSON projection.
    */
-  private deltaValue(kind: ItemDeltaPayload["kind"], value: JsonValue): JsonValue {
-    if (kind === "patch" && isJsonObject(value) && ("type" in value || "fileChanges" in value)) {
+  private deltaValue(kind: ItemDeltaPayload["kind"], value: JsonValue, stream: string): JsonValue {
+    if (kind === "patch" && isJsonObject(value) && "type" in value) {
       assertDefinition<Item>("Item", value);
-      return this.item(value) as unknown as JsonValue;
+      const snapshot = this.item(value);
+      this.streams.delete(stream);
+      return snapshot as unknown as JsonValue;
     }
     return this.json(value);
   }
   /**
-   * event projects delta text before validating/projecting an optional JSON value. A malformed patch
-   * throws after any prefix update, as publication fails through Session.emit; no buffered state is
-   * rolled back. Non-Item JSON still receives ordinary content projection.
+   * event projects optional patch text independently of the append stream. Other delta text can
+   * complete a buffered prefix. Malformed snapshot patches leave the prefix intact.
    */
   private itemDelta(payload: ItemDeltaPayload, turnId?: string): ItemDeltaPayload {
     const projected = { ...payload };
+    const stream = streamKey(payload.itemId, turnId);
     if (payload.text !== undefined) {
-      projected.text = this.delta(streamKey(payload.itemId, turnId), payload.text);
+      projected.text = payload.kind === "patch" ? this.text(payload.text) : this.delta(stream, payload.text);
     }
     if (payload.value !== undefined) {
-      projected.value = this.deltaValue(payload.kind, payload.value);
+      projected.value = this.deltaValue(payload.kind, payload.value, stream);
     }
     return projected;
   }

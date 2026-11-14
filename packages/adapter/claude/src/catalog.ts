@@ -31,6 +31,7 @@ export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
   let pendingHandshakeModels: Awaited<ReturnType<Query['supportedModels']>> | undefined
   let preparing: Promise<void> | undefined
   let disposing: Promise<void> | undefined
+  let modelReads = Promise.resolve()
 
   return { prepare, listModels, dispose }
 
@@ -65,13 +66,16 @@ export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
    * and handshake phases this call starts, and model reads are reported after initial preparation.
    * Success leaves the connection open for reuse. An already-aborted signal rejects with
    * RPC_ABORTED before work. Probe failures await shared cleanup before rejecting, with any
-   * cleanup failure taking precedence.
+   * cleanup failure taking precedence. Model reads wait for earlier reads and their cleanup.
    */
-  async function listModels(context: CatalogProbeOptions = {}) {
-    return withProbeCleanup(context, async () => {
+  function listModels(context: CatalogProbeOptions = {}) {
+    if (context.signal?.aborted) return Promise.reject(new HarnessSdkError('RPC_ABORTED'))
+    const read = modelReads.then(() => withProbeCleanup(context, async () => {
       await prepare(context)
       return catalogPhase(context, 'models', () => readModels(context))
-    })
+    }))
+    modelReads = read.then(() => {}, () => {})
+    return read
   }
 
   /** Release the directory connection and allow a later probe to reopen it.

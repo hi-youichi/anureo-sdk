@@ -10,7 +10,10 @@ import { spawnHarnessProcess, type HarnessProcess, type HarnessProcessOptions } 
 export interface AhpTransport {
   /** Yield one complete JSON-RPC text frame per value. AhpWire claims the reader immediately. */
   messages: AsyncIterable<string>;
-  /** Submit one frame and resolve when accepted locally. Reject write or admission failures; sends can overlap. */
+  /**
+   * Submit one frame and resolve when accepted locally. Sends can overlap. Use BACKPRESSURE_EXCEEDED
+   * with outcomeUnknown false only when rejecting admission before sending the frame.
+   */
   send: (message: string) => Promise<void>;
   /** Release the connection and unblock a waiting reader. Report local cleanup failures by rejecting. */
   close: () => Promise<void>;
@@ -65,8 +68,9 @@ export class AhpWire {
    * Send a request and resolve with its correlated result. Callers validate the result schema.
    * Serialization errors throw synchronously. Remote errors, malformed replies, admission limits,
    * timeouts and connection loss reject the promise. The reply deadline includes sending. Timeouts
-   * and asynchronous send failures reject with outcomeUnknown and leave the wire open. A synchronous
-   * transport send exception rejects as supplied and leaves correlation until reply, timeout or close.
+   * and ambiguous asynchronous write failures reject with outcomeUnknown and leave the wire open.
+   * A synchronous transport send exception rejects as supplied and leaves correlation until reply,
+   * timeout or close.
    * Callers own retry decisions. Use close to stop waiting for outstanding replies.
    */
   request(method: string, params: unknown): Promise<unknown> {
@@ -113,7 +117,7 @@ export class AhpWire {
 
   /**
    * Register correlation and its deadline before dispatch so a fast reply can settle the request.
-   * Asynchronous send rejection retires any still-pending entry and reports an unknown outcome.
+   * Asynchronous send rejection retires any still-pending entry and preserves explicit backpressure.
    */
   private sendRequest({ id, method, frame }: { id: number; method: string; frame: string }): Promise<unknown> {
     return new Promise((resolve, reject) => {
@@ -122,8 +126,11 @@ export class AhpWire {
         reject(new HarnessSdkError("RPC_TIMEOUT", "RPC_TIMEOUT", false, true, { method }));
       }, this.options.timeoutMs ?? 30_000);
       this.pending.set(id, { resolve, reject, timer });
-      void this.transport.send(frame).catch(() => {
-        this.takePending(id)?.reject(connectionClosedError());
+      void this.transport.send(frame).catch(cause => {
+        const error = cause instanceof HarnessSdkError && cause.code === "BACKPRESSURE_EXCEEDED" && !cause.outcomeUnknown
+          ? cause
+          : connectionClosedError();
+        this.takePending(id)?.reject(error);
       });
     });
   }
@@ -165,12 +172,16 @@ export class AhpWire {
     if (typeof message.id !== "number") return;
     const pending = this.takePending(message.id);
     if (!pending) return;
-    if (message.error && typeof message.error === "object") {
-      pending.reject(remoteErrorToSdkError(message.error as Record<string, unknown>));
-    } else if (Object.hasOwn(message, "result")) {
+    const hasResult = Object.hasOwn(message, "result");
+    const hasError = Object.hasOwn(message, "error");
+    const error = message.error;
+    if (hasResult && !hasError) {
       pending.resolve(message.result);
+    } else if (!hasResult && hasError && error && typeof error === "object" && !Array.isArray(error)
+      && "code" in error && Number.isInteger(error.code) && "message" in error && typeof error.message === "string") {
+      pending.reject(remoteErrorToSdkError(error));
     } else {
-      pending.reject(new HarnessSdkError("PROTOCOL_ERROR"));
+      pending.reject(new HarnessSdkError("PROTOCOL_ERROR", "Malformed JSON-RPC reply", false, true));
     }
   }
 
@@ -286,7 +297,7 @@ function parseFrame(frame: string, maxFrameBytes?: number): Record<string, unkno
   return message;
 }
 
-/** Preserve explicit remote outcome/retry metadata while discarding private remote error text. */
+/** Preserve explicit remote outcome/retry metadata and the recognized startup denial disposition. */
 function remoteErrorToSdkError(error: Record<string, unknown>): HarnessSdkError {
   const data = error.data && typeof error.data === "object" ? error.data as Record<string, unknown> : {};
   let code = "AHP_RPC_ERROR";
@@ -297,7 +308,12 @@ function remoteErrorToSdkError(error: Record<string, unknown>): HarnessSdkError 
   }
   const retryable = data.retryable === true;
   const outcomeUnknown = data.outcomeUnknown === true;
-  return new HarnessSdkError(code, "AHP_RPC_ERROR", retryable, outcomeUnknown);
+  const details = data.details;
+  const startupBlocked = code === "AGENT_STARTUP_BLOCKED"
+    && details && typeof details === "object" && !Array.isArray(details)
+    && "workflowDisposition" in details && details.workflowDisposition === "startup_blocked";
+  return new HarnessSdkError(code, "AHP_RPC_ERROR", retryable, outcomeUnknown,
+    startupBlocked ? { workflowDisposition: "startup_blocked" } : undefined);
 }
 
 /** Keep stderr flowing without retaining private output. createStdioTransport ignores drain failure. */
@@ -319,8 +335,8 @@ async function* readStdioFrames(process: HarnessProcess, maxFrameBytes: number):
       if (exceedsFrameLimit(line, maxFrameBytes)) throw new HarnessSdkError("FRAME_TOO_LARGE");
       if (line) yield line;
     }
-    // Bound the unfinished frame even before its newline arrives.
-    if (exceedsFrameLimit(buffer, maxFrameBytes)) throw new HarnessSdkError("FRAME_TOO_LARGE");
+    // A final carriage return may be the first byte of a split CRLF delimiter.
+    if (exceedsFrameLimit(buffer.replace(/\r$/, ""), maxFrameBytes)) throw new HarnessSdkError("FRAME_TOO_LARGE");
   }
   buffer += decoder.decode();
   if (buffer.trim()) throw new HarnessSdkError("PROTOCOL_ERROR", "Unterminated AHP frame");

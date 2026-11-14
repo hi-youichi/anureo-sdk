@@ -1,15 +1,28 @@
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { FakeAdapterOptions } from '@anureo/conformance'
 import type { HarnessError } from '@anureo/protocol'
 import { HarnessSdkError, type Client, type SessionEventSink } from '@anureo/sdk'
 import { z } from 'zod'
-import { agent, parallel, pipeline, type AgentOptions } from './index'
+import { agent, parallel, pipeline, workflow, type AgentOptions } from './index'
 import { createFixture } from './test-helpers'
 
 const clients: Client[] = []
 const fixture = createFixture(clients)
-afterEach(async () => { await Promise.all(clients.splice(0).map(client => client.dispose())) })
+const workflowDirectories: string[] = []
+afterEach(async () => {
+  await Promise.all(clients.splice(0).map(client => client.dispose()))
+  await Promise.all(workflowDirectories.splice(0).map(directory => rm(directory, { recursive: true, force: true })))
+})
+
+async function workflowOptions() {
+  const directory = await mkdtemp(join(tmpdir(), 'anureo-agent-'))
+  workflowDirectories.push(directory)
+  return { directory, name: 'agent', revision: '1', input: {} }
+}
 
 /** Publish final text before the test terminal so Turn.result retains it. */
 async function complete(sink: SessionEventSink, turnId: string, text: string) {
@@ -59,6 +72,32 @@ test('each call chooses its backend explicitly without shared configuration', as
   expect(b.adapter.opened[0]?.cwd).toBe('/b')
 })
 
+test('journaled execution and replay use the options captured at invocation', async () => {
+  const run = await workflowOptions()
+  const { client, adapter } = await fixture()
+  const other = await fixture()
+  const initial = {
+    client, cwd: run.directory, model: 'original', permissionMode: 'original',
+    schema: z.object({ count: z.number() }),
+  }
+  const first = await workflow(run, () => {
+    const options: AgentOptions = { ...initial }
+    const result = agent('{"count":3}', options)
+    Object.assign(options, {
+      client: other.client, cwd: tmpdir(), model: 'changed', permissionMode: 'changed',
+      schema: z.object({ other: z.string() }),
+    })
+    return result
+  })
+  expect(first.result).toEqual({ count: 3 })
+  expect(adapter.opened[0]).toMatchObject({ cwd: run.directory, model: 'original', permissionMode: 'original' })
+  const resumed = await workflow({ ...run, resumeFrom: first.runId }, () =>
+    agent('{"count":3}', { ...initial, wait: { associationMs: 1, resultMs: 1 } }))
+  expect(resumed.result).toEqual({ count: 3 })
+  expect(adapter.opened).toHaveLength(1)
+  expect(other.adapter.opened).toHaveLength(0)
+})
+
 test('native association and acceptance do not replace terminal evidence', async () => {
   const { promise: terminalEmitterReady, resolve: resolveTerminalEmitter } = Promise.withResolvers<() => Promise<void>>()
   const { client, adapter } = await fixture({ execute: async (call, sink) => {
@@ -76,6 +115,25 @@ test('native association and acceptance do not replace terminal evidence', async
   expect(adapter.calls.some(call => call.method === 'session/close')).toBe(false)
   await emitTerminal()
   expect(await result).toBe('actual terminal text')
+})
+
+test.each(['associationMs', 'resultMs'] as const)('%s expires with an unknown outcome and releases the session', async phase => {
+  const { client, adapter } = await fixture({ execute: async (call, sink) => {
+    if (call.method !== 'input/submit' || !('submissionId' in call.params)) return undefined
+    const { submissionId } = call.params
+    if (phase === 'resultMs') {
+      const turnId = randomUUID()
+      await sink.emit({ type: 'turn/started', payload: { turnId } })
+      return { submissionId, accepted: true, disposition: 'started', turnId }
+    }
+    return { submissionId, accepted: true, disposition: 'queued', receipt: { nativeId: submissionId } }
+  } })
+  await expect(agent('send once', { client, cwd: '.', wait: { [phase]: 20 } })).rejects.toMatchObject({
+    code: 'REQUEST_TIMEOUT', outcomeUnknown: true,
+  })
+  expect(adapter.calls.filter(call => call.method === 'input/submit')).toHaveLength(1)
+  expect(adapter.calls.some(call => call.method === 'turn/interrupt' || call.method === 'session/interrupt')).toBe(false)
+  expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
 })
 
 test('preserves native failure details and releases the session', async () => {
@@ -109,6 +167,30 @@ test('unknown submission outcomes are preserved without retries or implicit inte
   expect(adapter.calls.filter(call => call.method === 'input/submit')).toHaveLength(1)
   expect(adapter.calls.some(call => call.method === 'turn/interrupt' || call.method === 'session/interrupt')).toBe(false)
   expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
+})
+
+test('a failed terminal journal write preserves the uncertain error for the agent caller', async () => {
+  const run = { ...await workflowOptions(), runId: 'uncertain' }
+  const { client } = await fixture({ execute: async call => {
+    if (call.method !== 'input/submit') return undefined
+    const journal = join(run.directory, run.runId, 'journal.json')
+    await rm(journal)
+    await mkdir(journal)
+    throw new HarnessSdkError('RECEIPT_LOST', 'receipt lost', false, true)
+  } })
+  let caught: unknown
+  await expect(workflow(run, async () => {
+    try { await agent('send once', { client, cwd: run.directory }) }
+    catch (cause) { caught = cause }
+    return 'caught'
+  })).rejects.toMatchObject({
+    code: 'RECEIPT_LOST', outcomeUnknown: true,
+    details: { failureCodes: expect.arrayContaining(['WORKFLOW_STORAGE_FAILED']) },
+  })
+  expect(caught).toMatchObject({
+    code: 'RECEIPT_LOST', outcomeUnknown: true,
+    details: { journalErrorCode: 'WORKFLOW_STORAGE_FAILED' },
+  })
 })
 
 test('source failure remains uncertain and is not converted into successful cleanup', async () => {
@@ -152,6 +234,21 @@ test('cleanup failure cannot hide the primary uncertain execution failure', asyn
   expect([...adapter.backends.values()][0]?.disposeCount).toBe(1)
 })
 
+test('session release appends to cleanup diagnostics from submission', async () => {
+  const prior = { code: 'OUTPUT_TOOL_RELEASE_FAILED', outcomeUnknown: true }
+  const { client } = await fixture({ execute: async call => {
+    if (call.method === 'input/submit') {
+      throw new HarnessSdkError('SUBMIT_FAILED', 'submit failed', true, false, { cleanupErrors: [prior] })
+    }
+    if (call.method === 'session/close') throw new HarnessSdkError('CLOSE_FAILED')
+    return undefined
+  } })
+  await expect(agent('send', { client, cwd: '.' })).rejects.toMatchObject({
+    code: 'SUBMIT_FAILED', retryable: true, outcomeUnknown: false,
+    details: { cleanupErrors: [prior, { code: 'CLOSE_FAILED', outcomeUnknown: false }] },
+  })
+})
+
 /** Register a scripted client that publishes final text and a terminal before the submit receipt.
  * Disable the advertised output-schema route to exercise fallback against the same terminal. */
 function terminalFixture(
@@ -191,6 +288,16 @@ test('schema preflight rejects before opening, while absent backend support rele
   await expect(agent('unsupported', { client: unsupported.client, cwd: '.', schema: z.object({ a: z.string() }) })).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' })
   expect(unsupported.adapter.calls.some(call => call.method === 'input/submit')).toBe(false)
   expect([...unsupported.adapter.backends.values()][0]?.disposeCount).toBe(1)
+})
+
+test('a caught schema preflight failure leaves the workflow incomplete', async () => {
+  const run = await workflowOptions()
+  const { client, adapter } = await fixture()
+  const outcome = await workflow(run, () => parallel([
+    () => agent('invalid', { client, cwd: run.directory, schema: z.object({ count: z.coerce.number() }) }),
+  ]))
+  expect(outcome).toMatchObject({ status: 'incomplete', result: [null] })
+  expect(adapter.opened).toHaveLength(0)
 })
 
 test.each([
@@ -255,6 +362,36 @@ test('uncertainty overrides API and skip classifications, and generic interrupti
   }
   const { client } = await terminalFixture('interrupted')
   await expect(agent('interrupted', { client, cwd: '.' })).rejects.toMatchObject({ code: 'AGENT_INTERRUPTED' })
+})
+
+test.each([
+  { status: 'interrupted', code: 'RATE_LIMITED', details: undefined },
+  { status: 'failed', code: 'USER_SKIPPED', details: { workflowDisposition: 'skipped' } },
+] as const)('$code in a confirmed $status terminal still rejects', async ({ status, code, details }) => {
+  const { client } = await terminalFixture(status, { error: {
+    code, message: 'failure', retryable: false, outcomeUnknown: false, details,
+  } })
+  await expect(agent('fail', { client, cwd: '.' })).rejects.toMatchObject({ code, outcomeUnknown: false })
+})
+
+test('journaled drops retain their reason codes and still return null', async () => {
+  const run = await workflowOptions()
+  const limited = await terminalFixture('failed', { error: {
+    code: 'RATE_LIMITED', message: 'rate limited', retryable: true, outcomeUnknown: false,
+  } })
+  const blocked = await fixture({ onOpen: async () => {
+    throw new HarnessSdkError('AGENT_STARTUP_BLOCKED', 'blocked', false, false, { workflowDisposition: 'startup_blocked' })
+  } })
+  const result = await workflow(run, () => parallel([
+    () => agent('limited', { client: limited.client, cwd: run.directory }),
+    () => agent('blocked', { client: blocked.client, cwd: run.directory }),
+  ]))
+  expect(result).toMatchObject({ status: 'incomplete', result: [null, null] })
+  const events = JSON.parse(await readFile(join(run.directory, result.runId, 'journal.json'), 'utf8'))
+  expect(events.filter((event: { type: string }) => event.type === 'failed')).toEqual(expect.arrayContaining([
+    expect.objectContaining({ code: 'RATE_LIMITED', outcomeUnknown: false }),
+    expect.objectContaining({ code: 'AGENT_STARTUP_BLOCKED', outcomeUnknown: false }),
+  ]))
 })
 
 test('explicit skip metadata survives terminal-before-reply and startup denial requires its dedicated code', async () => {

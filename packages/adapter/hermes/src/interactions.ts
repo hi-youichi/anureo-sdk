@@ -12,17 +12,18 @@ import type { HermesRpc, ServerRequest } from './rpc'
  */
 export class HermesInteractions {
   /** Capture callbacks supplied by HermesSession; resolve identity/channel lazily so pending answers use the recovered connection. */
-  constructor({ sessionId, rpc, sink, turnId, epoch, options }: {
+  constructor({ sessionId, rpc, ready, sink, turnId, epoch, options }: {
     sessionId: () => string
     rpc: () => HermesRpc
+    ready: () => Promise<void>
     sink: SessionEventSink
-    /** Resolve a generation only in the session's current authority epoch. */
-    turnId: (generation: number) => string | undefined
+    turnId: (epoch: number, generation: number) => string | undefined
     epoch: () => number
     options: HermesAdapterOptions
   }) {
     this.sessionId = sessionId
     this.rpc = rpc
+    this.ready = ready
     this.sink = sink
     this.turnId = turnId
     this.epoch = epoch
@@ -36,18 +37,19 @@ export class HermesInteractions {
    * authority before sending once and requires a native ACK for the same prompt id. The sink
    * observes delivery failures through the responder.
    */
-  async prompt(value: NativeObject): Promise<void> {
-    const nativeId = identity(value.prompt_id), generation = integer(value.execution_generation), epoch = this.epoch()
-    const id = `hermes-prompt-${stableId(this.sessionId(), epoch, generation, nativeId)}`
+  async prompt(value: NativeObject, epoch: number): Promise<void> {
+    const target = promptTarget(value, epoch)
+    const { nativeId, generation } = target
+    const id = this.interactionId(target)
     if (this.pending.has(id)) return
     const kind = value.kind
     if (kind !== 'approval' && kind !== 'clarify') throw protocolError()
     const request: InteractionRequested = kind === 'approval' ? approvalRequest(id, value)
       : { interactionId: id, kind: 'userInput', questions: [this.question(nativeId, text(value.question), value.choices)] }
-    const scopedTurn = this.turnId(generation)
+    const scopedTurn = this.turnId(epoch, generation)
     if (scopedTurn) request.turnId = scopedTurn
     if (typeof value.timeout_s === 'number' && value.timeout_s > 0) request.expiresAt = new Date(Date.now() + value.timeout_s * 1000).toISOString()
-    const pending: Pending = { id, nativeId, generation, wire: 'prompt', done: false, responding: false }
+    const pending: Pending = { id, done: false, responding: false }
     this.register(pending, request, async response => {
       if (this.epoch() !== epoch) throw new HarnessSdkError('INTERACTION_EXPIRED')
       const params = { session_id: this.sessionId(), execution_generation: generation, prompt_id: nativeId }
@@ -68,7 +70,8 @@ export class HermesInteractions {
   async serverRequest(request: ServerRequest): Promise<void> {
     if (request.params.session_id !== this.sessionId()) { await this.rpc().reject(request.id); return }
     if (typeof request.id !== 'string' || !request.id.startsWith('srq-')) { await this.rpc().reject(request.id); return }
-    const id = `hermes-request-${stableId(this.sessionId(), request.id)}`
+    const target = { wire: 'request', nativeId: request.id } as const
+    const id = this.interactionId(target)
     if (this.pending.has(id)) return
     let questions: UserQuestion[]
     if (request.method === 'clarify') {
@@ -76,7 +79,7 @@ export class HermesInteractions {
     } else if (request.method === 'sudo' || request.method === 'secret') {
       questions = [{ id: 'value', prompt: request.method === 'sudo' ? 'Hermes requests a sudo password' : text(request.params.prompt), secret: true }]
     } else { await this.rpc().reject(request.id); return }
-    const pending: Pending = { id, nativeId: request.id, wire: 'request', done: false, responding: false }
+    const pending: Pending = { id, done: false, responding: false }
     this.register(pending, { interactionId: id, kind: 'userInput', questions }, async response => {
       const answers = response?.kind === 'userInput' ? response.answers : undefined
       const result = request.method === 'clarify'
@@ -97,31 +100,27 @@ export class HermesInteractions {
    * Sink publication failures reject to the caller.
    */
   async settled(target: InteractionTarget, reason: string): Promise<void> {
-    for (const pending of this.pending.values()) {
-      if (pending.done || pending.nativeId !== target.nativeId || pending.wire !== target.wire || target.wire === 'prompt' && pending.generation !== target.generation) continue
-      pending.cancelled = reason
-      if (pending.responding) continue // The local native ACK arbitrates the response already in flight.
-      pending.done = true
-      await this.sink.resolveInteraction({ interactionId: pending.id, outcome: reason === 'timeout' ? 'expired' : reason === 'resolved' ? 'unknown' : 'cancelled', reason: reason === 'resolved' ? 'native_settled' : reason })
-    }
+    await this.settlePending(this.pending.get(this.interactionId(target)), reason)
   }
   /**
    * HermesSession.snapshot reconciles open native questions before releasing held traffic. Withdraw
    * missing questions and register new ones; reject RESULT_UNKNOWN if a locally finished delivery is
    * still open remotely, preventing silent suppression or replay of a possibly delivered secret.
    */
-  async snapshot(prompts: unknown[], requests: unknown[]): Promise<void> {
-    const promptIds = new Set(prompts.map(value => identity(object(value).prompt_id)))
-    const requestIds = new Set(requests.map(value => identity(object(value).id)))
-    for (const value of this.pending.values()) if (value.done && !value.cancelled && (value.wire === 'prompt' ? promptIds : requestIds).has(value.nativeId)) {
+  async snapshot(prompts: unknown[], requests: unknown[], epoch: number): Promise<void> {
+    const openIds = new Set([
+      ...prompts.map(value => this.interactionId(promptTarget(object(value), epoch))),
+      ...requests.map(value => this.interactionId({ wire: 'request', nativeId: identity(object(value).id) })),
+    ])
+    for (const value of this.pending.values()) if (value.done && !value.cancelled && openIds.has(value.id)) {
       // A response may have left this process without reaching the owner. Never replay a secret
       // or silently suppress the still-open native question as though it had been answered.
       throw new HarnessSdkError('RESULT_UNKNOWN', 'Hermes interaction delivery could not be confirmed', false, true)
     }
-    for (const value of this.pending.values()) if (!value.done && !(value.wire === 'prompt' ? promptIds : requestIds).has(value.nativeId)) {
-      await this.settled(value, 'withdrawn')
+    for (const value of this.pending.values()) if (!value.done && !openIds.has(value.id)) {
+      await this.settlePending(value, 'withdrawn')
     }
-    for (const value of prompts) await this.prompt(object(value))
+    for (const value of prompts) await this.prompt(object(value), epoch)
     for (const value of requests) {
       const entry = object(value)
       await this.serverRequest({ id: identity(entry.id), method: identity(entry.method), params: object(entry.params) })
@@ -129,6 +128,18 @@ export class HermesInteractions {
   }
 
   private readonly pending = new Map<string, Pending>()
+  private interactionId(target: InteractionTarget): string {
+    return target.wire === 'prompt'
+      ? `hermes-prompt-${stableId(this.sessionId(), target.epoch, target.generation, target.nativeId)}`
+      : `hermes-request-${stableId(this.sessionId(), target.nativeId)}`
+  }
+  private async settlePending(pending: Pending | undefined, reason: string): Promise<void> {
+    if (!pending || pending.done) return
+    pending.cancelled = reason
+    if (pending.responding) return // The local native ACK arbitrates the response already in flight.
+    pending.done = true
+    await this.sink.resolveInteraction({ interactionId: pending.id, outcome: reason === 'timeout' ? 'expired' : reason === 'resolved' ? 'unknown' : 'cancelled', reason: reason === 'resolved' ? 'native_settled' : reason })
+  }
   /** Parse a nonempty clarify batch with distinct native question ids so one answer can be sent per id. */
   private batchQuestions(params: NativeObject): UserQuestion[] {
     const questions = array(params.questions).map(value => {
@@ -164,6 +175,8 @@ export class HermesInteractions {
     this.pending.set(pending.id, pending)
     // Do not await the user from the receive loop. Core owns cancellation and response privacy.
     pending.completion = this.sink.requestInteraction(request, async response => {
+      // Recovery can withdraw this interaction while delivery is waiting to begin.
+      await this.ready()
       if (pending.done) throw new HarnessSdkError('INTERACTION_EXPIRED')
       pending.responding = true
       await respond(response)
@@ -173,18 +186,23 @@ export class HermesInteractions {
 
   private readonly sessionId: () => string
   private readonly rpc: () => HermesRpc
+  private readonly ready: () => Promise<void>
   private readonly sink: SessionEventSink
-  private readonly turnId: (generation: number) => string | undefined
+  private readonly turnId: (epoch: number, generation: number) => string | undefined
   private readonly epoch: () => number
   private readonly options: HermesAdapterOptions
 }
 
-/** Preserve the native identity needed to match settlement, including the generation for prompts. */
+/** Preserve the native identity needed to match settlement, including the execution identity for prompts. */
 type InteractionTarget =
-  | { wire: 'prompt'; nativeId: string; generation: number }
-  | { wire: 'request'; nativeId: string; generation?: never }
+  | { wire: 'prompt'; nativeId: string; epoch: number; generation: number }
+  | { wire: 'request'; nativeId: string }
 
-type Pending = InteractionTarget & {
+function promptTarget(value: NativeObject, epoch: number): Extract<InteractionTarget, { wire: 'prompt' }> {
+  return { wire: 'prompt', nativeId: identity(value.prompt_id), epoch, generation: integer(value.execution_generation) }
+}
+
+interface Pending {
   id: string
   done: boolean
   /** Delivery has begun; native settlement must let that delivery's ACK arbitrate the outcome. */

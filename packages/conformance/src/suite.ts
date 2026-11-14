@@ -20,10 +20,16 @@ export interface ConformanceDriver {
   runtimeOptions?: RuntimeOptions;
   /**
    * runConformance awaits this hook after obtaining the initial Turn and completing any control request,
-   * before waiting for its result. Fixtures can use it to induce source loss. A rejection reaches the
-   * case as an execution failure and can satisfy a fault case if it carries one of that case's codes.
+   * before waiting for its result. Fixtures can use it to induce source loss. Fault cases require
+   * both execution and the session event stream to fail with an allowed source-loss code.
    */
   afterStart?: (session: Session) => Promise<void>;
+  /**
+   * For session-only interruption, wait for native admission when the peer publishes no start
+   * before receiving the interrupt. The runner calls this after initiating submission. Without
+   * this hook it waits for a turn/started event.
+   */
+  waitForInterruptReady?: (session: Session) => Promise<void>;
   /** Authoritative text expected by lifecycle and immediate. Defaults to 'conformance'. */
   expectedText?: string;
   /**
@@ -139,6 +145,7 @@ function createCaseClient(driver: ConformanceDriver): Promise<Client> {
 function collectEvents(session: Session) {
   const reader = session.events()[Symbol.asyncIterator]();
   const events: AhpEvent[] = [];
+  const started = Promise.withResolvers<void>();
   let failure: unknown;
   const task = (async () => {
     try {
@@ -146,13 +153,14 @@ function collectEvents(session: Session) {
         const event = await reader.next();
         if (event.done) return;
         events.push(event.value);
+        if (event.value.type === 'turn/started') started.resolve();
         if (events.length > 10_000) throw new Error('Too many events without completion');
       }
     } catch (cause) {
       failure = cause;
     }
   })();
-  return { reader, events, task, get failure() { return failure; } };
+  return { reader, events, task, started: started.promise, get failure() { return failure; } };
 }
 
 /**
@@ -165,10 +173,10 @@ async function checkScenario({ client, session, driver, scenario, observation, t
 }): Promise<void> {
   const { events } = observation;
   const capabilities = session.capabilities;
-  const execution = executeScenarioTurn({ session, driver, scenario, capabilities });
+  const execution = executeScenarioTurn({ session, driver, scenario, capabilities, observation });
   const expectsSourceFailure = scenario === 'disconnect' || scenario === 'backpressure';
   if (expectsSourceFailure) {
-    await checkSourceFailure({ execution, scenario, events, timeoutMs });
+    await checkSourceFailure({ execution, scenario, observation, timeoutMs });
   } else {
     const { turn, result } = await deadline(Promise.race([
       execution,
@@ -193,7 +201,7 @@ async function checkSessionOperation({ client, session, turn, scenario, capabili
       await checkDistinctExecution(session, turn);
       break;
     case 'history':
-      await checkHistoryIdentity(session);
+      await checkHistoryIdentity(session, turn);
       break;
     case 'fork': {
       const relations = capabilities.session?.fork;
@@ -202,9 +210,13 @@ async function checkSessionOperation({ client, session, turn, scenario, capabili
       break;
     }
     case 'revert': {
-      const scope = capabilities.session?.revert?.[0];
-      requireCondition(scope !== undefined, 'Revert capability missing');
-      await checkRevertBoundary({ session, turn, scope, history: capabilities.session?.history });
+      const scopes = capabilities.session?.revert;
+      requireCondition(scopes?.length, 'Revert capability missing');
+      for (const [index, scope] of scopes.entries()) {
+        const target = index === 0 ? turn : await session.submit({ input: 'conformance' });
+        requireCondition((await target.result()).status === 'completed', 'Revert target did not complete');
+        await checkRevertBoundary({ session, turn: target, scope, history: capabilities.session?.history });
+      }
       break;
     }
   }
@@ -212,18 +224,21 @@ async function checkSessionOperation({ client, session, turn, scenario, capabili
 
 /**
  * Start the initial input for checkScenario and return its associated Turn and retained result.
- * Session-level interruption is issued before awaiting association, which turn controls require.
+ * Session-level interruption waits for start evidence or fixture readiness. Exact-turn controls
+ * wait for association.
  * Await afterStart after controls so its effects or failure precede the result wait.
  */
-async function executeScenarioTurn({ session, driver, scenario, capabilities }: {
+async function executeScenarioTurn({ session, driver, scenario, capabilities, observation }: {
   session: Session; driver: ConformanceDriver; scenario: ConformanceScenario; capabilities: Capabilities;
+  observation: ReturnType<typeof collectEvents>;
 }) {
   const pendingTurn = session.submit({ input: 'conformance' });
   // Interruption/release may reject submission before we await the original promise.
   void pendingTurn.catch(() => {});
   const supportsTurnInterrupt = scenario === 'interrupt' && capabilities.input?.interrupt?.targets.includes('turn') === true;
   if (scenario === 'interrupt' && !supportsTurnInterrupt) {
-    await Promise.resolve();
+    const ready = driver.waitForInterruptReady?.(session) ?? observation.started;
+    await Promise.race([ready, pendingTurn.then(() => ready)]);
     await session.interrupt();
   }
   const turn = await pendingTurn;
@@ -233,22 +248,30 @@ async function executeScenarioTurn({ session, driver, scenario, capabilities }: 
   return { turn, result: await turn.result() };
 }
 
-/** Fail the case unless execution rejects with an allowed source-loss code and no terminal event was published. */
-async function checkSourceFailure({ execution, scenario, events, timeoutMs }: {
-  execution: ReturnType<typeof executeScenarioTurn>; scenario: 'disconnect' | 'backpressure'; events: AhpEvent[]; timeoutMs: number;
+/** Require execution and the session event stream to fail without a native terminal. */
+async function checkSourceFailure({ execution, scenario, observation, timeoutMs }: {
+  execution: ReturnType<typeof executeScenarioTurn>; scenario: 'disconnect' | 'backpressure';
+  observation: ReturnType<typeof collectEvents>; timeoutMs: number;
 }): Promise<void> {
-  try {
-    await deadline(execution, timeoutMs);
-  } catch (cause) {
-    requireCondition(cause && typeof cause === 'object' && 'code' in cause, 'Source failure must be typed');
-    const expectedCodes = scenario === 'disconnect'
-      ? ['CONNECTION_CLOSED', 'ACP_CONNECTION_CLOSED', 'RPC_CONNECTION_CLOSED']
-      : ['BACKPRESSURE_EXCEEDED', 'FRAME_TOO_LARGE'];
-    requireCondition(expectedCodes.includes(String(cause.code)), `Unexpected observation error: ${String(cause.code)}`);
-    requireCondition(!events.some(event => event.type === 'turn/completed'), 'SDK must not fabricate native terminal');
-    return;
-  }
-  throw new Error('Lost source must fail observation');
+  const expectedCodes = scenario === 'disconnect'
+    ? ['CONNECTION_CLOSED', 'ACP_CONNECTION_CLOSED', 'RPC_CONNECTION_CLOSED']
+    : ['BACKPRESSURE_EXCEEDED', 'FRAME_TOO_LARGE'];
+  await deadline(Promise.all([
+    execution.then(
+      () => { throw new Error('Lost source must fail observation'); },
+      cause => requireSourceError(cause, expectedCodes),
+    ),
+    observation.task,
+  ]), timeoutMs);
+  requireCondition(observation.failure !== undefined, 'Session event stream must fail');
+  requireSourceError(observation.failure, expectedCodes);
+  requireCondition(!observation.events.some(event => event.type === 'turn/completed'), 'SDK must not fabricate native terminal');
+}
+
+/** Preserve uncoded failures and check the source-loss allowlist for coded failures. */
+function requireSourceError(cause: unknown, expectedCodes: readonly string[]): void {
+  if (!cause || typeof cause !== 'object' || !('code' in cause)) throw cause;
+  requireCondition(expectedCodes.includes(String(cause.code)), `Unexpected observation error: ${String(cause.code)}`);
 }
 
 /** Check native terminal evidence before identity/history operations add further executions and events. */
@@ -259,7 +282,11 @@ function checkTurnResult({ scenario, driver, events, result }: {
   requireCondition(events.filter(event => event.type === 'turn/started').length === 1, 'Execution must start once');
   requireCondition(events.filter(event => event.type === 'turn/completed').length === 1, 'Execution must end once');
   if (isInteractionScenario(scenario)) {
-    requireCondition(events.some(event => event.type === 'interaction/requested') && events.some(event => event.type === 'interaction/resolved'), 'Interaction not exercised');
+    const responded = new Set(events.flatMap(event =>
+      event.type === 'interaction/resolved' && event.payload.outcome === 'responded' ? [event.payload.interactionId] : [],
+    ));
+    requireCondition(events.some(event => event.type === 'interaction/requested' && event.payload.kind === scenario
+      && responded.has(event.payload.interactionId)), 'Interaction not exercised');
   }
   if (scenario === 'lifecycle' || scenario === 'immediate') {
     requireCondition(result.text === (driver.expectedText ?? 'conformance'), 'Authoritative final text missing');
@@ -276,10 +303,11 @@ async function checkDistinctExecution(session: Session, turn: Turn): Promise<voi
   requireCondition(other.id !== turn.id, 'Execution identity reused');
 }
 
-/** Verify the first history page retains both execution and item IDs after completion. */
-async function checkHistoryIdentity(session: Session): Promise<void> {
+/** Verify the history page identifies the completed execution and its recorded items. */
+async function checkHistoryIdentity(session: Session, turn: Turn): Promise<void> {
   const page = await session.request('history/read', { sessionId: session.id, requestId: 'history' });
-  requireCondition(page.items.length && page.items.every(item => item.turnId && item.item.id), 'History identity missing');
+  requireCondition(page.items.some(entry => entry.turnId === turn.id && entry.item.id),
+    'Completed execution identity missing from history');
 }
 
 /**
@@ -301,15 +329,15 @@ async function checkForkBoundaries({ client, session, turn, relations, history }
   }
 }
 
-/** Verify the receipt for the first advertised scope, and check supported history when the scope includes conversation. */
+/** Verify the scope receipt and check supported history when the scope includes conversation. */
 async function checkRevertBoundary({ session, turn, scope, history }: {
   session: Session; turn: Turn; scope: RevertScope; history?: boolean;
 }): Promise<void> {
   const sessionId = session.id;
-  const result = await session.request('session/revert', { sessionId, requestId: 'revert', scope, boundary: { turnId: turn.id, relation: 'before' } });
+  const result = await session.request('session/revert', { sessionId, requestId: `revert:${scope}`, scope, boundary: { turnId: turn.id, relation: 'before' } });
   requireCondition(result.appliedScope === scope && result.boundary.turnId === turn.id, 'Revert scope mismatch');
   if (scope !== 'files' && history) {
-    const page = await session.request('history/read', { sessionId, requestId: 'reverted-history' });
+    const page = await session.request('history/read', { sessionId, requestId: `reverted-history:${scope}` });
     requireCondition(!page.items.some(item => item.turnId === turn.id), 'Revert boundary retained');
   }
 }

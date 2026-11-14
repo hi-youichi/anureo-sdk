@@ -36,7 +36,8 @@ interface CheckOptions {
 }
 
 /** Resolve the CLI defaults and reject invalid arguments before the entry code acquires resources. */
-function parseArguments([backend = 'dsh', flag, ...extra]: string[]): { backend: Backend; mode: 'session' | 'workflow' } {
+function parseArguments(args: string[]): { backend: Backend; mode: 'session' | 'workflow' } {
+  const [backend = 'dsh', flag, ...extra] = args[0] === '--session' ? ['dsh', ...args] : args
   if (
     (backend !== 'dsh' && backend !== 'hermes' && backend !== 'pi')
     || (flag !== undefined && flag !== '--session')

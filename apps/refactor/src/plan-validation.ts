@@ -5,35 +5,34 @@ import type { ModulePlan } from './schema'
  * After the planning worktree is released, plan in refactor.ts supplies the schema-validated
  * response and the inventory it sent to the agent. A thrown Error leaves the plan unpublished
  * and stops module dispatch. The run lifecycle records that error in the incomplete report.
- * Compare paths literally. Check each module's ID before its files, and throw on the first invalid
- * ID or assignment. Report omissions in inventory order after checking all assignments.
+ * Compare paths literally. Report ID and assignment errors in traversal order, then omissions
+ * in inventory order.
  */
 export function validatePlan(plan: ModulePlan, files: readonly string[]): void {
   const expectedFiles = new Set(files)
-  const assignedFiles = new Set<string>()
-  const claimedIds = new Set<string>()
-  for (const module of plan.modules) {
-    claimModuleId(module.id, claimedIds)
-    for (const file of module.files) {
-      if (!expectedFiles.has(file) || assignedFiles.has(file)) {
-        throw new Error(`Unlisted or duplicate module file: ${file}`)
+  const assignments = new Map<string, string>()
+  const claimedIds = new Map<string, string>()
+  const issues: string[] = []
+  for (const [index, module] of plan.modules.entries()) {
+    const location = `modules[${index}]`
+    const key = module.id.toLowerCase()
+    const firstId = claimedIds.get(key)
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(module.id)) {
+      issues.push(`${location}.id: ${JSON.stringify(module.id)} must start with an ASCII letter or digit and contain at most 80 letters, digits, underscores or hyphens`)
+    }
+    if (firstId) issues.push(`${location}.id: ${JSON.stringify(module.id)} duplicates ${firstId} ignoring case`)
+    else claimedIds.set(key, `${location}.id`)
+    for (const [fileIndex, file] of module.files.entries()) {
+      const assignment = `${location}.files[${fileIndex}]`
+      const firstAssignment = assignments.get(file)
+      if (!expectedFiles.has(file)) {
+        issues.push(`${assignment}: ${JSON.stringify(file)} is absent from the inventory`)
       }
-      assignedFiles.add(file)
+      if (firstAssignment) issues.push(`${assignment}: ${JSON.stringify(file)} was already assigned at ${firstAssignment}`)
+      else assignments.set(file, assignment)
     }
   }
-  const missing = files.filter(file => !assignedFiles.has(file))
-  if (missing.length) throw new Error(`Module plan omitted source files: ${missing.join(', ')}`)
-}
-
-/**
- * Reserve an ID in validatePlan's set of lowercase keys. IDs are 1–80 ASCII characters
- * and start with a letter or digit. Later characters can also be underscores or hyphens.
- * Throw on an unsafe or repeated ID so runModules can report each assignment using a unique ID.
- */
-function claimModuleId(id: string, claimedIds: Set<string>): void {
-  const key = id.toLowerCase()
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(id) || claimedIds.has(key)) {
-    throw new Error(`Invalid or duplicate module id: ${id}`)
-  }
-  claimedIds.add(key)
+  const missing = files.filter(file => !assignments.has(file))
+  if (missing.length) issues.push(`Module plan omitted source files: ${missing.map(file => JSON.stringify(file)).join(', ')}`)
+  if (issues.length) throw new Error(issues.join('\n'))
 }

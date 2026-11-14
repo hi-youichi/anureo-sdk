@@ -1,6 +1,7 @@
 // Owns adapter negotiation, session open admission and client-wide resource release.
 import { randomUUID } from 'node:crypto';
-import { AHP_PROTOCOL_CONTRACT, assertRequest, assertResult, supportsCapability,
+import sdkPackage from '../package.json' with { type: 'json' };
+import { AHP_PROTOCOL_CONTRACT, AHP_PROTOCOL_VERSION, assertRequest, assertResult, supportsCapability,
   type AhpRequestMap, type Capabilities, type InteractionRequested, type SessionBinding, type SessionOpenParams } from '@anureo/protocol';
 import { HarnessSdkError } from './errors';
 import { invalidWait, waitForRequest } from './request';
@@ -8,7 +9,7 @@ import type { RequestOptions } from './types';
 import type { ClientOptions } from './client-options';
 import { Session } from './session';
 import { immutable } from './lifecycle/immutable';
-import { positive } from './lifecycle/limits';
+import { DEFAULT_MAX_RESULT_BYTES, positive } from './lifecycle/limits';
 import { combined } from './lifecycle/errors';
 import { withStructuredOutput } from './structured-output/adapter';
 
@@ -31,7 +32,7 @@ export class Client {
       adapter: withStructuredOutput(options.adapter, {
         queue: options.runtime?.queue,
         maxSubmissions: options.limits?.maxSubmissions,
-        maxResultBytes: options.limits?.maxResultBytes,
+        maxResultBytes: options.limits?.maxResultBytes ?? DEFAULT_MAX_RESULT_BYTES,
         maxItems: options.limits?.maxItems,
       }),
     };
@@ -43,23 +44,30 @@ export class Client {
     return { adapterId: this.options.identity.adapterId, runtimeConfigId: this.options.identity.runtimeConfigId };
   }
   /**
-   * Negotiate adapter capabilities before opening sessions. Each call invokes adapter negotiation
-   * once if admitted and stores the validated capability snapshot on success. The wait defaults to
-   * 30 seconds unless configured by runtime.requestTimeoutMs. Invalid waits, adapter or protocol
-   * failures, abort and timeout reject. A negotiation that finishes after a failed wait cannot update
-   * the client's capabilities. createClient awaits this method and handles cleanup on failure.
+   * Negotiate adapter capabilities before opening sessions. Concurrent callers share an in-flight
+   * negotiation with independent waits. Each wait defaults to 30 seconds unless configured by
+   * runtime.requestTimeoutMs. Only a successful wait stores the capability snapshot. Invalid waits,
+   * adapter or protocol failures, abort and timeout reject. createClient handles cleanup on failure.
    */
   async initialize(wait?: RequestOptions): Promise<void> {
     if (invalidWait(wait)) throw new HarnessSdkError('INVALID_PARAMS');
-    const result = await waitForRequest(() => this.options.adapter.initialize({
-      protocolVersions: [1],
+    this.initialized = await waitForRequest(() => this.initializing ??= this.negotiate().finally(() => {
+      this.initializing = undefined;
+    }), wait, this.options.runtime?.requestTimeoutMs);
+  }
+
+  private async negotiate(): Promise<Capabilities> {
+    // Install the in-flight promise before invoking the adapter, which can call host code.
+    await Promise.resolve();
+    const result = await this.options.adapter.initialize({
+      protocolVersions: [AHP_PROTOCOL_VERSION],
       protocolContract: AHP_PROTOCOL_CONTRACT,
-      clientInfo: { name: 'anureo-native-lifecycle', version: '0.2.0' },
+      clientInfo: { name: 'anureo-native-lifecycle', version: sdkPackage.version },
       // Own keys advertise support even when the host will respond manually.
       clientCapabilities: { interactions: Object.keys(this.options.interactions ?? {}) as InteractionRequested['kind'][] },
-    }), wait, this.options.runtime?.requestTimeoutMs);
+    });
     assertResult('initialize', result);
-    this.initialized = immutable(result.capabilities);
+    return immutable(result.capabilities);
   }
   /**
    * Open with explicit request and binding IDs. Resolve with the client-owned Session after backend
@@ -81,6 +89,7 @@ export class Client {
 
   // TypeScript emits these as own fields. Keep their initialization order relative to sessions.
   private initialized?: Capabilities;
+  private initializing?: Promise<Capabilities>;
   private closed = false;
   private disposing?: Promise<void>;
   private readonly owned = new Set<Session>();
@@ -131,12 +140,12 @@ export class Client {
   /**
    * openSession and sessions.create/resume/fork return this promise to hosts. Validate before
    * allocating a Session, then own it before native callbacks or disposal can race attachment.
-   * Resolve the attached session, or remove it and await disposal before rejecting setup/wait failure
+   * Resolve the attached session, or await disposal before rejecting setup/wait failure
    * (aggregated if cleanup fails). attachSession continues to release late backends after wait failure.
    */
-  private async open(params: SessionOpenParams, wait?: RequestOptions): Promise<Session> {
-    const capabilities = this.validateOpen(params, wait);
-    const session = new Session(structuredClone(params), this.options, capabilities, this.createId);
+  private async open(input: unknown, wait?: RequestOptions): Promise<Session> {
+    const { params, capabilities } = this.validateOpen(input, wait);
+    const session = new Session(structuredClone(params), this.options, capabilities, this.createId, released => { this.owned.delete(released); });
     // Own the sink before dispatch: native events and client disposal can race attachment.
     this.owned.add(session);
     try {
@@ -144,7 +153,6 @@ export class Client {
       if (this.closed) throw new HarnessSdkError('CLIENT_DISPOSED');
       return session;
     } catch (cause) {
-      this.owned.delete(session);
       return rethrowAfterCleanup(cause, () => session.dispose());
     }
   }
@@ -154,7 +162,7 @@ export class Client {
    * precedence: wait validity, abort, client state, protocol shape, binding, then mode capability.
    * Throws before session allocation/native dispatch; open exposes that failure as its rejection.
    */
-  private validateOpen(params: SessionOpenParams, wait?: RequestOptions): Capabilities {
+  private validateOpen(params: unknown, wait?: RequestOptions): { params: SessionOpenParams; capabilities: Capabilities } {
     if (invalidWait(wait)) throw new HarnessSdkError('INVALID_PARAMS');
     if (wait?.signal?.aborted) throw new HarnessSdkError('REQUEST_ABORTED');
     if (this.closed) throw new HarnessSdkError('CLIENT_DISPOSED');
@@ -162,7 +170,7 @@ export class Client {
     assertRequest('session/open', params);
     if (!matchesIdentity(params.binding, this.options.identity)) throw new HarnessSdkError('SESSION_BINDING_MISMATCH');
     assertOpenCapability(params, this.initialized);
-    return this.initialized;
+    return { params, capabilities: this.initialized };
   }
 
   /**

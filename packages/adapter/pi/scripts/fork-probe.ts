@@ -1,4 +1,5 @@
 /** Offline probe of Pi's session-file semantics that the default host's fork/resume rely on. */
+import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -12,16 +13,17 @@ try {
   appendTurn({ manager, input: 'two', reply: 'r2' })
   const originalFile = manager.getSessionFile()
   const originalId = manager.getSessionId()
-  console.log('persisted file exists on disk:', originalFile)
+  assert(originalFile)
 
   // A persisted manager flushes its session file when the conversation starts.
-  const source = SessionManager.open(originalFile!, sessionDir)
+  const source = SessionManager.open(originalFile, sessionDir)
   const branched = source.createBranchedSession(first.replyId)
-  console.log('createBranchedSession ->', branched)
-  console.log('new id differs from source:', source.getSessionId() !== originalId)
-  console.log('branch ids:', source.getBranch().map(entry => entry.id).join(','), '(expected prefix', first.inputId, first.replyId, ')')
-  console.log('findById resolves new session:', SessionManager.findById(dir, source.getSessionId(), sessionDir) !== undefined)
-  console.log('findById resolves original session:', SessionManager.findById(dir, originalId, sessionDir) !== undefined)
+  assert(branched)
+  assert.notEqual(source.getSessionId(), originalId)
+  assert.deepEqual(source.getBranch().map(entry => entry.id), [first.inputId, first.replyId])
+  assert(SessionManager.findById(dir, source.getSessionId(), sessionDir))
+  assert(SessionManager.findById(dir, originalId, sessionDir))
+  console.log('Pi fork retained the expected prefix under a discoverable new session ID')
 } finally {
   await rm(dir, { recursive: true, force: true })
 }

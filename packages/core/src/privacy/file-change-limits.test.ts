@@ -55,6 +55,15 @@ test('a shared UTF-8 budget includes canonical source and raw/input/output mirro
   expect(validateDefinition('Item', result)).toBe(true)
 })
 
+test('empty unified patches retain complete metadata without truncation', () => {
+  const source = makeFileChangeItem()
+  source.fileChanges![0]!.materials = [{ format: 'unified', patch: '' }]
+  const result = boundFileChangeItem(source)
+  expect(result).toMatchObject({ fileChanges: [{ completeness: 'complete', materials: [{ format: 'unified', patch: '' }] }] })
+  expect(result.extensions?.['x-anureo/fileChangesTruncated']).toBeUndefined()
+  expect(validateDefinition('Item', result)).toBe(true)
+})
+
 /** Exhaust material capacity across files, checking retained count and the later file's downgraded stat accuracy. */
 test('the fifty-material limit spans all files and never leaves exact stats after truncation', () => {
   const source = makeFileChangeItem()
@@ -77,7 +86,7 @@ test('malformed Item-shaped patch snapshots fail before returning a retained eve
   let retained: unknown
   expect(() => { retained = filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'patch', value: value as unknown as JsonValue } }) }).toThrow('Invalid AHP Item')
   expect(retained).toBeUndefined()
-  expect(filter.event({ type: 'item/delta', payload: { itemId: 'extension', kind: 'patch', value: { custom: 'compatible JSON' } } })).toMatchObject({ payload: { value: { custom: 'compatible JSON' } } })
+  expect(filter.event({ type: 'item/delta', payload: { itemId: 'extension', kind: 'patch', value: { custom: 'compatible JSON', fileChanges: [] } } })).toMatchObject({ payload: { value: { custom: 'compatible JSON', fileChanges: [] } } })
 })
 
 /** Truncating either replacement side must make the whole replacement unavailable and the containing change partial. */
@@ -217,12 +226,39 @@ test('UTF-8 truncation retains complete lines and reserves canonical bytes befor
   expect(validateDefinition('Item', result)).toBe(true)
 })
 
-/** A rejected patch must preserve the earlier text-buffer update so extraction cannot silently change failure ordering. */
-test('delta text updates its prefix before an Item-shaped patch fails validation', () => {
+test('snapshot patches reset only their own stream and project optional text independently', () => {
   const filter = new SecretRedactor()
   filter.rememberResponse({ kind: 'userInput', interactionId: 'secret', questions: [{ id: 'key', prompt: 'Key', secret: true }] }, { kind: 'userInput', answers: { key: 'secret' } })
-  expect(() => filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'patch', text: 'sec', value: { type: 'toolCall' } } }, 'turn')).toThrow('Invalid AHP Item')
+  const delta = { type: 'item/delta' as const, payload: { itemId: 'edit', kind: 'text' as const, text: 'sec' } }
+  expect(filter.event(delta, 'one')).toMatchObject({ payload: { text: '' } })
+  expect(filter.event(delta, 'two')).toMatchObject({ payload: { text: '' } })
+  const patch = { type: 'item/delta' as const, payload: { itemId: 'edit', kind: 'patch' as const, text: 'ret secret sec' } }
+  const value = { type: 'agentMessage', id: 'edit', text: 'replacement' }
+  expect(filter.event({ ...patch, payload: { ...patch.payload, value } }, 'one')).toMatchObject({
+    payload: { text: 'ret [redacted] sec', value },
+  })
+  const next = { ...delta, payload: { ...delta.payload, text: 'ret' } }
+  expect(filter.event(next, 'one')).toMatchObject({ payload: { text: 'ret' } })
+  expect(filter.event(next, 'two')).toMatchObject({ payload: { text: '[redacted]' } })
+})
+
+test('invalid snapshot patches preserve the existing buffered prefix', () => {
+  const filter = new SecretRedactor()
+  filter.rememberResponse({ kind: 'userInput', interactionId: 'secret', questions: [{ id: 'key', prompt: 'Key', secret: true }] }, { kind: 'userInput', answers: { key: 'secret' } })
+  filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'text', text: 'sec' } }, 'turn')
+  expect(() => filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'patch', text: 'ret', value: { type: 'toolCall' } } }, 'turn')).toThrow('Invalid AHP Item')
   expect(filter.event({ type: 'item/delta', payload: { itemId: 'edit', kind: 'text', text: 'ret' } }, 'turn')).toMatchObject({ payload: { text: '[redacted]' } })
+})
+
+test('interaction events and receipts redact reasons and preserve identity', () => {
+  const filter = new SecretRedactor()
+  filter.rememberResponse({ kind: 'userInput', interactionId: 'request', questions: [{ id: 'key', prompt: 'Key', secret: true }] }, { kind: 'userInput', answers: { key: 'secret' } })
+  const result = { interactionId: 'secret', outcome: 'cancelled' as const, reason: 'peer echoed secret' }
+  const projected = { ...result, reason: 'peer echoed [redacted]' }
+  expect(filter.event({ type: 'interaction/resolved', payload: result })).toEqual({ type: 'interaction/resolved', payload: projected })
+  expect(filter.result('interaction/cancel', result)).toEqual(projected)
+  expect(filter.result('interaction/respond', result)).toEqual(projected)
+  expect(result.reason).toBe('peer echoed secret')
 })
 
 /** Complete matches take priority over longer pending candidates, while complete scans never retain an unmatched prefix. */

@@ -48,3 +48,92 @@ test('native close receipt revokes the output tool before a queued candidate run
     await client.dispose()
   }
 })
+
+test('close waits for pending tool installation before removing it and prevents input dispatch', async () => {
+  const installing = deferred<void>()
+  const installed = deferred<void>()
+  const closing = deferred<void>()
+  let tool: StructuredOutputToolDefinition | undefined
+  let inputs = 0
+  let disposed = false
+  const capabilities: Capabilities = { turn: { inputModalities: ['text'] }, input: { delivery: ['native'] } }
+  const adapter: HarnessAdapter = {
+    async initialize() {
+      return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT,
+        runtime: { name: 'fixture', version: '1', adapter: 'fixture' }, capabilities }
+    },
+    async openSession(params) {
+      return {
+        binding: params.binding, capabilities,
+        structuredOutputTool: { async configure(definition) {
+          if (definition) { installing.resolve(); await installed.promise }
+          tool = definition
+        } },
+        async execute(method) {
+          if (method === 'session/close') {
+            closing.resolve()
+            return { closed: true, observationClosed: true, executionStopped: 'unconfirmed' } as never
+          }
+          inputs++
+          throw new Error('Unexpected input dispatch')
+        },
+        async dispose() { disposed = true },
+      }
+    },
+    async dispose() {},
+  }
+  const client = await createClient({ adapter, identity: { adapterId: 'fixture', runtimeConfigId: 'test' } })
+  try {
+    const session = await client.sessions.create({ cwd: process.cwd() })
+    const submission = session.submit({ input: 'work', outputSchema: { type: 'string' } })
+    void submission.catch(() => {})
+    await installing.promise
+    const close = session.close()
+    await closing.promise
+    installed.resolve()
+    await expect(submission).rejects.toMatchObject({ code: 'SESSION_CLOSED' })
+    await expect(close).resolves.toMatchObject({ closed: true })
+    expect(inputs).toBe(0)
+    expect(tool).toBeUndefined()
+    expect(disposed).toBe(true)
+  } finally {
+    installed.resolve()
+    await client.dispose()
+  }
+})
+
+test('a tool cleanup failure after native close still disposes the backend and ends observation', async () => {
+  let closes = 0, removals = 0, disposals = 0
+  const capabilities: Capabilities = {}
+  const adapter: HarnessAdapter = {
+    async initialize() {
+      return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT,
+        runtime: { name: 'fixture', version: '1', adapter: 'fixture' }, capabilities }
+    },
+    async openSession(params) {
+      return {
+        binding: params.binding, capabilities,
+        structuredOutputTool: { async configure() { removals++; throw new Error('Tool cleanup failed') } },
+        async execute(method) {
+          if (method !== 'session/close') throw new Error('Unexpected fixture request')
+          closes++
+          return { closed: true, observationClosed: true, executionStopped: 'unconfirmed' } as never
+        },
+        async dispose() { disposals++ },
+      }
+    },
+    async dispose() {},
+  }
+  const client = await createClient({ adapter, identity: { adapterId: 'fixture', runtimeConfigId: 'test' } })
+  try {
+    const session = await client.sessions.create({ cwd: process.cwd() })
+    const event = session.events()[Symbol.asyncIterator]().next()
+    void event.catch(() => {})
+    await expect(session.close()).rejects.toMatchObject({ code: 'RESOURCE_RELEASE_FAILED' })
+    await expect(event).rejects.toMatchObject({ code: 'OBSERVATION_CLOSED' })
+    await expect(session.close()).rejects.toMatchObject({ code: 'RESOURCE_RELEASE_FAILED' })
+    expect({ closes, removals, disposals }).toEqual({ closes: 1, removals: 1, disposals: 1 })
+  } finally {
+    await client.dispose().catch(() => {})
+  }
+})

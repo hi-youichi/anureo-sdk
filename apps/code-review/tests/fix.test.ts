@@ -1,7 +1,8 @@
-import { expect, test } from 'bun:test'
+import { expect, spyOn, test } from 'bun:test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { access, mkdir, readFile, readdir, realpath, symlink, unlink, writeFile } from 'node:fs/promises'
+import * as fs from 'node:fs/promises'
+import { access, chmod, lstat, mkdir, readFile, readdir, realpath, symlink, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 import { correctnessAngle, formatReport, reviewCode, type ReviewProgress } from '../src'
@@ -209,6 +210,8 @@ test.each(['completed', 'skipped'] as const)('direct fix observer failure at %s 
 test('direct fix baseline failure publishes failed and lets observer exceptions reject', async () => {
   const { client, cwd: directory, prompts } = await fixFixture()
   const cwd = await realpath(directory)
+  await commitFixture(cwd)
+  await unlink(join(cwd, 'a.ts'))
   const events: string[] = []
   const failure = new Error('Failure observer failed')
   await expect(fixFindings({
@@ -321,9 +324,11 @@ test('fixing within a subdirectory preserves the original Git index', async () =
   const nested = join(cwd, 'module with spaces')
   await mkdir(nested)
   await writeFile(join(cwd, 'root.ts'), 'context')
-  await writeFile(join(nested, 'a.ts'), 'staged source')
+  await writeFile(join(nested, 'a.ts'), 'committed source')
   await writeFile(join(nested, 'b.ts'), 'unrelated source')
   await commitFixture(cwd)
+  await writeFile(join(nested, 'a.ts'), 'staged source')
+  await git(cwd, 'add', '--', 'module with spaces/a.ts')
   await writeFile(join(nested, 'a.ts'), 'original working copy')
   const report = await reviewCode({ client, cwd: nested, ...single, fix: true })
   expect(report.modules[0]?.fix).toMatchObject({ status: 'applied', changedFiles: ['a.ts'] })
@@ -391,6 +396,139 @@ test('a conflict in the last changed file prevents the entire fix from being app
   expect(prompts).toHaveLength(3)
 })
 
+test.each([false, true])('a failed installation restores originals or reports recovery paths (rollback fails: %s)', async failRollback => {
+  const { client, cwd } = await fixture(async (prompt, sessionCwd) => {
+    if (prompt.startsWith(stages.analyze)) {
+      return { ...plan, modules: [{ ...plan.modules[0], files: ['a.ts', 'b.ts'] }] }
+    }
+    if (prompt.startsWith(stages.fix)) {
+      await writeFile(join(sessionCwd, 'a.ts'), fixed)
+      await writeFile(join(sessionCwd, 'b.ts'), fixed)
+      return { ...fixResult, changedFiles: ['a.ts', 'b.ts'] }
+    }
+    return { findings: prompt.startsWith(stages.verify) ? [] : [finding] }
+  })
+  await commitFixture(cwd)
+  const root = await realpath(cwd)
+  const a = join(root, 'a.ts')
+  const b = join(root, 'b.ts')
+  const before = await readFile(a)
+  const link = fs.link
+  const rename = fs.rename
+  let recoveryPath: string | undefined
+  const install = spyOn(fs, 'link').mockImplementation(async (from, to) => {
+    if (to === b && String(from).endsWith('/staged')) {
+      expect(await readFile(a, 'utf8')).toBe(fixed)
+      throw Object.assign(new Error('Disk full during installation'), { code: 'ENOSPC' })
+    }
+    await link(from, to)
+  })
+  const restore = spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+    if (failRollback && to === a) {
+      recoveryPath = String(from)
+      throw Object.assign(new Error('Could not restore backup'), { code: 'EIO' })
+    }
+    await rename(from, to)
+  })
+  try {
+    const report = await reviewCode({ client, cwd, ...single, fix: true })
+    expect(await readFile(b)).toEqual(before)
+    expect(report.modules[0]?.fix).toMatchObject({
+      status: 'failed', changedFiles: failRollback ? ['a.ts'] : [],
+      error: { code: failRollback ? 'REVIEW_FIX_ROLLBACK' : 'ENOSPC', outcomeUnknown: failRollback },
+    })
+    if (failRollback) {
+      expect(recoveryPath).toBeDefined()
+      expect(report.modules[0]?.fix?.error?.message).toContain(recoveryPath!)
+      expect(await readFile(recoveryPath!)).toEqual(before)
+      expect(await readFile(a, 'utf8')).toBe(fixed)
+      expect(report.modules[0]?.verification?.angles[0]?.status).toBe('completed')
+    } else {
+      expect(await readFile(a)).toEqual(before)
+      expect(report.modules[0]?.verification).toBeNull()
+      expect((await readdir(root)).some(file => file.startsWith('.anureo-review-fix-'))).toBe(false)
+    }
+  } finally {
+    install.mockRestore()
+    restore.mockRestore()
+  }
+})
+
+test.skipIf(process.platform === 'win32')('fixes preserve raw LF and permission bits and report mode-only edits', async () => {
+  const { client, cwd } = await fixture(async (prompt, sessionCwd) => {
+    if (prompt.startsWith(stages.analyze)) {
+      return { ...plan, modules: [{ ...plan.modules[0], files: ['a.ts', 'b.ts'] }] }
+    }
+    if (prompt.startsWith(stages.fix)) {
+      const a = join(sessionCwd, 'a.ts')
+      expect((await lstat(a)).mode & 0o777).toBe(0o600)
+      await writeFile(a, fixed)
+      await chmod(join(sessionCwd, 'b.ts'), 0o664)
+      return fixResult
+    }
+    return { findings: prompt.startsWith(stages.verify) ? [] : [finding] }
+  })
+  await writeFile(join(cwd, '.gitattributes'), 'a.ts text eol=crlf\n')
+  await chmod(join(cwd, 'a.ts'), 0o600)
+  await chmod(join(cwd, 'b.ts'), 0o644)
+  await commitFixture(cwd)
+  await git(cwd, 'config', 'color.diff', 'always')
+  const report = await reviewCode({ client, cwd, ...single, fix: true })
+  expect(report.modules[0]?.fix).toMatchObject({ status: 'applied', changedFiles: ['a.ts', 'b.ts'] })
+  expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toBe(fixed)
+  expect((await lstat(join(cwd, 'a.ts'))).mode & 0o777).toBe(0o600)
+  expect((await lstat(join(cwd, 'b.ts'))).mode & 0o777).toBe(0o664)
+})
+
+test('binary fixes transfer in SHA-256 repositories', async () => {
+  const binary = Buffer.from([0, 0xff, 0x0a, 0x0d])
+  const { client, cwd } = await fixFixture({ fix: async sessionCwd => {
+    await writeFile(join(sessionCwd, 'a.ts'), binary)
+    return fixResult
+  } })
+  await git(cwd, 'init', '--quiet', '--object-format=sha256')
+  await commitFixture(cwd)
+  const result = await fixFindings({
+    client, cwd: await realpath(cwd), directory: join(cwd, '.anureo/workflows'),
+    sourceVersion: null, modules: reviewedModules,
+  })
+  expect(result).toMatchObject({ status: 'applied', changedFiles: ['a.ts'] })
+  expect(await readFile(join(cwd, 'a.ts'))).toEqual(binary)
+})
+
+test('temporary checkout refs and configuration are independent of the original repository', async () => {
+  const { client, cwd } = await fixFixture({ fix: async sessionCwd => {
+    await git(sessionCwd, 'branch', 'scratch-branch')
+    await git(sessionCwd, 'tag', 'scratch-tag')
+    await git(sessionCwd, 'config', '--local', 'review.scratch', 'true')
+    await writeFile(join(sessionCwd, 'a.ts'), fixed)
+    return fixResult
+  } })
+  await commitFixture(cwd)
+  const report = await reviewCode({ client, cwd, ...single, fix: true })
+  expect(report.modules[0]?.fix).toMatchObject({ status: 'applied', changedFiles: ['a.ts'] })
+  await expect(git(cwd, 'show-ref', '--verify', 'refs/heads/scratch-branch')).rejects.toThrow()
+  await expect(git(cwd, 'show-ref', '--verify', 'refs/tags/scratch-tag')).rejects.toThrow()
+  await expect(git(cwd, 'config', '--local', '--get', 'review.scratch')).rejects.toThrow()
+})
+
+test('checkout links resolve symlink components before parent traversal', async () => {
+  const { client, cwd } = await fixFixture({ fix: async sessionCwd => {
+    expect(await readFile(join(sessionCwd, 'link.ts'), 'utf8')).toBe('nested configuration')
+    await writeFile(join(sessionCwd, 'a.ts'), fixed)
+    return fixResult
+  } })
+  await mkdir(join(cwd, 'deep/nested'), { recursive: true })
+  await writeFile(join(cwd, 'deep/nested/entry.ts'), 'entry')
+  await writeFile(join(cwd, 'deep/config.ts'), 'nested configuration')
+  await writeFile(join(cwd, 'config.ts'), 'root configuration')
+  await symlink('deep/nested', join(cwd, 'alias'), 'dir')
+  await symlink('alias/../config.ts', join(cwd, 'link.ts'))
+  await commitFixture(cwd)
+  const report = await reviewCode({ client, cwd, ...single, fix: true })
+  expect(report.modules[0]?.fix).toMatchObject({ status: 'applied' })
+})
+
 test('fixing in a repository with an unborn branch leaves HEAD unborn', async () => {
   const { client, cwd } = await fixFixture()
   await git(cwd, 'init', '-q')
@@ -437,26 +575,39 @@ test('further edits to an already dirty out-of-scope file still fail scope valid
 })
 
 test.each([
-  { name: 'edits an unselected module file', edit: async (cwd: string) => {
+  { name: 'edits an unselected module file', file: 'b.ts', edit: async (cwd: string) => {
     await writeFile(join(cwd, 'a.ts'), fixed)
     await writeFile(join(cwd, 'b.ts'), fixed)
   } },
-  { name: 'creates a new file', edit: async (cwd: string) => {
+  { name: 'creates a new file', file: 'new.ts', edit: async (cwd: string) => {
     await writeFile(join(cwd, 'a.ts'), fixed)
     await writeFile(join(cwd, 'new.ts'), 'new\n')
   } },
-  { name: 'deletes a selected source file', edit: async (cwd: string) => {
+  { name: 'writes an ignored check artifact', file: 'check.log', edit: async (cwd: string) => {
+    await writeFile(join(cwd, 'a.ts'), fixed)
+    await writeFile(join(cwd, 'check.log'), 'check output\n')
+  } },
+  { name: 'changes only normalized bytes of an unselected source', file: 'b.ts', edit: async (cwd: string) => {
+    await writeFile(join(cwd, 'a.ts'), fixed)
+    const path = join(cwd, 'b.ts')
+    await writeFile(path, (await readFile(path, 'utf8')).replace(/\n/g, '\r\n'))
+  } },
+  { name: 'deletes a selected source file', file: 'a.ts', edit: async (cwd: string) => {
     await writeFile(join(cwd, 'a.ts'), fixed)
     await unlink(join(cwd, 'a.ts'))
   } },
-])('out-of-scope fix changes fail-stop with the paths listed: $name', async ({ edit }) => {
+])('unsupported fix changes fail-stop with the paths listed: $name', async ({ edit, file }) => {
   const { client, cwd, prompts } = await fixFixture({ fix: async directory => { await edit(directory); return fixResult } })
+  await writeFile(join(cwd, '.gitignore'), 'check.log\n')
+  await writeFile(join(cwd, '.gitattributes'), 'b.ts text eol=lf\n')
   await commitFixture(cwd)
   const report = await reviewCode({ client, cwd, ...single, fix: true })
   expect(report.status).toBe('incomplete')
   expect(report.modules[0]?.fix).toMatchObject({ status: 'failed', changedFiles: [],
     error: { code: 'REVIEW_FIX_SCOPE', outcomeUnknown: false } })
-  expect(report.modules[0]?.fix?.error?.message).toContain('outside the selected source files')
+  expect(report.modules[0]?.fix?.error?.message).toBe(
+    `Fix made unsupported changes: ${file}. Only edits to existing selected regular files are allowed.`,
+  )
   expect(await readFile(join(cwd, 'a.ts'), 'utf8')).toContain('n || 1')
   expect(prompts).toHaveLength(3)
 })

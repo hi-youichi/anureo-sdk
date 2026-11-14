@@ -47,11 +47,11 @@ export interface JsonlOptions {
   timeoutMs?: number;
   /**
    * Maximum UTF-8 bytes per frame. Defaults to 8 MiB. Outgoing frames include the newline.
-   * Complete incoming lines exclude LF or CRLF. While waiting for LF, the buffered text is
-   * checked as-is, including any trailing CR.
+   * Incoming lines exclude LF or CRLF. A buffered trailing CR is excluded until the next
+   * byte determines whether it is part of CRLF.
    */
   maxFrameBytes?: number;
-  /** Maximum unresolved client requests, default 128. */
+  /** Maximum unresolved client requests and, separately, maximum unfinished RPC writes. Defaults to 128. */
   maxPending?: number;
   /** Maximum concurrent server handlers until their full completion, default 32. */
   maxServerRequests?: number
@@ -97,23 +97,33 @@ export class CodexJsonlClient {
   /**
    * Send an RPC with empty params by default and await its correlated result. Callers must
    * validate native fields before use. T lets callers specify the expected result type.
-   * Closed/capacity admission failures are definite, as are CodexRpcError replies. Timeout, failed
-   * writes (including frame-bound rejection) and disposal report unknown outcomes without replay or
-   * native cancellation. Serialization exceptions reject unchanged but leave the pending slot until
-   * its deadline, a response or closure; reader failures keep their own classification. Callers
-   * interpret the result and decide recovery; they still own client disposal.
+   * Admission and frame preparation failures are definite, as are CodexRpcError replies. Timeout,
+   * failed process writes, malformed responses and disposal report unknown outcomes without replay
+   * or native cancellation. A timeout does not release write capacity until the write settles.
    */
   request<T = unknown>(method: string, params: NativeRecord = {}): Promise<T> {
     if (this.closed) return Promise.reject(new HarnessSdkError('CONNECTION_CLOSED'))
-    if (this.pending.size >= (this.options.maxPending ?? 128)) return Promise.reject(new HarnessSdkError('BACKPRESSURE_EXCEEDED'))
+    const maxPending = this.options.maxPending ?? 128
+    if (this.pending.size >= maxPending || this.queuedRequests >= maxPending) return Promise.reject(new HarnessSdkError('BACKPRESSURE_EXCEEDED'))
     const id = this.nextId++
+    let encoded: string | HarnessSdkError
+    try {
+      encoded = this.encodeFrame({ id, method, params })
+    } catch (cause) {
+      return Promise.reject(cause)
+    }
+    if (typeof encoded !== 'string') return Promise.reject(encoded)
+    // Serialization can invoke caller code before this request has reserved a slot.
+    if (this.closed) return Promise.reject(new HarnessSdkError('CONNECTION_CLOSED'))
+    if (this.pending.size >= maxPending || this.queuedRequests >= maxPending) return Promise.reject(new HarnessSdkError('BACKPRESSURE_EXCEEDED'))
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id)
         reject(new HarnessSdkError('REQUEST_TIMEOUT', 'Native request outcome is unknown', false, true))
       }, this.options.timeoutMs ?? 30_000)
       this.pending.set(id, { resolve: value => resolve(value as T), reject, timer })
-      void this.write({ id, method, params }).catch(() => {
+      this.queuedRequests++
+      void this.enqueueWrite(encoded).finally(() => { this.queuedRequests-- }).catch(() => {
         const waiting = this.takePendingRequest(id)
         if (!waiting) return
         waiting.reject(new HarnessSdkError('CONNECTION_CLOSED', 'Native request outcome is unknown', false, true))
@@ -139,6 +149,7 @@ export class CodexJsonlClient {
   // Shares the explicit process-disposal task across dispose() calls.
   private disposing?: Promise<void>
   private writeTail: Promise<void> = Promise.resolve()
+  private queuedRequests = 0
   private activeServerRequestHandlers = 0
   private readonly maxFrameBytes: number
   private readonly decoder = new TextDecoder('utf-8', { fatal: true })
@@ -151,11 +162,18 @@ export class CodexJsonlClient {
       }
     } catch { /* stdout owns failure; stderr is never exposed verbatim */ }
   }
-  /** Queue one frame for request/reply/notification callers. Serialization can throw synchronously; closed/oversized frames and process write failures reject. Recover the queue without masking the caller's failure. */
+  /** Prepare and queue a reply or notification. Serialization can throw synchronously. */
   private write(message: NativeRecord): Promise<void> {
     if (this.closed) return Promise.reject(new HarnessSdkError('CONNECTION_CLOSED', 'Codex connection is closed', false, true))
+    const encoded = this.encodeFrame(message)
+    return typeof encoded === 'string' ? this.enqueueWrite(encoded) : Promise.reject(encoded)
+  }
+  private encodeFrame(message: NativeRecord): string | HarnessSdkError {
     const encoded = JSON.stringify(message) + '\n'
-    if (new TextEncoder().encode(encoded).byteLength > this.maxFrameBytes) return Promise.reject(new HarnessSdkError('FRAME_TOO_LARGE'))
+    if (new TextEncoder().encode(encoded).byteLength > this.maxFrameBytes) return new HarnessSdkError('FRAME_TOO_LARGE')
+    return encoded
+  }
+  private enqueueWrite(encoded: string): Promise<void> {
     const writeTask = this.writeTail.then(() => this.process.write(encoded))
     // Recover the queue for later writes; the returned writeTask still propagates this write's failure.
     this.writeTail = writeTask.catch(() => {})
@@ -174,7 +192,7 @@ export class CodexJsonlClient {
         this.assertIncomingFrameSize(line)
         await this.receive(record(JSON.parse(line)))
       }
-      this.assertIncomingFrameSize(buffer)
+      this.assertIncomingFrameSize(buffer.replace(/\r$/, ''))
     }
     buffer += this.decoder.decode()
     if (buffer.trim()) throw new HarnessSdkError('PROTOCOL_ERROR', 'Incomplete Codex JSONL frame', false, true)
@@ -194,7 +212,7 @@ export class CodexJsonlClient {
       await this.handlers.notification(method, record(message.params))
       return
     }
-    if (typeof id !== 'number' && typeof id !== 'string') throw new HarnessSdkError('PROTOCOL_ERROR')
+    if (typeof id !== 'number' && typeof id !== 'string') throw new HarnessSdkError('PROTOCOL_ERROR', 'Invalid Codex message ID', false, true)
     if (typeof method === 'string') {
       this.startServerRequest({ id, method, params: record(message.params) })
       return
@@ -234,9 +252,17 @@ export class CodexJsonlClient {
   private settleResponse(id: number | string, message: NativeRecord): void {
     const waiting = this.takePendingRequest(id)
     if (!waiting) return // A late or duplicate response has no waiter to settle.
-    if (Object.hasOwn(message, 'error')) waiting.reject(new CodexRpcError(Number(record(message.error).code ?? -32603)))
-    else if (Object.hasOwn(message, 'result')) waiting.resolve(message.result)
-    else waiting.reject(new HarnessSdkError('PROTOCOL_ERROR'))
+    if (Object.hasOwn(message, 'error')) {
+      const code = record(message.error).code
+      if (typeof code === 'number' && Number.isInteger(code)) {
+        waiting.reject(new CodexRpcError(code))
+        return
+      }
+    } else if (Object.hasOwn(message, 'result')) {
+      waiting.resolve(message.result)
+      return
+    }
+    waiting.reject(new HarnessSdkError('PROTOCOL_ERROR', 'Invalid Codex response', false, true))
   }
   /** Release a response/write-failure waiter's capacity and deadline before settling it. Unknown or already-settled IDs return undefined, leaving other requests untouched. */
   private takePendingRequest(id: number | string): PendingRequest | undefined {

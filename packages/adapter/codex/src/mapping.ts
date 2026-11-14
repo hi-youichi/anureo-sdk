@@ -1,4 +1,6 @@
 /** Projects native item snapshots and exposes the mapping helpers available through the package's mapping subpath. */
+import { isAbsolute } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { codexFileChanges } from './file-changes'
 import type { InputBlock, Item } from '@anureo/protocol'
 import { HarnessSdkError } from '@anureo/sdk'
@@ -142,6 +144,9 @@ function userContentBlock(value: unknown): InputBlock {
   if (block.type === 'text') return { type: 'text', text: string(block.text) ?? '' }
   if (block.type === 'image' && typeof block.url === 'string') return { type: 'image', url: block.url }
   if (block.type === 'localImage' && typeof block.path === 'string') return { type: 'file', uri: block.path }
+  if (block.type === 'mention' && typeof block.path === 'string' && isAbsolute(block.path)) {
+    return { type: 'file', uri: pathToFileURL(block.path).href, name: string(block.name) }
+  }
   return { type: 'text', text: '[unsupported native input]' }
 }
 

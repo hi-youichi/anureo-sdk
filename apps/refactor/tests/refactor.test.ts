@@ -1,7 +1,7 @@
 // Exercises public sequencing, checkpoints and failure gates through refactorCode.
 import { expect, test } from 'bun:test'
-import { mkdir, readFile, readdir, rename, stat, symlink, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { createClient, HarnessSdkError, type StructuredOutputToolDefinition } from '@anureo/sdk'
 import { createPiAdapter } from '@anureo/adapter-pi'
 import { fakeFactory } from '../../../packages/adapter/pi/tests/fake-host'
@@ -81,7 +81,6 @@ test('each agent has a worktree and module sessions overlap on the same post-des
     if (++runningModules === 2) modulesReady.resolve()
     await modulesReady.promise
     await writeFile(join(cwd, `${module}.ts`), 'export const value = 2\n')
-    expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toContain('// design')
     const other = module === 'a' ? 'b' : 'a'
     expect(await readFile(join(cwd, `${other}.ts`), 'utf8')).toContain('value = 1')
     return edited()
@@ -200,6 +199,59 @@ test('a failed module leaves the target untouched for its assignment while sibli
   expect((await git(context.cwd, 'worktree', 'list', '--porcelain')).match(/^worktree /gm)).toHaveLength(1)
 })
 
+test('an unknown module outcome stops queued session dispatch', async () => {
+  const context = await fixture(prompt => {
+    if (prompt.startsWith('PLAN')) return plan
+    if (moduleOf(prompt) === 'a') return new HarnessSdkError('RECEIPT_LOST', 'Unknown', false, true)
+    return unchanged
+  })
+  const report = await refactorCode({ ...context, concurrency: 1, checks: [] })
+  expect(report.status).toBe('incomplete')
+  expect(report.modules[0]?.step?.failure).toMatchObject({ code: 'RECEIPT_LOST', outcomeUnknown: true })
+  expect(report.modules[1]?.step).toBeNull()
+  expect(context.adapter.opened).toHaveLength(3)
+})
+
+test.each(['planning', 'module'])('worktree cleanup failure preserves the %s outcome', async phase => {
+  let locked: string | undefined
+  const context = await fixture(async (prompt, cwd) => {
+    const planning = prompt.startsWith('PLAN')
+    if (phase === 'planning' ? planning : moduleOf(prompt) === 'a') {
+      await git(context.cwd, 'worktree', 'lock', cwd)
+      locked = cwd
+      if (planning) return new HarnessSdkError('RECEIPT_LOST', 'Planner receipt lost', true, true)
+      await writeFile(join(cwd, 'a.ts'), 'export const value = 2\n')
+      return edited()
+    }
+    return planning ? plan : unchanged
+  })
+  try {
+    const report = await refactorCode({ ...context, concurrency: 1, checks: [] })
+    expect(report.status).toBe('incomplete')
+    if (phase === 'planning') {
+      expect(report.failure).toMatchObject({
+        code: 'RECEIPT_LOST', outcomeUnknown: true, retryable: true, cleanupFailed: true,
+      })
+      expect(report.errors[0]).toContain('Planner receipt lost')
+      expect(report.errors[0]).toContain('Could not remove refactor worktree')
+      expect(report.plan).toBeNull()
+    } else {
+      expect(report.modules[0]?.step).toMatchObject({
+        status: 'failed', appliedFiles: ['a.ts'], failure: { cleanupFailed: true },
+      })
+      expect(report.modules[1]?.step).toBeNull()
+      expect(formatReport(report)).toContain('Files already applied: a.ts')
+      expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toContain('value = 2')
+    }
+    expect(JSON.parse(await readFile(join(report.directory, 'report.json'), 'utf8'))).toEqual(report)
+  } finally {
+    if (locked) {
+      try { await git(context.cwd, 'worktree', 'remove', '--force', '--force', locked) }
+      finally { await rm(dirname(locked), { recursive: true, force: true }) }
+    }
+  }
+})
+
 test('verified work merges while an earlier agent is still running, and competing additions fail', async () => {
   const merged = Promise.withResolvers<void>()
   const context = await fixture(async (prompt, cwd) => {
@@ -265,6 +317,53 @@ test('failed validation retains its output and prevents unverified changes from 
   expect(report.modules[1]?.step).toMatchObject({ status: 'applied', checks: [{ status: 'passed' }, { status: 'passed' }] })
   expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toBe('export const value = 1\n')
   expect(await readFile(join(context.cwd, 'b.ts'), 'utf8')).toBe('export const value = 2\n')
+})
+
+test('disjoint candidates are checked against the edits already merged', async () => {
+  const context = await fixture(async (prompt, cwd) => {
+    if (prompt.startsWith('PLAN')) return plan
+    const module = moduleOf(prompt)
+    if (!module) return unchanged
+    await writeFile(join(cwd, `${module}.ts`), 'export const value = 2\n')
+    return edited()
+  })
+  const report = await refactorCode({ ...context, checks: [
+    { executable: process.execPath, args: ['-e',
+      'if ((await import("./a.ts")).value + (await import("./b.ts")).value > 3) process.exit(1)'] },
+  ] })
+  expect(report.status).toBe('incomplete')
+  const applied = report.modules.find(item => item.step?.status === 'applied')
+  const failed = report.modules.find(item => item.step?.status === 'failed')
+  expect(applied?.step?.checks).toMatchObject([{ status: 'passed' }])
+  expect(failed?.step?.checks).toMatchObject([{ status: 'failed' }])
+  expect(await readFile(join(context.cwd, applied!.module.files[0]!), 'utf8')).toContain('value = 2')
+  expect(await readFile(join(context.cwd, failed!.module.files[0]!), 'utf8')).toContain('value = 1')
+})
+
+test('an assigned file cannot be replaced with binary data', async () => {
+  const context = await fixture(async (prompt, cwd) => {
+    if (prompt.startsWith('PLAN')) return plan
+    if (moduleOf(prompt) !== 'a') return unchanged
+    await writeFile(join(cwd, 'a.ts'), Buffer.from([0xff, 0x00]))
+    return edited()
+  })
+  const report = await refactorCode({ ...context, checks: [] })
+  expect(report.modules[0]?.step).toMatchObject({ status: 'failed', error: 'Assigned files must remain text source: a.ts' })
+  expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toContain('value = 1')
+})
+
+test('the planner cannot publish assignments after editing its checkout', async () => {
+  const context = await fixture(async (prompt, cwd) => {
+    if (!prompt.startsWith('PLAN')) return unchanged
+    await writeFile(join(cwd, 'a.ts'), 'export const value = 2\n')
+    return plan
+  })
+  const report = await refactorCode({ ...context, checks: [] })
+  expect(report.status).toBe('incomplete')
+  expect(report.errors).toEqual(['Module planner modified files'])
+  expect(report.plan).toBeNull()
+  expect(context.adapter.opened).toHaveLength(2)
+  expect(await readFile(join(context.cwd, 'a.ts'), 'utf8')).toContain('value = 1')
 })
 
 test('the plan checkpoint is published before either module starts', async () => {

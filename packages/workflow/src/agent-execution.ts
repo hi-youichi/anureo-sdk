@@ -23,32 +23,62 @@ export interface AgentOptions<S extends z.ZodObject = z.ZodObject> {
    * In a workflow this option contributes to replay identity even in text mode.
    */
   outputFallback?: 'json-text'
+  /**
+   * Positive observation timeouts in milliseconds, up to 2,147,483,647 (the default).
+   * The association wait begins at submission and the result wait begins after association.
+   * Expiry rejects with an unknown outcome and does not interrupt native execution.
+   * These limits do not affect journal replay identity.
+   */
+  wait?: { associationMs?: number; resultMs?: number }
 }
+
+const LONG_OBSERVATION_TIMEOUT_MS = 0x7fffffff
+
+/** Capture session settings and prepare structured output before any asynchronous work. */
+export function prepareAgentCall(options: AgentOptions) {
+  const { client, cwd, model, instructions, permissionMode, schema, outputFallback, wait } = options
+  const timeouts = wait && { associationMs: wait.associationMs, resultMs: wait.resultMs }
+  for (const timeout of [timeouts?.associationMs, timeouts?.resultMs]) {
+    if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0 || timeout > LONG_OBSERVATION_TIMEOUT_MS)) {
+      throw new HarnessSdkError('INVALID_PARAMS', 'Agent observation timeouts must be positive and at most 2,147,483,647 ms')
+    }
+  }
+  return {
+    client, cwd, model, instructions, permissionMode, outputFallback,
+    wait: timeouts,
+    output: schema === undefined ? undefined : prepareOutputSchema(schema),
+  }
+}
+
+export type PreparedAgentCall = ReturnType<typeof prepareAgentCall>
 
 /**
  * Run a fresh call for agent outside a workflow or for executeJournaledAgent after it publishes
- * its started marker and rechecks dispatch. Prepare the supplied schema before opening, then
- * release the acquired session before resolving with text, data or null, or rejecting with an
- * execution or release failure. The caller retains the Client. executeJournaledAgent uses the
- * settled outcome to publish a terminal journal event.
+ * its started marker and rechecks dispatch. Release the acquired session before returning the
+ * completed or dropped outcome or throwing an execution or release failure.
  */
-export async function executeAgent(prompt: string, options: AgentOptions): Promise<string | Record<string, unknown> | null> {
-  const { client, cwd, model, instructions, permissionMode, schema } = options
-  const output = schema === undefined ? undefined : prepareOutputSchema(schema)
-  const session = await openAgentSession({ client, cwd, model, instructions, permissionMode })
-  if (!session) return null // A failed open never hands session ownership to this call.
-  const outcome = await observeAgentTurn({ session, prompt, output, outputFallback: options.outputFallback })
+export async function executeAgent(prompt: string, call: PreparedAgentCall): Promise<SettledAgentOutcome> {
+  const { output, outputFallback, wait } = call
+  const opening = openAgentSession(call)
+  let session: Session
+  try {
+    session = await opening
+  } catch (cause) {
+    if (isStartupBlockException(cause)) return { status: 'dropped', error: summarizeAgentError(cause) }
+    throw cause
+  }
+  const outcome = await observeAgentTurn({ session, prompt, output, outputFallback, wait })
   const cleanupErrors = await releaseAgentSession(session)
   return settleAgentOutcome(outcome, cleanupErrors)
 }
 
-// Give association and terminal observation the longest supported timer delay for model execution.
-const LONG_OBSERVATION_TIMEOUT_MS = 0x7fffffff
-
-/** Execution evidence retained until cleanup has settled, before returning or rejecting the call. */
-type AgentOutcome =
+/** Completed or dropped execution after successful session release. */
+type SettledAgentOutcome =
   | { status: 'completed'; value: string | Record<string, unknown> }
   | { status: 'dropped'; error: AgentErrorSummary }
+
+type AgentOutcome =
+  | SettledAgentOutcome
   | { status: 'failed'; error: HarnessSdkError }
 
 /** Safe diagnostics retained from cleanup and dropped terminals without native messages. */
@@ -62,25 +92,19 @@ interface AgentTurnRequest {
   prompt: string
   output: AgentOutputSchema | undefined
   outputFallback: AgentOptions['outputFallback']
+  wait: AgentOptions['wait']
 }
 
-/**
- * Give executeAgent ownership of the attached session. A confirmed startup denial from the open
- * promise resolves to null. Other rejections and synchronous request setup errors propagate.
- */
+/** Request a fresh session and give executeAgent ownership when it attaches. */
 function openAgentSession({ client, cwd, model, instructions, permissionMode }: Pick<
   AgentOptions, 'client' | 'cwd' | 'model' | 'instructions' | 'permissionMode'
->): Promise<Session | null> {
+>): Promise<Session> {
   return client.sessions.create({
     cwd,
     ...(model !== undefined ? { model } : {}),
     ...(instructions !== undefined ? { instructions } : {}),
     ...(permissionMode !== undefined ? { permissionMode } : {}),
   })
-    .catch(cause => {
-      if (isStartupBlockException(cause)) return null
-      throw cause
-    })
 }
 
 /**
@@ -88,11 +112,11 @@ function openAgentSession({ client, cwd, model, instructions, permissionMode }: 
  * Return execution evidence to executeAgent, which owns session release and final settlement.
  */
 async function observeAgentTurn(request: AgentTurnRequest): Promise<AgentOutcome> {
-  const { session, output } = request
+  const { session, output, wait } = request
   try {
     const submission = agentSubmission(request)
-    const turn = await session.submit(submission, { timeoutMs: LONG_OBSERVATION_TIMEOUT_MS })
-    const result = await turn.result({ timeoutMs: LONG_OBSERVATION_TIMEOUT_MS })
+    const turn = await session.submit(submission, { timeoutMs: wait?.associationMs ?? LONG_OBSERVATION_TIMEOUT_MS })
+    const result = await turn.result({ timeoutMs: wait?.resultMs ?? LONG_OBSERVATION_TIMEOUT_MS })
     if (result.status === 'completed') {
       return { status: 'completed', value: output ? await output.parse(result.text) : result.text }
     }
@@ -160,25 +184,23 @@ async function releaseAgentSession(session: Session): Promise<AgentErrorSummary[
 }
 
 /**
- * Settle executeAgent after both release attempts. Return text/data or null on successful cleanup.
+ * Settle executeAgent after both release attempts. Return completed or dropped outcomes on successful cleanup.
  * Throw the primary failure with any cleanup diagnostics, or RESOURCE_RELEASE_FAILED if cleanup
  * was the only failure.
  */
-function settleAgentOutcome(outcome: AgentOutcome, errors: AgentErrorSummary[]): string | Record<string, unknown> | null {
+function settleAgentOutcome(outcome: AgentOutcome, errors: AgentErrorSummary[]): SettledAgentOutcome {
   if (errors.length) {
     if (outcome.status === 'failed') {
       const failure = outcome.error
+      const prior = failure.details?.cleanupErrors
       throw new HarnessSdkError(failure.code, failure.message, failure.retryable, failure.outcomeUnknown,
-        { ...failure.details, cleanupErrors: errors })
+        { ...failure.details, cleanupErrors: [...(Array.isArray(prior) ? prior : []), ...errors] })
     }
     throw new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'Agent session cleanup failed', false,
       errors.some(error => error.outcomeUnknown), { errors, ...(outcome.status === 'dropped' ? { droppedError: outcome.error } : {}) })
   }
-  switch (outcome.status) {
-    case 'completed': return outcome.value
-    case 'dropped': return null
-    case 'failed': throw outcome.error
-  }
+  if (outcome.status === 'failed') throw outcome.error
+  return outcome
 }
 
 /** Share the startup-denial rule between classifyTerminalFailure and isStartupBlockException.
@@ -187,10 +209,7 @@ function isStartupBlocked(error: Pick<HarnessSdkError, 'code' | 'outcomeUnknown'
   return !error.outcomeUnknown && error.code === 'AGENT_STARTUP_BLOCKED' && error.details?.workflowDisposition === 'startup_blocked'
 }
 
-/**
- * Recognize a thrown SDK startup denial. openAgentSession returns null for a matching rejection
- * from session creation. observeAgentTurn records a drop candidate and leaves settlement to cleanup.
- */
+/** Recognize a thrown SDK startup denial during session creation or turn observation. */
 function isStartupBlockException(cause: unknown): cause is HarnessSdkError {
   return cause instanceof HarnessSdkError && isStartupBlocked(cause)
 }

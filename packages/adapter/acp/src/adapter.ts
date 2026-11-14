@@ -39,29 +39,42 @@ export class AcpAdapter implements HarnessAdapter {
   get connected(): boolean { return !!this.connection && !this.connectionLost; }
   /** Negotiate ACP and return detached AHP capabilities. Calls after a successful handshake reuse its result.
    * Client.initialize awaits this through withStructuredOutput and retains the capabilities for later opens.
-   * Handshake request failures include a redacted stderr tail when available. Direct callers must dispose
-   * after setup failure and should finish initialization before opening sessions. */
+   * Overlapping calls share the handshake. Failures release the transport and include a redacted
+   * stderr tail when available. */
   async initialize(params: InitializeParams): Promise<InitializeResult> {
     if (this.closing) throw new HarnessSdkError('RUNTIME_DISPOSED');
     assertRequest("initialize", params);
     negotiateVersion(params.protocolVersions);
     if (this.info) return this.initializedResult();
+    this.initializing ??= Promise.resolve().then(() => this.initializeConnection(params)).finally(() => {
+      this.initializing = undefined;
+    });
+    await this.initializing;
+    return this.initializedResult();
+  }
+
+  private async initializeConnection(params: InitializeParams): Promise<void> {
+    if (this.closing) throw new HarnessSdkError('RUNTIME_DISPOSED');
     const channel = this.options.connect ? await this.options.connect() : await processStream(this.options);
     if (this.closing) { await channel.dispose(); throw new HarnessSdkError('RUNTIME_DISPOSED'); }
-    const terminal = this.installConnection(channel);
     try {
-      this.info = await this.call('initialize', { protocolVersion: acp.PROTOCOL_VERSION, clientInfo: { name: 'anureo-harness-sdk', version: '0.1.0' }, clientCapabilities: {
+      const terminal = this.installConnection(channel);
+      const info = await this.call('initialize', { protocolVersion: acp.PROTOCOL_VERSION, clientInfo: { name: 'anureo-harness-sdk', version: '0.1.0' }, clientCapabilities: {
         fs: { readTextFile: !!this.options.fs?.readTextFile, writeTextFile: !!this.options.fs?.writeTextFile }, terminal: !!terminal,
         session: { configOptions: { boolean: {} }, compaction: {} }, plan: {},
         elicitation: params.clientCapabilities?.interactions?.includes('elicitation') ? { form: {}, url: {} } : undefined,
         _meta: { ahp: { version: 1, clientRequests: ['_ahp/user_input', '_ahp/dynamic_tool'] } },
       } });
-    } catch (error) {
-      throw this.withDiagnostics(error instanceof HarnessSdkError ? error : sdkError(error, 'ACP_HANDSHAKE_FAILED', true));
+      if (this.closing) throw new HarnessSdkError('RUNTIME_DISPOSED');
+      if (info.protocolVersion !== acp.PROTOCOL_VERSION) throw new HarnessSdkError('PROTOCOL_VERSION_UNSUPPORTED');
+      this.info = info;
+      this.configureCapabilities();
+    } catch (cause) {
+      this.info = undefined;
+      const error = this.withDiagnostics(sdkError(cause, 'ACP_HANDSHAKE_FAILED', true));
+      if (this.channel === channel) await rethrowAfterRelease(error, () => this.releaseTransport());
+      throw error;
     }
-    if (this.info.protocolVersion !== acp.PROTOCOL_VERSION) { await this.dispose(); throw new HarnessSdkError('PROTOCOL_VERSION_UNSUPPORTED'); }
-    this.configureCapabilities();
-    return this.initializedResult();
   }
   /** Issue a native request with requestTimeoutMs (30 seconds by default). Rejections are translated
    * to SDK errors. A timeout ends this wait while native work may continue. The adapter's normal
@@ -76,8 +89,7 @@ export class AcpAdapter implements HarnessAdapter {
   /** Open, resume/load or fork one native session. Opens run one at a time so early updates
    * can establish the native identity. OutputSession.open supplies the sink and awaits the configured
    * backend before attachment. Supply protocol-valid parameters, including the fork source and boundary
-   * in fork mode. Dispatch or attachment failures remove local indexes and release the open slot.
-   * Successful backends remain adapter-tracked until teardown. Their owner must dispose them. */
+   * in fork mode. A timed-out native request holds the open slot until its reply is drained. */
   async openSession(params: SessionOpenParams, sink: SessionEventSink): Promise<BackendSession> {
     // Early session/update frames can identify only one opening session at a time.
     const previousOpenCompleted = this.sessionOpenQueueTail;
@@ -85,22 +97,54 @@ export class AcpAdapter implements HarnessAdapter {
     this.sessionOpenQueueTail = new Promise((resolve) => { releaseOpenSlot = resolve; });
     await previousOpenCompleted;
     const session = new AcpBackendSession(this, params, sink);
-    this.openingSession = session;
+    const finishOpen = () => {
+      this.openingSession = undefined;
+      releaseOpenSlot();
+    };
     try {
+      if (this.closing) throw new HarnessSdkError('RUNTIME_DISPOSED');
       const request = this.prepareSessionOpen(params, session);
-      const response = record(await this.call(request.method, request.params));
-      this.acceptOpenResponse(session, params.binding.sessionId, response);
+      this.openingSession = session;
+      const response = record(await this.requestSessionOpen(request, session, finishOpen));
+      this.registerOpenResponse(session, response);
+      if (this.closing) throw new HarnessSdkError('RUNTIME_DISPOSED');
+      session.configure(response);
+      session.hydrating = false;
+      if (session.loadedSnapshot.length) this.options.onLoadSnapshot?.(session.binding, session.loadedSnapshot);
       const patch = initialConfiguration(params, session.capabilities);
       if (Object.keys(patch).length) await session.setConfiguration(patch);
       const metadata = session.snapshot().metadata;
       if (metadata) await sink.emit({ type: 'session/metadata', payload: metadata });
+      if (this.closing) throw new HarnessSdkError('RUNTIME_DISPOSED');
+      this.savedBindings.set(params.binding.sessionId, session.binding);
       return session;
     } catch (error) {
-      this.forgetFailedOpen(session, params.binding.sessionId);
-      throw error;
+      if (session.abandonedOpen) throw error;
+      return await rethrowAfterRelease(error, () => session.dispose());
     } finally {
-      this.openingSession = undefined;
-      releaseOpenSlot();
+      if (!session.abandonedOpen) finishOpen();
+    }
+  }
+
+  private async requestSessionOpen(
+    request: { method: string; params: unknown },
+    session: AcpBackendSession,
+    finishOpen: () => void,
+  ): Promise<unknown> {
+    let nativeReply: Promise<unknown> | undefined;
+    try {
+      return await waitForRequest(() => nativeReply = this.agent.request(request.method, request.params), {}, this.options.requestTimeoutMs ?? 30_000);
+    } catch (cause) {
+      const error = errorFromNative(cause);
+      if (nativeReply && error.code === 'REQUEST_TIMEOUT') {
+        // Late updates still identify this open. Drain its reply and release any acquired session.
+        session.abandonedOpen = true;
+        void nativeReply.then(response => this.registerOpenResponse(session, record(response)))
+          .finally(() => session.dispose()).finally(finishOpen).catch(() => {});
+      } else if (request.method === this.extension.methods.fork && error.details?.nativeCode === -32601) {
+        await this.withdrawExtension('fork');
+      }
+      throw error;
     }
   }
   /** Attempt all tracked session releases, then close the native connection and channel, and clear indexes.
@@ -109,16 +153,32 @@ export class AcpAdapter implements HarnessAdapter {
   async dispose(): Promise<void> {
     if (this.closing) return; this.closing = true;
     const results = await Promise.allSettled([...this.sessions.values()].map(session => session.dispose()));
-    const transport = await Promise.allSettled([Promise.resolve().then(() => this.connection?.close()), Promise.resolve().then(() => this.channel?.dispose())]);
+    const transport = await Promise.allSettled([this.releaseTransport()]);
     this.sessions.clear(); this.nativeSessions.clear();
+    this.savedBindings.clear(); this.retiredNativeIds.clear();
     assertResourcesReleased([...results, ...transport]);
   }
+
+  private async releaseTransport(): Promise<void> {
+    const { connection, channel } = this;
+    this.connection = undefined;
+    this.channel = undefined;
+    const error = new HarnessSdkError('ACP_CONNECTION_CLOSED', 'ACP source connection closed', false, true);
+    for (const delivery of this.deliveries.values()) delivery.reject(error);
+    this.deliveries.clear();
+    const results = await Promise.allSettled([Promise.resolve().then(() => connection?.close()), Promise.resolve().then(() => channel?.dispose())]);
+    assertResourcesReleased(results);
+  }
+
   private connection: acp.ClientConnection | undefined;
   private channel: AcpChannel | undefined;
   private info: acp.InitializeResponse | undefined;
-  /** Adapter's AHP session index. Disposed sessions remain indexed until adapter teardown. */
+  private initializing?: Promise<void>;
+  /** AHP session index for acquired backends through the end of their release. */
   readonly sessions = new Map<string, AcpBackendSession>();
   private nativeSessions = new Map<string, AcpBackendSession>();
+  private readonly savedBindings = new Map<string, SessionBinding>();
+  private readonly retiredNativeIds = new Set<string>();
   private openingSession: AcpBackendSession | undefined;
   private sessionOpenQueueTail = Promise.resolve();
   private readonly deliveries = new Map<acp.JsonRpcId, Deferred>();
@@ -134,10 +194,13 @@ export class AcpAdapter implements HarnessAdapter {
    * closure, reject outstanding response deliveries and fail live sessions unless disposal is underway. */
   private installConnection(channel: AcpChannel): AcpTerminalPort | undefined {
     this.channel = channel;
+    this.connectionLost = false;
+    this.sourceFailure = undefined;
     const wrapped = this.wrapStream(channel);
     const { app, terminal } = this.createClientApplication();
-    this.connection = app.connect(wrapped);
-    void this.connection.closed.then(async () => {
+    const connection = this.connection = app.connect(wrapped);
+    void connection.closed.then(async () => {
+      if (this.connection !== connection) return;
       this.connectionLost = true;
       const error = this.withDiagnostics(this.sourceFailure ?? new HarnessSdkError('ACP_CONNECTION_CLOSED', 'ACP source connection closed', false, true));
       for (const delivery of this.deliveries.values()) delivery.reject(error);
@@ -159,12 +222,14 @@ export class AcpAdapter implements HarnessAdapter {
 
   /** Notify currently indexed sessions of observation loss. A rejected sink must not stop fan-out. */
   private failSessions(error: HarnessSdkError): Promise<void[]> {
-    return Promise.all([...this.sessions.values()].map(session => session.sink.fail(error).catch(() => {})));
+    return Promise.all([...this.sessions.values()].filter(session => session.acceptsPeerTraffic)
+      .map(session => session.sink.fail(error).catch(() => {})));
   }
 
   /** Build openSession's native request. For resume/load, register the known ID and begin snapshot
    * capture before dispatch so updates received before the reply reach the correct backend. */
   private prepareSessionOpen(params: SessionOpenParams, session: AcpBackendSession): { method: string; params: unknown } {
+    if (this.sessions.has(params.binding.sessionId)) throw new HarnessSdkError('SESSION_ALREADY_OPEN');
     if (params.instructions && !this.extension.instructions) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'ACP peer did not negotiate instructions');
     const common = {
       cwd: params.cwd,
@@ -175,7 +240,9 @@ export class AcpAdapter implements HarnessAdapter {
     if (params.mode === 'resume') {
       const nativeRef = params.binding.nativeRef;
       if (!nativeRef || nativeRef.provider !== 'acp') throw new HarnessSdkError('SESSION_BINDING_MISMATCH');
+      if (this.nativeSessions.has(nativeRef.value)) throw new HarnessSdkError('SESSION_ALREADY_OPEN');
       session.nativeId = nativeRef.value;
+      this.retiredNativeIds.delete(session.nativeId);
       this.nativeSessions.set(session.nativeId, session);
       session.hydrating = true;
       const method = this.nativeCapabilities.sessionCapabilities?.resume != null ? 'session/resume' : 'session/load';
@@ -184,39 +251,54 @@ export class AcpAdapter implements HarnessAdapter {
 
     // The session/open schema requires fork data for this mode. The generated type leaves it optional.
     const fork = params.fork;
-    const nativeRef = fork?.nativeRef ?? this.sessions.get(fork!.sourceSessionId)?.binding.nativeRef;
+    const nativeRef = fork?.nativeRef ?? this.savedBindings.get(fork!.sourceSessionId)?.nativeRef;
     const method = this.extension.methods.fork;
     if (!nativeRef || !method) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
     return { method, params: { ...common, sessionId: nativeRef.value, boundary: fork!.boundary } };
   }
 
-  /** Reconcile the reply with any early notification identity before openSession applies overrides.
-   * Index the backend and finish snapshot capture before invoking the host's snapshot callback. */
-  private acceptOpenResponse(session: AcpBackendSession, sessionId: string, response: Record<string, unknown>): void {
+  /** Confirm identity and take ownership before configuration and host callbacks. */
+  private registerOpenResponse(session: AcpBackendSession, response: Record<string, unknown>): void {
     if (typeof response.sessionId === 'string') {
       if (session.nativeId && response.sessionId !== session.nativeId) throw new HarnessSdkError('ACP_PROTOCOL_ERROR', 'ACP session identity changed while opening');
       session.nativeId = response.sessionId;
     }
     if (!session.nativeId) throw new HarnessSdkError('ACP_PROTOCOL_ERROR', 'ACP session response lacked an identity');
+    const owner = this.nativeSessions.get(session.nativeId);
+    if (owner && owner !== session) throw new HarnessSdkError('SESSION_ALREADY_OPEN');
+    session.nativeAcquired = true;
+    this.retiredNativeIds.delete(session.nativeId);
     this.nativeSessions.set(session.nativeId, session);
-    this.sessions.set(sessionId, session);
-    session.configure(response);
-    session.hydrating = false;
-    if (session.loadedSnapshot.length) this.options.onLoadSnapshot?.(session.binding, session.loadedSnapshot);
+    this.sessions.set(session.binding.sessionId, session);
   }
 
-  /** Remove the indexes that openSession may have populated before failure, including through early updates. */
-  private forgetFailedOpen(session: AcpBackendSession, sessionId: string): void {
-    for (const [nativeId, backend] of this.nativeSessions) {
-      if (backend === session) this.nativeSessions.delete(nativeId);
+  /** Remove only this backend's routes. Successful opens retain their separate bindings for fork lookup. */
+  retireSession(session: AcpBackendSession): void {
+    const { sessionId } = session.binding;
+    if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId);
+    if (this.nativeSessions.get(session.nativeId) === session) {
+      this.nativeSessions.delete(session.nativeId);
+      if (!this.closing) this.retiredNativeIds.add(session.nativeId);
     }
-    this.sessions.delete(sessionId);
+  }
+
+  /** Withdraw a peer-rejected method from dispatch and every advertised session snapshot. */
+  async withdrawExtension(key: ExtensionKey): Promise<void> {
+    if (!this.extension.methods[key]) return;
+    delete this.extension.methods[key];
+    removeExtensionCapability(this.capabilities, key);
+    const sessions = new Set(this.sessions.values());
+    if (this.openingSession) sessions.add(this.openingSession);
+    await Promise.allSettled([...sessions].filter(session => session.acceptsPeerTraffic)
+      .map(session => session.withdrawExtension(key)));
   }
 
   /** Attach redacted channel diagnostics before initialize rejects a handshake failure or the
    * SDK closure handler reports observation loss. Preserve the error when no tail is available. */
   private withDiagnostics(error: HarnessSdkError): HarnessSdkError {
-    const tail = this.channel?.diagnostics?.();
+    let tail: string | undefined;
+    try { tail = this.channel?.diagnostics?.(); }
+    catch { return error; }
     if (!tail) return error;
     return new HarnessSdkError(error.code, error.message, error.retryable, error.outcomeUnknown, {
       ...error.details,
@@ -225,10 +307,11 @@ export class AcpAdapter implements HarnessAdapter {
   }
   /** Resolve the native ID for SDK callbacks and routeNotification. Only a session/update may
    * identify the current opening backend. Reject other unknown IDs as invalid native parameters. */
-  private backend(nativeId: string, source: 'request' | 'update' = 'request'): AcpBackendSession {
+  private backend(nativeId: string, source: 'request' | 'update' | 'notification' = 'request'): AcpBackendSession {
     const existing = this.nativeSessions.get(nativeId);
-    if (existing) return existing;
-    if (source === 'update' && this.openingSession && (!this.openingSession.nativeId || this.openingSession.nativeId === nativeId)) {
+    if (existing && (source !== 'request' || existing.acceptsPeerTraffic)) return existing;
+    if (source === 'update' && !this.retiredNativeIds.has(nativeId) && this.openingSession && !this.openingSession.disposed
+      && (!this.openingSession.nativeId || this.openingSession.nativeId === nativeId)) {
       this.openingSession.nativeId = nativeId;
       // Index by native ID as soon as a session/update identifies the opening session.
       this.nativeSessions.set(nativeId, this.openingSession);
@@ -236,11 +319,21 @@ export class AcpAdapter implements HarnessAdapter {
     }
     throw new acp.RequestError(-32602, 'Unknown ACP session');
   }
+
+  /** A local observation can close while an already admitted notification is being published. */
+  private async publishNotification(session: AcpBackendSession, publish: () => Promise<void>): Promise<void> {
+    if (!session.acceptsPeerTraffic) return;
+    try { await publish(); }
+    catch (error) {
+      if (!(error instanceof HarnessSdkError && error.code === 'STREAM_CLOSED')) throw error;
+    }
+  }
   /** Register a native request with the session sink after establishing standard turn correlation.
    * The sink invokes the responder with an answer or cancellation. Resolve the native response first,
    * but keep the responder pending until wrapStream confirms its write, so settlement cannot claim early delivery. */
   private async interaction<T>(session: AcpBackendSession, requestId: acp.JsonRpcId, request: InteractionRequested, transform: (response: InteractionResponse | null) => T): Promise<T> {
     await session.ensureStandardStarted();
+    if (!session.acceptsPeerTraffic) throw new acp.RequestError(-32602, 'Unknown ACP session');
     const delivery = deferred(); this.deliveries.set(requestId, delivery);
     return new Promise<T>((resolve, reject) => {
       let answered = false;
@@ -257,22 +350,27 @@ export class AcpAdapter implements HarnessAdapter {
     if (!('method' in frame) || 'id' in frame) return 'forward-to-sdk';
     if (frame.method === 'session/update') {
       const value = record(frame.params);
-      const session = this.backend(String(value.sessionId), 'update');
-      await session.update(record(value.update));
+      const nativeId = String(value.sessionId);
+      if (this.retiredNativeIds.has(nativeId)) return 'consumed';
+      const session = this.backend(nativeId, 'update');
+      await this.publishNotification(session, () => session.update(record(value.update)));
       return 'consumed';
     }
-    if (frame.method === '_ahp/event' && (Object.keys(this.extension.methods).length || this.extension.nativeLifecycle)) {
+    if (frame.method === '_ahp/event' && this.capabilities.extensions?.length) {
       const value = record(frame.params);
-      const session = this.backend(String(value.sessionId));
-      const event = value.event;
-      if (this.extension.nativeLifecycle) await session.nativeEvent(event, value);
-      else await session.extensionEvent(event, value);
+      const nativeId = String(value.sessionId);
+      if (this.retiredNativeIds.has(nativeId)) return 'consumed';
+      const session = this.backend(nativeId, 'notification');
+      await this.publishNotification(session, () => this.extension.nativeLifecycle
+        ? session.nativeEvent(value.event, value) : session.extensionEvent(value.event, value));
       return 'consumed';
     }
     if (frame.method !== 'elicitation/complete') {
       const scope = record(frame.params).sessionId;
-      const recipients = typeof scope === 'string' ? [this.backend(scope)] : [...this.sessions.values()];
-      for (const session of recipients) await session.sink.emit({ type: 'notice', payload: { severity: 'info', code: 'ACP_UNKNOWN_NOTIFICATION', message: 'Unknown ACP notification retained', raw: safe({ method: frame.method, params: frame.params }) } });
+      if (typeof scope === 'string' && this.retiredNativeIds.has(scope)) return 'consumed';
+      const recipients = typeof scope === 'string' ? [this.backend(scope, 'notification')] : [...this.sessions.values()];
+      for (const session of recipients) await this.publishNotification(session, () =>
+        session.sink.emit({ type: 'notice', payload: { severity: 'info', code: 'ACP_UNKNOWN_NOTIFICATION', message: 'Unknown ACP notification retained', raw: safe({ method: frame.method, params: frame.params }) } }));
       return 'consumed';
     }
     return 'forward-to-sdk';
@@ -280,35 +378,47 @@ export class AcpAdapter implements HarnessAdapter {
   /** Route notifications in read order before forwarding other frames to the SDK. A successful
    * response write acknowledges delivery to the interaction responder. Stream errors fail observation. */
   private wrapStream(channel: AcpChannel): acp.Stream {
-    const rawReader = channel.stream.readable.getReader(); const rawWriter = channel.stream.writable.getWriter();
+    const rawReader = channel.stream.readable.getReader();
     return {
       writable: new WritableStream({ write: async (frame) => {
+        const rawWriter = channel.stream.writable.getWriter();
         try {
           await rawWriter.write(frame);
-          if ('id' in frame && !('method' in frame)) { this.deliveries.get(frame.id)?.resolve(); this.deliveries.delete(frame.id); }
+          if (this.channel === channel && 'id' in frame && !('method' in frame)) { this.deliveries.get(frame.id)?.resolve(); this.deliveries.delete(frame.id); }
         } catch (error) {
-          this.connectionLost = true;
-          const failure = this.sourceFailure = sdkError(error, 'ACP_CONNECTION_CLOSED', true);
-          for (const delivery of this.deliveries.values()) delivery.reject(failure);
-          void this.failSessions(failure);
+          if (this.channel === channel) {
+            this.connectionLost = true;
+            const failure = this.sourceFailure = sdkError(error, 'ACP_CONNECTION_CLOSED', true);
+            for (const delivery of this.deliveries.values()) delivery.reject(failure);
+            void this.failSessions(failure);
+          }
           throw error;
+        } finally {
+          rawWriter.releaseLock();
         }
-      }, close: () => rawWriter.close(), abort: (reason) => rawWriter.abort(reason) }),
+      }, close: () => channel.stream.writable.close(), abort: (reason) => channel.stream.writable.abort(reason) }),
       readable: new ReadableStream({ pull: async (controller) => {
         try {
           for (;;) {
-            const next = await rawReader.read(); if (next.done) { controller.close(); return; }
+            const next = await rawReader.read();
+            if (next.done || this.channel !== channel) { rawReader.releaseLock(); controller.close(); return; }
             const frame = next.value;
             if (await this.routeNotification(frame) === 'consumed') continue;
             controller.enqueue(frame); return;
           }
         } catch (error) {
-          this.connectionLost = true;
-          const failure = this.sourceFailure = sdkError(error, 'ACP_CONNECTION_CLOSED', true);
+          rawReader.releaseLock();
+          if (this.channel === channel) {
+            this.connectionLost = true;
+            const failure = this.sourceFailure = sdkError(error, 'ACP_CONNECTION_CLOSED', true);
+            void this.failSessions(failure);
+          }
           controller.error(error);
-          void this.failSessions(failure);
         }
-      }, cancel: (reason) => rawReader.cancel(reason) }),
+      }, cancel: async (reason) => {
+        try { await rawReader.cancel(reason); }
+        finally { rawReader.releaseLock(); }
+      } }),
     };
   }
   /** Configure the ACP SDK callbacks for installConnection before initialize advertises their
@@ -318,7 +428,8 @@ export class AcpAdapter implements HarnessAdapter {
       .onRequest('session/request_permission', (context) => this.requestPermission(context))
       .onRequest('elicitation/create', (context) => this.requestElicitation(context))
       .onNotification('elicitation/complete', async (context) => {
-        for (const session of this.sessions.values()) await session.sink.emit({ type: 'notice', payload: { severity: 'info', code: 'ACP_ELICITATION_COMPLETE', message: 'External authorization completed', raw: safe(context.params) } });
+        for (const session of [...this.sessions.values()]) await this.publishNotification(session, () =>
+          session.sink.emit({ type: 'notice', payload: { severity: 'info', code: 'ACP_ELICITATION_COMPLETE', message: 'External authorization completed', raw: safe(context.params) } }));
       })
       .onRequest('_ahp/user_input', (value: unknown) => record(value), (context) => this.extensionInteraction('userInput', context.requestId, context.params))
       .onRequest('_ahp/dynamic_tool', (value: unknown) => record(value), (context) => this.extensionInteraction('dynamicTool', context.requestId, context.params));
@@ -367,6 +478,7 @@ export class AcpAdapter implements HarnessAdapter {
             signal: context.signal,
           })
         : policy;
+      if (!session.acceptsPeerTraffic) throw new acp.RequestError(-32602, 'Unknown ACP session');
       const optionId = decision ? selectPermissionOption(context.params.options, decision) : undefined;
       if (optionId !== undefined) {
         await session.sink.emit({ type: 'notice', payload: {
@@ -390,7 +502,7 @@ export class AcpAdapter implements HarnessAdapter {
     if (this.options.fs?.writeTextFile) app.onRequest('fs/write_text_file', (ctx) => { this.backend(ctx.params.sessionId); return this.options.fs!.writeTextFile!(ctx.params); });
     const terminal = this.options.terminal;
     if (terminal) {
-      app.onRequest('terminal/create', async (ctx) => { const session = this.backend(ctx.params.sessionId); const result = await terminal.createTerminal(ctx.params); session.terminals.add(result.terminalId); return result; });
+      app.onRequest('terminal/create', (ctx) => this.backend(ctx.params.sessionId).createTerminal(terminal, ctx.params));
       app.onRequest('terminal/output', (ctx) => { this.backend(ctx.params.sessionId).requireTerminal(ctx.params.terminalId); return terminal.terminalOutput(ctx.params); });
       app.onRequest('terminal/wait_for_exit', (ctx) => { this.backend(ctx.params.sessionId).requireTerminal(ctx.params.terminalId); return terminal.waitForTerminalExit(ctx.params); });
       app.onRequest('terminal/kill', (ctx) => { this.backend(ctx.params.sessionId).requireTerminal(ctx.params.terminalId); return terminal.killTerminal(ctx.params); });
@@ -409,9 +521,10 @@ export class AcpAdapter implements HarnessAdapter {
       turn: { inputModalities: ['text', ...(native.promptCapabilities?.image ? ['image' as const] : []), ...(native.promptCapabilities?.embeddedContext ? ['file' as const] : [])] },
       interactions: ['approval', 'elicitation', ...(this.extension.userInput ? ['userInput' as const] : []), ...(this.extension.dynamicTool ? ['dynamicTool' as const] : [])],
       goal: { actions: [...(this.extension.methods.goalSet ? ['set' as const] : []), ...(this.extension.methods.goalClear ? ['clear' as const] : [])] },
-      compact: !!this.extension.methods.compact, review: !!this.extension.methods.review, subagents: { events: this.extension.subagents ? 'nested' : 'none' },
+      compact: !!this.extension.methods.compact, review: !this.extension.nativeLifecycle && !!this.extension.methods.review, subagents: { events: this.extension.subagents ? 'nested' : 'none' },
       mcp: { stdio: true, http: native.mcpCapabilities?.http === true, elicitation: ['form', 'url'] }, config: { options: [] },
-      extensions: Object.keys(this.extension.methods).length || this.extension.subagents || this.extension.userInput || this.extension.dynamicTool ? [{ name: 'x-acp/ahp', version: '1' }] : [],
+      extensions: this.extension.version && (this.extension.nativeLifecycle || Object.keys(this.extension.methods).length || this.extension.subagents || this.extension.userInput || this.extension.dynamicTool)
+        ? [{ name: 'x-acp/ahp', version: String(this.extension.version) }] : [],
     };
   }
   /** Handle registered _ahp user-input/tool requests only after negotiation; validate before sink registration.
@@ -522,6 +635,17 @@ export class AcpBackendSession implements BackendSession {
     if (!isSessionUpdate(data)) await this.ensureStandardStarted();
     await this.mapper.update(data);
   }
+  /** Track the create before invoking the host so disposal can release its eventual terminal. */
+  async createTerminal(terminal: AcpTerminalPort, params: acp.CreateTerminalRequest): Promise<acp.CreateTerminalResponse> {
+    if (!this.acceptsPeerTraffic) throw new acp.RequestError(-32602, 'Unknown ACP session');
+    const creation = Promise.resolve().then(() => terminal.createTerminal(params)).then(result => {
+      this.terminals.add(result.terminalId);
+      return result;
+    });
+    this.terminalCreations.add(creation);
+    try { return await creation; }
+    finally { this.terminalCreations.delete(creation); }
+  }
   /** Reject peer operations on terminal IDs not successfully created for this session or already released. */
   requireTerminal(id: string): void { if (!this.terminals.has(id)) throw new acp.RequestError(-32602, 'Terminal does not belong to this session'); }
   /** Apply a configuration patch in key order and return the resulting session state. Reject unknown
@@ -533,9 +657,13 @@ export class AcpBackendSession implements BackendSession {
     const appliedKeys: string[] = [];
     for (const [key, value] of Object.entries(patch)) {
       try {
-        const option = this.configKeys.get(key)!;
-        if (option.type === 'mode') await this.adapter.call('session/set_mode', { sessionId: this.nativeId, modeId: String(value) });
-        else {
+        const option = this.configKeys.get(key);
+        if (!option) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'ACP configuration option is no longer available');
+        if (option.type === 'mode') {
+          const modeId = String(value);
+          await this.adapter.call('session/set_mode', { sessionId: this.nativeId, modeId });
+          this.configure({ currentModeId: modeId });
+        } else {
           const response = await this.adapter.call('session/set_config_option', { sessionId: this.nativeId, configId: String(option.id), type: option.type === 'boolean' ? 'boolean' : 'select', value });
           this.configure(record(response));
         }
@@ -545,7 +673,6 @@ export class AcpBackendSession implements BackendSession {
         throw new HarnessSdkError('CONFIG_PARTIAL', 'Some configuration changes were applied', error.retryable, error.outcomeUnknown,
           { appliedKeys, failedKey: key, cause: { code: error.code } });
       }
-      this.config[key] = value;
       appliedKeys.push(key);
       // Native config methods commit independently; publish each confirmed state.
       await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
@@ -586,10 +713,18 @@ export class AcpBackendSession implements BackendSession {
   async dispose(): Promise<void> {
     return this.releasing ??= (async () => {
       this.closed = true;
-      const operations: Promise<unknown>[] = [...this.terminals].map(terminalId => Promise.resolve().then(() => this.adapter.options.terminal?.releaseTerminal({ sessionId: this.nativeId, terminalId })));
-      if (!this.nativeClosed && this.adapter.connected && this.adapter.nativeCapabilities.sessionCapabilities?.close != null) operations.push(this.adapter.call('session/close', { sessionId: this.nativeId }));
-      const results = await Promise.allSettled(operations); this.terminals.clear(); this.nativeMappers.clear();
-      assertResourcesReleased(results);
+      try {
+        await Promise.allSettled(this.terminalCreations);
+        const operations: Promise<unknown>[] = [...this.terminals].map(terminalId => Promise.resolve().then(() => this.adapter.options.terminal?.releaseTerminal({ sessionId: this.nativeId, terminalId })));
+        if (this.nativeAcquired && !this.nativeClosed && this.adapter.connected && this.adapter.nativeCapabilities.sessionCapabilities?.close != null) {
+          operations.push(this.adapter.call('session/close', { sessionId: this.nativeId }));
+        }
+        assertResourcesReleased(await Promise.allSettled(operations));
+      } finally {
+        this.terminals.clear();
+        this.nativeMappers.clear();
+        this.adapter.retireSession(this);
+      }
     })();
   }
   // Native lifecycle tracks turn IDs and a separate mapper per turn.
@@ -607,6 +742,10 @@ export class AcpBackendSession implements BackendSession {
 
   private releasing?: Promise<void>;
   private nativeClosed = false;
+  nativeAcquired = false;
+  abandonedOpen = false;
+  get disposed(): boolean { return this.closed; }
+  get acceptsPeerTraffic(): boolean { return !this.disposed && !this.abandonedOpen; }
   /** Native identity assigned by openSession, including early update correlation. */
   nativeId = '';
   /** While resume/load is pending, historical updates are captured instead of published. */
@@ -615,6 +754,7 @@ export class AcpBackendSession implements BackendSession {
   readonly loadedSnapshot: JsonObject[] = [];
   /** Successfully created terminal IDs awaiting explicit or disposal release. */
   readonly terminals = new Set<string>();
+  private readonly terminalCreations = new Set<Promise<acp.CreateTerminalResponse>>();
   /** Session-local negotiated capabilities, refreshed by native configuration and extension failures. */
   readonly capabilities: Capabilities;
   private config: JsonObject = {};
@@ -654,7 +794,8 @@ export class AcpBackendSession implements BackendSession {
    * Native start notifications establish binding. Definite pre-start rejection releases admission;
    * unknown outcome retains it, and method-not-found withdraws review capability before rejecting. */
   private async submitReview(params: AhpRequestMap['review/start']): Promise<AhpResultMap['review/start']> {
-    const method = this.adapter.extension.methods.review; if (!method) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
+    const method = this.adapter.extension.methods.review;
+    if (!method || this.adapter.extension.nativeLifecycle) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
     this.beginStandardSubmission(params.submissionId);
     try {
       await this.adapter.call(method, { ...params, sessionId: this.nativeId, turnId: this.activeTurn });
@@ -664,10 +805,7 @@ export class AcpBackendSession implements BackendSession {
     } catch (cause) {
       const error = errorFromNative(cause, 'ACP_REVIEW_REJECTED');
       if (!this.standardTurnStarted && !error.outcomeUnknown) { this.activeTurn = undefined; this.standardSubmissionId = undefined; }
-      if (error.code === 'CAPABILITY_UNSUPPORTED') {
-        this.withdrawExtension('review');
-        await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
-      }
+      if (error.details?.nativeCode === -32601) await this.adapter.withdrawExtension('review');
       throw error;
     }
   }
@@ -720,9 +858,12 @@ export class AcpBackendSession implements BackendSession {
       return { submissionId: start.submissionId, accepted: true, disposition: 'started', turnId };
     } catch (cause) {
       const error = errorFromNative(cause, 'ACP_INPUT_REJECTED');
-      if (this.standardTurnStarted) {
+      if (this.activeTurn === turnId && this.standardTurnStarted) {
         if (error.outcomeUnknown) await this.sink.fail(error);
-        else await this.sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: { code: error.code, message: error.code, retryable: false, outcomeUnknown: false } } });
+        else {
+          this.releaseStandardTurn(turnId);
+          await this.sink.emit({ type: 'turn/completed', payload: { turnId, status: 'failed', error: { code: error.code, message: error.code, retryable: false, outcomeUnknown: false } } });
+        }
       }
       throw error;
     } finally { this.releaseStandardTurn(turnId); }
@@ -734,34 +875,38 @@ export class AcpBackendSession implements BackendSession {
     try {
       const response = await this.adapter.call(nativeMethod, { ...params, sessionId: this.nativeId });
       const result = key === 'history' ? projectHistoryFileChanges(response) : response;
-      assertResult(method, result);
+      try { assertResult(method, result); }
+      catch { throw new HarnessSdkError('PROTOCOL_ERROR', 'Invalid ACP extension result', false, true); }
       return result;
     } catch (error) {
-      if (error instanceof HarnessSdkError && error.code === 'CAPABILITY_UNSUPPORTED') {
-        this.withdrawExtension(key);
-        await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
-      }
+      if (error instanceof HarnessSdkError && error.details?.nativeCode === -32601) await this.adapter.withdrawExtension(key);
       throw error;
     }
   }
 
-  /** Remove the rejected method for future dispatch and update this session's advertised capability.
-   * The caller publishes the revised session state before surfacing the native rejection. */
-  private withdrawExtension(key: ExtensionKey): void {
-    delete this.adapter.extension.methods[key];
-    switch (key) {
-      case 'steer': delete this.capabilities.input!.steer; break;
-      case 'history': this.capabilities.session!.history = false; break;
-      case 'revert': this.capabilities.session!.revert = []; break;
-      case 'compact': this.capabilities.compact = false; break;
-      case 'review': this.capabilities.review = false; break;
-      case 'goalSet':
-      case 'goalClear': {
-        const removedAction = key === 'goalSet' ? 'set' : 'clear';
-        const goal = this.capabilities.goal!;
-        goal.actions = goal.actions?.filter(action => action !== removedAction);
-        break;
-      }
+  /** Publish the revised capability with this session's current configuration. */
+  async withdrawExtension(key: ExtensionKey): Promise<void> {
+    removeExtensionCapability(this.capabilities, key);
+    this.capabilityRevision++;
+    if (this.nativeAcquired) await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
+  }
+}
+
+/** Update the operation's capability on the connection baseline or a session projection. */
+function removeExtensionCapability(capabilities: Capabilities, key: ExtensionKey): void {
+  switch (key) {
+    case 'fork': capabilities.session!.fork = []; break;
+    case 'steer': delete capabilities.input!.steer; break;
+    case 'history': capabilities.session!.history = false; break;
+    case 'revert': capabilities.session!.revert = []; break;
+    case 'compact': capabilities.compact = false; break;
+    case 'review': capabilities.review = false; break;
+    case 'goalSet':
+    case 'goalClear': {
+      const removedAction = key === 'goalSet' ? 'set' : 'clear';
+      const goal = capabilities.goal!;
+      goal.actions = goal.actions?.filter(action => action !== removedAction);
+      break;
     }
   }
 }
@@ -774,6 +919,18 @@ export function createAcpAdapter(options: AcpAdapterOptions): AcpAdapter { retur
 function assertResourcesReleased(results: PromiseSettledResult<unknown>[]): void {
   const errors = results.filter(result => result.status === 'rejected').map(() => ({ code: 'ACP_RELEASE_FAILED' }));
   if (errors.length) throw new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'ACP resources were not fully released', false, true, { errors });
+}
+
+/** Preserve the setup failure and append only a sanitized cleanup code if release also fails. */
+async function rethrowAfterRelease(cause: unknown, release: () => Promise<void>): Promise<never> {
+  try { await release(); }
+  catch (cleanupFailure) {
+    const error = sdkError(cause);
+    throw new HarnessSdkError(error.code, error.message, error.retryable, error.outcomeUnknown, {
+      ...error.details, cleanupErrors: [{ code: sdkError(cleanupFailure).code }],
+    });
+  }
+  throw cause;
 }
 
 /** Fill absent tool-call file changes from legacy ACP history output before extension result validation.
@@ -827,10 +984,8 @@ function deferred(): Deferred {
   void promise.catch(() => {}); return { promise, resolve, reject };
 }
 
-/** requestPermission uses this to select an offered one-shot kind or matching legacy ID.
- * When neither matches, it defers to the interactive path. */
+/** Select an offered one-shot kind, or defer to the interactive path. */
 function selectPermissionOption(options: readonly acp.PermissionOption[], decision: AcpPermissionDecision): string | undefined {
   const kind = decision === 'allow-once' ? 'allow_once' : 'reject_once';
-  return options.find((option) => option.kind === kind)?.optionId
-    ?? options.find((option) => option.optionId === decision)?.optionId;
+  return options.find((option) => option.kind === kind)?.optionId;
 }

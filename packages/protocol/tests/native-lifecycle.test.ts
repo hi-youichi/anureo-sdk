@@ -61,6 +61,16 @@ test('submission notifications retain complete source envelopes and scoped items
     expect(validateEvent(event)).toBe(true);
     expect(validateDefinition('AhpRpcMessage', { jsonrpc: '2.0', method: payload.type, params: event })).toBe(true);
   }
-  const item = { ...source, type: 'item/completed', payload: { item: { id: 'item', type: 'agentMessage', text: 'native' } } };
-  expect(validateEvent(item)).toBe(false); expect(validateEvent({ ...item, turnId: 'actual' })).toBe(true);
+  const item = { id: 'item', type: 'agentMessage', text: 'native' };
+  for (const payload of [
+    { type: 'item/started', payload: { item } },
+    { type: 'item/delta', payload: { itemId: item.id, kind: 'text', text: 'native' } },
+    { type: 'item/completed', payload: { item } },
+  ]) {
+    for (const [scope, expected] of [[{}, false], [{ turnId: '' }, false], [{ turnId: 'actual' }, true]] as const) {
+      const event = { ...source, ...payload, ...scope };
+      expect(validateEvent(event)).toBe(expected);
+      expect(validateDefinition('AhpRpcMessage', { jsonrpc: '2.0', method: event.type, params: event })).toBe(expected);
+    }
+  }
 });

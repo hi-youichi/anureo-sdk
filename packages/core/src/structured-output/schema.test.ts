@@ -25,3 +25,16 @@ test('draft-07 and explicit 2020-12 use their own array semantics and ignore sch
   expect(compileOutputSchema({ type: 'boolean' }).parse('false')).toBe(false)
   expect(() => compileOutputSchema(false).parse('null')).toThrow()
 })
+
+test('required fields must be own properties and diagnostics identify each missing field', () => {
+  for (const dialect of ['http://json-schema.org/draft-07/schema#', 'https://json-schema.org/draft/2020-12/schema']) {
+    const output = compileOutputSchema({ $schema: dialect, type: 'object', required: ['toString', 'constructor'] })
+    expect(() => output.parse('{}')).toThrow(expect.objectContaining({
+      details: { issues: [
+        { path: '', code: 'required', missingProperty: 'toString' },
+        { path: '', code: 'required', missingProperty: 'constructor' },
+      ] },
+    }))
+    expect(output.parse('{"toString":null,"constructor":null}')).toEqual({ toString: null, constructor: null })
+  }
+})

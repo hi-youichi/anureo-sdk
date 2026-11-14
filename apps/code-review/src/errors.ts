@@ -16,22 +16,26 @@ export interface ReviewFailure {
 /** Project a caught or synthesized cause into report data. reviewAngle and failedAngleReview
  * store it as missing coverage, applyFix returns it with the failed fix, and reviewCode collects
  * it when onProgress throws. formatFailure uses the same projection for CLI diagnostics.
- * Reading properties or converting the cause to a string can throw. */
-export function reviewFailure(cause: unknown): ReviewFailure {
-  const issues = failureIssues(cause)
-  const metadata = cause && typeof cause === 'object' ? cause : undefined
-  return {
-    message: cause instanceof Error ? cause.message : String(cause),
-    code: metadata && 'code' in metadata && typeof metadata.code === 'string' ? metadata.code : null,
-    outcomeUnknown: metadata !== undefined && 'outcomeUnknown' in metadata && metadata.outcomeUnknown === true,
-    ...(issues.length > 0 ? { issues } : {}),
+ * Use the fallback when the cause cannot be read or converted to a string. */
+export function reviewFailure(cause: unknown, fallback = 'Unreadable failure'): ReviewFailure {
+  try {
+    const issues = failureIssues(cause)
+    const metadata = cause && typeof cause === 'object' ? cause : undefined
+    const code = metadata && 'code' in metadata ? metadata.code : undefined
+    return {
+      message: cause instanceof Error ? String(cause.message) : String(cause),
+      code: typeof code === 'string' ? code : null,
+      outcomeUnknown: metadata !== undefined && 'outcomeUnknown' in metadata && metadata.outcomeUnknown === true,
+      ...(issues.length > 0 ? { issues } : {}),
+    }
+  } catch {
+    return { message: fallback, code: null, outcomeUnknown: false }
   }
 }
 
 /** Return a CLI diagnostic with the message, any nonempty code, and an uncertainty notice when
  * flagged. runCli writes it to stderr for command failures. executeReviewCommand uses it for a
- * secondary cleanup failure. Both callers add the prefix and newline. Errors while projecting
- * the cause propagate to the caller. */
+ * secondary cleanup failure. Both callers add the prefix and newline. */
 export function formatFailure(cause: unknown): string {
   const error = reviewFailure(cause)
   return `${error.message}${error.code ? ` [${error.code}]` : ''}${error.outcomeUnknown ? ' (execution outcome unknown)' : ''}`

@@ -15,8 +15,7 @@ export { safeCatalogErrorCode } from './diagnostics/errors'
  *
  * The probe owner enforces deadlines, interrupts native work if needed, and releases resources
  * even when the phase discards a successful result. Logger and synchronous observer failures are
- * isolated. A cause or signal property that throws during failure reporting prevents terminal
- * delivery and becomes the rejection.
+ * isolated. Failure projection falls back to the safe fields read before a cause property throws.
  *
  * The Codex and Claude catalog sessions await the spawn and handshake phases during preparation and
  * return the models phase value from listModels. Session users must await dispose after use.
@@ -44,7 +43,7 @@ function throwIfCatalogAborted(signal: AbortSignal | undefined): void {
 /**
  * Publish catalogPhase's failure report after classifying the cause, then let catalogPhase rethrow
  * that cause. Classify before sampling cancellation so the outcome reflects the signal at reporting
- * time. If classification or sampling throws, that failure escapes before a report is delivered.
+ * time. If classification throws, emit the safe fields already resolved.
  */
 function reportCatalogFailure(
   options: CatalogProbeOptions,
@@ -52,8 +51,14 @@ function reportCatalogFailure(
   startedAt: number,
   cause: unknown,
 ): void {
-  const errorCode = safeCatalogErrorCode(cause)
-  const nativeRpcCode = readNativeRpcCode(cause)
+  let errorCode = 'CATALOG_QUERY_FAILED'
+  let nativeRpcCode: number | undefined
+  try {
+    errorCode = safeCatalogErrorCode(cause)
+    nativeRpcCode = readNativeRpcCode(cause)
+  } catch {
+    // A rejected value can throw when its diagnostic properties are accessed.
+  }
   emitCatalogPhase(options, {
     phase,
     outcome: options.signal?.aborted ? 'cancelled' : 'error',

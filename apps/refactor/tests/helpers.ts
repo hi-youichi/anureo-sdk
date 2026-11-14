@@ -30,7 +30,11 @@ export const edited = (change = 'Renamed internal value') => ({ summary: 'Edited
 /** Return the first line for prompt routing, or an empty string for empty input. */
 export const kind = (prompt: string) => prompt.split('\n')[0]!
 /** Read a module ID from its serialized prompt header, or return undefined when absent. */
-export const moduleOf = (prompt: string) => /Module: \{"id":"([^"]+)"/.exec(prompt)?.[1]
+export function moduleOf(prompt: string): string | undefined {
+  const prefix = 'Module: '
+  const header = prompt.split('\n').find(line => line.startsWith(prefix))
+  return header ? JSON.parse(header.slice(prefix.length)).id : undefined
+}
 /** Build a two-file graph rooted at the test target for injected graph loaders. */
 export function graph(cwd: string): RepositoryGraph {
   return { schemaVersion: 1, repositoryPath: cwd, kind: 'all', indexReport: { status: 'indexed' }, nodes: [

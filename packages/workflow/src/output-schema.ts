@@ -28,9 +28,7 @@ export interface AgentOutputSchema<S extends z.ZodObject = z.ZodObject> {
  * Require closed objects and required JSON fields, including fields with JSON-compatible defaults.
  * Conversion schemas and other unsupported shapes synchronously throw INVALID_PARAMS with a
  * rule code in details.rule.
- * memoizedAgent prepares the pair before reserving a journal key and uses it for typed replay.
- * executeAgent prepares its own pair before opening a session. On a journal miss this happens
- * after the started record is published and dispatch is rechecked.
+ * prepareAgentCall prepares the pair at invocation for fresh execution and typed replay.
  */
 export function prepareOutputSchema<S extends z.ZodObject>(source: S): AgentOutputSchema<S> {
   const { schema, validate } = compilePortableSchema(source)
@@ -65,8 +63,16 @@ function parseRawOutput(text: string, validate: ValidateFunction): unknown {
   } catch {
     throw new HarnessSdkError('AGENT_STRUCTURED_OUTPUT_NOT_JSON')
   }
-  if (!value || typeof value !== 'object' || Array.isArray(value) || !validate(value)) {
-    const issues = validate.errors?.map(error => ({ path: error.instancePath, code: error.keyword })) ?? []
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw outputMismatch([])
+  if (!validate(value)) {
+    const issues = validate.errors?.map(({ instancePath, keyword, params }) => {
+      const property = keyword === 'required' ? params.missingProperty
+        : keyword === 'additionalProperties' ? params.additionalProperty : undefined
+      const path = typeof property === 'string'
+        ? `${instancePath}/${property.replace(/~/g, '~0').replace(/\//g, '~1')}`
+        : instancePath
+      return { path, code: keyword }
+    }) ?? []
     throw outputMismatch(issues)
   }
   return value

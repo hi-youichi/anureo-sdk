@@ -1,3 +1,4 @@
+// Run this example with Bun after installing @anureo/conformance.
 import { createClient } from '@anureo/sdk'
 import { createScriptedAdapter } from '@anureo/conformance/fake'
 

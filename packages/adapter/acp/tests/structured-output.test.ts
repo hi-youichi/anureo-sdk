@@ -2,6 +2,13 @@ import { expect, test } from 'bun:test'
 import { resolve } from 'node:path'
 import { createClient, type Session, type SubmitOptions } from '@anureo/sdk'
 import { createAcpAdapter } from '../src'
+import { submitOutput } from './fixtures/mcp-output-client.mjs'
+
+test('the stdio client reports bridge exit before the first reply', async () => {
+  await expect(submitOutput({
+    command: process.execPath, args: ['-e', 'process.exit(17)'], env: [],
+  }, [])).rejects.toThrow('MCP bridge exited (17)')
+}, 2000)
 
 for (const scenario of ['mcp-output', 'mcp-stdio-output']) {
   test(`local ACP ${scenario} supports sequential schemas and reconnects on resume`, async () => {

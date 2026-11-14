@@ -114,7 +114,7 @@ test('peer requests and unmatched replies do not disturb correlated response fai
     incoming.push(JSON.stringify({ jsonrpc: '2.0', id: malformedFrame.id }));
     incoming.push(JSON.stringify({ jsonrpc: '2.0', id: firstFrame.id, result: null }));
     expect(await first).toBeNull();
-    expect(await malformed).toMatchObject({ code: 'PROTOCOL_ERROR' });
+    expect(await malformed).toMatchObject({ code: 'PROTOCOL_ERROR', outcomeUnknown: true });
     expect(await unsupported).toMatchObject({ code: 'CAPABILITY_UNSUPPORTED', message: 'AHP_RPC_ERROR' });
     expect(sent[3]).toEqual({ jsonrpc: '2.0', id: 'peer-request', error: { code: -32601, message: 'Method not found' } });
     // A malformed correlated response fails its request rather than the whole connection.
@@ -126,4 +126,22 @@ test('peer requests and unmatched replies do not disturb correlated response fai
   } finally {
     await wire.close();
   }
+});
+
+test.each([
+  { result: null, error: null },
+  { result: {}, error: { code: -32603, message: 'private peer error' } },
+  { error: [] },
+  { error: { code: -32603.5, message: 'private peer error' } },
+  { error: { code: -32603, message: 1 } },
+])('malformed correlated reply rejects with an unknown outcome (%j)', async fields => {
+  const incoming = new BoundedEventQueue<string>();
+  const wire = new AhpWire({
+    messages: incoming,
+    send: async frame => { incoming.push(JSON.stringify({ jsonrpc: '2.0', id: JSON.parse(frame).id, ...fields })); },
+    close: async () => { incoming.end(); },
+  });
+  try {
+    await expect(wire.request('session/close', {})).rejects.toMatchObject({ code: 'PROTOCOL_ERROR', outcomeUnknown: true });
+  } finally { await wire.close(); }
 });

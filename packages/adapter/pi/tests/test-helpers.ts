@@ -69,7 +69,7 @@ export async function fixture(options: Partial<PiAdapterOptions> = {}, create: P
 export const observe = (promise: Promise<Turn>): Promise<Turn> => { void promise.catch(() => {}); return promise }
 
 /** Supply the current session ID and a fresh request ID. Return Session.request's result or rejection unchanged. */
-export function request<M extends 'history/read' | 'compact/start' | 'session/config/set' | 'goal/set' | 'review/start'>(
+export function request<M extends 'input/submit' | 'history/read' | 'compact/start' | 'session/config/set' | 'goal/set' | 'review/start'>(
   session: Session, method: M, params: Omit<AhpRequestMap[M], 'sessionId' | 'requestId'>,
 ): Promise<AhpResultMap[M]> {
   return session.request(method, { ...params, sessionId: session.id, requestId: randomUUID() } as AhpRequestMap[M])

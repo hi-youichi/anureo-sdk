@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnHarnessProcess } from '@anureo/sdk/process'
@@ -10,9 +10,10 @@ test('a bundled consumer runs on Node from an unrelated cwd against the native W
   try {
     const entry = join(directory, 'consumer.ts'), output = join(directory, 'consumer.mjs')
     const root = resolve(import.meta.dir, '../../../..')
+    await symlink(join(root, 'node_modules'), join(directory, 'node_modules'), 'junction')
     await writeFile(entry, `
-import { createClient } from ${JSON.stringify(join(root, 'packages/core/src/index.ts'))}
-import { createHermesAdapter } from ${JSON.stringify(join(root, 'packages/adapter/hermes/src/index.ts'))}
+import { createClient } from '@anureo/sdk'
+import { createHermesAdapter } from '@anureo/adapter-hermes'
 const client = await createClient({
   adapter: createHermesAdapter({ command: process.env.FIXTURE_BUN, args: [process.env.FIXTURE_ENTRY], env: process.env, timeoutMs: 2000 }),
   identity: { adapterId: 'hermes', runtimeConfigId: 'node-test' },

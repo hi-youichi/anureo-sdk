@@ -2,6 +2,7 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { message } from './errors'
+import { checkoutEnvironment } from './git'
 import { exec } from './process'
 import type { CheckResult } from './results'
 
@@ -13,13 +14,24 @@ export type CheckCommand = string | { executable: string; args?: readonly string
  * refactorCode runs this before repository preflight and parseCliInput uses it before client
  * creation. Omitted and empty lists pass this check. Only omission allows script discovery. */
 export function validateChecks(commands: readonly CheckCommand[] | undefined, label = 'check'): void {
-  for (const command of commands ?? []) {
+  const issues: string[] = []
+  let hasBlankCommand = false
+  for (const [index, command] of (commands ?? []).entries()) {
+    const location = `${label} #${index + 1}`
     const executable = typeof command === 'string' ? command : command.executable
-    if (!executable.trim()) throw new Error(`${label} commands must be nonempty`)
-    if (executable.includes('\0') || (typeof command !== 'string' && command.args?.some(arg => arg.includes('\0')))) {
-      throw new Error(`${label} commands and arguments cannot contain NUL`)
+    if (!executable.trim()) {
+      hasBlankCommand = true
+      issues.push(`${location} is blank`)
+    }
+    if (executable.includes('\0')) issues.push(`${location} contains NUL`)
+    if (typeof command !== 'string') {
+      for (const [position, arg] of (command.args ?? []).entries()) {
+        if (arg.includes('\0')) issues.push(`${location} argument #${position + 1} contains NUL`)
+      }
     }
   }
+  if (hasBlankCommand) issues.unshift(`${label} commands must be nonempty`)
+  if (issues.length) throw new Error(issues.join('\n'))
 }
 
 /** Discover typecheck then test for refactorCode when checks are omitted outside review-only mode.
@@ -52,7 +64,7 @@ export async function defaultChecks(cwd: string): Promise<CheckCommand[]> {
  * message on failure, and retain only the final 4,000 characters. An empty command list resolves
  * without changing results; existing entries are retained. */
 export async function runChecks(cwd: string, commands: readonly CheckCommand[], results: CheckResult[]): Promise<void> {
-  const limits = { cwd, maxBuffer: 8 << 20, timeout: 300_000, windowsHide: true }
+  const limits = { cwd, env: checkoutEnvironment(), maxBuffer: 8 << 20, timeout: 300_000, killSignal: 'SIGKILL' as const, windowsHide: true }
   for (const command of commands) {
     const display = typeof command === 'string' ? command : [command.executable, ...(command.args ?? [])]
       .map(arg => /^[\w./:-]+$/.test(arg) ? arg : JSON.stringify(arg)).join(' ')

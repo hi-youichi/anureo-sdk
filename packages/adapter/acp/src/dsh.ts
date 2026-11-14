@@ -1,6 +1,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createAcpAdapter, type AcpAdapter } from './adapter';
+import { DEFAULT_STDERR_TAIL_LINES } from './diagnostics';
 import type { AcpAdapterOptions } from './options';
 
 /** Configure the DSH command and approval policy alongside ACP's host ports and transport options. */
@@ -31,12 +32,14 @@ export interface DshAcpOptions extends Omit<AcpAdapterOptions, 'command' | 'args
  * handshake include the redacted stderr tail when available. The preset sets a 120,000 ms
  * native request wait (excluding session/prompt) when requestTimeoutMs is omitted. Passing it
  * explicitly as undefined uses ACP's 30,000 ms fallback. Stdio retains up to 200 stderr lines by default.
+ * createClient has a separate initialization wait that defaults to 30 seconds and includes process
+ * startup. Set timeoutMs in its second argument to cover both startup and the native handshake.
  * Child environment overrides are merged over the host environment and preset DSH_HOME.
  */
 export function createDshAcpAdapter(options: DshAcpOptions = {}): AcpAdapter {
   const { dshHome, profile = 'acp', autoApprove = false, ...rest } = options;
   return createAcpAdapter({
-    stderrTailLines: 200,
+    stderrTailLines: DEFAULT_STDERR_TAIL_LINES,
     requestTimeoutMs: 120_000,
     ...rest,
     command: rest.command ?? 'dsh',

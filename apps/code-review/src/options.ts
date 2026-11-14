@@ -5,6 +5,7 @@ import type { ReviewProgress } from './progress'
 
 /** Internal default shared by library preflight and CLI flag parsing for review and fix capacity. */
 export const DEFAULT_REVIEW_CONCURRENCY = 8
+export const MAX_REVIEW_ID_BYTES = 256
 
 /** Configure reviewCode with an initialized client. Keep the client available until the call
  * resolves or rejects and await its disposal when finished using it. */
@@ -31,6 +32,9 @@ export interface ReviewOptions {
    * Defaults to false. Fix mode requires a usable Git work tree and gives each agent a separate
    * temporary checkout. Applied edits remain if a later step fails. */
   fix?: boolean
+  /** Harness-specific read-only mode for analysis, review and verification. Omission uses the
+   * client's defaults. Use a client configured to enforce read-only access and deny write approvals. */
+  readPermissionMode?: string
   /** Harness-specific session permission mode for fix edits and checks; omission uses the session default. */
   fixPermissionMode?: string
   /** Shared maximum for simultaneous review, fix and verification agents. Must be a positive safe
@@ -55,7 +59,7 @@ export function validateReviewOptions(options: ReviewOptions) {
   if (maxModules !== undefined) validatePositiveInteger(maxModules, 'maxModules')
   const moduleIds = options.moduleIds ? [...options.moduleIds] : undefined
   validateModuleIds(moduleIds, 'moduleIds must contain unique nonempty module ids')
-  if (moduleIds) validateIdByteLength(moduleIds, 'moduleIds must be at most 256 bytes each (workflow step-key limit)')
+  if (moduleIds) validateIdByteLength(moduleIds, 'moduleIds must be at most 256 bytes each')
   const angles = copyReviewAngles(options.angles ?? defaultAngles)
   return { fixRequested, concurrency, maxModules, moduleIds, angles }
 }
@@ -70,9 +74,14 @@ export function validatePositiveInteger(value: number, label: string): void {
  * throws for empty lists, blank IDs or exact duplicates using the caller's diagnostic. Whitespace
  * is significant for matching IDs. */
 export function validateModuleIds(ids: readonly string[] | undefined, message: string): void {
-  if (ids && (ids.length === 0 || ids.some(id => !id.trim()) || hasDuplicateIds(ids))) {
+  if (ids && (ids.length === 0 || ids.some(id => !isNonblankReviewId(id)) || hasDuplicateIds(ids))) {
     throw new Error(message)
   }
+}
+
+/** Whitespace is significant in nonblank IDs. */
+export function isNonblankReviewId(id: string): boolean {
+  return id.trim().length > 0
 }
 
 /** Share exact-ID uniqueness checks across library selections and CLI flags without normalization. */
@@ -85,16 +94,16 @@ export function hasDuplicateIds(ids: readonly string[]): boolean {
 function copyReviewAngles(input: readonly ReviewAngle[]): ReviewAngle[] {
   const angles = input.map(angle => ({ ...angle }))
   const ids = angles.map(angle => angle.id)
-  if (angles.length === 0 || angles.some(angle => !angle.id.trim() || !angle.title.trim() || !angle.instructions.trim())
+  if (angles.length === 0 || angles.some(angle => !isNonblankReviewId(angle.id) || !angle.title.trim() || !angle.instructions.trim())
     || hasDuplicateIds(ids)) {
     throw new Error('Review angles must have unique nonempty ids and nonempty titles and instructions')
   }
-  validateIdByteLength(ids, 'Review angle ids must be at most 256 bytes (workflow step-key limit)')
+  validateIdByteLength(ids, 'Review angle ids must be at most 256 bytes')
   return angles
 }
 
 /** Enforce the review API's 256-byte UTF-8 ID cap for module and angle selections, throwing with
  * the caller's diagnostic. */
 function validateIdByteLength(ids: readonly string[], message: string): void {
-  if (ids.some(id => Buffer.byteLength(id) > 256)) throw new Error(message)
+  if (ids.some(id => Buffer.byteLength(id) > MAX_REVIEW_ID_BYTES)) throw new Error(message)
 }

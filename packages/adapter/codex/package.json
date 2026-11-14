@@ -1,7 +1,7 @@
 {
   "name": "@anureo/adapter-codex",
-  "description": "Anureo SDK adapter for the Codex CLI app-server protocol over stdio JSONL",
-  "version": "0.3.1",
+  "description": "Anureo SDK adapter for the Codex CLI app-server protocol over stdio JSONL. Published entry points are TypeScript source. Run them with Bun.",
+  "version": "0.3.2",
   "license": "Apache-2.0",
   "keywords": [
     "anureo",
@@ -45,6 +45,7 @@
     "@anureo/conformance": "workspace:*"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "bun": ">=1.4.2"
   }
 }

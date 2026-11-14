@@ -3,6 +3,8 @@ import { HarnessSdkError } from '@anureo/sdk'
 import { spawnHarnessProcess, type HarnessProcess } from '@anureo/sdk/process'
 import type { CodexAdapterOptions } from './options'
 
+type CodexVersion = { version: string; reportedVersion: string }
+
 /**
  * Read the version that CodexNativeAdapter.initialize uses to advertise capabilities. A nonempty
  * override bypasses launch. Otherwise, bound the stdout and exit wait after launch by timeoutMs
@@ -10,15 +12,18 @@ import type { CodexAdapterOptions } from './options'
  * exit reject with HARNESS_UNAVAILABLE. Launch and stream failures propagate. Await cleanup even
  * on failure, with cleanup rejection taking precedence over the read outcome.
  */
-export async function probeVersion(options: CodexAdapterOptions): Promise<string> {
-  if (options.version) return versionNumber(options.version)
+export async function probeVersion(options: CodexAdapterOptions): Promise<CodexVersion> {
+  if (options.version) return parseVersion(options.version)
   const process = await (options.processFactory ?? spawnHarnessProcess)({
     command: options.command, args: ['--version'], cwd: options.cwd, env: options.env,
   })
+  void (async () => {
+    for await (const _ of process.stderr) { /* Discard native diagnostics. */ }
+  })().catch(() => {})
   try {
     return await Promise.race([
       readVersionOutput(process),
-      new Promise<string>((_, reject) => {
+      new Promise<never>((_, reject) => {
         const timeout = setTimeout(() => reject(new HarnessSdkError('HARNESS_UNAVAILABLE', 'Codex version probe timed out')), options.timeoutMs ?? 30_000)
         timeout.unref?.()
       }),
@@ -28,17 +33,18 @@ export async function probeVersion(options: CodexAdapterOptions): Promise<string
   }
 }
 
-/** Extract major.minor.patch from an override or the trimmed CLI output, dropping an attached prerelease or build suffix. Preserve unmatched text for profile selection. */
-function versionNumber(value: string): string {
-  return /(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$|[-+])/.exec(value)?.[1] ?? value
+/** Extract major.minor.patch for profile selection and keep the full release token for pin verification. */
+function parseVersion(value: string): CodexVersion {
+  const match = /(?:^|\s)((\d+\.\d+\.\d+)(?:[-+]\S*)?)(?=\s|$)/.exec(value)
+  return { version: match?.[2] ?? value, reportedVersion: match?.[1] ?? value }
 }
 
 /**
- * For probeVersion, consume stdout and return its normalized version after a successful exit.
+ * For probeVersion, consume stdout and parse its release token after a successful exit.
  * Reject decoded output over 4096 UTF-16 code units with PROTOCOL_ERROR and nonzero exit with
  * HARNESS_UNAVAILABLE; stream/exit errors propagate. The caller owns timeout and process disposal.
  */
-async function readVersionOutput(process: HarnessProcess): Promise<string> {
+async function readVersionOutput(process: HarnessProcess): Promise<CodexVersion> {
   const decoder = new TextDecoder()
   let output = ''
   for await (const chunk of process.stdout) {
@@ -48,5 +54,5 @@ async function readVersionOutput(process: HarnessProcess): Promise<string> {
   // Drain stdout first: the exit promise may settle while version bytes are still buffered.
   const exit = await process.exited
   if (exit.code !== 0) throw new HarnessSdkError('HARNESS_UNAVAILABLE')
-  return versionNumber(output.trim())
+  return parseVersion(output.trim())
 }

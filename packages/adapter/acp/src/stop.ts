@@ -17,7 +17,8 @@ export interface StopOutcome {
  */
 export function stopOutcome(stopReason: unknown): StopOutcome {
   const key = typeof stopReason === 'string' ? stopReason : '';
-  return STOP_REASONS[key] ?? {
+  const outcome = Object.hasOwn(STOP_REASONS, key) ? STOP_REASONS[key] : undefined;
+  return outcome ?? {
     status: 'failed',
     notice: { code: 'ACP_STOP_UNKNOWN', message: 'Backend stopped for an unclassified reason' },
   };
@@ -27,7 +28,7 @@ export function stopOutcome(stopReason: unknown): StopOutcome {
  * AHP has no truncated status. Limits complete the turn with a warning so observers
  * can distinguish a response that hit a limit from an ordinary end_turn.
  */
-const STOP_REASONS: Readonly<Record<string, StopOutcome>> = {
+const STOP_REASONS: Readonly<Partial<Record<string, StopOutcome>>> = {
   end_turn: { status: 'completed' },
   max_tokens: {
     status: 'completed',

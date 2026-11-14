@@ -21,6 +21,6 @@ export interface CodexAdapterOptions extends JsonlOptions {
   maxHistoryItems?: number;
   /** Deadline in milliseconds per adapter RPC or version read, default 30,000. The version deadline starts after process launch. The catalog uses its preparation context's deadline instead, default 10,000. */
   timeoutMs?: number;
-  /** Maximum pending RPCs and, separately, maximum submissions awaiting native execution evidence in a session. Both limits default to 128 and reject new work at capacity. */
+  /** Separate limits for pending RPCs, unfinished RPC writes and submissions awaiting native execution evidence. Each defaults to 128 and rejects new work at capacity. */
   maxPending?: number;
 }

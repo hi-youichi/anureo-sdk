@@ -1,5 +1,6 @@
+import { join } from 'node:path'
 import { parseArgs } from 'node:util'
-import type { Client } from '@anureo/sdk'
+import { HarnessSdkError, type Client } from '@anureo/sdk'
 import { defaultAngles } from './angles'
 import { createReviewClient, fixPermissionMode, reviewHarnesses, type ReviewHarness } from './client'
 import { formatFailure } from './errors'
@@ -31,7 +32,9 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
     }
     return await executeReviewCommand(command, runtime)
   } catch (cause) {
-    runtime.stderr(`anureo-review: ${formatFailure(cause)}\n`)
+    const cleanup = cause instanceof HarnessSdkError && cause.details?.cleanupFailed === true
+      ? ' (workflow cleanup failed)' : ''
+    runtime.stderr(`anureo-review: ${formatFailure(cause)}${cleanup}\n`)
     return 2
   }
 }
@@ -45,7 +48,7 @@ Pi runs in-process; CLI-based harnesses require their corresponding executable.
 
 Options:
   --harness <id>          Review backend (default: codex): ${reviewHarnesses.join(', ')}
-  --model <name>          Model override (defaults to CODEX_MODEL or backend default)
+  --model <name>          Override the selected harness model (Codex also reads CODEX_MODEL)
   --concurrency <number>  Maximum simultaneous review and fix agents (default: ${DEFAULT_REVIEW_CONCURRENCY})
   --max-modules <number>  Review at most this many modules, in plan order
   --module <id>          Select an analyzed module ID (repeatable)
@@ -73,7 +76,7 @@ interface CliDependencies {
   stderr?: (text: string) => void
   /** Fallback when no positional directory is supplied; defaults to process.cwd(). Does not chdir. */
   cwd?: string
-  /** Supplies only the CODEX_MODEL fallback when --model is omitted; defaults to process.env.
+  /** Supplies the Codex-only CODEX_MODEL fallback when --model is omitted; defaults to process.env.
    * Built-in adapter factories still read process.env. */
   env?: Record<string, string | undefined>
 }
@@ -106,6 +109,9 @@ function parseCommand(args: string[]) {
   const maxModules = values['max-modules'] === undefined ? undefined : Number(values['max-modules'])
   if (maxModules !== undefined) validatePositiveInteger(maxModules, '--max-modules')
   validateModuleIds(values.module, '--module requires unique nonempty module ids')
+  if (values.module?.some(id => Buffer.byteLength(id) > 256)) {
+    throw new Error('--module IDs must be at most 256 bytes each')
+  }
   const angles = resolveSelectedAngles(values.angle)
   return {
     kind: 'review' as const, directory: positionals[0], harness, concurrency, maxModules, angles,
@@ -161,7 +167,8 @@ async function reviewAndPrintReport({ command, runtime, cwd, client }: {
   client: Client
 }): Promise<number> {
   const report = await reviewCode({
-    client, cwd, concurrency: command.concurrency, focus: command.focus, model: command.model ?? runtime.env.CODEX_MODEL,
+    client, cwd, concurrency: command.concurrency, focus: command.focus,
+    model: command.model ?? (command.harness === 'codex' ? runtime.env.CODEX_MODEL : undefined),
     angles: command.angles, moduleIds: command.moduleIds, maxModules: command.maxModules, fix: command.fix,
     ...(command.fix ? { fixPermissionMode: fixPermissionMode(command.harness) } : {}),
     workflowDirectory: command.workflowDirectory,
@@ -175,7 +182,7 @@ async function reviewAndPrintReport({ command, runtime, cwd, client }: {
 /** Render a progress event as one stderr line. reviewAndPrintReport registers the observer with
  * reviewCode, so progress stays out of the report stream even in JSON mode. */
 function formatProgress(event: ReviewProgress): string {
-  if (event.stage === 'workflow') return `[workflow] ${event.runId} (${event.directory})\n`
+  if (event.stage === 'workflow') return `[workflow] ${event.runId} (${join(event.directory, event.runId)})\n`
   if (event.stage === 'analysis') return `[analysis] ${event.status}\n`
   if (event.stage === 'fix') return `[fix/${event.moduleId}] ${event.status}\n`
   return `[${event.stage === 'verification' ? 'verification/' : ''}${event.moduleId}/${event.angleId}] ${event.status}\n`

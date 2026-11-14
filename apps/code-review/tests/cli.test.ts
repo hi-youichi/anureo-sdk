@@ -1,12 +1,13 @@
 import { expect, test } from 'bun:test'
-import { realpath } from 'node:fs/promises'
+import { realpath, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 import { createScriptedAdapter } from '@anureo/conformance'
 import type { ApprovalOption } from '@anureo/protocol'
 import { runCli } from '../src/cli'
 import { createReviewClient } from '../src/client'
-import { finding, fixture, output, plan } from './helpers'
+import { reviewGit } from '../src/git'
+import { finding, fixture, output, plan, stages } from './helpers'
 
 test.each([
   { semantics: ['deny', 'allowWithRule', 'allowSession', 'allowOnce'], expected: 'allowOnce' },
@@ -71,6 +72,9 @@ test('help and argument errors never initialize a backend', async () => {
   const duplicateAngle = output()
   expect(await runCli(['--angle', 'missing', '--angle', 'missing'], { ...dependencies, ...duplicateAngle })).toBe(2)
   expect(duplicateAngle.read().stderr).toContain('--angle requires unique angle ids')
+  const oversizedModule = output()
+  expect(await runCli(['--module', 'é'.repeat(129)], { ...dependencies, ...oversizedModule })).toBe(2)
+  expect(oversizedModule.read().stderr).toContain('--module IDs must be at most 256 bytes each')
   expect(opened).toBe(0)
 })
 
@@ -85,6 +89,18 @@ test('CLI selects the requested harness and defaults to codex', async () => {
   expect(await runCli(['--harness', 'missing', '.'], { ...unknown, createClient: async () => { throw new Error('Must not open') } })).toBe(2)
   expect(unknown.read().stderr).toContain('Unknown harness: missing')
   expect(unknown.read().stderr).toContain('Available: codex, claude, hermes, pi')
+})
+
+test.each([
+  { harness: 'codex', flags: [], expected: 'gpt-5.4' },
+  { harness: 'pi', flags: [], expected: undefined },
+  { harness: 'pi', flags: ['--model', 'provider/pi-model'], expected: 'provider/pi-model' },
+])('CLI uses CODEX_MODEL only as a Codex fallback: %j', async ({ harness, flags, expected }) => {
+  const { client, cwd, adapter } = await fixture()
+  expect(await runCli([cwd, '--harness', harness, '--module', 'a', '--angle', 'design', ...flags], {
+    ...output(), env: { CODEX_MODEL: 'gpt-5.4' }, createClient: async () => client,
+  })).toBe(0)
+  expect(adapter.opened.map(session => session.model)).toEqual([expected, expected])
 })
 
 test('directory preflight failures never initialize a backend', async () => {
@@ -159,6 +175,55 @@ test('CLI accepts a custom workflow directory and includes its run identity in t
   const report = JSON.parse(io.read().stdout)
   expect(report.workflowDirectory).toBe(directory)
   expect(report.runId).toBeString()
+  expect(io.read().stderr).toContain(`[workflow] ${report.runId} (${join(directory, report.runId)})\n`)
+})
+
+test.each([false, true])('CLI displays control characters safely in text and retains values in JSON: %s', async json => {
+  const file = process.platform === 'win32' ? 'source.ts' : 'source\nfile.ts'
+  const summary = 'Plan\r\n\tDetails\u001b[2J\r'
+  const module = { ...plan.modules[0]!, id: 'a\n1', name: 'Module\u2029A', files: [file] }
+  const reviewed = { ...finding, file, title: 'Finding\u2028title', body: 'First\r\nSecond\u009b', suggestion: 'Keep\nline breaks' }
+  const { client, cwd } = await fixture(prompt => prompt.startsWith('Analyze')
+    ? { summary, modules: [module] } : { findings: [reviewed] })
+  await writeFile(join(cwd, file), 'export {}\n')
+  const io = output()
+  expect(await runCli([cwd, '--angle', 'design', ...(json ? ['--json'] : [])], { ...io, createClient: async () => client })).toBe(1)
+  const { stdout } = io.read()
+  if (json) {
+    const report = JSON.parse(stdout)
+    expect(report.plan).toEqual({ summary, modules: [module] })
+    expect(report.modules[0].review.angles[0].findings).toEqual([reviewed])
+  } else {
+    expect(stdout).toContain('Findings counted: 1\n')
+    expect(stdout).toContain('Plan\n\tDetails\\u001b[2J\\u000d\n')
+    expect(stdout).toContain('## Module\\u2029A (a\\u000a1)\n')
+    expect(stdout).toContain(`- [P2] Finding\\u2028title (${file.replace('\n', '\\u000a')}:1-1)\n`)
+    expect(stdout).toContain('  First\n  Second\\u009b\n  Suggestion: Keep\n  line breaks\n')
+    expect(stdout).not.toMatch(/[\r\u001b\u009b\u2028\u2029]/)
+  }
+})
+
+test.each([false, true])('Pi CLI isolates write permissions to the fix and shows the final count (partial: %s)', async partial => {
+  const { adapter, cwd } = await fixture(async (prompt, sessionCwd) => {
+    if (prompt.startsWith(stages.analyze)) return plan
+    if (prompt.startsWith(stages.verify)) return partial ? new HarnessSdkError('RATE_LIMITED') : { findings: [] }
+    if (prompt.startsWith(stages.fix)) {
+      await writeFile(join(sessionCwd, 'a.ts'), 'export const fallback = (n: number) => n\n')
+      return { summary: 'Preserve zero.', changedFiles: ['a.ts'] }
+    }
+    return { findings: [finding] }
+  })
+  await reviewGit(cwd, 'init', '-q')
+  const io = output()
+  expect(await runCli([cwd, '--harness', 'pi', '--module', 'a', '--angle', 'correctness', '--fix'], {
+    ...io, createClient: (directory, harness) => createReviewClient(directory, harness, adapter),
+  })).toBe(partial ? 2 : 0)
+  expect(io.read().stdout).toContain(`Findings counted: 0${partial ? ' (partial coverage)' : ''}\n`)
+  expect(io.read().stdout).toContain('[P2] Incorrect fallback (a.ts:1-1)')
+  expect(io.read().stdout).toContain('### Review after fixes')
+  expect(adapter.opened.map(session => session.permissionMode)).toEqual([
+    'read-only', 'read-only', 'agent-full-access', 'read-only',
+  ])
 })
 
 test('partial reviews retain failed coverage in JSON and exit 2', async () => {
@@ -239,6 +304,17 @@ test('analysis failures and cleanup errors dispose the client and exit 2', async
   expect(await runCli([clean.cwd], { ...io, createClient: async () => clean.client })).toBe(2)
   expect(io.read().stderr).toContain('Cleanup failed')
   clean.client.dispose = dispose
+})
+
+test('CLI reports a workflow cleanup failure alongside a known execution error', async () => {
+  const { client, cwd, adapter } = await fixture(() => new HarnessSdkError(
+    'NATIVE_FAILED', 'Original execution failure', false, false, { cleanupFailed: true },
+  ))
+  const io = output()
+  expect(await runCli([cwd], { ...io, createClient: async () => client })).toBe(2)
+  expect(io.read().stderr).toContain('anureo-review: Original execution failure [NATIVE_FAILED] (workflow cleanup failed)\n')
+  expect(io.read().stdout).toBe('')
+  expect(adapter.disposeCount).toBe(1)
 })
 
 test.each([false, true])('CLI retains execution and cleanup errors together (unknown outcome: %s)', async unknown => {

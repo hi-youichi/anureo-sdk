@@ -21,7 +21,8 @@ export interface ReviewExecutionOptions {
   directory: string
   model?: string
   focus?: string
-  /** Git metadata fingerprint embedded in prompts. Null omits provenance. Sources can change after sampling. */
+  readPermissionMode?: string
+  /** Git source fingerprint embedded in prompts. Null omits provenance. Sources can change after sampling. */
   sourceVersion: string | null
   angles: readonly ReviewAngle[]
   concurrency: number
@@ -104,6 +105,7 @@ async function reviewAngle({ options, module, angle, phase, original }: AngleRev
       async (cwd, directory) => {
         const output = await agent(prompt, {
           client: options.client, cwd, model: options.model, schema: reviewOutputSchema,
+          ...(options.readPermissionMode !== undefined ? { permissionMode: options.readPermissionMode } : {}),
         })
         if (output === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Review agent returned no result')
         return validateOutput(() => validateFindings(cwd, module, output.findings, directory))

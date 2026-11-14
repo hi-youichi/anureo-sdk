@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import packageManifest from "../package.json" with { type: "json" };
 import {
   query, getSessionMessages, getSessionInfo, forkSession,
   type Options, type Query, type SDKMessage, type SDKUserMessage,
@@ -48,7 +49,7 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
     negotiateVersion(params.protocolVersions);
     if (this.disposed) throw new HarnessSdkError("RUNTIME_DISPOSED");
     if (!this.env.CLAUDE_CONFIG_DIR && !this.options.defaultHome && !this.options.queryFactory) throw new HarnessSdkError("HARNESS_CONFIG_INVALID", "Claude requires an explicit isolated CLAUDE_CONFIG_DIR");
-    return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: "claude", version: "0.3.265", adapter: "claude-native/0.1.0" }, capabilities: this.capabilities };
+    return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: "claude", version: packageManifest.dependencies["@anthropic-ai/claude-agent-sdk"], adapter: "claude-native/0.1.0" }, capabilities: this.capabilities };
   }
   /** Open and retain a backend for OutputSession.open to attach. Await resume/fork setup, query
    * construction and any resumed-title refresh. Native handshake and execution events arrive
@@ -58,9 +59,17 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
     if (this.disposed) throw new HarnessSdkError("RUNTIME_DISPOSED");
     if (params.binding.adapterId !== "claude" && params.binding.adapterId !== "claude-native") throw new HarnessSdkError("SESSION_BINDING_MISMATCH");
     const session = new ClaudeBackendSession(this, params, sink, this.defaultStore);
-    await session.open();
     this.sessions.add(session);
-    return session;
+    try {
+      await session.open();
+      if (this.disposed) throw new HarnessSdkError("RUNTIME_DISPOSED");
+      return session;
+    } catch (cause) {
+      this.sessions.delete(session);
+      await session.dispose();
+      if (this.disposed && cause instanceof HarnessSdkError && cause.code === "SESSION_CLOSED") throw new HarnessSdkError("RUNTIME_DISPOSED");
+      throw cause;
+    }
   }
   /** Read model metadata with a one-shot query using cwd, which defaults to process.cwd().
    * The adapter supplies an empty input stream and closes the query after discovery. Startup,
@@ -127,14 +136,15 @@ export class ClaudeBackendSession implements BackendSession {
   constructor(private readonly adapter: ClaudeNativeAdapter, private readonly params: SessionOpenParams, private readonly sink: SessionEventSink, private readonly fileStore?: FileSessionStore) {
     this.binding = { ...params.binding, nativeRef: params.binding.nativeRef ?? { provider: "claude", value: randomUUID() } };
     this.capabilities = adapter.capabilities; this.config = structuredClone(params.config ?? {}); this.model = params.model ?? str(this.config.model);
+    this.effectiveConfig = { ...this.config };
     for (const [key, value] of Object.entries(this.config)) {
       const option = this.capabilities.config?.options.find((entry) => entry.id === key);
       if (!option) throw new HarnessSdkError("CAPABILITY_UNSUPPORTED", "Unknown Claude config option");
       if (!validateJsonSchema(option.schema, value)) throw new HarnessSdkError("INVALID_PARAMS", "Invalid Claude config value");
     }
   }
-  /** Resolve resume/fork state and start a query for ClaudeNativeAdapter.openSession. Store,
-   * boundary and query-setup failures reject before the adapter registers the backend. */
+  /** Resolve resume/fork state and start a query for ClaudeNativeAdapter.openSession.
+   * Store, boundary and query-setup failures reject the open. */
   async open(): Promise<void> {
     if (this.params.mode === "resume" && !this.params.binding.nativeRef) throw new HarnessSdkError("SESSION_NOT_FOUND");
     if (this.params.mode === "fork") {
@@ -175,7 +185,7 @@ export class ClaudeBackendSession implements BackendSession {
       case 'turn/interrupt': case 'turn/steer': throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Claude controls target the session, not an atomically matched Turn');
       case "session/config/set":
         if (this.reverting) throw new HarnessSdkError('SESSION_BUSY', 'Claude configuration cannot change during revert');
-        result = await this.setConfig((params as AhpRequestMap["session/config/set"]).patch);
+        result = await this.setConfig(query, (params as AhpRequestMap["session/config/set"]).patch);
         break;
       case "session/revert": result = await this.revert(params as AhpRequestMap['session/revert']); break;
       default: throw new HarnessSdkError("CAPABILITY_UNSUPPORTED");
@@ -206,33 +216,37 @@ export class ClaudeBackendSession implements BackendSession {
     return this.query;
   }
   /** Apply execute's configuration controls in order and publish state after all controls succeed.
-   * Earlier native effects, including model changes, survive a rejected patch. Keep output-format
+   * Earlier native effects, including model changes, survive a rejected patch. Keep query
    * replacement blocked until the patch settles. Session.onRequestFailed enters recovery when
    * the returned SDK error carries an unknown outcome. */
-  private async setConfig(patch: JsonObject): Promise<SessionState> {
+  private async setConfig(query: ClaudeQuery, patch: JsonObject): Promise<SessionState> {
     this.configOperations++;
     try {
-      // Apply settings sequentially without rollback on failure. Model changes
-      // take effect immediately; commit the config snapshot only after all settings succeed.
+      // Keep each acknowledged setting for query startup, and commit the public config as a patch.
       if (patch.model !== undefined) {
         if (typeof patch.model !== "string") throw new HarnessSdkError("INVALID_PARAMS");
-        await this.query!.setModel(patch.model);
+        await query.setModel(patch.model);
         this.model = patch.model;
       }
       if (patch.permissionMode !== undefined) {
-        await this.query!.setPermissionMode(permission(patch.permissionMode));
+        const mode = permission(patch.permissionMode);
+        await query.setPermissionMode(mode);
+        this.effectiveConfig.permissionMode = mode;
       }
       if (patch.fastMode !== undefined) {
         if (typeof patch.fastMode !== "boolean") throw new HarnessSdkError("INVALID_PARAMS");
-        await this.query!.applyFlagSettings({ fastMode: patch.fastMode });
+        await query.applyFlagSettings({ fastMode: patch.fastMode });
+        this.effectiveConfig.fastMode = patch.fastMode;
       }
       if (patch.effort !== undefined) {
         if (patch.effort !== null && !isEffort(patch.effort)) throw new HarnessSdkError("INVALID_PARAMS");
-        await this.query!.applyFlagSettings({ effortLevel: patch.effort });
+        await query.applyFlagSettings({ effortLevel: patch.effort });
+        this.effectiveConfig.effort = patch.effort;
       }
       if (patch.maxThinkingTokens !== undefined) {
         if (patch.maxThinkingTokens !== null && typeof patch.maxThinkingTokens !== "number") throw new HarnessSdkError("INVALID_PARAMS");
-        await this.query!.setMaxThinkingTokens(patch.maxThinkingTokens);
+        await query.setMaxThinkingTokens(patch.maxThinkingTokens);
+        this.effectiveConfig.maxThinkingTokens = patch.maxThinkingTokens;
       }
 
       this.config = { ...this.config, ...patch };
@@ -251,7 +265,6 @@ export class ClaudeBackendSession implements BackendSession {
   private outputSchema?: OutputSchema;
   private switchingOutput = false;
   private queryMode: QueryStart["mode"] = "resume";
-  private queryResumeAt?: string;
   private queryFailure?: HarnessSdkError;
   private configOperations = 0;
   private input?: BoundedEventQueue<SDKUserMessage>;
@@ -260,10 +273,11 @@ export class ClaudeBackendSession implements BackendSession {
   private closed = false;
   private reverting = false;
   private config: JsonObject;
+  private readonly effectiveConfig: JsonObject;
   private capabilityRevision = 1;
   private model?: string;
   private turns: Record<string, string> = {};
-  private historySnapshots = new Map<string, HistoryItem[]>();
+  private historySnapshots = new Map<string, { items: HistoryItem[]; source: NonNullable<HistoryPage["source"]> }>();
   /** Native fast-mode outcome as the CLI reports it (the setting may be on but not in effect). */
   private fastMode?: { state: "off" | "cooldown" | "on"; reason?: string };
   private storeKeys = new Map<string, SessionKey>();
@@ -351,38 +365,42 @@ export class ClaudeBackendSession implements BackendSession {
   private snapshot(): SessionState { return { ...(this.sessionTitle !== undefined ? { metadata: { title: this.sessionTitle } } : {}), binding: structuredClone(this.binding), status: this.active ? "running" : "ready", config: structuredClone(this.config), capabilities: this.capabilities, capabilityRevision: this.capabilityRevision, ...(this.model ? { model: this.model } : {}), ...(this.fastMode ? { fastMode: this.fastMode } : {}), activeTurnIds: this.active ? [this.active.id] : [] }; }
   /** Construct a generation-specific query for open, restoreConversation or replaceOutputFormat,
    * then start background pumping and await resumed-title refresh. Fresh mode opens the current native
-   * ID as a new session; resume mode reopens its transcript, optionally at resumeAt. Factory/setup
+   * ID as a new session; resume mode reopens its transcript. Factory/setup
    * failures reject here; subsequent source failures are reported to the sink by pump. */
   private async startQuery(start: QueryStart): Promise<void> {
-    const { mode, resumeAt } = start;
+    const { mode } = start;
     if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
     const generation = ++this.generation;
     this.queryMode = mode;
-    this.queryResumeAt = resumeAt;
     this.input = new BoundedEventQueue<SDKUserMessage>({ maxEvents: 64 });
     const options = this.sessionQueryOptions(start, generation);
-    this.query = (this.adapter.options.queryFactory ?? query)({ prompt: this.input, options });
-    this.pumping = this.pump(this.query, generation);
+    const stream = (this.adapter.options.queryFactory ?? query)({ prompt: this.input, options });
+    if (this.closed) {
+      await this.releaseQuery(stream);
+      throw new HarnessSdkError('SESSION_CLOSED');
+    }
+    this.query = stream;
+    this.pumping = this.pump(stream, generation);
     if (mode === "resume") await this.refreshMetadata();
   }
   /** Project the session and generation into launch options for startQuery. Native tool callbacks
    * are invoked by the SDK. The observed store schedules title refreshes only for this generation. */
-  private sessionQueryOptions({ mode, resumeAt }: QueryStart, generation: number): Options {
+  private sessionQueryOptions({ mode }: QueryStart, generation: number): Options {
+    const { permissionMode, maxThinkingTokens, effort, fastMode } = this.effectiveConfig;
     const mcpServers: NonNullable<Options["mcpServers"]> = {};
     for (const server of this.params.mcpServers ?? []) mcpServers[server.name] = server.type === "stdio" ? { type: "stdio", command: server.command, args: server.args, env: server.env } : { type: "http", url: server.url, headers: server.headers };
     return {
       ...this.adapter.queryOptions(this.params.cwd),
       ...(this.adapter.sessionStore ? { sessionStore: this.observedStore(this.adapter.sessionStore, generation) } : {}),
       ...(mode === "fresh" ? { sessionId: this.nativeId } : { resume: this.nativeId }),
-      ...(resumeAt ? { resumeSessionAt: resumeAt } : {}),
       ...(this.model ? { model: this.model } : {}),
       ...(this.params.instructions ? { systemPrompt: this.params.instructions } : {}),
-      ...(this.config.permissionMode !== undefined || this.params.permissionMode ? { permissionMode: permission(this.config.permissionMode ?? this.params.permissionMode) } : {}),
+      ...(permissionMode !== undefined || this.params.permissionMode ? { permissionMode: permission(permissionMode ?? this.params.permissionMode) } : {}),
       // Permit an explicit later mode switch; this flag does not select bypass mode.
       allowDangerouslySkipPermissions: true,
-      ...(typeof this.config.maxThinkingTokens === "number" ? { maxThinkingTokens: this.config.maxThinkingTokens } : {}),
-      ...(isEffort(this.config.effort) ? { effort: this.config.effort } : {}),
-      ...(typeof this.config.fastMode === 'boolean' ? { settings: { fastMode: this.config.fastMode } } : {}),
+      ...(typeof maxThinkingTokens === "number" ? { maxThinkingTokens } : {}),
+      ...(isEffort(effort) ? { effort } : {}),
+      ...(typeof fastMode === 'boolean' ? { settings: { fastMode } } : {}),
       ...(this.outputSchema ? { outputFormat: { type: 'json_schema' as const, schema: this.outputSchema.schema } } : {}),
       mcpServers,
       canUseTool: async (toolName, input, details) => this.permissionRequest(toolName, input, details),
@@ -390,12 +408,17 @@ export class ClaudeBackendSession implements BackendSession {
     };
   }
   /** Consume the query started by startQuery until closure/generation replacement. Fail SDK
-   * observation on source errors or early EOF with pending work; never replay native input. */
+   * observation on source errors or EOF from the current query. */
   private async pump(stream: ClaudeQuery, generation: number): Promise<void> {
+    let failure: HarnessSdkError | undefined;
     try {
       for await (const message of stream) { if (this.closed || generation !== this.generation) return; await this.mapMessage(message); }
-      if (!this.closed && generation === this.generation && (this.active || this.nativeInputs.size)) await this.sink.fail(new HarnessSdkError("CONNECTION_CLOSED", "Claude query ended before a result", false, true));
-    } catch (cause) { if (!this.closed && generation === this.generation) await this.sink.fail(sdkError(cause, "CLAUDE_QUERY_FAILED", true)); }
+    } catch (cause) { failure = sdkError(cause, "CLAUDE_QUERY_FAILED", true); }
+    if (this.closed || generation !== this.generation) return;
+    const pending = this.active !== undefined || this.nativeInputs.size > 0;
+    this.queryFailure = failure ?? new HarnessSdkError("CONNECTION_CLOSED", pending ? "Claude query ended before a result" : "Claude query ended", false, pending);
+    this.input?.end();
+    await this.sink.fail(this.queryFailure);
   }
   /** Return the active execution to associateInputs. Allocate and publish it on the first native
    * execution evidence from associateInputs or permissionRequest. Starting work also makes later
@@ -403,8 +426,7 @@ export class ClaudeBackendSession implements BackendSession {
   private async beginExecution(userUuid: string = randomUUID()): Promise<ActiveTurn> {
     if (!this.active) {
       this.queryMode = "resume";
-      this.queryResumeAt = undefined;
-      this.active = { id: randomUUID(), userUuid, consumed: new Set(), output: new Map(), stoppedTools: new Map(), blockIndex: 0 };
+      this.active = { id: randomUUID(), userUuid, consumed: new Set(), output: new Map(), stoppedTools: new Map(), blockCounts: new Map() };
       await this.sink.emit({ type: 'turn/started', payload: { turnId: this.active.id } });
     }
     return this.active;
@@ -420,9 +442,11 @@ export class ClaudeBackendSession implements BackendSession {
     }
     const mainReply = !value.parent_tool_use_id && (message.type === 'assistant' || message.type === 'stream_event' || message.type === 'result');
     const uuids = Array.isArray(value.user_message_uuids) ? value.user_message_uuids.filter((id): id is string => typeof id === 'string') : str(value.user_message_uuid) ? [String(value.user_message_uuid)] : [];
+    const matchesPendingInput = uuids.some(id => this.nativeInputs.has(id));
+    const hasNonterminalEvidence = this.nativeInputs.size > 0 && message.type !== 'result';
     // A message UUID is input identity. New UUID echoes inside an active native
     // loop bind additional inputs to that loop; they never create another turn.
-    if (mainReply && (this.active || uuids.some(id => this.nativeInputs.has(id)) || this.nativeInputs.size && message.type !== 'result')) {
+    if (mainReply && (this.active || matchesPendingInput || hasNonterminalEvidence)) {
       if (message.type === 'result' && value.num_turns === 0 && !this.active) {
         for (const id of uuids) {
           if (!this.nativeInputs.has(id)) continue;
@@ -444,7 +468,12 @@ export class ClaudeBackendSession implements BackendSession {
     if (!active) { await this.notice(value); return; }
     if (message.type === "assistant") {
       if (!message.parent_tool_use_id) active.apiError = message.error;
-      for (const block of message.message.content) await this.completeBlock({ block: record(block), messageId: message.message.id, context: message.parent_tool_use_id !== null ? "subagent" : "main", active });
+      const { id: messageId, content } = message.message;
+      const offset = active.blockCounts.get(messageId) ?? 0;
+      active.blockCounts.set(messageId, offset + content.length);
+      for (const [index, block] of content.entries()) {
+        await this.completeBlock({ block: record(block), messageId, blockIndex: offset + index, context: message.parent_tool_use_id !== null ? "subagent" : "main", active });
+      }
       return;
     }
     if (message.type === "stream_event") { await this.streamEvent(record(message.event), active); return; }
@@ -534,15 +563,17 @@ export class ClaudeBackendSession implements BackendSession {
    * different execution. Binding or store failures reject and are reported by pump. */
   private async associateInputs(uuids: string[]): Promise<void> {
     const execution = await this.beginExecution(uuids[0]);
+    let changed = false;
     for (const id of uuids) {
       const pending = this.nativeInputs.get(id); if (!pending) continue;
       if (pending.turnId && pending.turnId !== execution.id) throw new HarnessSdkError('PROTOCOL_ERROR', 'Native input changed executions');
       if (!pending.turnId) {
         pending.turnId = execution.id; execution.consumed.add(id); this.turns[id] = execution.id;
+        changed = true;
         await this.sink.bindSubmission(pending.submissionId, execution.id);
       }
     }
-    await this.rememberTurnMap();
+    if (changed) await this.rememberTurnMap();
   }
   /** Finish mapMessage's captured execution. Validate final output, publish items and usage, then
    * clear consumed input IDs before the terminal and ready-state events. Uncorrelated inputs stay
@@ -631,33 +662,16 @@ export class ClaudeBackendSession implements BackendSession {
     if (block.type === "tool_use") {
       const name = str(block.name) ?? "unknown";
       const fileChanges = claudeFileChanges(name, block.input);
-      return { id, type: "toolCall", kind: name === "Bash" ? "command" : ["Write", "Edit", "MultiEdit"].includes(name) ? "fileChange" : name.startsWith("mcp__") ? "mcp" : "other", title: name, input: safe(block.input), status, nativeType: name, ...(fileChanges !== undefined ? { fileChanges } : {}) };
+      return { id, type: "toolCall", kind: name === "Bash" ? "command" : fileChanges !== undefined ? "fileChange" : name.startsWith("mcp__") ? "mcp" : "other", title: name, input: safe(block.input), status, nativeType: name, ...(fileChanges !== undefined ? { fileChanges } : {}) };
     }
     return { id, type: "toolCall", kind: "other", title: "Unknown Claude content", nativeType: str(block.type) ?? "unknown", raw: safe(block), status };
   }
-  /** Reconcile completeBlock with unfinished text/thinking streams before allocating a fallback ID.
-   * Mutates the turn's fallback counter only when no native or unfinished-stream identity exists. */
-  private resolveCompleteBlockId(block: Record<string, unknown>, messageId: string, active: ActiveTurn): string {
-    const nativeBlockId = str(block.id);
-    if (nativeBlockId) return nativeBlockId;
-
-    // Only text and thinking reuse unfinished stream items, in Map insertion order.
-    const existingStreamItem = [...active.output.values()].find((item) => {
-      if (!item.id.startsWith(`${messageId}:`) || item.status === "completed") return false;
-      if (block.type === "text") return item.type === "agentMessage";
-      if (block.type === "thinking") return item.type === "reasoning";
-      return false;
-    });
-    if (existingStreamItem) return existingStreamItem.id;
-
-    return `${messageId}:${active.blockIndex++}`;
-  }
   /** Merge a complete assistant block into active output and publish its start/patch/completion.
    * Text and tool calls stay pending until native result/tool evidence; sink failures reach pump. */
-  private async completeBlock({ block, messageId, context, active }: {
-    block: Record<string, unknown>; messageId: string; context: "main" | "subagent"; active: ActiveTurn;
+  private async completeBlock({ block, messageId, blockIndex, context, active }: {
+    block: Record<string, unknown>; messageId: string; blockIndex: number; context: "main" | "subagent"; active: ActiveTurn;
   }): Promise<void> {
-    const id = this.resolveCompleteBlockId(block, messageId, active);
+    const id = str(block.id) ?? `${messageId}:${blockIndex}`;
     const previous = active.output.get(id);
     const running = block.type === "text" || block.type === "tool_use";
     const status = active.stoppedTools.get(id) ?? (running ? "running" : "completed");
@@ -800,6 +814,7 @@ export class ClaudeBackendSession implements BackendSession {
     unavailable: T;
     respond: (answer: Parameters<NativeInteractionResponder>[0], finish: (result: T) => void) => Promise<void>;
   }): Promise<T> {
+    if (signal.aborted) return Promise.resolve(cancelled);
     const interactionId = request.interactionId;
     return new Promise((resolve) => {
       let answered = false;
@@ -819,7 +834,7 @@ export class ClaudeBackendSession implements BackendSession {
   }
   /** Read native history for boundary/history callers through the supplied public store. Capture
    * the SDK-derived store key for opaque attachment reads; reject absent stores and read failures. */
-  private async messages(nativeId = this.nativeId): Promise<SessionMessage[]> {
+  private async messages(nativeId: string): Promise<SessionMessage[]> {
     const store = this.adapter.sessionStore; if (!store) throw new HarnessSdkError("CAPABILITY_UNSUPPORTED");
     // Let the SDK derive its own project key. Observing that public load key avoids copying
     // the SDK's cwd-sanitization algorithm or reading its private transcript paths.
@@ -834,22 +849,28 @@ export class ClaudeBackendSession implements BackendSession {
   /** Resolve the checkpoint and transcript cutoff for open and revert. Without a store, use
    * native prompt IDs or known associations for file checkpoints. With a store, verify the prompt
    * in history and include opaque trailing entries for through boundaries when available.
+   * Prompts associated with the same execution share its first and next checkpoints.
    * Unknown boundaries and store failures reject the caller. */
   private async boundaryPoint(nativeId: string, boundary: Boundary): Promise<BoundaryPoint> {
     const store = this.adapter.sessionStore;
     if (!store) {
-      const promptUuid = boundary.nativeTurnId ?? Object.entries(this.turns).find(([, turn]) => turn === boundary.turnId)?.[0];
+      const prompts = Object.entries(this.turns);
+      const targetTurn = boundary.nativeTurnId ? this.turns[boundary.nativeTurnId] : boundary.turnId;
+      const index = prompts.findIndex(([, turn]) => turn === targetTurn);
+      const promptUuid = prompts[index]?.[0] ?? boundary.nativeTurnId;
       if (!promptUuid) throw new HarnessSdkError("TURN_NOT_FOUND");
-      const prompts = Object.keys(this.turns); const index = prompts.indexOf(promptUuid);
-      return { promptUuid, ...(index >= 0 && prompts[index + 1] ? { nextPromptUuid: prompts[index + 1] } : {}) };
+      const nextPromptUuid = index >= 0 ? prompts.find(([, turn], position) => position > index && turn !== targetTurn)?.[0] : undefined;
+      return { promptUuid, ...(nextPromptUuid ? { nextPromptUuid } : {}) };
     }
     const messages = await this.messages(nativeId);
     const turns = this.fileStore ? await this.fileStore.loadTurnMap(nativeId) : this.adapter.turnMaps.get(nativeId) ?? this.turns;
-    const promptUuid = boundary.nativeTurnId ?? Object.entries(turns).find(([, id]) => id === boundary.turnId)?.[0];
-    if (!promptUuid) throw new HarnessSdkError("TURN_NOT_FOUND", "No verified native turn boundary");
-    const index = messages.findIndex((message) => message.uuid === promptUuid && isPrompt(message));
+    const { nativeTurnId } = boundary;
+    if (nativeTurnId && !messages.some(message => message.uuid === nativeTurnId && isPrompt(message))) throw new HarnessSdkError("TURN_NOT_FOUND");
+    const targetTurn = nativeTurnId ? turns[nativeTurnId] : boundary.turnId;
+    const index = messages.findIndex(message => isPrompt(message) && (message.uuid === nativeTurnId || (targetTurn !== undefined && turns[message.uuid] === targetTurn)));
     if (index < 0) throw new HarnessSdkError("TURN_NOT_FOUND");
-    const next = messages.findIndex((message, position) => position > index && isPrompt(message));
+    const promptUuid = messages[index]!.uuid;
+    const next = messages.findIndex((message, position) => position > index && isPrompt(message) && (targetTurn === undefined || turns[message.uuid] !== targetTurn));
     let uuid = boundary.relation === "before" ? index > 0 ? messages[index - 1]!.uuid : undefined : messages[(next >= 0 ? next : messages.length) - 1]!.uuid;
     const key = this.storeKeys.get(nativeId);
     if (boundary.relation === "through" && key) {
@@ -872,7 +893,7 @@ export class ClaudeBackendSession implements BackendSession {
   private async revert(request: AhpRequestMap['session/revert']): Promise<AhpResultMap['session/revert']> {
     const query = this.query;
     if (this.closed || !query) throw new HarnessSdkError('SESSION_CLOSED');
-    if (this.reverting || this.active || this.nativeInputs.size) throw new HarnessSdkError('SESSION_BUSY', 'Claude revert requires no active or pending inputs');
+    if (this.reverting || this.active || this.nativeInputs.size || this.configOperations) throw new HarnessSdkError('SESSION_BUSY', 'Claude revert requires no active execution, pending input or configuration change');
     this.reverting = true;
     try {
       const point = await this.boundaryPoint(this.nativeId, request.boundary);
@@ -936,6 +957,7 @@ export class ClaudeBackendSession implements BackendSession {
       // Do not yield admission for an unchanged format: another submission could
       // otherwise start a switch before this input is recorded as pending.
       if (changing) await this.replaceOutputFormat(query, outputSchema);
+      if (this.queryFailure) throw this.queryFailure;
       if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
       const userUuid = randomUUID();
       this.nativeInputs.set(userUuid, { submissionId: start.submissionId });
@@ -959,7 +981,7 @@ export class ClaudeBackendSession implements BackendSession {
       if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
       this.query = undefined;
       this.outputSchema = outputSchema;
-      await this.startQuery({ mode: this.queryMode, resumeAt: this.queryResumeAt });
+      await this.startQuery({ mode: this.queryMode });
     } catch (cause) {
       const error = sdkError(cause, 'CLAUDE_OUTPUT_FORMAT_FAILED');
       // The new input has not been enqueued. Never replay it to recover a Query.
@@ -994,26 +1016,29 @@ export class ClaudeBackendSession implements BackendSession {
   private async readHistory(request: AhpRequestMap["history/read"]): Promise<HistoryPage> {
     let snapshotToken = request.snapshotToken;
     if (!snapshotToken) {
-      const items = this.projectHistory(await this.messages());
-      const withStructuredOutput = await this.structuredHistory(items);
-      snapshotToken = randomUUID(); this.historySnapshots.set(snapshotToken, withStructuredOutput);
+      const source = structuredClone(this.binding.nativeRef!);
+      const turns = { ...this.turns };
+      const items = this.projectHistory(await this.messages(source.value), turns);
+      const withStructuredOutput = await this.structuredHistory(items, source.value);
+      snapshotToken = randomUUID(); this.historySnapshots.set(snapshotToken, { items: withStructuredOutput, source });
       if (this.historySnapshots.size > 8) this.historySnapshots.delete(this.historySnapshots.keys().next().value!);
     }
     const snapshot = this.historySnapshots.get(snapshotToken); if (!snapshot) throw new HarnessSdkError("CURSOR_EXPIRED");
+    const { items, source } = snapshot;
     const offset = request.cursor === undefined ? 0 : Number(request.cursor);
-    if (!Number.isSafeInteger(offset) || offset < 0 || offset > snapshot.length) throw new HarnessSdkError("CURSOR_INVALID");
-    const limit = Math.min(request.limit ?? 200, 1000); const page = snapshot.slice(offset, offset + limit);
-    return { items: structuredClone(page), ...(offset + page.length < snapshot.length ? { nextCursor: String(offset + page.length) } : {}), snapshotToken, source: this.binding.nativeRef };
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > items.length) throw new HarnessSdkError("CURSOR_INVALID");
+    const limit = Math.min(request.limit ?? 200, 1000); const page = items.slice(offset, offset + limit);
+    return { items: structuredClone(page), ...(offset + page.length < items.length ? { nextCursor: String(offset + page.length) } : {}), snapshotToken, source: structuredClone(source) };
   }
   /** Reconstruct readHistory's live-compatible item IDs and tool results from ordered native entries.
    * Keep grouping and per-API-message block counters local to this snapshot; tool results amend only
    * an earlier call in the same turn, and unmatched results remain visible as unknown content. */
-  private projectHistory(messages: SessionMessage[]): HistoryItem[] {
+  private projectHistory(messages: SessionMessage[], turns: Record<string, string>): HistoryItem[] {
     const items: HistoryItem[] = []; let currentTurn = "native:session"; let currentNativeTurn: string | undefined;
     // Transcripts split one API message across entries; live items use `${apiMessageId}:${contentBlockIndex}`, so count blocks per API message.
     const blockCounts = new Map<string, number>();
     for (const message of messages) {
-      if (isPrompt(message)) { currentTurn = this.turns[message.uuid] ?? `native:${message.uuid}`; currentNativeTurn = message.uuid; }
+      if (isPrompt(message)) { currentTurn = turns[message.uuid] ?? `native:${message.uuid}`; currentNativeTurn = message.uuid; }
       const body = record(message.message).content;
       const blocks = typeof body === "string" ? [{ type: "text", text: body }] : Array.isArray(body) ? body.map(record) : [];
       if (message.type === "user" && isPrompt(message)) items.push({ turnId: currentTurn, nativeTurnId: message.uuid, nativeItemId: message.uuid, item: { id: message.uuid, type: "userMessage", content: blocks.filter((block) => block.type === "text").map((block) => ({ type: "text", text: str(block.text) ?? "" })), status: "completed" } });
@@ -1038,8 +1063,8 @@ export class ClaudeBackendSession implements BackendSession {
   }
   /** Add saved structured-output attachments only for tool calls surviving readHistory's transcript.
    * Read the captured public-store key; missing keys leave history unchanged and load failures reject. */
-  private async structuredHistory(items: HistoryItem[]): Promise<HistoryItem[]> {
-    const key = this.storeKeys.get(this.nativeId), store = this.adapter.sessionStore;
+  private async structuredHistory(items: HistoryItem[], nativeId: string): Promise<HistoryItem[]> {
+    const key = this.storeKeys.get(nativeId), store = this.adapter.sessionStore;
     if (!key || !store) return items;
     // The public history helper omits attachments. Only expose native output
     // attachments linked to a StructuredOutput call surviving in that history.
@@ -1131,9 +1156,9 @@ function isPrompt(message: SessionMessage): boolean {
 interface BoundaryPoint { uuid?: string; promptUuid: string; nextPromptUuid?: string }
 
 /** Query startup identity retained by schema replacement until beginExecution observes native work. */
-type QueryStart = { mode: "fresh" | "resume"; resumeAt?: string };
+type QueryStart = { mode: "fresh" | "resume" };
 
 type NativeElicitation = NonNullable<Options["onElicitation"]>;
 
 /** Execution output and input associations that completeTurn reads before clearing the active slot. */
-interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageId?: string; blockIndex: number; apiError?: Extract<SDKMessage, { type: 'assistant' }>['error'] }
+interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageId?: string; blockCounts: Map<string, number>; apiError?: Extract<SDKMessage, { type: 'assistant' }>['error'] }

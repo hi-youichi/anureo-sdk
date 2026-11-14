@@ -1,11 +1,14 @@
 // Verifies Git snapshots and source eligibility against real filesystem entries.
-import { expect, test } from 'bun:test'
-import { chmod, lstat, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { expect, spyOn, test } from 'bun:test'
+import * as fs from 'node:fs/promises'
+import { chmod, lstat, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
+import { runChecks, validateChecks } from '../src/checks'
 import { captureTree, changes, treeVersion } from '../src/git-tree'
-import { gitFiles } from '../src/git'
+import { git, gitFiles } from '../src/git'
 import { exec } from '../src/process'
 import { isSource, isTextSource } from '../src/source-policy'
+import { createAgentWorktree, mergeWorktree, prepareCheckDependencies, removeAgentWorktree, withWorktreeBaseline } from '../src/worktree'
 import { fixture, temporary } from './helpers'
 
 /** Exercise Git visibility separately from snapshot exclusions, including force-added run storage. */
@@ -25,6 +28,114 @@ test('snapshots sort visible files, omit deleted entries and metadata, and retai
   const version = treeVersion(tree)
   await writeFile(join(cwd, '.anureo', 'report.ts'), 'changed run output')
   expect(treeVersion(await captureTree(cwd))).toBe(version)
+})
+
+test('Git file discovery preserves an initial BOM and rejects invalid filename bytes', async () => {
+  const { cwd } = await fixture()
+  await writeFile(join(cwd, '\uFEFFfile.ts'), 'text')
+  expect(await gitFiles(cwd)).toContain('\uFEFFfile.ts')
+
+  const blob = (await git(cwd, 'rev-parse', ':a.ts')).trim()
+  const stdin = Buffer.concat([Buffer.from(`100644 ${blob}\t`), Buffer.from([0xff, 0])])
+  const child = Bun.spawn(['git', '-C', cwd, 'update-index', '-z', '--index-info'], { stdin })
+  expect(await child.exited).toBe(0)
+  await expect(gitFiles(cwd)).rejects.toThrow('filename that is not valid UTF-8')
+})
+
+test('detached worktrees restore the frozen split index and discover its paths', async () => {
+  const { cwd } = await fixture()
+  await git(cwd, 'update-index', '--split-index')
+  const before = await captureTree(cwd)
+  await withWorktreeBaseline(cwd, async baseline => {
+    const worktree = await createAgentWorktree(baseline)
+    try {
+      expect(await captureTree(worktree.root)).toEqual(before)
+    } finally {
+      await removeAgentWorktree(baseline, worktree)
+    }
+  })
+})
+
+test('validation copies ignored in-repository dependency targets and rebases workspace links', async () => {
+  const { cwd } = await fixture()
+  const installed = join(cwd, '.deps', 'node_modules')
+  await mkdir(installed, { recursive: true })
+  await writeFile(join(installed, 'installed.txt'), 'dependency content')
+  await symlink(cwd, join(installed, 'workspace'), 'junction')
+  await symlink(installed, join(cwd, 'node_modules'), 'junction')
+  await writeFile(join(cwd, '.gitignore'), '.anureo/\n.deps/\n')
+  await withWorktreeBaseline(cwd, async baseline => {
+    const worktree = await createAgentWorktree(baseline)
+    try {
+      await writeFile(join(worktree.cwd, 'a.ts'), 'candidate content')
+      await prepareCheckDependencies(baseline, worktree)
+      expect(await readFile(join(worktree.cwd, 'node_modules', 'installed.txt'), 'utf8')).toBe('dependency content')
+      expect(await readFile(join(worktree.cwd, 'node_modules', 'workspace', 'a.ts'), 'utf8')).toBe('candidate content')
+    } finally {
+      await removeAgentWorktree(baseline, worktree)
+    }
+  })
+})
+
+test('shell and argv validation commands use their checkout despite inherited Git selectors', async () => {
+  const { cwd } = await fixture()
+  await withWorktreeBaseline(cwd, async baseline => {
+    const worktree = await createAgentWorktree(baseline)
+    const previous = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE }
+    try {
+      await writeFile(join(worktree.cwd, 'a.ts'), 'candidate content')
+      process.env.GIT_DIR = join(cwd, '.git')
+      process.env.GIT_WORK_TREE = cwd
+      for (const command of ['git diff --exit-code -- a.ts', { executable: 'git', args: ['diff', '--exit-code', '--', 'a.ts'] }]) {
+        const results: Parameters<typeof runChecks>[2] = []
+        await expect(runChecks(worktree.cwd, [command], results)).rejects.toThrow('Validation failed')
+        expect(results).toMatchObject([{ status: 'failed', output: expect.stringContaining('+candidate content') }])
+      }
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      await removeAgentWorktree(baseline, worktree)
+    }
+  })
+})
+
+test('validation preflight reports every invalid command and argument position', () => {
+  expect(() => validateChecks([' ', { executable: 'git\0', args: ['diff', 'a\0', 'b\0'] }])).toThrow(
+    'check commands must be nonempty\ncheck #1 is blank\ncheck #2 contains NUL\ncheck #2 argument #2 contains NUL\ncheck #2 argument #3 contains NUL',
+  )
+})
+
+test('merge rolls back a late target edit from its target-relative recovery path', async () => {
+  const { cwd } = await fixture()
+  const file = 'nested/edit.ts'
+  const target = join(cwd, file)
+  await mkdir(join(cwd, 'nested'))
+  await mkdir(join(cwd, '.anureo', 'refactor'), { recursive: true })
+  await writeFile(target, 'baseline content')
+  await withWorktreeBaseline(cwd, async baseline => {
+    const worktree = await createAgentWorktree(baseline)
+    const mergeTarget = resolve(baseline.root, baseline.scope, file)
+    const rename = fs.rename
+    const moves: string[] = []
+    const mock = spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (from === mergeTarget) {
+        moves.push(String(to))
+        await writeFile(from, 'late editor save')
+      }
+      await rename(from, to)
+    })
+    try {
+      await writeFile(join(worktree.cwd, file), 'candidate content')
+      await expect(mergeWorktree(baseline, worktree, [file])).rejects.toThrow(`Source changed during refactor: ${file}`)
+      expect(moves).toEqual([expect.stringContaining(join('backups', file))])
+      expect(await readFile(target, 'utf8')).toBe('late editor save')
+    } finally {
+      mock.mockRestore()
+      await removeAgentWorktree(baseline, worktree)
+    }
+  })
 })
 
 /** Compare real file/link edits so content, mode and link text remain independently observable. */

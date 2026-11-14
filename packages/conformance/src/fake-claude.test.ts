@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import { HarnessSdkError } from '@anureo/sdk'
 import { createFakeClaudeQuery } from './fake-claude'
 
 test('scripted query records every control surface without touching the event queue', async () => {
@@ -51,6 +52,16 @@ test('initial messages are cloned and drain after idempotent close', async () =>
   expect((await reader.next()).value).toEqual({ type: 'system', nested: { value: 'initial' } })
   expect((await reader.next()).done).toBe(true)
   expect(query.calls).toEqual([{ method: 'close' }])
+})
+
+test('output failure drains buffered messages before rejecting with the original cause', async () => {
+  const message = { type: 'system' }
+  const query = createFakeClaudeQuery({ messages: [message] })
+  const cause = new HarnessSdkError('BACKPRESSURE_EXCEEDED')
+  query.fail(cause)
+  const reader = query[Symbol.asyncIterator]()
+  expect(await reader.next()).toEqual({ done: false, value: message })
+  await expect(reader.next()).rejects.toBe(cause)
 })
 
 test('input callback failure stops input consumption without closing output', async () => {

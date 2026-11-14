@@ -4,13 +4,10 @@ import { realpath } from 'node:fs/promises'
 import { promisify } from 'node:util'
 import { HarnessSdkError } from '@anureo/sdk'
 
-/** Buffered execFile for internal Git calls that choose their own cwd, encoding or environment.
- * diffFile uses buffered bytes and accepts exit status 1 for a nonempty patch. Fingerprint reads
- * inherit the environment and map command failures to null. */
-export const execGit = promisify(execFile)
+const execGit = promisify(execFile)
 
 /** Maximum buffered bytes per stdout or stderr stream for review Git commands. */
-export const GIT_MAX_BUFFER = 1 << 24
+const GIT_MAX_BUFFER = 1 << 24
 
 /** Resolve the canonical Git worktree root from a review directory. prepareReview awaits this
  * before starting a fix-enabled workflow, and applyFix resolves it if none was supplied. Git or

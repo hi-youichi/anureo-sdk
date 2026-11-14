@@ -5,14 +5,13 @@ import {
   type AhpEventPayload, type AhpRequestMap, type AhpResultMap, type Boundary, type Capabilities, type HistoryItem,
   type InitializeParams, type InitializeResult, type Item, type JsonObject, type SessionBinding, type SessionOpenParams, type SessionState,
 } from '@anureo/protocol'
-import { HarnessSdkError, sdkError, type BackendSession, type HarnessAdapter, type SessionEventSink, type SessionMethod, type StructuredOutputToolPort } from '@anureo/sdk'
+import { BoundedEventQueue, HarnessSdkError, sdkError, type BackendSession, type HarnessAdapter, type SessionEventSink, type SessionMethod, type StructuredOutputToolPort } from '@anureo/sdk'
 import {
   createPiHost, type PiHostEntry, type PiHostEvent, type PiHostFactory, type PiHostMessage,
   type PiHostModel, type PiHostOpenOptions, type PiPromptDisposition, type PiSessionHost,
 } from './host'
 import {
-  PERMISSION_MODES, completeTool, contentText, createRedactor, historyItems, nativeInput, permissionTools, piTurnError, toolItem, turnStarts, usageOf,
-  type Redactor,
+  assistantTextPhase, completeTool, contentText, createRedactor, historyItems, historyTurnId, nativeInput, permissionTools, piTurnError, toolItem, turnStarts, usageOf,
 } from './mapping'
 import type { PiAdapterOptions } from './options'
 import { capabilities, resolvePiProfile, type PiProfile } from './profile'
@@ -61,6 +60,7 @@ export class PiAdapter implements HarnessAdapter {
     const session = new PiBackendSession(this, params, sink)
     try {
       await session.open()
+      if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
     } catch (cause) {
       await session.dispose().catch(() => {})
       throw cause
@@ -72,6 +72,7 @@ export class PiAdapter implements HarnessAdapter {
   async dispose(): Promise<void> {
     if (this.disposed) return
     this.disposed = true
+    this.turnMaps.clear()
     const results = await Promise.allSettled([...this.sessions].map(session => session.dispose()))
     this.sessions.clear()
     const failed = results.find((value): value is PromiseRejectedResult => value.status === 'rejected')
@@ -81,6 +82,11 @@ export class PiAdapter implements HarnessAdapter {
   hostFactory(): PiHostFactory { return this.factory }
   /** PiBackendSession.dispose removes itself after release. Turn mappings remain available for resume and fork. */
   forget(session: PiBackendSession): void { this.sessions.delete(session) }
+  /** Retain mappings only for persisted sessions the adapter can reopen. */
+  retainTurns(session: PiBackendSession, turns: Map<string, string>): void {
+    if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
+    if (session.host.persistent && session.capabilities.session?.resume) this.turnMaps.set(session.nativeId, turns)
+  }
   /** Find a tracked source for PiBackendSession.forkHost to borrow. The source backend retains disposal ownership. */
   liveHost(nativeId: string): PiSessionHost | undefined {
     for (const session of this.sessions) {
@@ -95,7 +101,7 @@ export class PiAdapter implements HarnessAdapter {
   /** Shared maps keyed by Pi session ID, then native user entry ID, to retain SDK turn IDs across resume and fork. */
   readonly turnMaps = new Map<string, Map<string, string>>()
   /** Content redactor shared by backends, captured from the constructor options. */
-  readonly redact: Redactor
+  readonly redact: ReturnType<typeof createRedactor>
   private readonly factory: PiHostFactory
   private disposed = false
   private version: string | undefined
@@ -152,9 +158,10 @@ export class PiBackendSession implements BackendSession {
     }
     this.binding = { ...this.binding, nativeRef: { provider: 'pi', value: this.host.sessionId } }
     this.model = this.host.model ?? this.model
-    this.adapter.turnMaps.set(this.nativeId, this.turns)
     this.markKnown()
+    this.adapter.retainTurns(this, this.turns)
     this.unsubscribe = this.host.subscribe(event => this.enqueue(event))
+    void this.drainEvents()
   }
   /**
    * Dispatch an SDK-validated request from OutputSession.execute after open. Submission resolves
@@ -200,14 +207,16 @@ export class PiBackendSession implements BackendSession {
   /**
    * Share one cleanup attempt across callers. Stop admission, unsubscribe and discard pending
    * inputs before best-effort abort and awaited host disposal. Host disposal failure rejects the
-   * shared promise and leaves adapter tracking intact; cleanup does not await event-tail drainage.
+   * shared promise and leaves adapter tracking intact; cleanup does not await event publication.
    */
   async dispose(): Promise<void> {
     return this.release ??= (async () => {
       this.closed = true
       this.unsubscribe?.()
       this.unsubscribe = undefined
+      this.stopEvents()
       this.pending = []
+      this.active?.redactionPrefixes.clear()
       const host = this.host
       if (host) {
         if (host.busy) await host.abort().catch(() => {})
@@ -223,7 +232,7 @@ export class PiBackendSession implements BackendSession {
   binding: SessionBinding
   /** Native capabilities captured for attachment; direct output support is projected by the SDK wrapper. */
   readonly capabilities: Capabilities
-  private readonly redact: Redactor
+  private readonly redact: ReturnType<typeof createRedactor>
   private unsubscribe?: () => void
   private active?: ActiveTurn
   private pending: string[] = []
@@ -233,19 +242,21 @@ export class PiBackendSession implements BackendSession {
   private model?: string
   private capabilityRevision = 1
   private title?: string | null
-  private tail: Promise<void> = Promise.resolve()
+  private readonly events = new BoundedEventQueue<PiHostEvent>({ maxFrameBytes: MAX_HOST_EVENT_BYTES }, hostEventSize)
+  private readonly eventReader = this.events[Symbol.asyncIterator]()
+  private observing = true
   private turns = new Map<string, string>()
   private snapshots = new Map<string, HistoryItem[]>()
   private compactions = 0
-  /** Entry ids that existed before the current run, so the run's own user entry can be told apart. */
+  /** Transcript entries present at open or already associated with a live execution. */
   private known = new Set<string>()
-  /** Snapshot entry ids at open/turn completion so the next run can associate its first new user entry. */
   private markKnown(): void { this.known = new Set(this.host.entries().map(entry => entry.id)) }
 
   /** Build host options before native-open error wrapping, preserving validation failures as parameter errors. */
   private hostOptions(): Omit<PiHostOpenOptions, 'mode'> {
     const { params } = this
-    const tools = permissionTools(this.permissionMode())
+    const mode = this.config.permissionMode ?? params.permissionMode
+    const tools = permissionTools(mode === undefined ? undefined : String(mode))
     return {
       cwd: params.cwd, persist: this.adapter.persist && this.adapter.profile.resume,
       ...(this.model ? { model: this.model } : {}),
@@ -274,13 +285,6 @@ export class PiBackendSession implements BackendSession {
     }
     return factory({ ...common, mode: 'new' })
   }
-  /** Resolve config before the open request's permission mode; omission keeps native host defaults. */
-  private permissionMode(): string | undefined {
-    const value = this.config.permissionMode ?? this.params.permissionMode
-    assertPermissionMode(value)
-    return value === undefined ? undefined : String(value)
-  }
-
   /**
    * Fork from a tracked source or a temporary resumed host. Copy the SDK turn IDs retained by
    * the branch so open can register them for the new session. Always attempt to dispose the
@@ -300,8 +304,11 @@ export class PiBackendSession implements BackendSession {
       const starts = turnStarts(entries, turns)
       const leaf = forkLeaf({ entries, starts, turns, boundary })
       const forked = await source.fork(leaf)
-      this.turns = new Map([...turns].filter(([entryId]) =>
-        entries.findIndex(entry => entry.id === entryId) <= entries.findIndex(entry => entry.id === leaf)))
+      const retained = entries.slice(0, entries.findIndex(entry => entry.id === leaf) + 1)
+      for (const entry of retained) {
+        const turnId = turns.get(entry.id)
+        if (turnId !== undefined) this.turns.set(entry.id, turnId)
+      }
       return forked
     } finally {
       if (!live) await source.dispose().catch(() => {})
@@ -309,15 +316,37 @@ export class PiBackendSession implements BackendSession {
   }
 
   /**
-   * The listener registered by open appends events here without blocking Pi. Await each handler in
-   * arrival order and skip queued work after close. Report mapping or publication failures through
-   * OutputSession's forwarding sink, which delegates observation failure to Session.fail. Disposal
-   * unsubscribes and leaves any in-flight handler to finish independently.
+   * Native callbacks cannot wait for capacity. Fail observation if they outrun publication.
    */
   private enqueue(event: PiHostEvent): void {
-    this.tail = this.tail
-      .then(() => this.closed ? undefined : this.handle(event))
-      .catch(cause => this.sink.fail(sdkError(cause, 'PI_EVENT_FAILED', true)).catch(() => {}))
+    if (!this.observing) return
+    try {
+      this.events.push(event)
+    } catch {
+      this.stopEvents()
+      void this.sink.fail(new HarnessSdkError('BACKPRESSURE_EXCEEDED', 'Pi host event buffer exceeded its limit', false, true)).catch(() => {})
+    }
+  }
+  /** Process one native event at a time so dependent publications retain their source order. */
+  private async drainEvents(): Promise<void> {
+    try {
+      while (this.observing) {
+        const next = await this.eventReader.next()
+        if (next.done || !this.observing) return
+        await this.handle(next.value)
+      }
+    } catch (cause) {
+      if (!this.observing) return
+      this.stopEvents()
+      await this.sink.fail(sdkError(cause, 'PI_EVENT_FAILED', true)).catch(() => {})
+    }
+  }
+  /** Release buffered events even if an in-flight publication has yet to return. */
+  private stopEvents(): void {
+    this.observing = false
+    this.events.end()
+    while (this.events.bufferedEvents) void this.eventReader.next()
+    void this.eventReader.return?.()
   }
   /** Return detached binding and config for config receipts and post-terminal state. Capabilities remain shared. */
   private snapshot(): SessionState {
@@ -331,7 +360,7 @@ export class PiBackendSession implements BackendSession {
   /** Publish a new turn before binding pending inputs; retries/continuations reuse the active turn until settlement. */
   private async beginTurn(): Promise<ActiveTurn> {
     if (this.active) return this.active
-    this.active = { id: randomUUID(), assistant: 0, items: new Map(), messages: [], firstUserSeen: false }
+    this.active = { id: randomUUID(), assistant: 0, items: new Map(), messages: [], redactionPrefixes: new Map() }
     await this.sink.emit({ type: 'turn/started', payload: { turnId: this.active.id } })
     for (const submissionId of this.pending.splice(0)) await this.sink.bindSubmission(submissionId, this.active.id)
     return this.active
@@ -460,42 +489,50 @@ export class PiBackendSession implements BackendSession {
     } else if (update.phase === 'delta') {
       const previous = active.items.get(id)
       if (!previous || (previous.type !== 'agentMessage' && previous.type !== 'reasoning')) return
-      const text = this.redact.text(update.delta ?? '')
+      const { text, pending } = this.redact.delta((active.redactionPrefixes.get(id) ?? '') + (update.delta ?? ''))
+      if (pending) active.redactionPrefixes.set(id, pending)
+      else active.redactionPrefixes.delete(id)
+      if (!text) return
       previous.text = (previous.text ?? '') + text
       await this.sink.emit({ type: 'item/delta', payload: { itemId: id, kind: previous.type === 'reasoning' ? 'reasoningSummary' : 'text', text } }, { turnId: active.id })
     } else if (update.kind === 'thinking') {
       const previous = active.items.get(id)
-      const text = part?.type === 'thinking' ? part.thinking : previous?.type === 'reasoning' ? previous.text ?? '' : ''
-      const item: Item = { id, type: 'reasoning', status: 'completed', text: this.redact.text(text) }
+      const pending = active.redactionPrefixes.get(id) ?? ''
+      active.redactionPrefixes.delete(id)
+      const text = part?.type === 'thinking'
+        ? this.redact.text(part.thinking)
+        : (previous?.type === 'reasoning' ? previous.text ?? '' : '') + this.redact.text(pending)
+      const item: Item = { id, type: 'reasoning', status: 'completed', text }
       active.items.set(id, item)
       await this.sink.emit({ type: 'item/completed', payload: { item } }, { turnId: active.id })
     }
   }
   /**
-   * Associate the first new user entry with this turn. For assistant messages, retain usage and
+   * Associate each new user entry with this turn. For assistant messages, retain usage and
    * errors and publish completed text blocks with their final or commentary phase. Successful
    * assistant continuations clear earlier attempt failures.
    */
   private async messageEnd(active: ActiveTurn, message: PiHostMessage): Promise<void> {
     if (message.role === 'user') {
-      this.recordTurnStart(active)
+      this.recordUserEntry(active)
       return
     }
     if (message.role !== 'assistant') return
+    active.redactionPrefixes.clear()
     active.messages.push(message)
     active.lastAssistant = message
     const error = piTurnError(message)
     if (error) active.error = error
     else if (message.stopReason === 'stop' || message.stopReason === 'toolUse') active.error = undefined
     const content = Array.isArray(message.content) ? message.content : []
-    const hasTools = content.some(part => part.type === 'toolCall')
+    const phase = assistantTextPhase(content, message.stopReason)
     for (let index = 0; index < content.length; index++) {
       const part = content[index]!
       if (part.type !== 'text') continue
       const id = this.itemId(active, index)
       const item: Item = {
         id, type: 'agentMessage', status: 'completed', text: this.redact.text(part.text),
-        phase: !hasTools && message.stopReason === 'stop' ? 'final' : 'commentary',
+        phase,
       }
       if (!active.items.has(id)) await this.sink.emit({ type: 'item/started', payload: { item: { ...item, status: 'running', text: '' } } }, { turnId: active.id })
       active.items.set(id, item)
@@ -503,15 +540,15 @@ export class PiBackendSession implements BackendSession {
     }
   }
   /**
-   * On the first user message end, record the new Pi entry so history and fork can resolve the
-   * SDK turn ID. Further user messages may belong to queued continuations of the same turn.
+   * Match each user message end to the next unobserved transcript entry, including continuations.
    */
-  private recordTurnStart(active: ActiveTurn): void {
-    if (active.firstUserSeen) return
-    active.firstUserSeen = true
+  private recordUserEntry(active: ActiveTurn): void {
     const entry = this.host.entries().find(candidate =>
       candidate.kind === 'message' && candidate.message?.role === 'user' && !this.known.has(candidate.id))
-    if (entry) this.turns.set(entry.id, active.id)
+    if (entry) {
+      this.known.add(entry.id)
+      this.turns.set(entry.id, active.id)
+    }
   }
   /**
    * Complete unfinished tool items, then publish usage, the terminal and ready state in order.
@@ -532,7 +569,6 @@ export class PiBackendSession implements BackendSession {
     const usage = usageOf(active.messages)
     await this.sink.emit({ type: 'usage/updated', payload: usage }, { turnId: active.id })
     this.active = undefined
-    this.markKnown()
     const status = interrupted ? 'interrupted' : error ? 'failed' : 'completed'
     await this.sink.emit({ type: 'turn/completed', payload: { turnId: active.id, status, usage, ...(error ? { error } : {}) } })
     await this.sink.emit({ type: 'session/state', payload: this.snapshot() })
@@ -540,8 +576,8 @@ export class PiBackendSession implements BackendSession {
 
   /**
    * Convert input before native admission. Reserve idle input before prompt can emit events. Other
-   * inputs use followUp or steer, then join an active turn if present or wait for a binding event.
-   * Extension handling returns acceptance without a turn. Native failures use PI_SUBMIT_FAILED
+   * inputs use followUp or steer, keeping the known target across receipt delivery.
+   * Extension handling returns acceptance and reports that no execution occurred. Native failures use PI_SUBMIT_FAILED
    * as a fallback code. OutputSession prepares schema-bearing input before dispatch.
    */
   private async submit(start: AhpRequestMap['input/submit']): Promise<AhpResultMap['input/submit']> {
@@ -550,7 +586,8 @@ export class PiBackendSession implements BackendSession {
     const imageArg = images.length ? images : undefined
     const { submissionId } = start
     try {
-      const idle = !this.host.busy && !this.active && !this.pending.length
+      const joiningTurnId = this.active?.id
+      const idle = !this.host.busy && !joiningTurnId && !this.pending.length
       if (idle) this.pending.push(submissionId)
 
       // A rejection leaves the default in place so it releases the reservation just like extension handling.
@@ -568,10 +605,19 @@ export class PiBackendSession implements BackendSession {
           this.pending = this.pending.filter(entry => entry !== submissionId)
         }
       }
-      if (disposition === 'handled') return { submissionId, accepted: true, disposition: 'accepted' }
-      // The event tail may already have consumed an idle prompt's reservation and published its binding.
+      if (disposition === 'handled') {
+        await this.sink.emit({
+          type: 'submission/status', payload: {
+            submissionId, status: 'rejected',
+            error: { code: 'NATIVE_INPUT_NOT_EXECUTED', message: 'Extension handled the input without a turn', retryable: false, outcomeUnknown: false },
+          },
+        })
+        return { submissionId, accepted: true, disposition: 'accepted' }
+      }
+      // The event drain may already have published the binding for an idle prompt.
       if (!idle) {
-        if (this.active) return { submissionId, accepted: true, disposition: 'joined', turnId: this.active.id }
+        const turnId = joiningTurnId ?? this.active?.id
+        if (turnId !== undefined) return { submissionId, accepted: true, disposition: 'joined', turnId }
         this.pending.push(submissionId)
       }
       return { submissionId, disposition: 'dispatched' }
@@ -593,7 +639,6 @@ export class PiBackendSession implements BackendSession {
     }
     const models = patch.model !== undefined || patch.thinkingLevel !== undefined ? await this.host.listModels() : []
     const { model, thinkingLevel } = this.validateModelConfig(patch, models)
-    assertPermissionMode(patch.permissionMode)
     const tools = permissionTools(patch.permissionMode)
     try {
       if (model !== undefined) {
@@ -656,10 +701,45 @@ export class PiBackendSession implements BackendSession {
   }
 }
 
-/** Backend opening and config updates share this check so unsupported modes always fail with INVALID_PARAMS. */
-function assertPermissionMode(value: unknown): void {
-  if (value === undefined) return
-  if (!(PERMISSION_MODES as readonly string[]).includes(String(value))) throw new HarnessSdkError('INVALID_PARAMS', 'Unsupported Pi permission mode')
+const MAX_HOST_EVENT_BYTES = 8 * 1024 * 1024
+
+/** Estimate retained payload size without serializing native objects or following cycles. */
+function hostEventSize(event: PiHostEvent): number {
+  let bytes = 0
+  const visited = new WeakSet<object>()
+  const visit = (value: unknown, depth: number): void => {
+    bytes += 32
+    if (typeof value === 'string') {
+      bytes += value.length * 2
+      return
+    }
+    if (!value || typeof value !== 'object' || visited.has(value)) return
+    if (depth > 32) {
+      bytes = MAX_HOST_EVENT_BYTES + 1
+      return
+    }
+    visited.add(value)
+    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+      bytes += value.byteLength
+      return
+    }
+    if (value instanceof Map || value instanceof Set) {
+      for (const entry of value) {
+        visit(entry, depth + 1)
+        if (bytes > MAX_HOST_EVENT_BYTES) break
+      }
+      return
+    }
+    for (const key in value) {
+      if (!Object.hasOwn(value, key)) continue
+      bytes += key.length * 2
+      const property = Object.getOwnPropertyDescriptor(value, key)
+      visit(property?.value, depth + 1)
+      if (bytes > MAX_HOST_EVENT_BYTES) break
+    }
+  }
+  visit(event, 0)
+  return bytes
 }
 
 /**
@@ -673,7 +753,7 @@ function forkLeaf({ entries, starts, turns, boundary }: {
   turns: ReadonlyMap<string, string>
   boundary: Boundary
 }): string | null {
-  const startId = boundary.nativeTurnId ?? [...turns].find(([, turn]) => turn === boundary.turnId)?.[0]
+  const startId = boundary.nativeTurnId ?? entries.find(entry => starts.has(entry.id) && historyTurnId(entry.id, turns) === boundary.turnId)?.id
   if (!startId || !starts.has(startId)) throw new HarnessSdkError('TURN_NOT_FOUND', 'No verified native turn boundary')
   const index = entries.findIndex(entry => entry.id === startId)
   if (boundary.relation === 'before') return entries[index]!.parentId
@@ -693,7 +773,7 @@ function retryNotice(event: Extract<PiHostEvent, { type: 'retry' }>): Extract<Ah
   }
 }
 
-/** Mutable execution state owned by the serialized event tail from beginTurn through finishTurn. */
+/** Mutable execution state owned by the event drain from beginTurn through finishTurn. */
 interface ActiveTurn {
   id: string
   /** Pi assistant messages seen so far; item ids derive from this counter. */
@@ -701,6 +781,6 @@ interface ActiveTurn {
   items: Map<string, Item>
   messages: PiHostMessage[]
   lastAssistant?: PiHostMessage
-  firstUserSeen: boolean
+  redactionPrefixes: Map<string, string>
   error?: ReturnType<typeof piTurnError>
 }

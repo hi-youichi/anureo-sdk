@@ -15,6 +15,7 @@ export function createReferenceHarness(send: (message: string) => void | Promise
   // The harness retains and disposes every client when it closes.
   const ownedClients = new Set<Client>();
   const openSessions = new Map<string, OpenSessionRecord>();
+  const openingSessions = new Set<string>();
   // Replay logs outlive session closure and remain for the harness lifetime.
   const replayLogs = new Map<string, AhpEvent[]>();
   let initialized = false;
@@ -40,17 +41,23 @@ export function createReferenceHarness(send: (message: string) => void | Promise
   };
   /** Own the client before opening; publish initial state before starting the ongoing event drain. */
   const openSession = async (params: SessionOpenParams) => {
-    if (openSessions.has(params.binding.sessionId)) throw new HarnessSdkError('SESSION_ALREADY_OPEN');
-    const client = await createClient({ adapter, identity: params.binding, interactions: { approval: undefined } });
-    ownedClients.add(client);
-    const session = await client.openSession(params);
-    const streamId = randomUUID();
-    const state = session.snapshot;
-    openSessions.set(session.id, { session, streamId, lastPublishedSeq: 0 });
-    const reader = session.events()[Symbol.asyncIterator]();
-    await publish({ sessionId: session.id, streamId, seq: 1, timestamp: new Date().toISOString(), type: 'session/state', payload: state });
-    void publishSessionEvents(reader).catch(() => {});
-    return { binding: session.binding, streamId, state, capabilities: session.capabilities };
+    const { sessionId } = params.binding;
+    if (openingSessions.has(sessionId) || openSessions.has(sessionId)) throw new HarnessSdkError('SESSION_ALREADY_OPEN');
+    openingSessions.add(sessionId);
+    try {
+      const client = await createClient({ adapter, identity: params.binding, interactions: { approval: undefined } });
+      ownedClients.add(client);
+      const session = await client.openSession(params);
+      const streamId = randomUUID();
+      const state = session.snapshot;
+      openSessions.set(session.id, { session, streamId, lastPublishedSeq: 0 });
+      const reader = session.events()[Symbol.asyncIterator]();
+      await publish({ sessionId: session.id, streamId, seq: 1, timestamp: new Date().toISOString(), type: 'session/state', payload: state });
+      void publishSessionEvents(reader).catch(() => {});
+      return { binding: session.binding, streamId, state, capabilities: session.capabilities };
+    } finally {
+      openingSessions.delete(sessionId);
+    }
   };
   /** invoke returns a complete replay range or reports SOURCE_STREAM_UNAVAILABLE, including when old entries were evicted. */
   const readEvents = ({ sessionId, streamId, afterSeq, throughSeq }: ReplayRange) => {
@@ -65,8 +72,9 @@ export function createReferenceHarness(send: (message: string) => void | Promise
     if (method === 'initialize') {
       assertRequest(method, params);
       const result = await adapter.initialize(params);
+      adapter.replayEnabled = supportsExtension(params.clientCapabilities ?? {}, replayExtension.name, replayExtension.version);
       initialized = true;
-      return result;
+      return { ...result, capabilities: adapter.capabilities };
     }
     if (!initialized) throw new HarnessSdkError('NOT_INITIALIZED');
     if (method === 'session/open') {
@@ -75,6 +83,7 @@ export function createReferenceHarness(send: (message: string) => void | Promise
     }
     if (!params || typeof params !== 'object' || !('sessionId' in params) || typeof params.sessionId !== 'string') throw new HarnessSdkError('INVALID_PARAMS');
     if (method === 'x-anureo/events/read') {
+      if (!adapter.replayEnabled) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
       return readEvents(params as ReplayRange);
     }
     const source = openSessions.get(params.sessionId);
@@ -155,13 +164,23 @@ interface ReplayRange {
   throughSeq: number;
 }
 
-const capabilities: Capabilities = {
+const replayExtension = { name: 'x-anureo/event-replay', version: '1' };
+const capabilities = {
   input: { delivery: ['native'], interrupt: { targets: ['turn'], reportsPendingInputs: false } },
   turn: { inputModalities: ['text'] }, interactions: ['approval'],
-  extensions: [{ name: 'x-anureo/event-replay', version: '1' }, { name: 'x-anureo/session-metadata', version: '1' }],
-};
+  extensions: [{ name: 'x-anureo/session-metadata', version: '1' }],
+} satisfies Capabilities;
 /** Scripted native backend used by the reference peer; each open owns its active execution slot. */
 class ReferenceAdapter implements HarnessAdapter {
+  /** The connection dispatcher negotiates replay. Internal SDK clients share that selection. */
+  replayEnabled = false;
+
+  get capabilities(): Capabilities {
+    return this.replayEnabled
+      ? { ...capabilities, extensions: [...capabilities.extensions, replayExtension] }
+      : capabilities;
+  }
+
   /**
    * The harness dispatcher and SDK wrapper both negotiate this scripted backend. Reject invalid
    * parameters or versions and retain title support for later opens once a caller advertises it.
@@ -170,7 +189,7 @@ class ReferenceAdapter implements HarnessAdapter {
     assertRequest('initialize', params);
     negotiateVersion(params.protocolVersions);
     this.metadataEnabled ||= supportsExtension(params.clientCapabilities ?? {}, 'x-anureo/session-metadata', '1');
-    return { protocolVersion: 1 as const, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: 'reference', version: '1', adapter: 'reference/1' }, capabilities };
+    return { protocolVersion: 1 as const, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: 'reference', version: '1', adapter: 'reference/1' }, capabilities: this.capabilities };
   }
   /** OutputSession.open adopts this backend, which owns one scripted execution and publishes through the supplied sink. */
   async openSession(params: SessionOpenParams, sink: SessionEventSink): Promise<BackendSession> {
@@ -195,7 +214,7 @@ class ReferenceAdapter implements HarnessAdapter {
       }
     };
     return {
-      binding, capabilities,
+      binding, capabilities: this.capabilities,
       /**
        * OutputSession dispatches one scripted operation here. Submit returns a dispatch receipt,
        * interrupt waits for the active turn's terminal, and close confirms observation.

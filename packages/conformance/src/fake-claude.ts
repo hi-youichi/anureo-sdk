@@ -22,7 +22,7 @@ export interface ClaudeQueryScript {
  * for assertions. To use one with a Claude adapter's queryFactory, bridge the factory's
  * prompt into streamInput, project the output as native SDK messages and supply additional
  * Query methods the adapter requires, such as applyFlagSettings.
- * Direct callers end output with finish or close and drain or return the output iterator.
+ * Direct callers end output with finish, fail or close and drain or return the output iterator.
  */
 export class ScriptedClaudeQuery implements AsyncIterable<JsonObject> {
   /** Ordered input/control observations; input values are retained by reference. */
@@ -36,7 +36,7 @@ export class ScriptedClaudeQuery implements AsyncIterable<JsonObject> {
   /**
    * Claim exclusive output reads. A second acquisition throws EVENT_STREAM_ALREADY_OWNED
    * until the first iterator releases ownership. Overlapping pending reads reject with
-   * CONCURRENT_EVENT_READ. Call return when stopping early. If finish or close settled
+   * CONCURRENT_EVENT_READ. Call return when stopping early. If ending output settled
    * an already pending read, call return or next again to release ownership.
    */
   [Symbol.asyncIterator](): AsyncIterator<JsonObject> { return this.queue[Symbol.asyncIterator](); }
@@ -71,6 +71,8 @@ export class ScriptedClaudeQuery implements AsyncIterable<JsonObject> {
 
   /** End output admission once and wake blocked emits to reject. Buffered messages still drain and input stays open. */
   finish(): void { this.queue.end(); }
+  /** End output admission with a cause. Buffered messages drain before the iterator rejects with that cause. */
+  fail(cause: Error): void { this.queue.end(cause); }
   /** Record close once and end output admission; buffered messages still drain and input is not cancelled. */
   close(): void {
     if (this.closeCalled) return;

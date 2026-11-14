@@ -9,12 +9,10 @@ import {
 } from "@anureo/protocol";
 import type { ConformanceDriver, ConformanceFactory, ConformanceScenario } from "./suite";
 
-/** One backend dispatch, recorded before any custom hook runs. */
-export interface FakeCall {
-  method: SessionMethod;
-  /** The dispatched object also used by the default handler if the hook returns undefined. */
-  params: AhpRequestMap[SessionMethod];
-}
+/** One backend dispatch. The default handler uses the same params if the hook returns undefined. */
+export type FakeCall = {
+  [M in SessionMethod]: { method: M; params: AhpRequestMap[M] };
+}[SessionMethod];
 /** Configure an injectable in-memory backend for SDK, workflow and application fixtures. */
 export interface FakeAdapterOptions {
   /** Replaces the complete default capability set. Adapter capability reads clone it. */
@@ -28,7 +26,7 @@ export interface FakeAdapterOptions {
   execute?: (call: FakeCall, sink: SessionEventSink) => Promise<AhpResultMap[SessionMethod] | undefined>;
   /**
    * Publish setup events or hold session acquisition. ScriptedHarnessAdapter.openSession awaits
-   * this hook after recording the backend and copying any fork history. A throw or rejection
+   * this hook after recording the backend and copying any fork or resume history. A throw or rejection
    * rejects acquisition and leaves the recorded fixture state available.
    */
   onOpen?: (params: SessionOpenParams, sink: SessionEventSink) => Promise<void>;
@@ -94,6 +92,7 @@ export class ScriptedHarnessAdapter implements HarnessAdapter {
   readonly sinks = new Map<string, SessionEventSink>();
   /** Latest created backend per session ID, recorded before fork validation and onOpen. */
   readonly backends = new Map<string, ScriptedBackendSession>();
+  private readonly savedBackends = new Map<string, ScriptedBackendSession>();
   /** Number of disposal calls received, including any repeated direct calls. */
   disposeCount = 0;
   /** Return detached declared capabilities, using FAKE_CAPABILITIES when omitted. */
@@ -109,19 +108,25 @@ export class ScriptedHarnessAdapter implements HarnessAdapter {
     return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: "scripted", version: "1.0.0", adapter: "conformance/0.1.0" }, capabilities: this.capabilities };
   }
   /**
-   * Supply OutputSession.open with a backend for SDK attachment. Record the backend and sink
-   * before copying fork history so a failed setup is observable. Missing source or boundary
-   * rejects with SESSION_NOT_FOUND or TURN_NOT_FOUND, respectively. Await onOpen before returning
-   * the backend. Hook failures reject and leave the recorded fixture state available.
+   * Restore saved history before replacing a resumed backend. Record the backend and sink
+   * before copying fork history and calling onOpen. Missing source or boundary rejects with
+   * SESSION_NOT_FOUND or TURN_NOT_FOUND, respectively.
    */
   async openSession(params: SessionOpenParams, sink: SessionEventSink): Promise<BackendSession> {
     this.opened.push(structuredClone(params));
-    this.sinks.set(params.binding.sessionId, sink);
     const backend = new ScriptedBackendSession(this, params, sink);
+    if (params.mode === "resume") {
+      const ref = params.binding.nativeRef;
+      const saved = ref?.provider === "scripted" ? this.savedBackends.get(ref.value) : undefined;
+      if (!saved) throw new HarnessSdkError("SESSION_NOT_FOUND");
+      backend.history.push(...structuredClone(saved.history));
+    }
+    this.sinks.set(params.binding.sessionId, sink);
     this.backends.set(params.binding.sessionId, backend);
     const fork = params.fork;
     if (params.mode === "fork" && fork) this.copyForkHistory(fork, backend);
     await this.options.onOpen?.(params, sink);
+    this.savedBackends.set(backend.binding.nativeRef.value, backend);
     return backend;
   }
   /** Count adapter release. The SDK wrapper calls this after session cleanup attempts. */
@@ -145,7 +150,7 @@ export class ScriptedHarnessAdapter implements HarnessAdapter {
  */
 export class ScriptedBackendSession implements BackendSession {
   /** Requested identity with a deterministic scripted nativeRef, adopted by the SDK at attachment. */
-  readonly binding: SessionBinding;
+  readonly binding: SessionBinding & { nativeRef: NonNullable<SessionBinding["nativeRef"]> };
   /** Capabilities cloned from the adapter at construction and shared with the fixture state. */
   readonly capabilities: Capabilities;
   /** Mutable native history. Default backend history/read returns this array by reference. */
@@ -161,7 +166,11 @@ export class ScriptedBackendSession implements BackendSession {
     /** Callbacks supplied at open for event publication, interactions and source faults. */
     readonly sink: SessionEventSink,
   ) {
-    this.binding = { ...params.binding, nativeRef: { provider: "scripted", value: `native:${params.binding.sessionId}` } };
+    this.binding = {
+      ...params.binding,
+      nativeRef: (params.mode === "resume" ? params.binding.nativeRef : undefined)
+        ?? { provider: "scripted", value: `native:${params.binding.sessionId}` },
+    };
     this.capabilities = adapter.capabilities;
     this.state = {
       binding: this.binding,
@@ -184,34 +193,35 @@ export class ScriptedBackendSession implements BackendSession {
    */
   execute<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]>;
   async execute(method: SessionMethod, params: AhpRequestMap[SessionMethod]): Promise<AhpResultMap[SessionMethod] | undefined> {
-    const call: FakeCall = { method, params };
+    const call = { method, params } as FakeCall;
+    const { method: dispatchedMethod, params: dispatchedParams } = call;
     this.adapter.calls.push(call);
     const custom = await this.adapter.options.execute?.(call, this.sink);
     if (custom !== undefined) return custom;
 
-    switch (method) {
+    switch (dispatchedMethod) {
       case "input/submit":
-        return await this.submitInput(params as InputSubmitParams);
+        return await this.submitInput(dispatchedParams);
       case "turn/steer": {
-        const request = params as AhpRequestMap["turn/steer"];
+        const request = dispatchedParams;
         await this.emit({ type: "turn/completed", payload: { turnId: request.expectedTurnId, status: "completed" } });
         return { submissionId: request.submissionId, turnId: request.expectedTurnId, accepted: true };
       }
       case "turn/interrupt": {
-        const { turnId } = params as AhpRequestMap["turn/interrupt"];
+        const { turnId } = dispatchedParams;
         await this.emit({ type: "turn/completed", payload: { turnId, status: "interrupted" } });
         return { accepted: true, turnId };
       }
       case "session/config/set": {
         this.state = {
           ...this.state,
-          config: { ...this.state.config, ...(params as AhpRequestMap["session/config/set"]).patch },
+          config: { ...this.state.config, ...dispatchedParams.patch },
           capabilityRevision: this.state.capabilityRevision + 1,
         };
         return this.state;
       }
       case "session/revert": {
-        const request = params as AhpRequestMap["session/revert"];
+        const request = dispatchedParams;
         if (request.scope !== "files") {
           this.history.splice(historyBoundaryIndex(this.history, request.boundary));
         }
@@ -220,7 +230,7 @@ export class ScriptedBackendSession implements BackendSession {
       case "history/read":
         return { items: this.history, snapshotToken: "fake-snapshot", source: this.binding.nativeRef };
       case "goal/set":
-        return { goal: (params as AhpRequestMap["goal/set"]).goal, status: "active" };
+        return { goal: dispatchedParams.goal, status: "active" };
       case "goal/clear":
         return { goal: null, status: "cleared" };
       case "compact/start":
@@ -229,7 +239,7 @@ export class ScriptedBackendSession implements BackendSession {
         const turnId = randomUUID();
         await this.emit({ type: "turn/started", payload: { turnId } });
         await this.emit({ type: "turn/completed", payload: { turnId, status: "completed" } });
-        return startedReceipt((params as AhpRequestMap["review/start"]).submissionId, turnId);
+        return startedReceipt(dispatchedParams.submissionId, turnId);
       }
       case "session/interrupt":
         return { accepted: true, stillQueued: [] };
@@ -268,31 +278,45 @@ function startedReceipt(submissionId: string, turnId: string) {
 }
 
 /**
- * Find the end of the retained prefix shared by fork and revert. Use the first matching history
- * entry as the boundary. Throw TURN_NOT_FOUND before either caller changes history if it is absent.
+ * Find the end of the retained prefix shared by fork and revert. A before boundary excludes the
+ * whole turn and a through boundary includes it. Throw TURN_NOT_FOUND if the turn is absent.
  */
 function historyBoundaryIndex(history: HistoryItem[], boundary: AhpRequestMap["session/revert"]["boundary"]): number {
   const index = history.findIndex(entry => entry.turnId === boundary.turnId);
   if (index < 0) throw new HarnessSdkError("TURN_NOT_FOUND");
-  return boundary.relation === "before" ? index : index + 1;
+  if (boundary.relation === "before") return index;
+  for (let end = history.length - 1; end > index; end--) {
+    if (history[end]?.turnId === boundary.turnId) return end + 1;
+  }
+  return index + 1;
 }
 
 /**
  * Create the hook that ScriptedBackendSession.execute awaits. Only special submissions supply a
  * receipt here. Held cases stop after start so the suite can drive control or observation loss.
+ * A session interrupt completes the held interrupt case.
  * Interaction cases await SDK settlement before completion. Sink failures reject dispatch.
  */
 function scenarioExecutor(scenario: ConformanceScenario): NonNullable<FakeAdapterOptions["execute"]> {
+  const interruptTurn = Promise.withResolvers<string>();
   return async (call, sink) => {
+    if (call.method === "session/interrupt" && scenario === "interrupt") {
+      const turnId = await interruptTurn.promise;
+      await sink.emit({ type: "turn/completed", payload: { turnId, status: "interrupted" } });
+      return { accepted: true, stillQueued: [] };
+    }
     if (call.method !== "input/submit") return undefined;
-    const { submissionId } = call.params as InputSubmitParams;
+    const { submissionId } = call.params;
     const turnId = randomUUID();
     const hold = ["interrupt", "steer", "disconnect", "backpressure"].includes(scenario);
     const interaction = hold ? undefined : scenarioInteraction(scenario, turnId);
     if (!hold && !interaction && scenario !== "unknown-item") return undefined;
 
     await sink.emit({ type: "turn/started", payload: { turnId } });
-    if (hold) return startedReceipt(submissionId, turnId);
+    if (hold) {
+      if (scenario === "interrupt") interruptTurn.resolve(turnId);
+      return startedReceipt(submissionId, turnId);
+    }
     if (interaction) {
       // The SDK registry calls this responder when it settles the request. The fixture has no
       // native peer to notify, but it still waits for the registry before completing the turn.

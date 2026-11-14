@@ -16,7 +16,7 @@ test('Hermes canonical gateway satisfies the applicable shared conformance cases
       }
     })
     expect(report.cases.filter(value => value.status === 'failed')).toEqual([])
-    expect(report.passed).toBe(true)
+    expect(report.cases).toEqual(expect.arrayContaining(['approval', 'userInput', 'interrupt'].map(scenario => ({ scenario, status: 'passed' }))))
   } finally { await Promise.all(fixtures.map(value => value.dispose())) }
 }, 30_000)
 

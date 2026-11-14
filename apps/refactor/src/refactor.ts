@@ -5,7 +5,7 @@ import { agent } from '@anureo/workflow'
 import { inAgentWorktree, runAgentWork } from './agent-work'
 import { defaultChecks, validateChecks, type CheckCommand } from './checks'
 import { repositoryDirectory } from './git'
-import { treeVersion } from './git-tree'
+import { captureTree, changes, treeVersion } from './git-tree'
 import { exportGraph, type GraphArtifactContext } from './graph-artifacts'
 import { validateConcurrency, validateGraphOptions, type RefactorOptions } from './options'
 import { validatePlan } from './plan-validation'
@@ -22,11 +22,12 @@ export type { RefactorOptions } from './options'
 /** Overall run report and the step, validation and failure records it contains. */
 export type { RefactorReport, ModuleResult, StepResult, CheckResult, Failure } from './results'
 
-/** Refactor a Git target in detached worktrees. The host checks edits in each worktree and
- * serializes transfers into the target as worktrees become ready. Review-only runs skip both.
+/** Refactor a Git target in detached worktrees. The host serializes checks of prospective
+ * changes and transfers into the target as worktrees become ready. Review-only runs skip both.
  *
  * Returns a completed or incomplete report after final publication and writer-lock release. Design and planning failures
- * stop advancement. Module failures are recorded while other modules continue. Invalid input, repository preflight,
+ * stop advancement. Unknown outcomes or cleanup failures stop new module sessions. Active sessions settle.
+ * Invalid input, repository preflight,
  * lock acquisition, report initialization, final publication and lock cleanup failures reject.
  * Keep the supplied client usable until settlement and dispose it separately. */
 export async function refactorCode(input: RefactorOptions): Promise<RefactorReport> {
@@ -87,10 +88,11 @@ async function runDesign(context: RunContext): Promise<DesignResult> {
       baseline, options, checks, assignedFiles: initial.files, publish: operation => operation(),
       prompt: designPrompt({
         files: initial.files, graphFile, version: treeVersion(initial.tree), checks,
-        mode: options.reviewOnly ? 'read-only' : 'edit', isolated: true,
+        mode: options.reviewOnly ? 'read-only' : 'edit',
       }),
     }),
   )
+  if (!design) throw new Error('Cross-module design did not start')
   report.design = design
   await checkpointStep(context, 'design', design)
   if (design.status === 'failed') throw new Error(`Cross-module design failed: ${design.error}`)
@@ -116,6 +118,7 @@ async function runModules(context: RunContext, baseline: WorktreeBaseline, input
   const { options, report, checks, progress } = context
   const results: ModuleResult[] = input.plan.modules.map(module => ({ module, step: null }))
   report.modules = results
+  const dispatch = { stopped: false }
   let writer = Promise.resolve()
   const publish = (operation: () => Promise<void>) => {
     const result = writer.then(operation)
@@ -123,16 +126,17 @@ async function runModules(context: RunContext, baseline: WorktreeBaseline, input
     return result
   }
 
-  await runModuleWorkers(results, options.concurrency ?? results.length, async result => {
+  await runModuleWorkers(results, options.concurrency ?? results.length, () => !dispatch.stopped, async result => {
     const { module } = result
     progress(`module/${module.id}: started`)
     const step = await runAgentWork({
-      baseline, options, checks, publish, assignedFiles: module.files,
+      baseline, options, checks, publish, dispatch, assignedFiles: module.files,
       prompt: modulePrompt({
         module, graphFile: input.graphFile, version: input.version, checks,
-        mode: options.reviewOnly ? 'read-only' : 'edit', design: input.design, isolated: true,
+        mode: options.reviewOnly ? 'read-only' : 'edit', design: input.design,
       }),
     })
+    if (!step) return
     progress(`module/${module.id}: finished`)
     await publish(async () => {
       result.step = step
@@ -151,29 +155,30 @@ async function checkpointStep(context: RunContext, label: string, step: StepResu
   await saveReport(context.report)
 }
 
-/** Partition the post-design inventory for prepareModules. Supply the read permission mode
- * and await checkout removal before checking exact path coverage. A missing result, invalid
- * assignment, session failure or checkout failure rejects before the report can record a plan. */
+/** Partition the post-design inventory without edits, then verify coverage after checkout removal. */
 async function plan(options: RefactorOptions, baseline: WorktreeBaseline, files: string[], version: string): Promise<ModulePlan> {
-  const result = await inAgentWorktree(baseline, ({ cwd }) =>
-    agent(planPrompt(files, version), {
+  const result = await inAgentWorktree(baseline, async ({ cwd, root }) => {
+    const before = await captureTree(root)
+    const planned = await agent(planPrompt(files, version), {
       client: options.client, cwd, model: options.model, permissionMode: options.readPermissionMode,
       schema: modulePlanSchema, outputFallback: 'json-text',
-    }),
-  )
-  if (!result) throw new Error('Module planning returned no result')
+    })
+    if (changes(before, await captureTree(root)).length) throw new Error('Module planner modified files')
+    if (!planned) throw new Error('Module planning returned no result')
+    return planned
+  })
   validatePlan(result, files)
   return result
 }
 
-/** Claim each result slot once, with at most limit callbacks active. runModules supplies a callback
- * that records the step and emits progress. Drain every slot before propagating the earliest
+/** Claim available slots while dispatch is open, with at most limit callbacks active. runModules
+ * supplies a callback that records the step and emits progress. Drain active workers before propagating the earliest
  * callback rejection in plan order, so baseline cleanup cannot race a running worker. */
-async function runModuleWorkers(results: ModuleResult[], limit: number, run: (result: ModuleResult) => Promise<void>): Promise<void> {
+async function runModuleWorkers(results: ModuleResult[], limit: number, mayDispatch: () => boolean, run: (result: ModuleResult) => Promise<void>): Promise<void> {
   let next = 0
   let rejection: { index: number; cause: unknown } | undefined
   const workers = Array.from({ length: Math.min(limit, results.length) }, async () => {
-    while (next < results.length) {
+    while (next < results.length && mayDispatch()) {
       const index = next++
       try { await run(results[index]!) }
       catch (cause) {

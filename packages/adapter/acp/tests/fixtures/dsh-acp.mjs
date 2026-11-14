@@ -30,7 +30,10 @@ const createDefaultConfigOptions = () => [
     currentValue: 'deepseek-official/deepseek-v4-flash',
     options: [{
       group: 'deepseek-official', name: 'deepseek-official',
-      options: [{ value: 'deepseek-official/deepseek-v4-flash', name: 'deepseek-v4-flash' }],
+      options: [
+        { value: 'deepseek-official/deepseek-v4-flash', name: 'deepseek-v4-flash' },
+        { value: 'deepseek-official/deepseek-v4-pro', name: 'deepseek-v4-pro' },
+      ],
     }],
   },
   {
@@ -150,7 +153,7 @@ async function prompt(frame, params) {
   answerChunk(params.sessionId, 'pong');
   if (permission) {
     promptResponseIdsBySession.set(params.sessionId, frame.id);
-    const response = await request('session/request_permission', {
+    const { outcome } = await request('session/request_permission', {
       sessionId: params.sessionId,
       toolCall: { toolCallId: 'call-1', title: 'Run tests', kind: 'execute', rawInput: { command: 'bun test' } },
       options: [
@@ -159,7 +162,7 @@ async function prompt(frame, params) {
       ],
     });
     promptResponseIdsBySession.delete(params.sessionId);
-    answerChunk(params.sessionId, ` ${response.outcome.outcome}`);
+    answerChunk(params.sessionId, outcome.outcome === 'selected' ? ` selected:${outcome.optionId}` : ` ${outcome.outcome}`);
   }
   respond(frame, { stopReason });
 }

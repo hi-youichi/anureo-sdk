@@ -24,6 +24,8 @@ export interface StepResult extends Work {
   status: 'applied' | 'unchanged' | 'failed'
   /** Sorted Git-visible paths changed by the isolated agent within the target directory. */
   changedFiles: string[]
+  /** Paths confirmed transferred to the target, even if cleanup later failed. Absence conveys no confirmed transfer. */
+  appliedFiles?: string[]
   /** Legacy report field containing the path to a historical patch artifact. */
   patch?: string
   /** Executed checks in command order; a failure stops subsequent checks. */

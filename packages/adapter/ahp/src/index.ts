@@ -98,13 +98,16 @@ export class AhpAdapter implements HarnessAdapter {
     try {
       const opened = await wire.request("session/open", params);
       assertResult("session/open", opened);
+      if (this.sessions.get(params.binding.sessionId) !== record) {
+        throw new HarnessSdkError("SOURCE_STREAM_UNAVAILABLE");
+      }
       this.bindOpenedStream(record, params.binding, opened);
       if (!record.metadataObserved && opened.state?.metadata) {
         await sink.emit({ type: "session/metadata", payload: opened.state.metadata });
       }
       return this.createBackendSession({ wire, params, record, opened });
     } catch (cause) {
-      this.sessions.delete(params.binding.sessionId);
+      this.retire(params.binding.sessionId, record);
       throw cause;
     }
   }
@@ -145,7 +148,7 @@ export class AhpAdapter implements HarnessAdapter {
     const wire = this.wire = new AhpWire(transport, this.options);
     wire.onNotification = (method, event) => this.notification(wire, method, event);
     wire.onClose = cause => this.failConnection(cause);
-    const result = await wire.request("initialize", withMetadataCapability(params));
+    const result = await wire.request("initialize", withAdapterExtensions(params));
     assertResult("initialize", result);
     negotiateVersion([result.protocolVersion]);
     this.result = result;
@@ -184,7 +187,8 @@ export class AhpAdapter implements HarnessAdapter {
       throw new HarnessSdkError("SESSION_BINDING_MISMATCH");
     }
     const streamId = opened.streamId;
-    if (this.retiredStreams.has(streamKey(requested.sessionId, streamId))) {
+    if ((record.streamId !== undefined && record.streamId !== streamId)
+      || this.retiredStreams.has(streamKey(requested.sessionId, streamId))) {
       throw new HarnessSdkError("SOURCE_STREAM_UNAVAILABLE");
     }
     record.streamId = streamId;
@@ -193,14 +197,26 @@ export class AhpAdapter implements HarnessAdapter {
   /** Build the backend that openSession transfers to OutputSession after setup and metadata publication. */
   private createBackendSession({ wire, params, record, opened }: OpenedSession): BackendSession {
     const adapter = this;
+    let state = opened.state;
+    if (record.metadataObserved && state?.metadata) {
+      const metadata = { ...state.metadata };
+      delete metadata.title;
+      state = { ...state, metadata };
+    }
     return {
       binding: opened.binding,
       capabilities: opened.capabilities,
-      state: opened.state,
-      /** OutputSession.execute supplies validated input and receives the peer result or RPC/schema rejection. */
+      state,
+      /** Validate the peer result before OutputSession can use it for submission bookkeeping. */
       async execute<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
         const result = await wire.request(method, params);
-        assertResult(method, result);
+        try {
+          assertResult(method, result);
+        } catch {
+          const cause = new HarnessSdkError("PROTOCOL_ERROR", "Invalid native result", false, true);
+          void record.sink.fail(cause).catch(() => {});
+          throw cause;
+        }
         return result;
       },
       /** OutputSession.dispose releases local routing here. The SDK sends session/close separately. */
@@ -220,10 +236,10 @@ export class AhpAdapter implements HarnessAdapter {
   /**
    * AhpWire serializes this callback while continuing to read RPC replies. Ignore duplicate
    * sequences and retired streams, repair gaps before delivery, and forward unknown methods as
-   * notices. Rejection starts wire cleanup, which invokes failConnection.
+   * notices. Once routed to a stream, replay and delivery failures end that session's observation.
    */
   private async notification(wire: AhpWire, method: string, value: unknown): Promise<void> {
-    if (!KNOWN_NOTIFICATIONS.includes(method)) {
+    if (!Object.hasOwn(KNOWN_NOTIFICATIONS, method)) {
       const raw = publicValue(JSON.parse(JSON.stringify(value ?? null)) as JsonValue);
       for (const session of this.sessions.values()) {
         await session.sink.emit({
@@ -246,17 +262,25 @@ export class AhpAdapter implements HarnessAdapter {
       throw new HarnessSdkError("SOURCE_STREAM_UNAVAILABLE");
     }
     session.streamId = value.streamId;
-    if (value.seq !== last + 1) await this.replayMissingEvents({ wire, session, next: value, last });
-    await this.deliver(wire, session, value);
+    try {
+      if (value.seq !== last + 1) await this.replayMissingEvents({ wire, session, next: value, last });
+      if (this.sessions.get(value.sessionId) !== session) return;
+      await this.deliver(wire, session, value);
+    } catch (cause) {
+      if (this.sessions.get(value.sessionId) !== session) return;
+      this.retire(value.sessionId, session);
+      // Teardown can wait for new RPC replies or interaction confirmations.
+      void session.sink.fail(cause).catch(() => {});
+    }
   }
 
   /**
    * Fill the prefix immediately before the live event. notification awaits each repaired event before
    * delivering the live one. Replayed events can already have reached the sink when a later entry
-   * proves the range invalid or incomplete and rejects the callback.
+   * proves the range invalid or incomplete.
    */
   private async replayMissingEvents({ wire, session, next, last }: ReplayGap): Promise<void> {
-    if (!this.result || !supportsExtension(this.result.capabilities, "x-anureo/event-replay", "1")) {
+    if (!this.result || !supportsExtension(this.result.capabilities, REPLAY_EXTENSION.name, REPLAY_EXTENSION.version)) {
       throw new HarnessSdkError("SOURCE_SEQUENCE_GAP");
     }
     const raw = await wire.request("x-anureo/events/read", {
@@ -265,10 +289,12 @@ export class AhpAdapter implements HarnessAdapter {
       afterSeq: last,
       throughSeq: next.seq - 1,
     });
+    if (this.sessions.get(next.sessionId) !== session) return;
     if (!raw || typeof raw !== "object" || !("events" in raw) || !Array.isArray(raw.events)) {
       throw new HarnessSdkError("SOURCE_STREAM_UNAVAILABLE");
     }
     for (const event of raw.events) {
+      if (this.sessions.get(next.sessionId) !== session) return;
       assertEvent(event);
       if (event.sessionId !== next.sessionId || event.streamId !== next.streamId) {
         throw new HarnessSdkError("SOURCE_SEQUENCE_GAP");
@@ -349,7 +375,7 @@ export class AhpAdapter implements HarnessAdapter {
 
   /**
    * The SDK invokes the responder on answer or cancellation, including rejection at admission.
-   * Await the first RPC reply or matching resolution, validate it, and reject unknown outcomes.
+   * Await the first RPC reply or matching resolution and confirm the requested outcome.
    * The SDK publishes local settlement. Release both registrations on exit and leave any outstanding
    * RPC under the wire's own deadline and close handling.
    */
@@ -367,8 +393,18 @@ export class AhpAdapter implements HarnessAdapter {
         ...(response ? { response } : { reason }),
       });
       const result = await Promise.race([call, confirmation]);
-      assertResult(method, result);
+      try {
+        assertResult(method, result);
+      } catch {
+        throw new HarnessSdkError("PROTOCOL_ERROR", "Invalid interaction result", false, true);
+      }
+      if (result.interactionId !== request.interactionId) {
+        throw new HarnessSdkError("PROTOCOL_ERROR", "Interaction result identity mismatch", false, true);
+      }
       if (result.outcome === "unknown") throw new HarnessSdkError("RESULT_UNKNOWN", "RESULT_UNKNOWN", false, true);
+      if (response ? result.outcome !== "responded" : result.outcome === "responded") {
+        throw new HarnessSdkError("INTERACTION_ALREADY_RESOLVED");
+      }
     } finally {
       this.inFlightInteractionResponses.delete(key);
       session.pendingInteractionIds.delete(request.interactionId);
@@ -434,19 +470,33 @@ interface InFlightInteractionResponse {
 }
 
 const METADATA_EXTENSION = { name: "x-anureo/session-metadata", version: "1" };
-const KNOWN_NOTIFICATIONS = [
-  "submission/bound", "submission/status", "session/metadata", "session/state", "turn/started",
-  "turn/completed", "item/started", "item/delta", "item/completed", "usage/updated",
-  "interaction/requested", "interaction/resolved", "notice", "extension",
-];
+const REPLAY_EXTENSION = { name: "x-anureo/event-replay", version: "1" };
+const KNOWN_NOTIFICATIONS: Record<AhpEvent["type"], true> = {
+  "submission/bound": true,
+  "submission/status": true,
+  "session/metadata": true,
+  "session/state": true,
+  "turn/started": true,
+  "turn/completed": true,
+  "item/started": true,
+  "item/delta": true,
+  "item/completed": true,
+  "usage/updated": true,
+  "interaction/requested": true,
+  "interaction/resolved": true,
+  notice: true,
+  extension: true,
+};
 
-/** Replace offers for this extension so initializeConnection always advertises the version it can decode. */
-function withMetadataCapability(params: InitializeParams): InitializeParams {
+/** Advertise the versions of the extensions implemented by the adapter. */
+function withAdapterExtensions(params: InitializeParams): InitializeParams {
   const clientCapabilities = {
     ...params.clientCapabilities,
     extensions: [
-      ...(params.clientCapabilities?.extensions ?? []).filter(e => e.name !== METADATA_EXTENSION.name),
+      ...(params.clientCapabilities?.extensions ?? []).filter(e =>
+        e.name !== METADATA_EXTENSION.name && e.name !== REPLAY_EXTENSION.name),
       METADATA_EXTENSION,
+      REPLAY_EXTENSION,
     ],
   };
   return { ...params, clientCapabilities };
@@ -459,5 +509,5 @@ function streamKey(sessionId: string, streamId: string): string {
 
 /** Correlate the response callback and remote resolution using the same session/interaction key. */
 function interactionKey(sessionId: string, interactionId: string): string {
-  return `${sessionId}:${interactionId}`;
+  return JSON.stringify([sessionId, interactionId]);
 }

@@ -1,6 +1,6 @@
 {
   "name": "@anureo/workflow",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Agent execution, composition, and durable workflow steps over the Anureo SDK",
   "license": "Apache-2.0",
   "repository": {
@@ -8,6 +8,7 @@
     "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
     "directory": "packages/workflow"
   },
+  "homepage": "https://github.com/hi-youichi/anureo-sdk/tree/main/packages/workflow#readme",
   "publishConfig": {
     "access": "public"
   },

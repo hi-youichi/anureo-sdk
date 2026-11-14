@@ -1,12 +1,15 @@
 import { expect,test } from "bun:test";
 import path from "node:path";
 import { createClient,BoundedEventQueue,type Session } from "@anureo/sdk";
-import type { AhpEvent } from "@anureo/protocol";
+import { AHP_PROTOCOL_CONTRACT, type AhpEvent } from "@anureo/protocol";
 import { createAhpAdapter,createWebSocketTransport,AhpWire,createStdioTransport,type AhpTransport } from "../src/index";
 import { createReferenceHarness } from "../examples/reference";
 
 /** Connect an owned client/session to a scripted peer, optionally perturbing notifications; dispose runtime. */
-async function fixture(options:{dropSeq?:number;replay?:boolean;duplicate?:boolean}={}){
+async function referenceClient(options:{
+  dropSeq?:number;replay?:boolean;duplicate?:boolean;
+  intercept?: (frame: string, forward: (frame: string) => void) => void;
+}={}){
   const queue=new BoundedEventQueue<string>();
   const forwardedFrames: Array<{method?:string;params?:AhpEvent}>=[];
   let dropped=false;
@@ -24,7 +27,8 @@ async function fixture(options:{dropSeq?:number;replay?:boolean;duplicate?:boole
 
     forwardedFrames.push(message);
     const serializedFrame=JSON.stringify(message);
-    queue.push(serializedFrame);
+    if (options.intercept) options.intercept(serializedFrame, frame => queue.push(frame));
+    else queue.push(serializedFrame);
     if(options.duplicate&&message.params?.seq===1){
       // Record once, but deliver the same serialized frame twice.
       queue.push(serializedFrame);
@@ -32,8 +36,18 @@ async function fixture(options:{dropSeq?:number;replay?:boolean;duplicate?:boole
   });
   const transport:AhpTransport={messages:queue,send:frame=>reference.receive(frame),close:async()=>{await reference.close();queue.end();}};
   const runtime=await createClient({identity:{adapterId:"ahp",runtimeConfigId:"ref"},interactions:{approval:undefined},adapter:createAhpAdapter({transport,timeoutMs:500})});
-  const session=await runtime.openSession({requestId:"open",mode:"new",binding:{sessionId:"session",adapterId:"ahp",runtimeConfigId:"ref"},cwd:process.cwd()});
-  return {runtime,session,queue,forwardedFrames};
+  const open = (sessionId: string) => runtime.openSession({requestId:"open",mode:"new",binding:{sessionId,adapterId:"ahp",runtimeConfigId:"ref"},cwd:process.cwd()});
+  return {runtime,open,queue,forwardedFrames};
+}
+
+async function fixture(options?: Parameters<typeof referenceClient>[0]) {
+  const f = await referenceClient(options);
+  try {
+    return { ...f, session: await f.open("session") };
+  } catch (cause) {
+    await f.runtime.dispose();
+    throw cause;
+  }
 }
 /** Collect through the first terminal, optionally answer requests, and release the reader and timer. */
 async function collect(
@@ -77,8 +91,15 @@ test("external AHP preserves immediate lifecycle over stdio",async()=>{
 });
 test("remote interaction responds once, with no duplicate local resolution",async()=>{
   const f=await fixture();try{
-    const reading=collect(f.session,denyApproval);await f.session.submit({ input:[{type:"text",text:"/approval"}] });
-    const events=await reading;expect(events.filter(e=>e.type==="interaction/resolved")).toHaveLength(1);expect(events.filter(e=>e.type==="interaction/requested")).toHaveLength(1);
+    const reading=collect(f.session,async (session, request) => {
+      expect(await denyApproval(session, request)).toMatchObject({ interactionId: request.interactionId, outcome: "responded" });
+    });await f.session.submit({ input:[{type:"text",text:"/approval"}] });
+    const events=await reading;
+    expect(events.filter(e=>e.type==="interaction/requested")).toHaveLength(1);
+    const request = events.find(e=>e.type==="interaction/requested")!;
+    expect(events.filter(e=>e.type==="interaction/resolved").map(e=>e.payload)).toEqual([
+      { interactionId: request.payload.interactionId, outcome: "responded" },
+    ]);
   }finally{await f.runtime.dispose();}
 });
 test("advertised source replay fills remote gaps and dedupes source notifications",async()=>{
@@ -88,14 +109,155 @@ test("advertised source replay fills remote gaps and dedupes source notification
     expect(events.every((e,i)=>e.seq===events[0]!.seq+i)).toBe(true);
   }finally{await f.runtime.dispose();}
 });
-test("source without replay fails a missing sequence instead of silently continuing",async()=>{
+test("the reference peer requires an exact replay offer and reserves concurrent opens", async () => {
+  const replies = new Map<number, { result?: unknown; error?: unknown }>();
+  const peer = createReferenceHarness(frame => {
+    const message = JSON.parse(frame);
+    if (typeof message.id === "number") replies.set(message.id, message);
+  });
+  const send = (id: number, method: string, params: unknown) =>
+    peer.receive(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+  const replayName = "x-anureo/event-replay";
+  try {
+    await send(1, "initialize", {
+      protocolVersions: [1], protocolContract: AHP_PROTOCOL_CONTRACT, clientInfo: { name: "test", version: "1" },
+      clientCapabilities: { extensions: [{ name: replayName, version: "2" }] },
+    });
+    expect(replies.get(1)?.result).toMatchObject({ capabilities: { extensions: [{ name: "x-anureo/session-metadata", version: "1" }] } });
+
+    const binding = { sessionId: "same", adapterId: "ahp", runtimeConfigId: "ref" };
+    const params = { mode: "new", binding, cwd: process.cwd() };
+    await Promise.all([
+      send(2, "session/open", { ...params, requestId: "first" }),
+      send(3, "session/open", { ...params, requestId: "second" }),
+    ]);
+    expect(replies.get(2)?.result).toMatchObject({ binding });
+    expect(replies.get(3)?.error).toMatchObject({ data: { code: "SESSION_ALREADY_OPEN" } });
+    await send(4, "x-anureo/events/read", { sessionId: binding.sessionId });
+    expect(replies.get(4)?.error).toMatchObject({ data: { code: "CAPABILITY_UNSUPPORTED" } });
+  } finally { await peer.close(); }
+});
+test("source without replay fails a missing sequence while a sibling turn completes",async()=>{
   const f=await fixture({dropSeq:3,replay:false});try{
+    const sibling=await f.open("sibling");
     const reading=collect(f.session);
     const submission=f.session.submit({ input:[{type:"text",text:"gap"}] });
     const submissionSettled=submission.catch(()=>undefined);
     await expect(reading).rejects.toMatchObject({code:"SOURCE_SEQUENCE_GAP"});
     await submissionSettled;
+    const turn=await sibling.submit({input:"sibling result"});
+    expect((await turn.result()).text).toBe("sibling result");
   }finally{await f.runtime.dispose();}
+});
+
+test("replay arriving after close leaves a sibling's observation usable", async () => {
+  const replay = Promise.withResolvers<() => void>();
+  const f = await fixture({
+    dropSeq: 3,
+    intercept(frame, forward) {
+      if (JSON.parse(frame).result?.events) replay.resolve(() => forward(frame));
+      else forward(frame);
+    },
+  });
+  try {
+    const sibling = await f.open("sibling");
+    const submission = f.session.submit({ input: "gap before close" }).catch(() => undefined);
+    const releaseReplay = await replay.promise;
+    await f.session.close();
+    releaseReplay();
+    await submission;
+    const turn = await sibling.submit({ input: "sibling result" });
+    expect((await turn.result()).text).toBe("sibling result");
+  } finally { await f.runtime.dispose(); }
+});
+
+test("a malformed submission receipt leaves acceptance unknown and ends observation", async () => {
+  const f = await fixture({
+    intercept(frame, forward) {
+      const message = JSON.parse(frame);
+      if (message.method === "submission/bound") return;
+      if (message.result?.submissionId) delete message.result.disposition;
+      forward(JSON.stringify(message));
+    },
+  });
+  try {
+    const observation = collect(f.session).catch(cause => cause as unknown);
+    const receipt = f.session.request("input/submit", {
+      sessionId: f.session.id, requestId: "submit", submissionId: "submission",
+      input: [{ type: "text", text: "/wait" }], delivery: "native",
+    });
+    await expect(receipt).rejects.toMatchObject({ code: "PROTOCOL_ERROR", outcomeUnknown: true });
+    expect(await observation).toMatchObject({ code: "PROTOCOL_ERROR", outcomeUnknown: true });
+    expect(f.session.snapshot.status).toBe("closed");
+  } finally { await f.runtime.dispose(); }
+});
+
+test.each([
+  { confirmation: "notification", code: "INTERACTION_ALREADY_RESOLVED" },
+  { confirmation: "reply", code: "INTERACTION_ALREADY_RESOLVED" },
+  { confirmation: "wrong ID", code: "PROTOCOL_ERROR" },
+])("interaction confirmation rejects a conflicting $confirmation", async ({ confirmation, code }) => {
+  const f = await fixture({
+    intercept(frame, forward) {
+      const message = JSON.parse(frame);
+      if (message.method === "interaction/resolved") {
+        if (confirmation === "notification") {
+          message.params.payload.outcome = "expired";
+        } else {
+          message.method = message.params.type = "notice";
+          message.params.payload = { severity: "info", code: "AWAIT_REPLY", message: "Confirmation will follow by RPC" };
+        }
+      }
+      if (message.result?.interactionId) {
+        if (confirmation === "notification") return;
+        if (confirmation === "wrong ID") message.result.interactionId = "other";
+        else message.result.outcome = "expired";
+      }
+      forward(JSON.stringify(message));
+    },
+  });
+  try {
+    const reader = f.session.events()[Symbol.asyncIterator]();
+    try {
+      await f.session.submit({ input: "/approval" });
+      for (;;) {
+        const next = await reader.next();
+        if (next.done) throw new Error("Missing approval request");
+        if (next.value.type !== "interaction/requested") continue;
+        await expect(denyApproval(f.session, next.value.payload)).rejects.toMatchObject({ code });
+        break;
+      }
+    } finally { await reader.return?.(); }
+  } finally { await f.runtime.dispose(); }
+});
+
+test("open rejects a reply on a different stream from an early event", async () => {
+  const f = await referenceClient({
+    intercept(frame, forward) {
+      const message = JSON.parse(frame);
+      if (message.result?.streamId) message.result.streamId = "conflicting-source";
+      forward(JSON.stringify(message));
+    },
+  });
+  try {
+    await expect(f.open("session")).rejects.toMatchObject({ code: "SOURCE_STREAM_UNAVAILABLE" });
+  } finally { await f.runtime.dispose(); }
+});
+
+test.each(["current", null])("early title %j takes precedence over the open snapshot", async title => {
+  const f = await referenceClient({
+    intercept(frame, forward) {
+      const message = JSON.parse(frame);
+      if (message.method === "session/state") message.params.payload.metadata = { title };
+      if (message.result?.streamId) message.result.state.metadata = { title: "stale", other: "preserved" };
+      forward(JSON.stringify(message));
+    },
+  });
+  try {
+    const session = await f.open("session");
+    const expected = { title, other: "preserved" };
+    expect(session.snapshot.metadata).toEqual(expected);
+  } finally { await f.runtime.dispose(); }
 });
 test("WebSocket factory uses identical lifecycle and closes only its connection",async()=>{
   const harnessesByConnectionId=new Map<string,ReturnType<typeof createReferenceHarness>>();
@@ -176,16 +338,21 @@ test("wire send failures reject the caller once with an unknown outcome", async 
 
 test("stdio transport frames stdout and drains broken stderr silently", async () => {
   const transport = await createStdioTransport({
-    command: process.execPath, args: ["-e", "console.log('unused')"],
+    command: process.execPath, args: ["-e", "console.log('unused')"], maxFrameBytes: 5,
     processFactory: async () => ({
       pid: 4242, owned: true,
-      stdout: (async function* () { yield new TextEncoder().encode("frame\r\n"); })(),
+      stdout: (async function* () {
+        const encoder = new TextEncoder();
+        yield encoder.encode("frame\r\nframe\r");
+        yield encoder.encode("\n");
+      })(),
       stderr: (async function* () { throw new Error("stderr gone"); })(),
       exited: Promise.resolve({ code: 0, signal: null }),
       async write() {}, async closeInput() {}, async dispose() {},
     }),
   });
   const reader = transport.messages[Symbol.asyncIterator]();
+  expect(await reader.next()).toMatchObject({ value: "frame" });
   expect(await reader.next()).toMatchObject({ value: "frame" });
   await transport.close();
 });
@@ -203,12 +370,12 @@ function fakeWebSocket(initialReadyState = 0) {
     close() { if (object.readyState !== 3) { object.readyState = 3; object.dispatchEvent(new Event("close")); } },
   };
   const dispatch = (type: string, data?: unknown) => { object.dispatchEvent(Object.assign(new Event(type), { data })); };
-  return { object: object as unknown as WebSocket, dispatch };
+  return { object: object as unknown as WebSocket, dispatch, sent, setBufferedAmount: (bytes: number) => { object.bufferedAmount = bytes; } };
 }
 
 test("webSocket transport times out an unresponsive handshake and closes the socket", async () => {
   const socket = fakeWebSocket();
-  await expect(createWebSocketTransport("ws://127.0.0.1/x", { factory: () => socket.object, timeoutMs: 30 })).rejects.toMatchObject({ code: "RPC_CONNECTION_FAILED" });
+  await expect(createWebSocketTransport("ws://127.0.0.1/x", { factory: () => socket.object, timeoutMs: 30 })).rejects.toMatchObject({ code: "RPC_TIMEOUT" });
   expect(socket.object.readyState).toBe(3);
 });
 
@@ -217,6 +384,32 @@ test("webSocket transport reports failed handshakes", async () => {
   const pending = createWebSocketTransport("ws://127.0.0.1/x", { factory: () => socket.object, timeoutMs: 5000 });
   socket.dispatch("error");
   await expect(pending).rejects.toMatchObject({ code: "RPC_CONNECTION_FAILED" });
+  expect(socket.object.readyState).toBe(3);
+});
+
+test("invalid WebSocket limits are rejected before dialing", async () => {
+  let acquired = false;
+  const socket = fakeWebSocket(1);
+  await expect(createWebSocketTransport("ws://127.0.0.1/x", {
+    factory: () => { acquired = true; return socket.object; },
+    maxFrameBytes: 0,
+  })).rejects.toMatchObject({ code: "INVALID_PARAMS" });
+  expect(acquired).toBe(false);
+});
+
+test("WebSocket send backpressure leaves the outcome known and the wire usable", async () => {
+  const socket = fakeWebSocket(1);
+  const transport = await createWebSocketTransport("ws://127.0.0.1/x", { factory: () => socket.object, maxBufferedBytes: 128 });
+  const wire = new AhpWire(transport);
+  try {
+    socket.setBufferedAmount(129);
+    await expect(wire.request("input/submit", {})).rejects.toMatchObject({ code: "BACKPRESSURE_EXCEEDED", outcomeUnknown: false });
+    expect(socket.sent).toHaveLength(0);
+    socket.setBufferedAmount(0);
+    const pending = wire.request("input/submit", {});
+    socket.dispatch("message", JSON.stringify({ jsonrpc: "2.0", id: JSON.parse(socket.sent[0]!).id, result: null }));
+    expect(await pending).toBeNull();
+  } finally { await wire.close(); }
 });
 
 test("webSocket transport rejects non-text frames and closes", async () => {

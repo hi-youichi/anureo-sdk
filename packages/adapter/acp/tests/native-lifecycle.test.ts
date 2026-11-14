@@ -7,6 +7,8 @@ test('official ACP transport preserves explicit native turn correlation and earl
   const client = await createClient({ adapter: createAcpAdapter({ command: process.execPath, args: [executable, '--native-lifecycle'] }), identity: { adapterId: 'acp', runtimeConfigId: 'native' } });
   try {
     const session = await client.sessions.create({ cwd: process.cwd() });
+    expect(session.capabilities.review).toBe(false);
+    await expect(session.review({ target: {} })).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
     const holdSubmission = session.submit({ input: 'hold' });
     const joinSubmission = session.submit({ input: 'join' });
     const [holdTurn, joinTurn] = await Promise.all([holdSubmission, joinSubmission]);

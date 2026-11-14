@@ -33,7 +33,7 @@ export function verifyRecord<S extends z.ZodType>(schema: S, value: unknown): z.
 
 /** File names and version used by the target writer and the compatible-source reader. */
 export const checkpointFormat = {
-  version: 2,
+  version: 3,
   lock: 'writer.lock',
   manifest: 'run.json',
   journal: 'journal.json',
@@ -51,20 +51,10 @@ export const runIdSchema = z.string().min(1).refine(value => value !== '.' && va
 const uuidSchema = z.string().uuid()
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/)
 
-/** Format-v2 writer claim. Replay checks host/PID liveness. Release checks the held inode. */
+/** Writer claim. Replay checks host/PID liveness. Release checks the held inode. */
 export const lockSchema = z.strictObject({
   checkpointFormatVersion: z.literal(checkpointFormat.version), token: uuidSchema, hostname: z.string(),
   pid: z.number().int().positive(), createdAt: z.string().datetime(), recordDigest: hashSchema,
-})
-
-/** Persist only safe failure metadata; diagnostic messages and details stay out of manifests. */
-const failureSchema = z.strictObject({
-  code: z.string(),
-  retryable: z.boolean(),
-  /** The failure left execution's outcome uncertain. */
-  outcomeUnknown: z.boolean(),
-  /** Resource release failed even if execution itself had a known outcome. */
-  cleanupFailed: z.boolean(),
 })
 
 const jsonSchema: z.ZodType<JsonValue> = z.lazy(() => z.union([
@@ -74,24 +64,40 @@ const identitySchema = z.strictObject({
   runId: runIdSchema, directory: z.string(), name: z.string().min(1), revision: z.string().min(1), input: jsonSchema,
 })
 
-/** Format-v2 run metadata. Replay rejects earlier formats, checks recordDigest with verifyRecord,
- * and checks resultDigest against result.json for completed and incomplete runs. */
+/** Versioned chained SHA-256 identity for an agent call, independent of its execution UUID. */
+export const journalKeyPrefix = 'v2:'
+const journalKeySchema = z.string().refine(key =>
+  key.startsWith(journalKeyPrefix) && hashSchema.safeParse(key.slice(journalKeyPrefix.length)).success)
+const failedEventSchema = z.strictObject({ type: z.literal('failed'), key: journalKeySchema, agentId: uuidSchema,
+  code: z.string().min(1), outcomeUnknown: z.boolean() })
+
+/** Strict persisted events. Replay validates the entire array before handing it to AgentJournal.
+ * The chained key determines reuse. The execution UUID is recorded as agentId. */
+export const journalEventSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('started'), key: journalKeySchema, agentId: uuidSchema,
+    retainReplayKeys: journalKeySchema.array().optional() }),
+  z.strictObject({ type: z.literal('result'), key: journalKeySchema, agentId: uuidSchema, result: jsonSchema }),
+  failedEventSchema,
+])
+
+const unknownFailureSchema = failedEventSchema.extend({ outcomeUnknown: z.literal(true) })
+export type UnknownFailure = z.output<typeof unknownFailureSchema>
+
+/** Persist only safe failure metadata; diagnostic messages and details stay out of manifests. */
+const failureSchema = z.strictObject({
+  code: z.string(),
+  retryable: z.boolean(),
+  outcomeUnknown: z.boolean(),
+  cleanupFailed: z.boolean(),
+  unpublishedUnknownFailures: unknownFailureSchema.array().optional(),
+})
+
+/** Replay verifies the manifest digest and the journal of every terminal run. */
 export const manifestSchema = z.strictObject({
   checkpointFormatVersion: z.literal(checkpointFormat.version),
   identity: identitySchema, createdAt: z.string().datetime(),
   resumedFrom: z.strictObject({ directory: z.string(), runId: runIdSchema }).nullable(),
   status: z.enum(['running', 'completed', 'incomplete', 'failed']),
-  resultDigest: hashSchema.nullable(), failure: failureSchema.nullable(), recordDigest: hashSchema,
+  journalDigest: hashSchema.nullable(), resultDigest: hashSchema.nullable(),
+  failure: failureSchema.nullable(), recordDigest: hashSchema,
 })
-
-/** Versioned chained SHA-256 identity for an agent call, independent of its execution UUID. */
-const journalKeySchema = z.string().regex(/^v1:[a-f0-9]{64}$/)
-
-/** Strict persisted events. Replay validates the entire array before handing it to AgentJournal.
- * The chained key determines reuse. The execution UUID is recorded as agentId. */
-export const journalEventSchema = z.discriminatedUnion('type', [
-  z.strictObject({ type: z.literal('started'), key: journalKeySchema, agentId: uuidSchema }),
-  z.strictObject({ type: z.literal('result'), key: journalKeySchema, agentId: uuidSchema, result: jsonSchema }),
-  z.strictObject({ type: z.literal('failed'), key: journalKeySchema, agentId: uuidSchema,
-    code: z.string().min(1), outcomeUnknown: z.boolean() }),
-])

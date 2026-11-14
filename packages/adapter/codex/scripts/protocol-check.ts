@@ -3,10 +3,9 @@ import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+import { CODEX_SCHEMA_PINS, resolveCodexProfile } from '../src/profile'
 
-const legacyPin = { version: '0.148.0', revertDefinition: 'ThreadRollbackParams' } as const
-const modernPin = { version: '0.164.0', revertDefinition: 'ThreadRevertParams' } as const
-type SchemaPin = typeof legacyPin | typeof modernPin
+type SchemaPin = typeof CODEX_SCHEMA_PINS[number]
 type SchemaDefinitions = Record<string, unknown>
 
 /** Minimum native request/item vocabulary needed by both supported profiles. */
@@ -55,12 +54,23 @@ function parseDefinitions(bytes: Buffer): SchemaDefinitions {
  * For checkPinnedSchema, require the shared vocabulary before checking the pin's exclusive revert
  * contract. Throw on the first violation.
  */
-function validateDefinitions({ version, revertDefinition }: SchemaPin, definitions: SchemaDefinitions): void {
-  for (const definitionName of requiredDefinitionNames) {
+function validateDefinitions({ version, revertMethod }: SchemaPin, definitions: SchemaDefinitions): void {
+  const { profile, verified } = resolveCodexProfile(version)
+  if (!profile || !verified || profile.revert !== revertMethod) {
+    throw new Error(`${version}: expected verified ${revertMethod} mapping, selected ${profile?.revert ?? 'no profile'} (verified: ${verified})`)
+  }
+  const required = [
+    ...requiredDefinitionNames,
+    profile.turns === 'thread/turns/list' ? 'ThreadTurnsListParams' : 'ThreadReadParams',
+  ]
+  if (profile.history === 'thread/items/list') required.push('ThreadItemsListParams')
+  if (profile.settings === 'thread/settings/update') required.push('ThreadSettingsUpdateParams')
+  for (const definitionName of required) {
     if (!definitions[definitionName]) {
       throw new Error(`${version}: missing ${definitionName}`)
     }
   }
+  const revertDefinition = profile.revert === 'thread/revert' ? 'ThreadRevertParams' : 'ThreadRollbackParams'
   const otherDefinition = revertDefinition === 'ThreadRevertParams' ? 'ThreadRollbackParams' : 'ThreadRevertParams'
   if (!definitions[revertDefinition] || definitions[otherDefinition]) {
     throw new Error(`${version}: unsafe revert/rollback mapping`)
@@ -69,6 +79,7 @@ function validateDefinitions({ version, revertDefinition }: SchemaPin, definitio
 
 /** Reread both schemas in version order after verification and print the watched method changes. Read and parse failures reject the CLI before the diff is printed. */
 async function reportSchemaChanges(): Promise<void> {
+  const [legacyPin, modernPin] = CODEX_SCHEMA_PINS
   const legacy = parseDefinitions(await readSchemaBytes(legacyPin))
   const modern = parseDefinitions(await readSchemaBytes(modernPin))
   const watched = [
@@ -84,5 +95,5 @@ async function reportSchemaChanges(): Promise<void> {
   }))
 }
 
-for (const pin of [legacyPin, modernPin]) await checkPinnedSchema(pin)
+for (const pin of CODEX_SCHEMA_PINS) await checkPinnedSchema(pin)
 await reportSchemaChanges()

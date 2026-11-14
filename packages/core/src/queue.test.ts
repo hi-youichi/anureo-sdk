@@ -105,6 +105,16 @@ test("synchronous abort during dispatch wins over the operation's rejection", as
   await expect(pending).rejects.toMatchObject({ code: "REQUEST_ABORTED", outcomeUnknown: true });
 });
 
+test("stopping abort event propagation on a shared signal does not suppress request cancellation", async () => {
+  const controller = new AbortController();
+  controller.signal.addEventListener("abort", event => event.stopImmediatePropagation());
+  const pending = waitForRequest(async () => {
+    controller.abort();
+    return "receipt";
+  }, { signal: controller.signal });
+  await expect(pending).rejects.toMatchObject({ code: "REQUEST_ABORTED", outcomeUnknown: true });
+});
+
 /** Let the request deadline precede backend rejection; await both intervals to detect unobserved rejection and prove the operation is never resubmitted. */
 test("timeout observes a late backend rejection without resubmitting", async () => {
   let calls = 0;

@@ -33,7 +33,7 @@ export const workSchema = z.strictObject({
 })
 
 /** Read the planner's summary and validated assignments from RefactorReport.plan.
- * Modules appear in the order the planner supplied and the host uses that order for integration.
+ * Modules and report entries retain planner order. Verified edits are integrated in readiness order.
  * Constructing this type performs no validation. */
 export type ModulePlan = z.infer<typeof modulePlanSchema>
 

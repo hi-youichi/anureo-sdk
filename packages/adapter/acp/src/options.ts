@@ -81,8 +81,11 @@ export interface AcpAdapterOptions {
   /** Supply an owned ACP channel for initialization. Takes precedence over spawning command.
    * A rejected factory rejects initialization. The adapter disposes a successfully returned channel. */
   connect?: () => Promise<AcpChannel>;
-  /** Deadline in milliseconds for AcpAdapter.call. Defaults to 30,000. The normal session prompt
-   * path waits separately. Expiry ends the wait while native work may continue. */
+  /** Deadline in milliseconds for adapter requests, including the ACP handshake and session open.
+   * Defaults to 30,000. Expiry ends the wait while native work may continue. SDK client
+   * initialization has its own deadline via runtime.requestTimeoutMs or the createClient wait
+   * options. Session prompts bypass the adapter deadline. Session.submit waits for turn binding,
+   * and Turn.result uses a separate terminal wait. */
   requestTimeoutMs?: number;
   /** Incoming/outgoing stdio line limit in bytes, excluding newline; defaults to 8 MiB. Not applied to connect streams. */
   maxFrameBytes?: number;
@@ -101,7 +104,7 @@ export interface AcpAdapterOptions {
    * Receive nonempty resume/load snapshots after identity/configuration capture and before initial overrides.
    * Historical updates have no turn boundaries; title updates instead enter session metadata.
    * Return synchronously. AcpAdapter skips awaiting the callback, and a synchronous throw rejects
-   * session open and removes its local indexes.
+   * session open and triggers release of the acquired session.
    */
   onLoadSnapshot?: (binding: SessionBinding, updates: readonly JsonObject[]) => void;
 }

@@ -31,7 +31,9 @@ export class CodexNativeAdapter implements HarnessAdapter {
     assertRequest("initialize", params)
     negotiateVersion(params.protocolVersions)
     return this.initialized ??= (async () => {
-      this.version = await probeVersion(this.options)
+      const { version, reportedVersion } = await probeVersion(this.options)
+      this.version = version
+      this.reportedVersion = reportedVersion
       this.clientInfo = params.clientInfo
       if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
       return {
@@ -113,39 +115,49 @@ export class CodexNativeAdapter implements HarnessAdapter {
 
     const { session, client } = this.attachSessionClient({
       prepared, process, sink, capabilities,
-      native: { profile: native.profile ?? CODEX_PROFILES[0], verified: native.verified },
+      native: { profile: native.profile ?? CODEX_PROFILES[0], verified: native.verified && this.reportedVersion === this.version },
     })
+    this.openingClients.add(client)
     try {
       await this.initializeClient(client, this.clientInfo)
+      if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
       await session.open()
-      // Registration follows open so aggregate disposal only sees fully opened sessions.
+      if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
       this.sessions.add(session)
       return session
     } catch (cause) {
       await client.dispose()
       throw cause
+    } finally {
+      this.openingClients.delete(client)
     }
   }
 
   /**
-   * Close initialization and session-open admission and concurrently dispose the registered sessions.
-   * After they settle, clear registration and reject the first cleanup failure in registration order.
-   * Independent probes and opens already past the launch check can finish separately. Disposal
-   * releases local resources without establishing that native execution stopped.
+   * Close admission and dispose registered sessions and clients attached during setup. Concurrent
+   * calls share cleanup and its first failure. Independent probes and pending launches finish
+   * separately. Disposal releases local resources without confirming native execution stopped.
    */
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
     this.disposed = true
-    const results = await Promise.allSettled([...this.sessions].map(session => session.dispose()))
-    this.sessions.clear()
-    const failure = results.find((value): value is PromiseRejectedResult => value.status === 'rejected')
-    if (failure) throw failure.reason
+    if (this.disposalInFlight) return this.disposalInFlight
+    const resources = [...this.sessions, ...this.openingClients]
+    return this.disposalInFlight = Promise.resolve().then(async () => {
+      const results = await Promise.allSettled(resources.map(resource => resource.dispose()))
+      this.sessions.clear()
+      const failure = results.find((value): value is PromiseRejectedResult => value.status === 'rejected')
+      if (failure) throw failure.reason
+    })
   }
 
   private disposed = false
+  private disposalInFlight?: Promise<void>
   private version = ''
+  private reportedVersion = ''
   private clientInfo?: InitializeParams['clientInfo']
   private initialized?: Promise<InitializeResult>
   private readonly sessions = new Set<CodexBackendSession>()
+  private readonly openingClients = new Set<CodexJsonlClient>()
 
   /**
    * Check mode capabilities before openSession launches a process. Forks use an explicit native
@@ -257,9 +269,9 @@ function hasCodexNativeRef(binding: SessionBinding): binding is SessionBinding &
   return binding.nativeRef?.provider === 'codex'
 }
 
-/** Compare native terminal status using string coercion. Reconciliation returns the status from the native snapshot. */
-function isTerminalStatus(status: unknown): boolean {
-  return ['completed', 'interrupted', 'failed'].includes(String(status))
+/** Require an exact native terminal status. */
+function isTerminalStatus(status: unknown): status is 'completed' | 'interrupted' | 'failed' {
+  return status === 'completed' || status === 'interrupted' || status === 'failed'
 }
 
 /** Evaluate inspectExecution's thread/read reply. Require matching thread and turn identities, explicit idle state and terminal status for every turn. */
@@ -269,5 +281,5 @@ function inspectThread(thread: NativeRecord, { threadId, nativeTurnId }: { threa
   if (turns.some(turn => !isTerminalStatus(turn.status))) return { stopped: false }
   const target = turns.find(turn => turn.id === nativeTurnId)
   if (!target || !isTerminalStatus(target.status)) return { stopped: false }
-  return { stopped: true, status: target.status as 'completed'|'interrupted'|'failed', turnId: nativeTurnId }
+  return { stopped: true, status: target.status, turnId: nativeTurnId }
 }

@@ -1,7 +1,7 @@
 {
   "name": "@anureo/adapter-pi",
   "description": "Anureo SDK adapter for the Pi coding agent, embedded through its TypeScript SDK",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "license": "Apache-2.0",
   "keywords": ["anureo", "ahp", "harness", "agent", "pi"],
   "homepage": "https://github.com/hi-youichi/anureo-sdk#readme",
@@ -39,5 +39,5 @@
     "@anureo/conformance": "workspace:*",
     "@earendil-works/pi-coding-agent": "1.5.2"
   },
-  "engines": { "node": ">=22" }
+  "engines": { "node": ">=22", "bun": ">=1.4.2" }
 }

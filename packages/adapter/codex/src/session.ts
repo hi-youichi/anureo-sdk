@@ -75,7 +75,13 @@ export class CodexBackendSession implements BackendSession {
         result = await this.setConfig((p as AhpRequestMap['session/config/set']).patch)
         break
       case 'session/revert':
-        result = await this.revert(p as AhpRequestMap['session/revert'])
+        if (this.reverting) throw new HarnessSdkError('SESSION_BUSY')
+        this.reverting = true
+        try {
+          result = await this.revert(p as AhpRequestMap['session/revert'])
+        } finally {
+          this.reverting = false
+        }
         break
       case 'history/read':
         result = await this.readHistory(p as AhpRequestMap['history/read'])
@@ -143,9 +149,9 @@ export class CodexBackendSession implements BackendSession {
       await this.completeTurn(record(params.turn))
       return
     }
-    const deltaKind = DELTA_KIND_BY_METHOD[method]
-    if (deltaKind) {
-      await this.projectDelta({ method, params, turnId, kind: deltaKind })
+    const delta = DELTA_BY_METHOD.get(method)
+    if (delta) {
+      await this.projectDelta({ params, turnId, delta })
       return
     }
     if (method === 'thread/tokenUsage/updated') {
@@ -170,9 +176,8 @@ export class CodexBackendSession implements BackendSession {
    * Transport entry for concurrent native requests: scope and translate each prompt with its answer
    * encoder, then await SDK settlement. CodexNativeAdapter.openSession registers this handler with
    * CodexJsonlClient, which keeps draining stdout. Invalid or unsupported requests receive wire
-   * errors. Projection and error-write failures reject to the transport fallback. The SDK invokes
-   * the responder for answer delivery and when cancellation requires a native reply. This handler
-   * absorbs sink rejection.
+   * errors. Projection, sink and error-write failures reject to the transport fallback. The SDK
+   * invokes the responder for answers and cancellations, which claim the reply before any fallback.
    */
   async serverRequest(request: NativeRequest, reply: (result: unknown) => Promise<void>, reject: (code: number, message: string) => Promise<void>): Promise<void> {
     const { params } = request
@@ -190,8 +195,7 @@ export class CodexBackendSession implements BackendSession {
       return
     }
     const { interaction, encode } = projected
-    try { await this.sink.requestInteraction(interaction, answer => reply(encode(answer))) }
-    catch { /* The SDK owns interaction settlement, including any cancellation reply. */ }
+    await this.sink.requestInteraction(interaction, answer => reply(encode(answer)))
   }
 
   /** Forward CodexJsonlClient's transport failure to the sink while observation is open. Await the sink's failure handling and propagate its rejection. */
@@ -223,6 +227,8 @@ export class CodexBackendSession implements BackendSession {
   private executionOutput = new Map<string, string>()
   private itemStartedAt = new Map<string, string>()
   private history = new Map<string, HistoryItem[]>()
+  private historyGeneration = 0
+  private reverting = false
   private closing = false
   private unverifiedNoticed = false
   private capabilityRevision = 1
@@ -395,8 +401,8 @@ export class CodexBackendSession implements BackendSession {
   /**
    * execute awaits input or review acceptance here. Check pending capacity (128 by default)
    * and conflicts before the one-time version warning. Track the submission before dispatch
-   * so early notifications can bind it. A definite dispatch or receipt failure releases its
-   * pending ID. An unknown outcome keeps any pending slot available to later execution evidence.
+   * so early notifications can bind it. A definite dispatch failure releases its pending ID.
+   * An unknown outcome keeps any pending slot available to later execution evidence.
    */
   private async submitInput(submission: SubmissionRequest): Promise<import('@anureo/protocol').SubmissionAcceptance> {
     const { params } = submission
@@ -414,11 +420,13 @@ export class CodexBackendSession implements BackendSession {
         ? await this.startInput(submission.params)
         : record(await this.optional('review/start', { threadId: this.threadId, target: submission.params.target, delivery: 'inline' }, () => { this.capabilities.review = false }))
       const id = string(record(value.turn).id)
-      if (!id) throw new HarnessSdkError('PROTOCOL_ERROR')
+      if (!id) throw new HarnessSdkError('PROTOCOL_ERROR', 'Native submission receipt lacks a turn ID', false, true)
       // Native may return the submitted client ID. A receipt can bind only to an observed execution.
       if (this.started.has(id)) {
-        await this.sink.bindSubmission(params.submissionId, id)
-        this.awaitingTurnSubmissionIds.delete(params.submissionId)
+        if (this.awaitingTurnSubmissionIds.has(params.submissionId)) {
+          await this.sink.bindSubmission(params.submissionId, id)
+          this.awaitingTurnSubmissionIds.delete(params.submissionId)
+        }
         if (previousTurns.has(id)) return { submissionId: params.submissionId, accepted: true, disposition: 'joined', turnId: id }
       } else if (this.awaitingTurnSubmissionIds.has(params.submissionId)) {
         this.receiptTurnIdBySubmissionId.set(params.submissionId, id)
@@ -515,7 +523,12 @@ export class CodexBackendSession implements BackendSession {
     if (this.native.profile.revert === 'thread/revert' && params.boundary.relation === 'before') {
       await this.optional('thread/revert', { threadId: this.threadId, beforeTurnId: native }, disableRevert)
     } else {
-      const turns = await this.turns()
+      const turns = await this.turns().catch(cause => {
+        const error = sdkError(cause)
+        throw error.outcomeUnknown
+          ? new HarnessSdkError(error.code, error.message, error.retryable, false, error.details)
+          : cause
+      })
       const suffix = revertSuffix({ turns, nativeTurnId: native, relation: params.boundary.relation })
       if (suffix) {
         const request = this.native.profile.revert === 'thread/revert'
@@ -524,6 +537,7 @@ export class CodexBackendSession implements BackendSession {
         await this.optional(request.method, request.params, disableRevert)
       }
     }
+    this.historyGeneration++
     this.history.clear()
     return { appliedScope: 'conversation', boundary: params.boundary }
   }
@@ -536,6 +550,7 @@ export class CodexBackendSession implements BackendSession {
       return turns.map(record)
     }
     const turns: NativeRecord[] = []
+    const seen = new Set<string>()
     let cursor: string | undefined
     do {
       const page = record(await this.client.request('thread/turns/list', { threadId: this.threadId, sortDirection: 'asc', limit: 200, ...(cursor ? { cursor } : {}) }))
@@ -543,6 +558,10 @@ export class CodexBackendSession implements BackendSession {
       turns.push(...page.data.map(record))
       if (turns.length > (this.options.maxHistoryItems ?? 10000)) throw new HarnessSdkError('HISTORY_LIMIT_EXCEEDED')
       cursor = string(page.nextCursor)
+      if (cursor) {
+        if (seen.has(cursor)) throw new HarnessSdkError('PROTOCOL_ERROR', 'Repeated native turn cursor')
+        seen.add(cursor)
+      }
     } while (cursor)
     return turns
   }
@@ -550,11 +569,13 @@ export class CodexBackendSession implements BackendSession {
   private async readHistory(params: AhpRequestMap['history/read']): Promise<HistoryPage> {
     let token = params.snapshotToken
     let offset = 0
-    if (params.cursor) {
+    if (params.cursor !== undefined) {
       try {
-        const parsed = JSON.parse(Buffer.from(params.cursor, 'base64url').toString()) as { token: string; offset: number }
-        if (token && parsed.token !== token) throw new Error()
-        token = parsed.token
+        const parsed = record(JSON.parse(Buffer.from(params.cursor, 'base64url').toString()))
+        const cursorToken = string(parsed.token)
+        if (!cursorToken || (token && cursorToken !== token)) throw new Error()
+        if (typeof parsed.offset !== 'number' || !Number.isSafeInteger(parsed.offset) || parsed.offset < 0) throw new Error()
+        token = cursorToken
         offset = parsed.offset
       } catch {
         throw new HarnessSdkError('CURSOR_INVALID')
@@ -562,7 +583,7 @@ export class CodexBackendSession implements BackendSession {
     }
     const snapshot = await this.historySnapshot(token)
     const { items } = snapshot
-    if (!Number.isSafeInteger(offset) || offset < 0 || offset > items.length) throw new HarnessSdkError('CURSOR_INVALID')
+    if (offset > items.length) throw new HarnessSdkError('CURSOR_INVALID')
     const limit = params.limit ?? 200
     const end = Math.min(offset + limit, items.length)
     return {
@@ -574,8 +595,8 @@ export class CodexBackendSession implements BackendSession {
   }
   /**
    * For readHistory, resolve an existing token or load and retain a new snapshot with a required token.
-   * Reject expired tokens before fetching; native/projection failures leave the cache untouched.
-   * Evict the oldest snapshot above eight entries before readHistory validates its page offset.
+   * Reject expired tokens before fetching. Native/projection failures and intervening reverts
+   * prevent snapshot publication. Evict the oldest snapshot above eight entries.
    */
   private async historySnapshot(token: string | undefined): Promise<{ token: string; items: HistoryItem[] }> {
     if (token) {
@@ -583,9 +604,11 @@ export class CodexBackendSession implements BackendSession {
       if (!items) throw new HarnessSdkError('CURSOR_EXPIRED')
       return { token, items }
     }
+    const generation = this.historyGeneration
     const items = this.native.profile.history === 'thread/items/list'
       ? await this.pagedHistoryItems()
       : await this.turnHistoryItems()
+    if (generation !== this.historyGeneration) throw new HarnessSdkError('CURSOR_EXPIRED')
     const snapshotToken = randomUUID()
     this.history.set(snapshotToken, items)
     // Size > 8 proves the insertion-ordered map has an oldest key.
@@ -595,6 +618,7 @@ export class CodexBackendSession implements BackendSession {
   /** historySnapshot awaits ascending item pages before retaining a snapshot. Enforce maxHistoryItems after each page (10,000 by default). Malformed entries, overflow, and native or sink errors reject. Method absence revokes history support. */
   private async pagedHistoryItems(): Promise<HistoryItem[]> {
     const items: HistoryItem[] = []
+    const seen = new Set<string>()
     let cursor: string | undefined
     do {
       const page = record(await this.optional('thread/items/list', { threadId: this.threadId, sortDirection: 'asc', limit: 200, ...(cursor ? { cursor } : {}) }, () => { this.capabilities.session!.history = false }))
@@ -607,6 +631,10 @@ export class CodexBackendSession implements BackendSession {
       }
       if (items.length > (this.options.maxHistoryItems ?? 10000)) throw new HarnessSdkError('HISTORY_LIMIT_EXCEEDED')
       cursor = string(page.nextCursor)
+      if (cursor) {
+        if (seen.has(cursor)) throw new HarnessSdkError('PROTOCOL_ERROR', 'Repeated native history cursor')
+        seen.add(cursor)
+      }
     } while (cursor)
     return items
   }
@@ -694,23 +722,17 @@ export class CodexBackendSession implements BackendSession {
    * emit the delta. Output fragments are bounded diagnostics, never file patch material. Reject
    * missing scope or sink failures at the publication boundary; notification owns wire ordering.
    */
-  private async projectDelta({ method, params, turnId, kind }: {
-    method: string
+  private async projectDelta({ params, turnId, delta: { kind, start } }: {
     params: NativeRecord
     turnId: string | undefined
-    kind: NativeDeltaKind
+    delta: NativeDelta
   }): Promise<void> {
     const itemId = string(params.itemId)
     if (!itemId || !turnId) throw new HarnessSdkError('PROTOCOL_ERROR')
     const key = `${turnId}\0${itemId}`
     if (!this.items.has(key)) {
       this.items.add(key)
-      const item: Item = method === 'item/fileChange/outputDelta'
-        ? { id: itemId, type: 'toolCall', kind: 'fileChange', title: 'File changes', status: 'running' }
-        : method === 'item/commandExecution/outputDelta'
-          ? { id: itemId, type: 'toolCall', kind: 'command', title: 'Command', status: 'running' }
-          : { id: itemId, type: 'agentMessage', phase: 'commentary', text: '', status: 'running' }
-      await this.sink.emit({ type: 'item/started', payload: { item } }, { turnId, itemId })
+      await this.sink.emit({ type: 'item/started', payload: { item: start(itemId) } }, { turnId, itemId })
     }
     const deltaText = string(params.delta) ?? ''
     if (kind === 'output') {
@@ -779,17 +801,34 @@ type InteractionProjection =
   | { code: number; message: string }
 
 type ItemPhase = 'started' | 'completed'
-type NativeDeltaKind = 'text' | 'reasoningSummary' | 'output' | 'patch'
-
-/** Route native text and diagnostic delta methods to the corresponding SDK item delta. */
-const DELTA_KIND_BY_METHOD: Partial<Record<string, NativeDeltaKind>> = {
-  'item/agentMessage/delta': 'text',
-  'item/reasoning/summaryTextDelta': 'reasoningSummary',
-  'item/reasoning/textDelta': 'reasoningSummary',
-  'item/commandExecution/outputDelta': 'output',
-  'item/fileChange/outputDelta': 'output',
-  'item/plan/delta': 'text',
+type NativeDelta = {
+  kind: 'text' | 'reasoningSummary' | 'output'
+  start: (id: string) => Item
 }
+
+const messageDelta: NativeDelta = {
+  kind: 'text',
+  start: id => ({ id, type: 'agentMessage', phase: 'commentary', text: '', status: 'running' }),
+}
+const reasoningDelta: NativeDelta = {
+  kind: 'reasoningSummary',
+  start: id => ({ id, type: 'reasoning', summary: '', status: 'running' }),
+}
+/** Pair each native delta with the item to publish when the delta arrives first. */
+const DELTA_BY_METHOD = new Map<string, NativeDelta>([
+  ['item/agentMessage/delta', messageDelta],
+  ['item/plan/delta', messageDelta],
+  ['item/reasoning/summaryTextDelta', reasoningDelta],
+  ['item/reasoning/textDelta', reasoningDelta],
+  ['item/commandExecution/outputDelta', {
+    kind: 'output',
+    start: id => ({ id, type: 'toolCall', kind: 'command', title: 'Command', status: 'running' }),
+  }],
+  ['item/fileChange/outputDelta', {
+    kind: 'output',
+    start: id => ({ id, type: 'toolCall', kind: 'fileChange', title: 'File changes', status: 'running' }),
+  }],
+])
 
 /**
  * Find the suffix revert removes from the ascending native turn list. A through boundary

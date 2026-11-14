@@ -23,6 +23,13 @@ for await (const line of input) {
   if (frame.id === undefined) continue;
   let result = {};
   if (frame.method === 'initialize') result = { protocolVersion: 1, ...(process.argv.includes('--old-peer') ? {} : { protocolContract: 'native-lifecycle' }), runtime: { name: 'native-peer', version: '1', adapter: 'fixture' }, capabilities };
+  if (frame.method === 'session/open' && process.argv.includes('--startup-blocked')) {
+    send({ id: frame.id, error: { code: -32070, message: 'private peer error', data: {
+      code: 'AGENT_STARTUP_BLOCKED', retryable: false, outcomeUnknown: false,
+      details: { workflowDisposition: 'startup_blocked', diagnostic: 'private peer detail' },
+    } } });
+    continue;
+  }
   if (frame.method === 'session/open') { binding = p.binding; result = { binding, streamId: 'native-source', capabilities, state: { binding, status: 'ready', activeTurnIds: [], config: {}, capabilities, capabilityRevision: 1 } }; }
   if (frame.method === 'input/submit') {
     const joined = hasStartedTurn;

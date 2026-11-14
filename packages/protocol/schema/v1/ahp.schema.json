@@ -585,35 +585,56 @@
       "additionalProperties": true
     },
     "ImageBlock": {
-      "type": "object",
-      "properties": {
-        "type": {
-          "const": "image"
-        },
-        "url": {
-          "type": "string"
-        },
-        "data": {
-          "type": "string"
-        },
-        "mimeType": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "type"
-      ],
-      "additionalProperties": true,
-      "anyOf": [
+      "allOf": [
         {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "image"
+            },
+            "url": {
+              "type": "string"
+            },
+            "data": {
+              "type": "string"
+            },
+            "mimeType": {
+              "type": "string"
+            }
+          },
           "required": [
-            "url"
-          ]
+            "type"
+          ],
+          "additionalProperties": true
         },
         {
-          "required": [
-            "data",
-            "mimeType"
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "url"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "data": {
+                  "type": "string"
+                },
+                "mimeType": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "data",
+                "mimeType"
+              ]
+            }
           ]
         }
       ]
@@ -796,105 +817,123 @@
       ],
       "additionalProperties": true
     },
-    "SessionOpenParams": {
+    "SessionForkDetails": {
       "type": "object",
       "properties": {
-        "requestId": {
+        "sourceSessionId": {
           "type": "string",
           "minLength": 1
         },
-        "mode": {
-          "enum": [
-            "new",
-            "resume",
-            "fork"
-          ]
+        "nativeRef": {
+          "$ref": "#/$defs/NativeRef"
         },
-        "binding": {
-          "$ref": "#/$defs/SessionBinding"
-        },
-        "cwd": {
-          "type": "string",
-          "minLength": 1
-        },
-        "model": {
-          "type": "string"
-        },
-        "instructions": {
-          "type": "string"
-        },
-        "mcpServers": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/McpServer"
-          }
-        },
-        "permissionMode": {
-          "type": "string"
-        },
-        "config": {
-          "$ref": "#/$defs/JsonObject"
-        },
-        "fork": {
-          "type": "object",
-          "properties": {
-            "sourceSessionId": {
-              "type": "string",
-              "minLength": 1
-            },
-            "nativeRef": {
-              "$ref": "#/$defs/NativeRef"
-            },
-            "boundary": {
-              "$ref": "#/$defs/Boundary"
-            }
-          },
-          "required": [
-            "sourceSessionId",
-            "boundary"
-          ],
-          "additionalProperties": true
+        "boundary": {
+          "$ref": "#/$defs/Boundary"
         }
       },
       "required": [
-        "requestId",
-        "mode",
-        "binding",
-        "cwd"
+        "sourceSessionId",
+        "boundary"
       ],
-      "additionalProperties": true,
+      "additionalProperties": true
+    },
+    "SessionOpenParams": {
       "allOf": [
         {
-          "if": {
-            "properties": {
-              "mode": {
-                "const": "resume"
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "binding": {
+              "$ref": "#/$defs/SessionBinding"
+            },
+            "cwd": {
+              "type": "string",
+              "minLength": 1
+            },
+            "model": {
+              "type": "string"
+            },
+            "instructions": {
+              "type": "string"
+            },
+            "mcpServers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/McpServer"
               }
+            },
+            "permissionMode": {
+              "type": "string"
+            },
+            "config": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "fork": {
+              "$ref": "#/$defs/SessionForkDetails"
             }
           },
-          "then": {
-            "properties": {
-              "binding": {
-                "required": [
-                  "nativeRef"
-                ]
-              }
-            }
-          }
+          "required": [
+            "requestId",
+            "binding",
+            "cwd"
+          ],
+          "additionalProperties": true
         },
         {
-          "if": {
-            "properties": {
-              "mode": {
-                "const": "fork"
-              }
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "const": "new"
+                }
+              },
+              "required": [
+                "mode"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "const": "resume"
+                },
+                "binding": {
+                  "type": "object",
+                  "properties": {
+                    "nativeRef": {
+                      "$ref": "#/$defs/NativeRef"
+                    }
+                  },
+                  "required": [
+                    "nativeRef"
+                  ]
+                }
+              },
+              "required": [
+                "mode",
+                "binding"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "const": "fork"
+                },
+                "fork": {
+                  "$ref": "#/$defs/SessionForkDetails"
+                }
+              },
+              "required": [
+                "mode",
+                "fork"
+              ]
             }
-          },
-          "then": {
-            "required": [
-              "fork"
-            ]
-          }
+          ]
         }
       ]
     },
@@ -1396,6 +1435,15 @@
       ],
       "additionalProperties": false
     },
+    "ItemStatus": {
+      "enum": [
+        "running",
+        "completed",
+        "failed",
+        "declined",
+        "interrupted"
+      ]
+    },
     "UserMessageItem": {
       "type": "object",
       "properties": {
@@ -1404,13 +1452,7 @@
           "minLength": 1
         },
         "status": {
-          "enum": [
-            "running",
-            "completed",
-            "failed",
-            "declined",
-            "interrupted"
-          ]
+          "$ref": "#/$defs/ItemStatus"
         },
         "startedAt": {
           "type": "string"
@@ -1450,13 +1492,7 @@
           "minLength": 1
         },
         "status": {
-          "enum": [
-            "running",
-            "completed",
-            "failed",
-            "declined",
-            "interrupted"
-          ]
+          "$ref": "#/$defs/ItemStatus"
         },
         "startedAt": {
           "type": "string"
@@ -1499,13 +1535,7 @@
           "minLength": 1
         },
         "status": {
-          "enum": [
-            "running",
-            "completed",
-            "failed",
-            "declined",
-            "interrupted"
-          ]
+          "$ref": "#/$defs/ItemStatus"
         },
         "startedAt": {
           "type": "string"
@@ -1544,13 +1574,7 @@
           "minLength": 1
         },
         "status": {
-          "enum": [
-            "running",
-            "completed",
-            "failed",
-            "declined",
-            "interrupted"
-          ]
+          "$ref": "#/$defs/ItemStatus"
         },
         "startedAt": {
           "type": "string"
@@ -1612,13 +1636,7 @@
           "minLength": 1
         },
         "status": {
-          "enum": [
-            "running",
-            "completed",
-            "failed",
-            "declined",
-            "interrupted"
-          ]
+          "$ref": "#/$defs/ItemStatus"
         },
         "startedAt": {
           "type": "string"
@@ -1726,13 +1744,7 @@
           "minLength": 1
         },
         "status": {
-          "enum": [
-            "running",
-            "completed",
-            "failed",
-            "declined",
-            "interrupted"
-          ]
+          "$ref": "#/$defs/ItemStatus"
         },
         "startedAt": {
           "type": "string"
@@ -1789,13 +1801,7 @@
           "minLength": 1
         },
         "status": {
-          "enum": [
-            "running",
-            "completed",
-            "failed",
-            "declined",
-            "interrupted"
-          ]
+          "$ref": "#/$defs/ItemStatus"
         },
         "startedAt": {
           "type": "string"
@@ -1838,13 +1844,7 @@
           "minLength": 1
         },
         "status": {
-          "enum": [
-            "running",
-            "completed",
-            "failed",
-            "declined",
-            "interrupted"
-          ]
+          "$ref": "#/$defs/ItemStatus"
         },
         "startedAt": {
           "type": "string"
@@ -1883,13 +1883,7 @@
           "minLength": 1
         },
         "status": {
-          "enum": [
-            "running",
-            "completed",
-            "failed",
-            "declined",
-            "interrupted"
-          ]
+          "$ref": "#/$defs/ItemStatus"
         },
         "startedAt": {
           "type": "string"
@@ -1932,13 +1926,7 @@
           "minLength": 1
         },
         "status": {
-          "enum": [
-            "running",
-            "completed",
-            "failed",
-            "declined",
-            "interrupted"
-          ]
+          "$ref": "#/$defs/ItemStatus"
         },
         "startedAt": {
           "type": "string"
@@ -2770,7 +2758,7 @@
       ],
       "additionalProperties": true
     },
-    "AhpEventPayload": {
+    "NonItemEventPayload": {
       "oneOf": [
         {
           "$ref": "#/$defs/SessionStateEvent"
@@ -2783,15 +2771,6 @@
         },
         {
           "$ref": "#/$defs/TurnCompletedEvent"
-        },
-        {
-          "$ref": "#/$defs/ItemStartedEvent"
-        },
-        {
-          "$ref": "#/$defs/ItemDeltaEvent"
-        },
-        {
-          "$ref": "#/$defs/ItemCompletedEvent"
         },
         {
           "$ref": "#/$defs/UsageUpdatedEvent"
@@ -2813,6 +2792,29 @@
         },
         {
           "$ref": "#/$defs/SubmissionStatusEvent"
+        }
+      ]
+    },
+    "ItemEventPayload": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ItemStartedEvent"
+        },
+        {
+          "$ref": "#/$defs/ItemDeltaEvent"
+        },
+        {
+          "$ref": "#/$defs/ItemCompletedEvent"
+        }
+      ]
+    },
+    "AhpEventPayload": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/NonItemEventPayload"
+        },
+        {
+          "$ref": "#/$defs/ItemEventPayload"
         }
       ]
     },
@@ -2853,13 +2855,46 @@
       ],
       "additionalProperties": true
     },
-    "AhpEvent": {
+    "ItemEventEnvelope": {
+      "description": "Source envelope for item events and notifications. An item must be associated with an execution.",
       "allOf": [
         {
           "$ref": "#/$defs/SourceEnvelope"
         },
         {
-          "$ref": "#/$defs/AhpEventPayload"
+          "type": "object",
+          "properties": {
+            "turnId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "turnId"
+          ]
+        }
+      ]
+    },
+    "AhpEvent": {
+      "oneOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/SourceEnvelope"
+            },
+            {
+              "$ref": "#/$defs/NonItemEventPayload"
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/ItemEventEnvelope"
+            },
+            {
+              "$ref": "#/$defs/ItemEventPayload"
+            }
+          ]
         }
       ]
     },
@@ -3253,6 +3288,77 @@
       ],
       "additionalProperties": false
     },
+    "EventsReadParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "streamId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "afterSeq": {
+          "description": "Exclusive lower sequence boundary.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "throughSeq": {
+          "description": "Inclusive upper sequence boundary.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "sessionId",
+        "streamId",
+        "afterSeq",
+        "throughSeq"
+      ],
+      "additionalProperties": false
+    },
+    "EventsReadResult": {
+      "type": "object",
+      "properties": {
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AhpEvent"
+          }
+        }
+      },
+      "required": [
+        "events"
+      ],
+      "additionalProperties": true
+    },
+    "EventsReadRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "x-anureo/events/read"
+        },
+        "params": {
+          "$ref": "#/$defs/EventsReadParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
     "AhpRpcRequest": {
       "oneOf": [
         {
@@ -3302,6 +3408,9 @@
         },
         {
           "$ref": "#/$defs/SessionInterruptRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/EventsReadRpcRequest"
         }
       ]
     },
@@ -3354,6 +3463,9 @@
             },
             {
               "$ref": "#/$defs/SessionInterruptResult"
+            },
+            {
+              "$ref": "#/$defs/EventsReadResult"
             }
           ]
         }
@@ -3546,22 +3658,10 @@
             "params": {
               "allOf": [
                 {
-                  "$ref": "#/$defs/SourceEnvelope"
+                  "$ref": "#/$defs/ItemEventEnvelope"
                 },
                 {
                   "$ref": "#/$defs/ItemStartedEvent"
-                },
-                {
-                  "type": "object",
-                  "properties": {
-                    "turnId": {
-                      "type": "string",
-                      "minLength": 1
-                    }
-                  },
-                  "required": [
-                    "turnId"
-                  ]
                 }
               ]
             }
@@ -3585,22 +3685,10 @@
             "params": {
               "allOf": [
                 {
-                  "$ref": "#/$defs/SourceEnvelope"
+                  "$ref": "#/$defs/ItemEventEnvelope"
                 },
                 {
                   "$ref": "#/$defs/ItemDeltaEvent"
-                },
-                {
-                  "type": "object",
-                  "properties": {
-                    "turnId": {
-                      "type": "string",
-                      "minLength": 1
-                    }
-                  },
-                  "required": [
-                    "turnId"
-                  ]
                 }
               ]
             }
@@ -3624,22 +3712,10 @@
             "params": {
               "allOf": [
                 {
-                  "$ref": "#/$defs/SourceEnvelope"
+                  "$ref": "#/$defs/ItemEventEnvelope"
                 },
                 {
                   "$ref": "#/$defs/ItemCompletedEvent"
-                },
-                {
-                  "type": "object",
-                  "properties": {
-                    "turnId": {
-                      "type": "string",
-                      "minLength": 1
-                    }
-                  },
-                  "required": [
-                    "turnId"
-                  ]
                 }
               ]
             }
@@ -4470,6 +4546,12 @@
     "session/interrupt": [
       "SessionInterruptParams",
       "SessionInterruptResult"
+    ]
+  },
+  "x-extension-methods": {
+    "x-anureo/events/read": [
+      "EventsReadParams",
+      "EventsReadResult"
     ]
   }
 }

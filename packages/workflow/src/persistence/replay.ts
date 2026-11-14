@@ -14,7 +14,8 @@ import {
  * into the new journal. A mismatched run ID or invalid required record rejects as
  * WORKFLOW_CHECKPOINT_INVALID. Mismatched name or revision rejects as WORKFLOW_INCOMPATIBLE_RUN.
  * A valid lock without evidence of a dead local writer rejects as WORKFLOW_SOURCE_ACTIVE.
- * Completed and incomplete sources must have a result matching the manifest digest.
+ * Terminal sources must have a journal matching the manifest digest. Completed and incomplete
+ * sources must also have a matching result.
  * Other filesystem errors propagate for storage error normalization.
  * The caller supplies a separate target directory. This check acquires no source lock. */
 export async function loadSourceJournal(directory: string, identity: SourceIdentity): Promise<JournalEvent[]> {
@@ -23,12 +24,13 @@ export async function loadSourceJournal(directory: string, identity: SourceIdent
   const manifest = verifyRecord(manifestSchema, await requiredJson(join(directory, checkpointFormat.manifest)))
   assertCompatibleIdentity(manifest.identity, identity)
   const raw = await requiredJson(join(directory, checkpointFormat.journal))
+  if (manifest.status !== 'running' && digest(raw) !== manifest.journalDigest) invalidCheckpoint()
   const parsed = journalEventSchema.array().safeParse(raw)
   if (!parsed.success) invalidCheckpoint()
   if (manifest.status === 'completed' || manifest.status === 'incomplete') {
     if (digest(await requiredJson(join(directory, checkpointFormat.result))) !== manifest.resultDigest) invalidCheckpoint()
   }
-  return parsed.data
+  return parsed.data.concat(manifest.failure?.unpublishedUnknownFailures ?? [])
 }
 
 type SourceIdentity = Pick<Manifest['identity'], 'name' | 'revision' | 'runId'>

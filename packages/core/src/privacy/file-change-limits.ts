@@ -93,7 +93,7 @@ function boundMaterial(material: FileChange['materials'][number], budget: Retent
   if (material.format === 'unified') {
     const patch = takeText(budget, material.patch)
     return {
-      material: patch.value ? { ...material, patch: patch.value } : { format: 'unavailable', reason: 'tooLarge' },
+      material: patch.complete || patch.value ? { ...material, patch: patch.value } : { format: 'unavailable', reason: 'tooLarge' },
       partial: !patch.complete,
     }
   }

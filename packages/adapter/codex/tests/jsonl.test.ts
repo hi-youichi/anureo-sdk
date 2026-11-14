@@ -64,6 +64,77 @@ describe('native JSONL transport', () => {
     const f = fixture({ options: { timeoutMs: 5 } }); await expect(f.client.request('mutation', { secret: 'private' })).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT', outcomeUnknown: true })
     expect(f.writes).toHaveLength(1); await f.client.dispose()
   })
+
+  test('a timed-out RPC keeps write capacity while stdin is blocked', async () => {
+    const f = fixture({ options: { maxPending: 1, timeoutMs: 20 } })
+    const releaseWrite = Promise.withResolvers<void>()
+    const write = f.client.process.write.bind(f.client.process)
+    f.client.process.write = async chunk => {
+      await write(chunk)
+      if (JSON.parse(String(chunk)).method === 'blocked') await releaseWrite.promise
+    }
+    try {
+      await expect(f.client.request('blocked')).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT', outcomeUnknown: true })
+      await expect(f.client.request('extra')).rejects.toMatchObject({ code: 'BACKPRESSURE_EXCEEDED', outcomeUnknown: false })
+      releaseWrite.resolve()
+      await f.client.notify('barrier')
+      const next = f.client.request('next')
+      await f.client.notify('after-next')
+      const id = JSON.parse(f.writes[2]!).id
+      f.stdout.write(JSON.stringify({ id, result: true }) + '\n')
+      expect(await next).toBe(true)
+      expect(f.writes.map(frame => JSON.parse(frame).method)).toEqual(['blocked', 'barrier', 'next', 'after-next'])
+    } finally {
+      releaseWrite.resolve()
+      await f.client.dispose()
+    }
+  })
+
+  test('oversized and unserializable requests leave admission available', async () => {
+    const f = fixture({ options: { maxPending: 1, maxFrameBytes: 64 } })
+    try {
+      await expect(f.client.request('oversized', { text: 'x'.repeat(64) })).rejects.toMatchObject({ code: 'FRAME_TOO_LARGE', outcomeUnknown: false })
+      await expect(f.client.request('unserializable', { value: 1n })).rejects.toThrow(TypeError)
+      expect(f.writes).toEqual([])
+      const next = f.client.request('next')
+      await f.waitForWrite()
+      const id = JSON.parse(f.writes[0]!).id
+      f.stdout.write(JSON.stringify({ id, result: true }) + '\n')
+      expect(await next).toBe(true)
+    } finally { await f.client.dispose() }
+  })
+
+  test('malformed replies leave dispatched request outcomes unknown', async () => {
+    const f = fixture()
+    try {
+      const outcomes = Promise.all(['missing', 'invalid error', 'invalid id'].map(method => f.client.request(method).catch(cause => cause)))
+      await f.client.notify('barrier')
+      const [first, second] = f.writes.map(frame => JSON.parse(frame).id)
+      f.stdout.write([
+        { id: first },
+        { id: second, error: { code: '-32601' } },
+        { id: null, result: true },
+      ].map(frame => JSON.stringify(frame) + '\n').join(''))
+      for (const cause of await outcomes) {
+        expect(cause).toMatchObject({ code: 'PROTOCOL_ERROR', outcomeUnknown: true })
+      }
+      expect(f.failures).toHaveLength(1)
+    } finally { await f.client.dispose() }
+  })
+
+  test('accepts an incoming frame at the byte limit when CRLF is split', async () => {
+    const frame = JSON.stringify({ id: 1, result: 'x'.repeat(64) })
+    const f = fixture({ options: { maxFrameBytes: Buffer.byteLength(frame) } })
+    try {
+      const result = f.client.request('boundary')
+      await f.waitForWrite()
+      // Schedule the LF separately so the reader checks the buffered CR first.
+      f.stdout.write(frame + '\r')
+      await new Promise<void>(resolve => setImmediate(resolve))
+      f.stdout.write('\n')
+      expect(await result).toBe('x'.repeat(64))
+    } finally { await f.client.dispose() }
+  })
   /** Framing failures must identify the transport problem without echoing arbitrary native content. */
   test('oversized or malformed frames fail the source, not raw data', async () => {
     const f = fixture({ options: { maxFrameBytes: 64 } }); f.stdout.write('x'.repeat(65)); await f.client.finished

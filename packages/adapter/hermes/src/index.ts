@@ -14,12 +14,14 @@ export type { HermesAdapterOptions } from './options'
  * observation without stopping the shared owner or its executions.
  */
 export class HermesAdapter implements HarnessAdapter {
-  /** Configuration for subsequent native work. Argument, toolset and environment containers are copied at construction. */
-  readonly options: HermesAdapterOptions
+  private readonly config: HermesAdapterOptions
+  /** Return a copy of the adapter configuration. */
+  get options(): HermesAdapterOptions { return copyOptions(this.config) }
   /** Validate and copy configuration without native I/O; invalid options throw INVALID_PARAMS. */
   constructor(options: HermesAdapterOptions = {}) {
-    try { validateOptions(options) } catch { throw new HarnessSdkError('INVALID_PARAMS', 'Invalid Hermes adapter options') }
-    this.options = { ...options, ...(options.toolsets ? { toolsets: [...options.toolsets] } : {}), ...(options.args ? { args: [...options.args] } : {}), ...(options.env ? { env: { ...options.env } } : {}) }
+    const issues = validateOptions(options)
+    if (issues.length) throw new HarnessSdkError('INVALID_PARAMS', 'Invalid Hermes adapter options', false, false, { issues })
+    this.config = copyOptions(options)
   }
   /** Return 'http' to OutputSession.open for a new editor-capable session, or undefined when the bridge is unavailable. */
   outputBridgeTransport(params: SessionOpenParams): 'http' | undefined {
@@ -47,7 +49,7 @@ export class HermesAdapter implements HarnessAdapter {
     if (!this.profileId) throw new HarnessSdkError('NOT_INITIALIZED')
     assertRequest('session/open', params)
     this.assertSupportedOpen(params)
-    const session = new HermesSession({ params, sink, options: this.options, profileId: this.profileId, released: () => this.sessions.delete(session) })
+    const session = new HermesSession({ params, sink, options: this.config, profileId: this.profileId, released: () => this.sessions.delete(session) })
     this.sessions.add(session)
     try {
       await session.open()
@@ -84,13 +86,13 @@ export class HermesAdapter implements HarnessAdapter {
    * because the probe never submits work.
    */
   private async probeRuntime(): Promise<InitializeResult> {
-    const grant = await attachGateway(this.options, this.options.startup ?? 'start', this.abort.signal)
+    const grant = await attachGateway(this.config, this.config.startup ?? 'start', this.abort.signal)
     let channel: HermesRpc | undefined
     channel = await HermesRpc.connect(grant, {
       event: async () => {},
       request: async request => { await channel?.reject(request.id) },
       failure: () => {},
-    }, this.options, this.abort.signal)
+    }, this.config, this.abort.signal)
     if (this.disposed) {
       channel.dispose()
       throw new HarnessSdkError('RUNTIME_DISPOSED')
@@ -122,6 +124,15 @@ export class HermesAdapter implements HarnessAdapter {
       || (params.mcpServers !== undefined && (!this.editorMcp || params.mode !== 'new'))
       || Object.keys(params.config ?? {}).length) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
     if (params.mode === 'resume' && params.binding.nativeRef?.provider !== 'hermes') throw new HarnessSdkError('SESSION_BINDING_MISMATCH')
+  }
+}
+
+function copyOptions(options: HermesAdapterOptions): HermesAdapterOptions {
+  return {
+    ...options,
+    ...(options.args ? { args: [...options.args] } : {}),
+    ...(options.toolsets ? { toolsets: [...options.toolsets] } : {}),
+    ...(options.env ? { env: { ...options.env } } : {}),
   }
 }
 

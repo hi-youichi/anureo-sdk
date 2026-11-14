@@ -11,6 +11,7 @@ import type { HarnessError } from '@anureo/protocol'
 import { z } from 'zod'
 import { workflow, parallel, agent, type WorkflowOptions } from './index'
 import { canonicalJson, digest } from './persistence/json'
+import { record, type JournalEvent } from './persistence/records'
 
 const clients: Client[] = []
 const fixture = createFixture(clients)
@@ -50,7 +51,7 @@ test('run identity is durable before body, inputs are isolated, and results are 
     const manifest = JSON.parse(await readFile(join(options.directory, run.runId, 'run.json'), 'utf8'))
     expect(manifest.identity.runId).toBe(run.runId)
     expect(manifest.status).toBe('running')
-    expect(manifest.checkpointFormatVersion).toBe(2)
+    expect(manifest.checkpointFormatVersion).toBe(3)
     expect(Object.isFrozen(run.input.values)).toBe(true)
     expect(Object.isFrozen(options.input.values)).toBe(false)
     return agent('hello', { client, cwd: options.directory })
@@ -62,6 +63,8 @@ test('run identity is durable before body, inputs are isolated, and results are 
   const journal = JSON.parse(await readFile(join(options.directory, result.runId, 'journal.json'), 'utf8'))
   expect(journal).toHaveLength(2)
   expect(journal[1]).toMatchObject({ type: 'result', result: 'hello' })
+  const manifest = JSON.parse(await readFile(join(options.directory, result.runId, 'run.json'), 'utf8'))
+  expect(manifest.journalDigest).toBe(digest(journal))
 })
 
 test('resumed runs replay identical agent calls from the journal without new sessions', async () => {
@@ -115,6 +118,17 @@ test('prompt, options, and client identity changes miss the cache', async () => 
   await workflow({ ...options, resumeFrom: first.runId }, () => agent('same', { client: other.client, cwd: options.directory, model: 'm1' }))
   expect(adapter.opened).toHaveLength(3)
   expect(other.adapter.opened).toHaveLength(1)
+})
+
+test('lone surrogates and replacement characters have distinct replay keys', async () => {
+  const options = await setup()
+  const { client, adapter } = await fixture()
+  const first = await workflow(options, () => agent('\ud800', { client, cwd: options.directory }))
+  const second = await workflow({ ...options, resumeFrom: first.runId }, () =>
+    agent('\ufffd', { client, cwd: options.directory }))
+  expect(first.result).toBe('\ud800')
+  expect(second.result).toBe('\ufffd')
+  expect(adapter.opened).toHaveLength(2)
 })
 
 test('name or revision changes reject resume before the body runs', async () => {
@@ -177,6 +191,50 @@ test('unknown previous outcomes require reconciliation instead of silent re-exec
     agent('unknown', { client, cwd: options.directory })))
     .rejects.toMatchObject({ code: 'WORKFLOW_RECONCILIATION_REQUIRED' })
   expect(adapter.opened).toHaveLength(1)
+})
+
+test('a failed journal replacement preserves exact-key uncertainty in the manifest', async () => {
+  const options = { ...await setup(), name: 'crash-test' }
+  await runCrashFixture(options.directory, 'unpublished-unknown', 0)
+  const source = join(options.directory, 'crashed')
+  const journal = JSON.parse(await readFile(join(source, 'journal.json'), 'utf8')) as JournalEvent[]
+  expect(journal.map(event => event.type)).toEqual(['started'])
+  const manifest = JSON.parse(await readFile(join(source, 'run.json'), 'utf8'))
+  expect(manifest).toMatchObject({ status: 'failed', journalDigest: digest(journal), failure: {
+    outcomeUnknown: true,
+    unpublishedUnknownFailures: [{
+      ...journal[0], type: 'failed', code: 'NATIVE_FAILED', outcomeUnknown: true,
+    }],
+  } })
+
+  const { client, adapter } = await crashClient()
+  const resumed = { ...options, resumeFrom: 'crashed' }
+  await expect(workflow({ ...resumed, runId: 'blocked' }, () => agent('work', { client, cwd: options.directory })))
+    .rejects.toMatchObject({ code: 'WORKFLOW_RECONCILIATION_REQUIRED' })
+  await expect(workflow({ ...resumed, resumeFrom: 'blocked' }, () => agent('work', { client, cwd: options.directory })))
+    .rejects.toMatchObject({ code: 'WORKFLOW_RECONCILIATION_REQUIRED' })
+  expect(adapter.opened).toHaveLength(0)
+  const other = await workflow(resumed, () => agent('other', { client, cwd: options.directory }))
+  expect(other.result).toBe('other')
+  await writeFile(join(source, 'journal.json'), '[]')
+  await expect(workflow(resumed, () => agent('work', { client, cwd: options.directory })))
+    .rejects.toMatchObject({ code: 'WORKFLOW_CHECKPOINT_INVALID' })
+  expect(adapter.opened).toHaveLength(1)
+})
+
+test('workflow rejections preserve schema diagnostics outside the stored failure summary', async () => {
+  const options = { ...await setup(), runId: 'schema-error' }
+  const { client, adapter } = await fixture()
+  await expect(workflow(options, () => agent('work', {
+    client, cwd: options.directory, schema: z.strictObject({ value: z.string().optional() }),
+  }))).rejects.toMatchObject({
+    code: 'INVALID_PARAMS', details: { rule: 'valueConversionOrNonportableType', runId: options.runId },
+  })
+  const manifest = JSON.parse(await readFile(join(options.directory, options.runId, 'run.json'), 'utf8'))
+  expect(manifest.failure).toEqual({
+    code: 'INVALID_PARAMS', retryable: false, outcomeUnknown: false, cleanupFailed: false,
+  })
+  expect(adapter.opened).toHaveLength(0)
 })
 
 test('storage failure is sticky and blocks subsequent agent dispatch', async () => {
@@ -248,8 +306,11 @@ test('source activity, target competition, and reused explicit ids reject before
 test('initialization rejects invalid identities and releases a failed target claim before entering body', async () => {
   const options = await setup()
   let entered = false
-  await expect(workflow({ ...options, runId: '../escape' }, () => { entered = true; return {} }))
-    .rejects.toMatchObject({ code: 'INVALID_PARAMS' })
+  await expect(workflow({ ...options, runId: '../escape', revision: '' }, () => { entered = true; return {} }))
+    .rejects.toMatchObject({
+      code: 'INVALID_PARAMS',
+      message: 'Invalid workflow options: runId must be a valid directory basename (at most 255 UTF-8 bytes), revision must be a nonempty string',
+    })
   const { client } = await fixture()
   const original = await workflow({ ...options, runId: 'source' }, () => agent('a', { client, cwd: options.directory }))
   await expect(workflow({ ...options, name: 'incompatible', runId: 'target', resumeFrom: original.runId }, () => {
@@ -257,6 +318,22 @@ test('initialization rejects invalid identities and releases a failed target cla
   })).rejects.toMatchObject({ code: 'WORKFLOW_INCOMPATIBLE_RUN' })
   expect(entered).toBe(false)
   expect(await readdir(join(options.directory, 'target'))).not.toContain('writer.lock')
+})
+
+test('overlapping target roots are rejected without creating directories in the source', async () => {
+  const options = await setup()
+  const first = await workflow(options, () => 'source')
+  const source = join(options.directory, first.runId)
+  const alias = join(options.directory, 'alias')
+  await symlink(source, alias, 'dir')
+  const original = await readdir(source)
+  for (const root of [source, alias]) {
+    await expect(workflow({
+      ...options, directory: join(root, 'missing', 'nested'),
+      resumeFrom: { directory: options.directory, runId: first.runId },
+    }, () => 'bad')).rejects.toMatchObject({ code: 'WORKFLOW_OVERLAPPING_RUNS' })
+    expect(await readdir(source)).toEqual(original)
+  }
 })
 
 test('preallocated Unicode and spaced output names resume without changing directory meaning', async () => {
@@ -270,12 +347,13 @@ test('preallocated Unicode and spaced output names resume without changing direc
 })
 
 test('corrupt or missing recovery materials fail rather than execute', async () => {
-  for (const variant of ['bad-json', 'missing', 'symlink'] as const) {
+  for (const variant of ['bad-json', 'stale', 'missing', 'symlink'] as const) {
     const options = await setup()
     const { client, adapter } = await fixture()
     const first = await workflow(options, () => agent('a', { client, cwd: options.directory }))
     const path = join(options.directory, first.runId, 'journal.json')
     if (variant === 'bad-json') await writeFile(path, '{broken')
+    else if (variant === 'stale') await writeFile(path, '[]')
     else {
       await rm(path)
       if (variant === 'symlink') await symlink(join(options.directory, first.runId, 'run.json'), path)
@@ -286,15 +364,17 @@ test('corrupt or missing recovery materials fail rather than execute', async () 
   }
 })
 
-test('format-v1 run directories are rejected on resume', async () => {
+test('rejects correctly digested manifests with older format versions', async () => {
   const options = await setup()
   const { client } = await fixture()
   const first = await workflow(options, () => agent('a', { client, cwd: options.directory }))
   const manifestPath = join(options.directory, first.runId, 'run.json')
-  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
-  await writeFile(manifestPath, JSON.stringify({ ...manifest, checkpointFormatVersion: 1 }))
-  await expect(workflow({ ...options, resumeFrom: first.runId }, () => 'bad'))
-    .rejects.toMatchObject({ code: 'WORKFLOW_CHECKPOINT_INVALID' })
+  const { recordDigest: _, ...payload } = JSON.parse(await readFile(manifestPath, 'utf8'))
+  for (const checkpointFormatVersion of [1, 2]) {
+    await writeFile(manifestPath, canonicalJson(record({ ...payload, checkpointFormatVersion })))
+    await expect(workflow({ ...options, resumeFrom: first.runId }, () => 'bad'))
+      .rejects.toMatchObject({ code: 'WORKFLOW_CHECKPOINT_INVALID' })
+  }
 })
 
 test('strict JSON rejects lossy inputs and canonical hashes ignore object insertion order', () => {
@@ -310,15 +390,12 @@ test('strict JSON rejects lossy inputs and canonical hashes ignore object insert
 test('real process death at durable boundaries replays committed agent work only', async () => {
   for (const phase of ['before-started', 'after-execute', 'before-final', 'after-later-result']) {
     const options = await setup()
-    const child = Bun.spawn([process.execPath, fileURLToPath(new URL('./fixtures/workflow-crash.ts', import.meta.url)),
-      options.directory, phase], { stdout: 'ignore', stderr: 'pipe' })
-    const code = await child.exited
-    expect(code).not.toBe(0)
-    const error = await new Response(child.stderr).text()
-    expect(error).toBe('')
-    const adapter = createScriptedAdapter()
-    const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: 'crash-fixture' } })
-    clients.push(client)
+    await runCrashFixture(options.directory, phase, 137)
+    if (phase === 'before-started' || phase === 'after-execute') {
+      const journal = JSON.parse(await readFile(join(options.directory, 'crashed', 'journal.json'), 'utf8')) as JournalEvent[]
+      expect(journal.map(event => event.type)).toEqual(phase === 'before-started' ? [] : ['started'])
+    }
+    const { client, adapter } = await crashClient()
     const result = await workflow({ ...options, name: 'crash-test', resumeFrom: 'crashed' }, async () => {
       const first = agent('work', { client, cwd: options.directory })
       // An unfinished first key permits a rerun without invalidating the second key's saved result.
@@ -336,6 +413,56 @@ test('real process death at durable boundaries replays committed agent work only
     await client.dispose()
   }
 }, 15000)
+
+test('a retry invalidates inherited suffix results even when the process dies before the next call', async () => {
+  const options = { ...await setup(), name: 'crash-test' }
+  const fail = failingExecute({ code: 'NATIVE_FAILED', message: 'failed', retryable: false, outcomeUnknown: false })
+  const { client: sourceClient } = await crashClient({
+    async execute(call, sink) {
+      if (call.method === 'input/submit' && 'input' in call.params
+        && call.params.input.some(part => part.type === 'text' && part.text === 'work')) return fail(call, sink)
+      return undefined
+    },
+  })
+  const cwd = options.directory
+  const source = await workflow({ ...options, runId: 'source' }, async () => {
+    await agent('prefix', { client: sourceClient, cwd })
+    await expect(agent('work', { client: sourceClient, cwd })).rejects.toMatchObject({ code: 'NATIVE_FAILED' })
+    return agent('later', { client: sourceClient, cwd })
+  })
+  expect(source.status).toBe('incomplete')
+  expect(source.result).toBe('later')
+  await runCrashFixture(cwd, 'after-retry', 137)
+  const journal = JSON.parse(await readFile(join(cwd, 'crashed', 'journal.json'), 'utf8')) as JournalEvent[]
+  expect(journal.slice(-2)).toMatchObject([{ type: 'started' }, { type: 'result', result: 'work' }])
+
+  const { client, adapter } = await crashClient()
+  const result = await workflow({ ...options, resumeFrom: 'crashed' }, async () => {
+    const prefix = await agent('prefix', { client, cwd })
+    const work = await agent('work', { client, cwd })
+    const later = await agent('later', { client, cwd })
+    return [prefix, work, later]
+  })
+  expect(result.result).toEqual(['prefix', 'work', 'later'])
+  const submissions = adapter.calls.filter(call => call.method === 'input/submit')
+  expect(submissions).toHaveLength(1)
+  expect(submissions[0]?.params).toMatchObject({ input: [{ type: 'text', text: 'later' }] })
+})
+
+async function runCrashFixture(directory: string, phase: string, exitCode: number): Promise<void> {
+  const child = Bun.spawn([process.execPath, fileURLToPath(new URL('./fixtures/workflow-crash.ts', import.meta.url)),
+    directory, phase], { stdout: 'ignore', stderr: 'pipe' })
+  const error = await new Response(child.stderr).text()
+  expect(error).toBe('')
+  expect(await child.exited).toBe(exitCode)
+}
+
+async function crashClient(options?: FakeAdapterOptions) {
+  const adapter = createScriptedAdapter(options)
+  const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: 'crash-fixture' } })
+  clients.push(client)
+  return { client, adapter }
+}
 
 test('an interrupted run reuses the unchanged call prefix in original order', async () => {
   const options = await setup()

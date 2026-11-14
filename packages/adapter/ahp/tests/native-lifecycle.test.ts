@@ -18,6 +18,14 @@ test('external revised-v1 peer negotiates on the real wire and preserves overlap
 test('old v1 peer without the lifecycle marker is rejected during initialization', async () => {
   await expect(connectPeer('native', '--old-peer')).rejects.toThrow();
 });
+test('startup denial on session/open preserves the workflow disposition', async () => {
+  const client = await connectPeer('blocked', '--startup-blocked');
+  try {
+    const failure = await client.sessions.create({ cwd: process.cwd() }).catch(cause => cause as unknown);
+    expect(failure).toMatchObject({ code: 'AGENT_STARTUP_BLOCKED', message: 'AHP_RPC_ERROR', outcomeUnknown: false });
+    expect(failure).toHaveProperty('details', { workflowDisposition: 'startup_blocked' });
+  } finally { await client.dispose(); }
+});
 test('interrupted reason metadata survives the wire and privacy/result projection before the submit reply', async () => {
   const client = await connectPeer('reason', '--skip');
   try {
@@ -29,7 +37,7 @@ test('interrupted reason metadata survives the wire and privacy/result projectio
 });
 
 /** Start a real stdio peer. createClient owns initialization-failure cleanup and tests dispose successful clients. */
-function connectPeer(runtimeConfigId: string, mode?: '--old-peer' | '--skip') {
+function connectPeer(runtimeConfigId: string, mode?: '--old-peer' | '--skip' | '--startup-blocked') {
   return createClient({
     adapter: createAhpAdapter({
       command: process.execPath,

@@ -3,12 +3,13 @@ import { InteractionRegistry } from "./interactions";
 import { approveWithNarrowestScope } from "./approval";
 import { deferred } from "./deferred";
 import { HarnessSdkError } from "../errors";
+import { SecretRedactor } from "../privacy/secrets";
 import type { InteractionRequested, InteractionResponse, InteractionResult } from "@anureo/protocol";
 
 /**
  * Settlement tests use this recorder with optional publication/privacy hooks to gate or fail a phase.
- * The registry invokes publication hooks during settlement and privacy hooks before response
- * admission. Tests own gates and must settle requests or cancelAll to release expiry timers.
+ * The registry invokes publication hooks during settlement and privacy hooks before native
+ * delivery. Tests own gates and must settle requests or cancelAll to release expiry timers.
  */
 function harness(overrides: Partial<ConstructorParameters<typeof InteractionRegistry>[1]> = {}, hooks: {
   publish?: ConstructorParameters<typeof InteractionRegistry>[0];
@@ -109,6 +110,27 @@ test("peer settlement supersedes an in-flight answer and retries replay the fail
   }
 });
 
+test("peer settlement supersedes an in-flight cancellation", async () => {
+  const native = deferred<void>();
+  const { registry, published } = harness();
+  const notifications: unknown[] = [];
+  const observed = registry.begin(approval("i1"), async (response, reason) => {
+    notifications.push({ response, reason });
+    await native.promise;
+  });
+  const operation = registry.cancel("i1", "user dismissed prompt");
+  const peerResult = { interactionId: "i1", outcome: "expired" } as const;
+  try {
+    await registry.resolveExternally(peerResult);
+    await expect(observed).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
+    native.resolve();
+    await expect(operation).rejects.toMatchObject({ code: "RESULT_UNKNOWN", outcomeUnknown: true });
+    expect(notifications).toEqual([{ response: null, reason: "user dismissed prompt" }]);
+    expect(published).toEqual([peerResult]);
+    expect(registry.pendingCount).toBe(0);
+  } finally { native.resolve(); await operation.catch(() => {}); }
+});
+
 /** Hold native delivery to verify replay/conflict rules and capacity, then release all owned work. */
 test("response retries share native delivery while settling retains capacity", async () => {
   const native = deferred<void>();
@@ -134,12 +156,12 @@ test("response retries share native delivery while settling retains capacity", a
 });
 
 /** Validation precedes privacy registration; privacy failure leaves the request actionable for a later answer. */
-test("validation and privacy checks precede admission and run again on replay", async () => {
+test("validation precedes privacy checks and matching replays repeat the check", async () => {
   let checks = 0, deliveries = 0;
   let refuse = true;
   const failure = new HarnessSdkError("SECRET_PERSISTENCE_FAILED");
   const { registry } = harness({}, {
-    /** respond invokes this hook for every valid attempt, even a retry that would otherwise use the cache. */
+    /** A matching replay can still fail the privacy check. */
     beforeResponse: () => { checks++; if (refuse) throw failure; },
   });
   const observed = registry.begin(approval("i1"), async () => { deliveries++; });
@@ -157,6 +179,31 @@ test("validation and privacy checks precede admission and run again on replay", 
     expect(checks).toBe(3);
     expect(deliveries).toBe(1);
   } finally { await registry.cancelAll("test_cleanup"); }
+});
+
+test("registers marked user-input answers before delivery and skips conflicting answers", async () => {
+  const remembered: string[] = [];
+  const redactor = new SecretRedactor(value => remembered.push(value));
+  const { registry } = harness({}, {
+    beforeResponse: (request, response) => redactor.rememberResponse(request, response),
+  });
+  const request: InteractionRequested = {
+    kind: "userInput",
+    interactionId: "i1",
+    questions: [{ id: "flagged", prompt: "Flagged", secret: true }, { id: "key", prompt: "Key" }],
+    schema: { type: "object", properties: { key: { type: "string", writeOnly: true } } },
+  };
+  const response: InteractionResponse = { kind: "userInput", answers: { flagged: "flagged-secret", key: "schema-secret" } };
+  const observed = registry.begin(request, async () => {
+    expect(remembered).toEqual(["flagged-secret", "schema-secret"]);
+  });
+  await registry.respond("i1", "r1", response);
+  await expect(observed).resolves.toEqual(response);
+  await expect(registry.respond("i1", "r2", {
+    kind: "userInput", answers: { flagged: "conflicting-flagged", key: "conflicting-key" },
+  })).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
+  expect(remembered).toEqual(["flagged-secret", "schema-secret"]);
+  expect(redactor.item({ type: "agentMessage", id: "echo", text: "schema-secret" })).toMatchObject({ text: "[redacted]" });
 });
 
 /** Gate publication after native delivery: capacity is released, but the adapter waiter must still wait. */
@@ -202,19 +249,19 @@ for (const phase of ["delivery", "publication"] as const) test(`response ${phase
     : { interactionId: "i1", outcome: "responded" }]);
 });
 
-/** Preserve the response path's distinct failure boundary: failed unknown publication never reaches waiter rejection. */
-test("failed unknown publication is cached while the original waiter remains unresolved", async () => {
+/** The response caller and the original waiter each receive their respective failure. */
+test("failed unknown publication is cached while the original waiter receives the delivery failure", async () => {
   const failure = new Error("publication failed");
-  let deliveries = 0, settled = false;
+  const delivery = new HarnessSdkError("RESULT_UNKNOWN", "Native delivery failed", false, true);
+  let deliveries = 0;
   const { registry, published } = harness({}, { publish: async () => { throw failure; } });
   const observed = registry.begin(approval("i1"), async () => {
     deliveries++;
-    throw new Error("native delivery failed");
+    throw delivery;
   });
-  void observed.then(() => { settled = true; }, () => { settled = true; });
   await expect(registry.respond("i1", "r1", answer)).rejects.toBe(failure);
   await expect(registry.respond("i1", "r1", answer)).rejects.toBe(failure);
-  expect(settled).toBe(false);
+  await expect(observed).rejects.toBe(delivery);
   expect(deliveries).toBe(1);
   expect(registry.pendingCount).toBe(0);
   expect(published).toEqual([{ interactionId: "i1", outcome: "unknown", reason: "RESULT_UNKNOWN" }]);
@@ -235,7 +282,7 @@ test("response timeout is unknown and late native rejection stays observed", asy
   } finally { native.reject(new Error("late native failure")); await operation.catch(() => {}); }
 });
 
-/** A default cancellation cannot interrupt delivery; teardown can end it as unknown without a second native call. */
+/** Manual cancellation cannot interrupt delivery; teardown can end it without a second native call. */
 test("teardown during response delivery publishes once and suppresses late success", async () => {
   const native = deferred<void>();
   const { registry, published } = harness();
@@ -244,12 +291,13 @@ test("teardown during response delivery publishes once and suppresses late succe
   const operation = registry.respond("i1", "r1", answer);
   try {
     await expect(registry.cancel("i1")).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
-    await expect(registry.cancel("i1", "runtime_disposed")).resolves.toEqual({ interactionId: "i1", outcome: "unknown", reason: "runtime_disposed" });
+    await expect(registry.cancel("i1", "user dismissed prompt")).rejects.toMatchObject({ code: "INTERACTION_ALREADY_RESOLVED" });
+    await registry.cancelAll("cancelled");
     await expect(observed).rejects.toMatchObject({ code: "RESULT_UNKNOWN", outcomeUnknown: true });
     native.resolve();
     await expect(operation).rejects.toMatchObject({ code: "RESULT_UNKNOWN", outcomeUnknown: true });
     expect(deliveries).toBe(1);
-    expect(published).toHaveLength(1);
+    expect(published).toEqual([{ interactionId: "i1", outcome: "unknown", reason: "cancelled" }]);
   } finally { native.resolve(); await operation.catch(() => {}); await registry.cancelAll("test_cleanup"); }
 });
 
@@ -290,13 +338,14 @@ for (const mode of ["cancel", "external", "settling"] as const) test(`${mode} se
   const response = mode === "settling" ? registry.respond("i1", "r1", answer) : undefined;
   const operation = mode === "external"
     ? registry.resolveExternally({ interactionId: "i1", outcome: "responded" })
-    : registry.cancel("i1", "runtime_disposed");
+    : mode === "settling" ? registry.cancelAll("runtime_disposed") : registry.cancel("i1", "runtime_disposed");
   try {
     await publishing.promise;
     expect(registry.pendingCount).toBe(0);
     expect(settled).toBe(false);
     publication.reject(failure);
-    await expect(operation).rejects.toBe(failure);
+    if (mode === "settling") await expect(operation).resolves.toBeUndefined();
+    else await expect(operation).rejects.toBe(failure);
     await expect(observed).rejects.toMatchObject({
       code: mode === "external" ? "INTERACTION_ALREADY_RESOLVED" : mode === "settling" ? "RESULT_UNKNOWN" : "INTERACTION_CANCELLED",
       outcomeUnknown: mode === "settling",

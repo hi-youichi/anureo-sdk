@@ -126,10 +126,14 @@ export class FakePiHost implements PiSessionHost {
     const child = new FakePiHost({ ...this.open, mode: 'resume' })
     child.script = this.script
     const keep = entryId === null ? -1 : this.entriesList.findIndex(entry => entry.id === entryId)
-    child.entriesList.push(...structuredClone(this.entriesList.slice(0, keep + 1)))
-    child.seq = this.seq
+    child.copyBranchFrom(this, this.entriesList.slice(0, keep + 1))
     child.sibling = this
     return child
+  }
+  /** Restore both the transcript and the allocation counter so the next entry gets a fresh ID. */
+  copyBranchFrom(source: FakePiHost, entries = source.entriesList): void {
+    this.entriesList.push(...structuredClone(entries))
+    this.seq = source.seq
   }
   /** Clear listeners and record disposal immediately. PiBackendSession requests abort separately when busy. */
   async dispose(): Promise<void> {
@@ -207,7 +211,7 @@ export function fakeFactory(setup?: (host: FakePiHost) => void): { factory: PiHo
     if (!existing) throw new Error('SESSION_NOT_FOUND')
     const resumed = new FakePiHost(options)
     resumed.sessionId = existing.sessionId
-    resumed.entriesList.push(...structuredClone(existing.entriesList))
+    resumed.copyBranchFrom(existing)
     resumed.script = existing.script
     return resumed
   }

@@ -16,7 +16,7 @@ export function mapUsage(value: unknown, scope: 'turn' | 'session' = 'turn'): Us
     ['inputTokens', 'input'],
     ['outputTokens', 'output'],
     ['cachedInputTokens', 'cacheRead'],
-    ['cacheCreationInputTokens', 'cacheWrite'],
+    ['cacheWriteInputTokens', 'cacheWrite'],
     ['totalTokens', 'total'],
   ] as const) {
     const counter = nativeCounter(raw, source)

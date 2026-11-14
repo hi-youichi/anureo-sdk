@@ -1,7 +1,7 @@
 {
   "name": "@anureo/adapter-ahp",
-  "description": "Anureo SDK adapter for external AHP harnesses over stdio or WebSocket",
-  "version": "0.3.1",
+  "description": "External AHP harnesses over stdio or WebSocket for the Anureo SDK. Requires Bun or compatible TypeScript build tooling.",
+  "version": "0.3.2",
   "license": "Apache-2.0",
   "keywords": [
     "anureo",

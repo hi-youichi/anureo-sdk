@@ -7,7 +7,7 @@ import { fixResultSchema } from './schema'
 import { buildFixPrompt } from './prompts'
 import type { FixReport, ModuleReview } from './results'
 import { captureWorkingTreeBaseline, inspectWorkingTreeChanges } from './fix-tree'
-import { applyFixPatch, capturePatchBaseline } from './fix-patch'
+import { applyFixPatch, FixIntegrationError } from './fix-patch'
 import { reviewGit, reviewRepositoryRoot } from './git'
 import { withAgentWorktree, type AgentWorktree } from './worktree'
 
@@ -86,11 +86,16 @@ async function applyFix(options: FixOptions, prompt: string, files: readonly str
         ...(options.permissionMode !== undefined ? { permissionMode: options.permissionMode } : {}),
       })
       if (output === null) throw new HarnessSdkError('REVIEW_AGENT_INCOMPLETE', 'Fix agent returned no result')
-      const changedFiles = await checkFixChanges(baseline)
-      if (changedFiles.length > 0) await applyFixPatch(root, checkout, changedFiles)
-      outcome = {
-        summary: output.summary,
-        changedFiles: changedFiles.map(file => relativePath(options.cwd, resolve(root, file))),
+      const edits = await checkFixChanges(baseline)
+      const reportPaths = (paths: string[]) => paths.map(file => relativePath(options.cwd, resolve(root, file)))
+      try {
+        const changedFiles = await applyFixPatch(root, checkout.root, baseline.tree.states, edits)
+        outcome = { summary: output.summary, changedFiles: reportPaths(changedFiles) }
+      } catch (cause) {
+        if (cause instanceof FixIntegrationError) {
+          outcome = { summary: output.summary, changedFiles: reportPaths(cause.changedFiles) }
+        }
+        throw cause
       }
     })
     if (!outcome) throw new Error('Fix worktree did not produce an outcome')
@@ -107,12 +112,9 @@ async function applyFix(options: FixOptions, prompt: string, files: readonly str
   }
 }
 
-/** Save scope fingerprints, patch inputs and Git metadata before applyFix starts the agent.
- * A failed read or copy aborts dispatch. Scratch copies live until the worktree is cleaned up.
- */
+/** Save scope fingerprints and Git metadata before applyFix starts the agent. */
 async function captureFixBaseline(checkout: AgentWorktree, allowed: readonly string[]) {
   const tree = await captureWorkingTreeBaseline(checkout.root, allowed)
-  await capturePatchBaseline(checkout, allowed)
   const head = await reviewGit(checkout.root, 'rev-parse', 'HEAD')
   const index = await reviewGit(checkout.root, 'ls-files', '--stage', '-z')
   return { tree, head, index }
@@ -121,14 +123,15 @@ async function captureFixBaseline(checkout: AgentWorktree, allowed: readonly str
 /** Reject HEAD, index or detected out-of-scope changes after agent settlement. applyFix uses
  * the returned Git-root-relative paths to integrate only observed, eligible edits.
  */
-async function checkFixChanges({ tree, head, index }: Awaited<ReturnType<typeof captureFixBaseline>>): Promise<string[]> {
+async function checkFixChanges({ tree, head, index }: Awaited<ReturnType<typeof captureFixBaseline>>) {
   if (await reviewGit(tree.root, 'rev-parse', 'HEAD') !== head
       || await reviewGit(tree.root, 'ls-files', '--stage', '-z') !== index) {
     throw new HarnessSdkError('REVIEW_FIX_SCOPE', 'Fix changed Git HEAD or the index in its worktree')
   }
   const { changedFiles, violations } = await inspectWorkingTreeChanges(tree)
   if (violations.length > 0) {
-    throw new HarnessSdkError('REVIEW_FIX_SCOPE', `Fix changed paths outside the selected source files: ${violations.join(', ')}`)
+    throw new HarnessSdkError('REVIEW_FIX_SCOPE',
+      `Fix made unsupported changes: ${violations.join(', ')}. Only edits to existing selected regular files are allowed.`)
   }
   return changedFiles
 }

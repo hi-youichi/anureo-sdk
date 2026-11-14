@@ -8,7 +8,7 @@ const nativeLifecycle = process.argv.includes('--native-lifecycle');
 const nativeHeld = new Map();
 const badVersion = process.argv.includes('--bad-version');
 const noResume = process.argv.includes('--load-only');
-const missingSteer = process.argv.includes('--missing-steer');
+const missingHistory = process.argv.includes('--missing-history');
 const invalidExtension = process.argv.includes('--bad-extension');
 const authRequired = process.argv.includes('--auth-required');
 const scenarioIndex = process.argv.indexOf('--scenario');
@@ -40,9 +40,31 @@ async function handle(frame) {
     respondRestoredSession({ method: frame.method, p, respond });
     return;
   }
-  if (frame.method === 'session/close') { respond({}); return; }
+  if (frame.method === 'session/close') {
+    if (scenario === 'observe-close') send({ method: '_test/closed', params: { closedId: p.sessionId } });
+    respond({}); return;
+  }
   if (frame.method === 'session/set_mode') { configFor(p.sessionId).modes.currentModeId = p.modeId; update(p.sessionId, { sessionUpdate: 'current_mode_update', currentModeId: p.modeId }); respond({}); return; }
-  if (frame.method === 'session/set_config_option') { const data = configFor(p.sessionId); const option = data.configOptions.find((option) => option.id === p.configId); if (option) option.currentValue = p.value; respond({ configOptions: data.configOptions }); return; }
+  if (frame.method === 'session/set_config_option') {
+    const data = configFor(p.sessionId);
+    const option = data.configOptions.find((option) => option.id === p.configId);
+    if (option) option.currentValue = scenario === 'canonical-config' && p.configId === 'model-id' ? 'fake-model' : p.value;
+    if (scenario === 'canonical-config') data.configOptions = data.configOptions.filter(option => option.id !== 'enabled');
+    respond({ configOptions: data.configOptions }); return;
+  }
+  if (frame.method === '_test/late-traffic') {
+    update(p.sessionId, { sessionUpdate: 'session_info_update', title: 'Late title' });
+    send({ method: '_test/scoped', params: { sessionId: p.sessionId } });
+    send({ method: '_test/broadcast', params: {} });
+    send({ method: 'elicitation/complete', params: { elicitationId: 'authorization-id' } });
+    try {
+      await request('terminal/create', { sessionId: p.sessionId, command: 'late-terminal' });
+      respond({ terminalRejected: false });
+    } catch (error) {
+      respond({ terminalRejected: error.code === -32602 });
+    }
+    return;
+  }
   if (frame.method === 'session/cancel') { const promptId = waitingPromptIdsBySession.get(p.sessionId); if (promptId !== undefined) { send({ id: promptId, result: { stopReason: 'cancelled' } }); waitingPromptIdsBySession.delete(p.sessionId); } return; }
   if (frame.method === 'session/prompt') return handlePrompt({ frame, p, respond });
   if (extensions && frame.method.startsWith('_ahp/')) { handleExtension({ frame, p, respond }); return; }
@@ -58,7 +80,15 @@ function respondNewSession({ frame, p, respond }) {
   const id = `native-${++nextId}`;
   historyBySession.set(id, []);
   mcpBySession.set(id, p.mcpServers);
-  respond({ sessionId: id, ...configFor(id) });
+  const reply = () => respond({ sessionId: id, ...configFor(id) });
+  if (scenario === 'slow-first-open' && id === 'native-1') {
+    setTimeout(() => {
+      update(id, { sessionUpdate: 'session_info_update', title: 'First open' });
+      reply();
+    }, 150);
+  } else {
+    reply();
+  }
 }
 
 /** Send restore notifications before the reply so the adapter exercises its snapshot capture path. */
@@ -84,7 +114,7 @@ function respondInitialization(p, respond) {
         promptCapabilities: {},
         sessionCapabilities: { close: {} },
       },
-      _meta: { ahp: { version: 2, turnCorrelation: true } },
+      _meta: { ahp: { version: 2, turnCorrelation: true, methods: { review: '_ahp/review/start' } } },
     });
     return;
   }
@@ -94,8 +124,8 @@ function respondInitialization(p, respond) {
     const extensionMethods = {
       fork: '_ahp/session/fork',
       revert: '_ahp/session/revert',
-      steer: missingSteer ? '_ahp/missing/steer' : '_ahp/turn/steer',
-      history: '_ahp/history/read',
+      steer: '_ahp/turn/steer',
+      history: missingHistory ? '_ahp/missing/history' : '_ahp/history/read',
       goalSet: '_ahp/goal/set',
       goalClear: '_ahp/goal/clear',
       compact: '_ahp/compact/start',
@@ -124,7 +154,7 @@ function respondInitialization(p, respond) {
       mcpCapabilities: { http: scenario !== 'mcp-stdio-output' },
       sessionCapabilities: {
         ...(noResume ? {} : { resume: {} }),
-        close: {},
+        ...(scenario === 'no-close' ? {} : { close: {} }),
       },
     },
     ...(extensions ? { _meta: extensionMetadata } : {}),
@@ -144,11 +174,20 @@ async function handlePrompt({ frame, p, respond }) {
   if (scenario) command = { approval: 'permission', userInput: 'userInput', dynamicTool: 'dynamicTool', elicitation: 'elicitation', interrupt: 'wait', steer: 'wait', disconnect: 'disconnect' }[scenario] ?? command;
   if (scenario === 'backpressure') { update(p.sessionId, { sessionUpdate: 'future_update', content: 'x'.repeat(4096) }); respond({ stopReason: 'end_turn' }); return; }
   if (command === 'disconnect') { process.exit(1); }
-  if (command === 'wait') { waitingPromptIdsBySession.set(p.sessionId, frame.id); return; }
+  if (command === 'wait') {
+    waitingPromptIdsBySession.set(p.sessionId, frame.id);
+    if (scenario === 'interrupt') {
+      update(p.sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Waiting for cancellation' } });
+    }
+    return;
+  }
   if (command === 'capabilities') {
     update(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: JSON.stringify(clientCapabilities) } });
-  } else if (command === 'permission') {
-    const response = await request('session/request_permission', { sessionId: p.sessionId, toolCall: { toolCallId: 'tool', title: 'Execute' }, options: [{ optionId: 'allow', name: 'Allow once', kind: 'allow_once' }, { optionId: 'deny', name: 'Deny', kind: 'reject_once' }] });
+  } else if (command === 'permission' || command === 'permission-id-collision') {
+    const options = command === 'permission'
+      ? [{ optionId: 'allow', name: 'Allow once', kind: 'allow_once' }, { optionId: 'deny', name: 'Deny', kind: 'reject_once' }]
+      : [{ optionId: 'allow-once', name: 'Allow always', kind: 'allow_always' }, { optionId: 'deny', name: 'Deny', kind: 'reject_once' }];
+    const response = await request('session/request_permission', { sessionId: p.sessionId, toolCall: { toolCallId: 'tool', title: 'Execute' }, options });
     update(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: response.outcome.outcome } });
   } else if (command === 'elicitation' || command === 'elicitation-url') {
     const response = await request('elicitation/create', command === 'elicitation' ? { sessionId: p.sessionId, mode: 'form', message: 'Name', requestedSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } } : { sessionId: p.sessionId, mode: 'url', message: 'Authorize', url: 'https://auth.example.test/login?token=private-token', elicitationId: 'authorization-id' });
@@ -159,9 +198,15 @@ async function handlePrompt({ frame, p, respond }) {
   } else if (command === 'fs') {
     await request('fs/read_text_file', { sessionId: p.sessionId, path: '/injected-file' });
     await request('fs/write_text_file', { sessionId: p.sessionId, path: '/injected-file', content: 'write' });
-  } else if (command === 'terminal') {
+  } else if (command === 'terminal' || command === 'terminal-create-only') {
     const terminal = await request('terminal/create', { sessionId: p.sessionId, command: 'injected-command', args: [] });
-    for (const method of ['terminal/output', 'terminal/wait_for_exit', 'terminal/kill', 'terminal/release']) await request(method, { sessionId: p.sessionId, terminalId: terminal.terminalId });
+    if (command === 'terminal') {
+      for (const method of ['terminal/output', 'terminal/wait_for_exit', 'terminal/kill', 'terminal/release']) await request(method, { sessionId: p.sessionId, terminalId: terminal.terminalId });
+    }
+  } else if (command === 'fail-started') {
+    update(p.sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Starting' } });
+    send({ id: frame.id, error: { code: -32602, message: 'Prompt failed' } });
+    return;
   } else if (command === 'unknown-request') {
     try { await request('_future/unknown', { sessionId: p.sessionId }); throw Error('Unexpected approval'); } catch (error) { if (error.code !== -32601) throw error; }
   } else {
@@ -237,7 +282,7 @@ function handleExtension({ frame, p, respond }) {
     return;
   }
   if (frame.method === '_ahp/history/read') { respond({ items: historyBySession.get(p.sessionId) ?? [], snapshotToken: 'native-snapshot', source: { provider: 'acp', value: p.sessionId } }); return; }
-  if (frame.method === '_ahp/goal/set') { respond({ goal: p.goal, status: 'active' }); return; }
+  if (frame.method === '_ahp/goal/set') { respond(scenario === 'malformed-goal' ? {} : { goal: p.goal, status: 'active' }); return; }
   if (frame.method === '_ahp/goal/clear') { respond({ goal: null, status: 'cleared' }); return; }
   if (frame.method === '_ahp/compact/start') { respond({ maintenanceId: 'compact', status: 'completed' }); return; }
   if (frame.method === '_ahp/review/start') { send({ method: '_ahp/event', params: { sessionId: p.sessionId, event: { type: 'turn/started', payload: { turnId: p.turnId } } } }); send({ method: '_ahp/event', params: { sessionId: p.sessionId, event: { type: 'turn/completed', payload: { turnId: p.turnId, status: 'completed' } } } }); respond({ turnId: p.turnId, accepted: true }); return; }

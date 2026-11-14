@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { SessionKey, SessionStore, SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
 import { HarnessSdkError } from "@anureo/sdk";
@@ -26,17 +26,18 @@ export class FileSessionStore implements SessionStore {
   async append(key: SessionKey, entries: SessionStoreEntry[]): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     const file = this.transcriptPath(key);
-    const lockPath = `${file}.lock`;
-    const lockHandle = await acquireSessionLock(lockPath);
     const temporary = `${file}.${randomUUID()}.tmp`;
+    const releaseLock = await acquireSessionLock(`${file}.lockdir`);
     try {
       const stored = await this.readTranscript(file) ?? { key: structuredClone(key), entries: [], mtime: 0 };
       mergeSessionEntries(stored, entries);
       await publishJson({ file, temporary, value: stored });
     } finally {
-      await rm(temporary, { force: true });
-      await lockHandle.close();
-      await rm(lockPath, { force: true });
+      try {
+        await rm(temporary, { force: true });
+      } finally {
+        await releaseLock();
+      }
     }
   }
 
@@ -51,6 +52,8 @@ export class FileSessionStore implements SessionStore {
   }
 
   /** List transcripts with no truthy subpath for a project in filesystem order.
+   * An explicit empty subpath has a distinct on-disk key and is listed as a root transcript.
+   * When both root keys exist, the session ID appears twice, and listSubkeys omits the empty key.
    * The stored mtime is in Unix epoch milliseconds and advances on every committed append.
    * A missing directory yields an empty list. Read and envelope errors anywhere in the
    * transcript scan reject the listing. */
@@ -69,10 +72,18 @@ export class FileSessionStore implements SessionStore {
     });
   }
 
-  /** Remove the transcript for this exact key, accepting an absent file.
-   * Other subpaths and turn maps remain. The caller must coordinate this unlocked deletion with
-   * writers. Other removal failures reject. */
+  /** Remove the exact transcript when a subpath is supplied. For an omitted subpath, remove
+   * all transcripts for this project and session, including the explicit empty subpath.
+   * Accept absent files and retain turn maps. The caller must coordinate deletion with writers.
+   * Scan and removal failures reject. */
   async delete(key: SessionKey): Promise<void> {
+    if (key.subpath === undefined) {
+      for (const { key: storedKey } of await this.scanTranscripts()) {
+        if (storedKey.projectKey === key.projectKey && storedKey.sessionId === key.sessionId && storedKey.subpath !== undefined) {
+          await rm(this.transcriptPath(storedKey), { force: true });
+        }
+      }
+    }
     await rm(this.transcriptPath(key), { force: true });
   }
 
@@ -155,35 +166,62 @@ interface StoredSession {
   mtime: number;
 }
 
-/** Acquire append's exclusive lock and record its PID. Once the handle is returned, append owns
- * close and removal. A rejected PID write can strand the handle and lock file before transfer. */
-async function acquireSessionLock(lockPath: string): Promise<Awaited<ReturnType<typeof open>>> {
+/** Publish a populated directory atomically. A competing rename cannot replace a nonempty lock.
+ * The owner name includes a nonce so delayed recovery can only remove the owner it inspected.
+ * The directory lock uses a different path from legacy PID files. */
+async function acquireSessionLock(lockPath: string): Promise<() => Promise<void>> {
   const deadline = Date.now() + 10_000;
-  let lockHandle: Awaited<ReturnType<typeof open>> | undefined;
-  while (!lockHandle) {
-    try {
-      lockHandle = await open(lockPath, "wx", 0o600);
-      await lockHandle.writeFile(String(process.pid));
-    } catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code !== "EEXIST") throw cause;
-      await waitForSessionLock({ lockPath, deadline });
+  const owner = `${process.pid}-${randomUUID()}`;
+  const staged = `${lockPath}-${owner}`;
+  await mkdir(staged, { mode: 0o700 });
+  try {
+    await mkdir(join(staged, owner), { mode: 0o700 });
+    while (true) {
+      try {
+        await rename(staged, lockPath);
+        return () => removeSessionLockOwner(lockPath, owner);
+      } catch (cause) {
+        const code = (cause as NodeJS.ErrnoException).code;
+        // Windows can report access denied when a rename targets an existing directory.
+        const windowsContention = process.platform === "win32" && (code === "EPERM" || code === "EACCES");
+        if (code !== "EEXIST" && code !== "ENOTEMPTY" && !windowsContention) throw cause;
+      }
+      await recoverSessionLock(lockPath);
+      if (Date.now() >= deadline) throw new HarnessSdkError("SESSION_STORE_BUSY");
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
+  } catch (cause) {
+    await rm(staged, { recursive: true, force: true });
+    throw cause;
   }
-  return lockHandle;
 }
 
-/** Resolve contention before acquireSessionLock retries. Reclaim only a lock whose PID is gone,
- * since an unreadable PID or an old lock can still belong to a live writer. For other owners,
- * wait 10 ms before retrying or reject with SESSION_STORE_BUSY at the deadline. A failed removal
- * also rejects append. */
-async function waitForSessionLock({ lockPath, deadline }: { lockPath: string; deadline: number }): Promise<void> {
-  const pid = Number(await readFile(lockPath, "utf8").catch(() => ""));
-  if (isLockOwnerDefinitelyAbsent(pid)) {
-    await rm(lockPath, { force: true });
-    return;
+/** Recover an exited owner or finish removing an already empty lock. */
+async function recoverSessionLock(lockPath: string): Promise<void> {
+  const owners = await readdir(lockPath).catch((cause: NodeJS.ErrnoException) => {
+    if (cause.code !== "ENOENT") throw cause;
+  });
+  if (!owners) return;
+  const [owner] = owners;
+  if (owner === undefined) {
+    await removeEmptyLockDirectory(lockPath);
+  } else if (owners.length === 1 && isLockOwnerDefinitelyAbsent(Number(owner.split("-", 1)[0]))) {
+    await removeSessionLockOwner(lockPath, owner);
   }
-  if (Date.now() >= deadline) throw new HarnessSdkError("SESSION_STORE_BUSY");
-  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+
+async function removeSessionLockOwner(lockPath: string, owner: string): Promise<void> {
+  await rmdir(join(lockPath, owner)).catch((cause: NodeJS.ErrnoException) => {
+    if (cause.code !== "ENOENT") throw cause;
+  });
+  await removeEmptyLockDirectory(lockPath);
+}
+
+/** A replacement lock is already populated, so rmdir cannot remove it. */
+async function removeEmptyLockDirectory(lockPath: string): Promise<void> {
+  await rmdir(lockPath).catch((cause: NodeJS.ErrnoException) => {
+    if (cause.code !== "ENOENT" && cause.code !== "ENOTEMPTY" && cause.code !== "EEXIST") throw cause;
+  });
 }
 
 /** Treat only ESRCH for a valid positive PID as proof; permission errors leave the lock intact. */

@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 import { tmpdir } from 'node:os'
 import { createClient, type Client, type InteractionHandlers, type Session } from '@anureo/sdk'
+import { spawnHarnessProcess } from '@anureo/sdk/process'
 import type { AhpEvent } from '@anureo/protocol'
 import type { HermesAdapterOptions } from '../src'
 import { startFake, until } from './helpers'
@@ -235,6 +236,17 @@ test.each(['reconnect', 'gap', 'ack-lost'])('%s reconciles native terminal evide
   })
 })
 
+test('a storage error after admission reconciles the ambiguous submission without sending it again', async () => {
+  await withFixture('submit-storage-error', async (fixture, client) => {
+    const session = await client.sessions.create({ cwd: tmpdir() })
+    const turn = await session.submit({ input: 'run once' })
+    expect(await turn.result()).toMatchObject({ status: 'completed', text: 'authoritative final' })
+    const state = await fixture.state()
+    expect(state.inputs).toHaveLength(1)
+    expect(state.methods).toContain('session.resume')
+  })
+})
+
 test('owner restart with an unknown receipt fails observation without fabricating terminal or resolving the FIFO', async () => {
   await withFixture('unknown', async (fixture, client) => {
     const session = await client.sessions.create({ cwd: tmpdir() }), read = collect(session)
@@ -258,35 +270,50 @@ test('cancelling an unclaimed native queued row rejects submission without fabri
     const session = await client.sessions.create({ cwd: tmpdir() }), read = collect(session)
     try {
       const first = await session.submit({ input: 'first' })
-      const second = session.submit({ input: 'second' }); void second.catch(() => {})
-      await until(async () => (await fixture.state()).inputs.length === 2)
+      const second = session.submit({ input: 'x'.repeat(2048) }); void second.catch(() => {})
+      await until(async () => read.events.some(event => event.type === 'submission/status' && event.payload.status === 'queued'))
       await fixture.control('cancelQueued')
       await expect(second).rejects.toMatchObject({ code: 'INPUT_CANCELLED' })
       expect(read.events.filter(value => value.type === 'turn/started')).toHaveLength(1)
+      const third = session.submit({ input: 'y'.repeat(2048) }); void third.catch(() => {})
+      await until(async () => (await fixture.state()).inputs.length === 3)
       await first.interrupt()
+      await fixture.control('release')
+      expect((await (await third).result()).status).toBe('completed')
     } finally { await read.stop() }
-  })
+  }, { options: { maxBufferedBytes: 4096 } })
 })
 
 test.each(['approval-reconnect', 'batch-reconnect'])('%s restores one pending question and responds over the new connection', async scenario => {
   let release: () => void = () => {}, questions = 0
   const answer = new Promise<void>(resolve => { release = resolve })
+  let reconnect: () => void = () => {}, attaches = 0
+  const allowReconnect = new Promise<void>(resolve => { reconnect = resolve })
   try {
     await withFixture(scenario, async (fixture, client) => {
       const session = await client.sessions.create({ cwd: tmpdir() }), turn = await session.submit({ input: 'ask once' })
-      await until(async () => (await fixture.state()).methods.includes('session.resume'))
-      release()
+      try {
+        await until(async () => attaches === 3 && questions === 1)
+        release()
+        const disconnected = await fixture.state()
+        expect(disconnected.methods).not.toContain('session.resume')
+        expect(disconnected.responses).toHaveLength(0)
+      } finally { reconnect() }
       expect((await turn.result()).status).toBe('completed')
       expect(questions).toBe(1)
       expect((await fixture.state()).responses).toHaveLength(1)
       expect((await fixture.state()).inputs).toHaveLength(1)
     }, {
+      options: { processFactory: async options => {
+        if (++attaches === 3) await allowReconnect
+        return spawnHarnessProcess(options)
+      } },
       interactions: {
         approval: async () => { questions++; await answer; return { kind: 'approval', optionId: 'once' } },
         userInput: async () => { questions++; await answer; return { kind: 'userInput', answers: { q1: 'yes', q2: 'text' } } },
       },
     })
-  } finally { release() }
+  } finally { release(); reconnect() }
 })
 
 test('another viewer settling a prompt closes the interaction without submitting a second answer', async () => {

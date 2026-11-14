@@ -1,9 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import type { JsonObject } from '@anureo/protocol'
 import { HarnessSdkError, sdkError } from '@anureo/sdk'
 import type { z } from 'zod'
-import { executeAgent, type AgentOptions } from './agent-execution'
-import { prepareOutputSchema, type AgentOutputSchema } from './output-schema'
+import { executeAgent, prepareAgentCall, type AgentOptions, type PreparedAgentCall } from './agent-execution'
+import type { AgentOutputSchema } from './output-schema'
 import { currentRun, isFatal, type RunContext } from './workflow-state'
 import { canonicalJson, jsonCopy, type JsonValue } from './persistence/json'
 
@@ -40,57 +39,54 @@ export function agent<S extends z.ZodObject>(prompt: string, options: AgentOptio
 export async function agent(prompt: string, options: AgentOptions): Promise<string | Record<string, unknown> | null> {
   const context = currentRun()
   if (context) return memoizedAgent(context, prompt, options)
-  return executeAgent(prompt, options)
+  const outcome = await executeAgent(prompt, prepareAgentCall(options))
+  return outcome.status === 'dropped' ? null : outcome.value
 }
 
 /**
- * Prepare the schema for the key and for replay, then reserve the key synchronously when agent
- * inherits the run context. Preflight failures reject before registration. RunState admits and
- * observes the replay or execution so workflow can drain it even if the body leaves the call
- * unawaited. On a miss, executeAgent prepares the schema from the options again after the started
- * record is published and dispatch is rechecked.
+ * Track preflight, replay and execution so workflow observes failures and can drain unawaited calls.
+ * Prepare the call and reserve its key synchronously in invocation order.
  */
-async function memoizedAgent<S extends z.ZodObject>(
+async function memoizedAgent(
   context: RunContext,
   prompt: string,
-  options: AgentOptions<S>,
-): Promise<string | z.output<S> | null> {
+  options: AgentOptions,
+): Promise<string | Record<string, unknown> | null> {
   const { journal, state } = context
-  const output = options.schema === undefined ? undefined : prepareOutputSchema(options.schema)
-  // The key advances synchronously here: host invocation order fixes the chain.
-  const key = journal.nextKey(prompt, canonicalOptions(options, output?.schema))
   return state.track(() => {
+    const call = prepareAgentCall(options)
+    const key = journal.nextKey(prompt, canonicalOptions(call))
     const decision = journal.resolveCall(key)
-    if (decision.action === 'replay') return replayAgentResult(decision.result, output)
+    if (decision.action === 'replay') return replayAgentResult(decision.result, call.output)
     if (decision.action === 'reconcile') {
       throw new HarnessSdkError('WORKFLOW_RECONCILIATION_REQUIRED',
         'A previous run left this agent call with an unknown outcome; reconcile it before resuming', false, true)
     }
-    return executeJournaledAgent({ context, key, prompt, options })
+    return executeJournaledAgent({ context, key, prompt, call })
   })
 }
 
 /** Project the options memoizedAgent hashes with the prompt. Preserve the persisted key format
  * by using null for absent model, instructions, permission mode and schema, and omitting absent
  * fallback. Use the client identity so equivalent backend configurations can share a key. */
-function canonicalOptions(options: AgentOptions, schema: JsonObject | undefined): JsonValue {
+function canonicalOptions(call: PreparedAgentCall): JsonValue {
   return {
-    model: options.model ?? null,
-    instructions: options.instructions ?? null,
-    permissionMode: options.permissionMode ?? null,
-    schema: schema ?? null,
-    ...(options.outputFallback ? { outputFallback: options.outputFallback } : {}),
-    cwd: options.cwd,
-    client: options.client.identity,
+    model: call.model ?? null,
+    instructions: call.instructions ?? null,
+    permissionMode: call.permissionMode ?? null,
+    schema: call.output?.schema ?? null,
+    ...(call.outputFallback ? { outputFallback: call.outputFallback } : {}),
+    cwd: call.cwd,
+    client: call.client.identity,
   }
 }
 
 /** Return saved text or await current schema validation for memoizedAgent's typed hit.
  * A rejected validation propagates to the agent caller without rerunning the prompt. */
-async function replayAgentResult<S extends z.ZodObject>(
+async function replayAgentResult(
   hit: JsonValue,
-  output: AgentOutputSchema<S> | undefined,
-): Promise<string | z.output<S>> {
+  output: AgentOutputSchema | undefined,
+): Promise<string | Record<string, unknown>> {
   return output ? output.parse(canonicalJson(hit)) : hit as string
 }
 
@@ -101,34 +97,39 @@ async function replayAgentResult<S extends z.ZodObject>(
  * without attempting a second terminal write. The dispatch check is outside the execution catch
  * so a call stopped during publication retains its started marker.
  */
-async function executeJournaledAgent<S extends z.ZodObject>({ context, key, prompt, options }: {
+async function executeJournaledAgent({ context, key, prompt, call }: {
   context: RunContext
   key: string
   prompt: string
-  options: AgentOptions<S>
-}): Promise<string | z.output<S> | null> {
+  call: PreparedAgentCall
+}): Promise<string | Record<string, unknown> | null> {
   const { journal, state } = context
   const agentId = randomUUID()
   await journal.append({ type: 'started', key, agentId })
   state.assertDispatch()
   try {
-    // Cache identity was computed at invocation. Fresh execution reads options after publication.
-    const value = await executeAgent(prompt, options)
-    if (value === null) {
-      await journal.append({ type: 'failed', key, agentId, code: 'AGENT_DROPPED', outcomeUnknown: false })
+    const outcome = await executeAgent(prompt, call)
+    if (outcome.status === 'dropped') {
+      await journal.append({ type: 'failed', key, agentId, code: outcome.error.code, outcomeUnknown: false })
       state.noteIncomplete()
       return null
     }
-    const stored = jsonCopy(value) as JsonValue
+    const stored = jsonCopy(outcome.value) as JsonValue
     await journal.append({ type: 'result', key, agentId, result: stored })
-    return jsonCopy(stored) as string | z.output<S>
+    return jsonCopy(stored) as string | Record<string, unknown>
   } catch (cause) {
     const error = sdkError(cause, 'AGENT_FAILED')
     if (isFatal(error)) state.stop(error)
     // The storage layer may have published a terminal record already.
     if (error.code !== 'WORKFLOW_STORAGE_FAILED') {
-      await journal.append({ type: 'failed', key, agentId,
-        code: error.code, outcomeUnknown: error.outcomeUnknown === true })
+      try {
+        await journal.append({ type: 'failed', key, agentId,
+          code: error.code, outcomeUnknown: error.outcomeUnknown === true })
+      } catch {
+        state.noteStorageFailure()
+        throw new HarnessSdkError(error.code, error.message, error.retryable, error.outcomeUnknown,
+          { ...error.details, journalErrorCode: 'WORKFLOW_STORAGE_FAILED' })
+      }
     }
     throw error
   }

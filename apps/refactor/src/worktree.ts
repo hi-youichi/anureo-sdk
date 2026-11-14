@@ -2,7 +2,7 @@
 import { constants } from 'node:fs'
 import { copyFile, cp, link, lstat, mkdir, mkdtemp, readdir, readlink, realpath, rename, rm, rmdir, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, isAbsolute, join, relative, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { inspectGitPath, isSnapshotPath } from './git-path'
 import { fileFingerprint } from './git-tree'
 import { git, gitFiles } from './git'
@@ -21,6 +21,8 @@ export interface WorktreeBaseline {
   source: string
   /** Whether the scratch directory contains a copy of the repository's index. */
   hasIndex: boolean
+  /** Name of the shared index file required by a split index, when present. */
+  sharedIndex?: string
   /** Enqueue a Git registry mutation for this baseline and return its result or rejection.
    * A rejected update still releases the next queued update. */
   updateWorktreeRegistry: (update: () => Promise<string>) => Promise<string>
@@ -73,6 +75,9 @@ export async function createAgentWorktree(baseline: WorktreeBaseline): Promise<A
   try {
     if (baseline.hasIndex) {
       const index = await gitIndexPath(root)
+      if (baseline.sharedIndex) {
+        await copyFile(join(baseline.directory, baseline.sharedIndex), join(dirname(index), baseline.sharedIndex))
+      }
       await copyFile(join(baseline.directory, 'index'), index)
     }
     await cp(baseline.source, root, { recursive: true, verbatimSymlinks: true })
@@ -113,13 +118,32 @@ export async function prepareCheckDependencies(baseline: WorktreeBaseline, workt
     })
     if (!installed) continue
     if (installed.isSymbolicLink()) {
+      const resolved = await realpath(from)
+      const rebased = rebaseDependencyLink(resolved, baseline.root, worktree.root)
+      if (rebased !== resolved && rebased !== worktree.root) {
+        const local = relative(worktree.root, rebased).split(sep).join('/')
+        const { info, linkedAncestor } = await inspectGitPath(worktree.root, local)
+        if (linkedAncestor || (info && !info.isDirectory())) throw new Error(`Invalid dependency target: ${local}`)
+        if (!info) {
+          await mkdir(dirname(rebased), { recursive: true })
+          await copyDependencies(resolved, rebased, baseline.root, worktree.root)
+        }
+      }
       await mkdir(dirname(to), { recursive: true })
-      await symlink(rebaseDependencyLink(await realpath(from), baseline.root, worktree.root), to, 'junction')
+      const copied = await lstat(to).catch((cause: NodeJS.ErrnoException) => {
+        if (cause.code !== 'ENOENT') throw cause
+      })
+      if (copied?.isSymbolicLink()) await rm(to)
+      await symlink(rebased, to, 'junction')
     } else if (installed.isDirectory()) {
-      await cp(from, to, { recursive: true, verbatimSymlinks: true, mode: constants.COPYFILE_FICLONE })
-      await rebaseDependencyLinks(to, baseline.root, worktree.root)
+      await copyDependencies(from, to, baseline.root, worktree.root)
     }
   }
+}
+
+async function copyDependencies(from: string, to: string, sourceRoot: string, targetRoot: string): Promise<void> {
+  await cp(from, to, { recursive: true, verbatimSymlinks: true, mode: constants.COPYFILE_FICLONE })
+  await rebaseDependencyLinks(to, sourceRoot, targetRoot)
 }
 
 async function rebaseDependencyLinks(directory: string, source: string, target: string): Promise<void> {
@@ -156,18 +180,20 @@ export async function mergeWorktree(
   const original = join(baseline.source, baseline.scope)
   const entries = await Promise.all(files.map(async file => {
     const before = await inspectGitPath(target, file)
-    if (await fileFingerprint(target, file) !== await fileFingerprint(original, file)) {
+    const expected = await fileFingerprint(original, file)
+    if (await fileFingerprint(target, file) !== expected) {
       throw new Error(`Source changed during refactor: ${file}`)
     }
     const after = await inspectGitPath(worktree.cwd, file)
     if (after.linkedAncestor || (after.info && !after.info.isFile()) || (before.info && !before.info.isFile())) {
       throw new Error(`Refactor merge requires regular files: ${file}`)
     }
-    return { file, path: before.path, existed: !!before.info, replacement: !!after.info }
+    return { file, path: before.path, expected, replacement: !!after.info }
   }))
 
   const directory = await mkdtemp(join(target, '.anureo', 'refactor', 'merge-'))
   const staged = join(directory, 'staged')
+  const backups = join(directory, 'backups')
   const applied: { path: string; backup?: string; installed: boolean }[] = []
   const createdDirectories: string[] = []
   let keepRecovery = false
@@ -175,14 +201,20 @@ export async function mergeWorktree(
     for (const entry of entries) {
       if (entry.replacement) await copyEntry(worktree.cwd, staged, entry.file)
     }
-    for (const [index, entry] of entries.entries()) {
-      if (await fileFingerprint(target, entry.file) !== await fileFingerprint(original, entry.file)) {
+    for (const entry of entries) {
+      if (await fileFingerprint(target, entry.file) !== entry.expected) {
         throw new Error(`Source changed during refactor: ${entry.file}`)
       }
-      const backup = entry.existed ? join(directory, String(index)) : undefined
-      if (backup) await rename(entry.path, backup)
+      const backup = entry.expected !== undefined ? join(backups, entry.file) : undefined
+      if (backup) {
+        await mkdir(dirname(backup), { recursive: true })
+        await rename(entry.path, backup)
+      }
       const write = { path: entry.path, backup, installed: false }
       applied.push(write)
+      if (backup && await fileFingerprint(backups, entry.file) !== entry.expected) {
+        throw new Error(`Source changed during refactor: ${entry.file}`)
+      }
       if (entry.replacement) {
         const parent = dirname(entry.path)
         const firstCreated = await mkdir(parent, { recursive: true })
@@ -232,10 +264,13 @@ async function snapshotBaseline({ root, scope, directory }: Pick<WorktreeBaselin
     if (error.code === 'ENOENT') return false
     throw error
   })
+  const sharedPath = hasIndex ? (await git(root, 'rev-parse', '--path-format=absolute', '--shared-index-path')).replace(/\r?\n$/, '') : ''
+  const sharedIndex = sharedPath ? basename(sharedPath) : undefined
+  if (sharedIndex) await copyFile(sharedPath, join(directory, sharedIndex))
   for (const file of await gitFiles(root)) {
     if (isSnapshotPath(file)) await copyEntry(root, source, file)
   }
-  return { root, scope, head, directory, source, hasIndex, updateWorktreeRegistry: createRegistryQueue() }
+  return { root, scope, head, directory, source, hasIndex, sharedIndex, updateWorktreeRegistry: createRegistryQueue() }
 }
 
 /** Resolve the index for the specific checkout, since linked worktrees have their own index paths.

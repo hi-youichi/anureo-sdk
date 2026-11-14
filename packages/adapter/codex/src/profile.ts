@@ -66,8 +66,12 @@ export function codexCapabilities(version: string): Capabilities {
   }
 }
 
-/** Exact versions checked against the pinned native schema; other versions stay unverified even when a compatibility profile matches. */
-const VERIFIED_VERSIONS: readonly string[] = ['0.148.0', '0.164.0']
+/** Exact releases certified by the pinned schemas, with the expected revert method for each. */
+export const CODEX_SCHEMA_PINS = [
+  { version: '0.148.0', revertMethod: 'thread/rollback' },
+  { version: '0.164.0', revertMethod: 'thread/revert' },
+] as const satisfies readonly { version: string; revertMethod: CodexProfile['revert'] }[]
+const VERIFIED_VERSIONS: readonly string[] = CODEX_SCHEMA_PINS.map(pin => pin.version)
 /**
  * Compare dotted components for resolveCodexProfile, treating missing components as zero.
  * A nonnumeric component at the first differing position yields NaN, so that candidate fails the

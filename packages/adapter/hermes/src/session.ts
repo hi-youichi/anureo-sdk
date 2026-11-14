@@ -44,8 +44,8 @@ export class HermesSession implements BackendSession {
     this.released = released
     this.binding = structuredClone(params.binding)
     this.model = params.model
-    this.interactions = new HermesInteractions({ sessionId: () => this.nativeId, rpc: () => this.channel(), sink,
-      turnId: generation => [...this.turns.values()].find(value => value.epoch === this.description?.epoch && value.generation === generation)?.id,
+    this.interactions = new HermesInteractions({ sessionId: () => this.nativeId, rpc: () => this.channel(), ready: () => this.ready(), sink,
+      turnId: (epoch, generation) => [...this.turns.values()].find(value => value.epoch === epoch && value.generation === generation)?.id,
       epoch: () => this.description!.epoch, options })
   }
   /** Supply OutputSession with the native attachment snapshot, including active turns restored from pending rows. */
@@ -181,7 +181,7 @@ export class HermesSession implements BackendSession {
       request: async value => { if (this.rpc === channel && !this.disposed) await this.serverRequest(value) },
       failure: cause => {
         if (this.rpc !== channel || this.disposed) return
-        if (!recoverable(cause) || (this.options.reconnectAttempts ?? 3) === 0) void this.sink.fail(cause)
+        if (!recoverable(cause) || this.reconnectAttempts === 0) void this.sink.fail(cause)
         else void this.recover().catch(error => this.sink.fail(error))
       },
     }, this.options, this.abort.signal)
@@ -207,12 +207,12 @@ export class HermesSession implements BackendSession {
     await this.apply(event)
   }
   /** Drain held batches, including traffic arriving during awaits; only snapshot recovery tolerates replay discontinuity. */
-  private async flush(continuity: ReplayContinuity): Promise<void> {
+  private async flush(continuity: ReplayContinuity, reconciling = false): Promise<void> {
     while (this.held.length) {
       const entries = this.held; this.held = []; this.heldBytes = 0
       for (const value of entries) {
         if ('method' in value) await this.interactions.serverRequest(value)
-        else await this.apply(value, continuity)
+        else await this.apply(value, continuity, reconciling)
       }
     }
   }
@@ -251,6 +251,7 @@ export class HermesSession implements BackendSession {
       if (value.status === 'terminal') for (const [id, input] of inputs) {
         if (!input || input.rejected) continue
         input.rejected = true
+        this.releaseSettledInput(input)
         await this.sink.emit({ type: 'submission/status', payload: { submissionId: id, status: 'rejected',
           error: { code: 'INPUT_CANCELLED', message: 'Hermes input cancelled before execution', retryable: false, outcomeUnknown: false } } })
       }
@@ -261,6 +262,7 @@ export class HermesSession implements BackendSession {
     await turn.start()
     for (const [id, input] of inputs) if (input) await turn.bind(id, input.input)
     if (value.status === 'terminal' && !turn.terminal && value.result) await turn.fromReceipt(value.result, value.outcome)
+    if (turn.terminal) for (const [, input] of inputs) if (input) this.releaseSettledInput(input, true)
     return turn
   }
   /** Record evidence before publishing a binding or reporting uncertainty. A known input cannot change admissions. */
@@ -277,7 +279,8 @@ export class HermesSession implements BackendSession {
   private async snapshot(snapshot: NativeObject): Promise<void> {
     this.nativeId = identity(snapshot.session_id)
     const info = object(snapshot.info)
-    if (integer(snapshot.authority_epoch) !== this.description!.epoch || info.profile_id !== undefined && info.profile_id !== this.profileId) throw new HarnessSdkError('SESSION_BINDING_MISMATCH')
+    const epoch = integer(snapshot.authority_epoch)
+    if (epoch !== this.description!.epoch || info.profile_id !== undefined && info.profile_id !== this.profileId) throw new HarnessSdkError('SESSION_BINDING_MISMATCH')
     this.subscriptionId = identity(snapshot.subscription_id)
     this.binding = { ...this.binding, nativeRef: { provider: 'hermes', value: this.nativeId } }
     if (typeof info.title === 'string') this.title = info.title
@@ -285,7 +288,7 @@ export class HermesSession implements BackendSession {
     for (const value of array(snapshot.pending)) {
       await this.associatePending(value)
     }
-    await this.interactions.snapshot(array(snapshot.prompts), snapshot.open_requests == null ? [] : array(snapshot.open_requests))
+    await this.interactions.snapshot(array(snapshot.prompts), snapshot.open_requests == null ? [] : array(snapshot.open_requests), epoch)
   }
   /** Trust the pending row's explicit input id only for a locally tracked submission. */
   private async associatePending(value: unknown): Promise<void> {
@@ -293,7 +296,7 @@ export class HermesSession implements BackendSession {
     await this.associate(pending, pending.inputId && this.submissions.has(pending.inputId) ? pending.inputId : undefined)
   }
   /** Apply live or replayed traffic, advancing the cursor only after all resulting publications succeed. */
-  private async apply(event: NativeEvent, continuity: ReplayContinuity = 'contiguous'): Promise<void> {
+  private async apply(event: NativeEvent, continuity: ReplayContinuity = 'contiguous', reconciling = false): Promise<void> {
     const position = this.eventPosition(event)
     if (!position) return
     if (position.epoch !== this.cursor.epoch || position.sequence !== this.cursor.sequence + 1) {
@@ -311,11 +314,11 @@ export class HermesSession implements BackendSession {
         break
       case 'approval.request':
       case 'clarify.request':
-        await this.interactions.prompt({ ...payload, kind: event.type === 'approval.request' ? 'approval' : 'clarify', authority_epoch: event.authority_epoch ?? this.description!.epoch })
+        await this.interactions.prompt({ ...payload, kind: event.type === 'approval.request' ? 'approval' : 'clarify' }, event.authority_epoch ?? this.description!.epoch)
         break
       case 'approval.settled':
       case 'clarify.settled':
-        await this.interactions.settled({ wire: 'prompt', nativeId: identity(payload.prompt_id), generation: integer(payload.execution_generation) }, 'resolved')
+        await this.interactions.settled({ wire: 'prompt', nativeId: identity(payload.prompt_id), generation: integer(payload.execution_generation), epoch: event.authority_epoch ?? this.description!.epoch }, 'resolved')
         break
       case 'request.cancel':
         await this.interactions.settled({ wire: 'request', nativeId: identity(payload.id) }, identity(payload.reason))
@@ -334,7 +337,8 @@ export class HermesSession implements BackendSession {
         break
       case 'error':
         // A bare error does not identify an execution's terminal state.
-        throw new HarnessSdkError('HERMES_REPLAY_GAP', 'Hermes execution requires reconciliation', false, true)
+        if (!reconciling) throw new HarnessSdkError('HERMES_REPLAY_GAP', 'Hermes execution requires reconciliation', false, true)
+        break
     }
     this.cursor = position
   }
@@ -371,8 +375,9 @@ export class HermesSession implements BackendSession {
     }
     if (event.type === 'message.complete') await this.interactions.waitResponders()
     await turn.apply(event)
-    if (turn.terminal) for (const input of this.submissions.values()) if (input.admission?.id === admissionId && input.acknowledged) this.releaseInput(input)
+    if (turn.terminal) for (const input of this.submissions.values()) if (input.admission?.id === admissionId) this.releaseSettledInput(input, true)
   }
+  private get reconnectAttempts(): number { return this.options.reconnectAttempts ?? 3 }
   /** Await any current recovery, or start one for a disconnected channel, before dispatching another request. */
   private async ready(): Promise<void> {
     if (this.disposed) throw new HarnessSdkError('SESSION_CLOSED')
@@ -394,7 +399,7 @@ export class HermesSession implements BackendSession {
   private async retryRecovery(old: HermesRpc): Promise<void> {
     await old.finished
     let last: unknown = new HarnessSdkError('CONNECTION_CLOSED', 'Hermes connection lost', false, true)
-    const attempts = this.options.reconnectAttempts ?? 3
+    const attempts = this.reconnectAttempts
     for (let attempt = 0; attempt < attempts; attempt++) {
       if (this.disposed) throw new HarnessSdkError('SESSION_CLOSED')
       if (attempt) await delay((this.options.reconnectDelayMs ?? 100) * 2 ** (attempt - 1), undefined, { signal: this.abort.signal })
@@ -416,7 +421,7 @@ export class HermesSession implements BackendSession {
     const rpc = this.channel()
     const continuity = await this.replaySnapshot(rpc)
     await this.reconcileAdmissions(rpc)
-    await this.flush(continuity)
+    await this.flush(continuity, true)
     this.holding = false
   }
   /** Try attachment first; subsequent attempts may request owner recovery within the rolling per-session budget. */
@@ -431,7 +436,7 @@ export class HermesSession implements BackendSession {
   private async replaySnapshot(rpc: HermesRpc): Promise<ReplayContinuity> {
     const replay = object(await rpc.request('session.events.since', { session_id: this.nativeId, replay_epoch: this.cursor.epoch, last_sequence: this.cursor.sequence }))
     if (typeof replay.snapshot_required !== 'boolean') throw protocolError()
-    if (!replay.snapshot_required) for (const value of array(replay.events)) await this.apply(nativeEvent(value))
+    if (!replay.snapshot_required) for (const value of array(replay.events)) await this.apply(nativeEvent(value), 'contiguous', true)
     const snapshot = object(await rpc.request('session.resume', { session_id: this.nativeId, omit_messages: true }))
     const gap = replay.snapshot_required || snapshot.replay_epoch !== this.cursor.epoch
     if (gap) {
@@ -440,7 +445,7 @@ export class HermesSession implements BackendSession {
     }
     await this.snapshot(snapshot)
     const continuity = gap ? 'snapshot' : 'contiguous'
-    await this.flush(continuity)
+    await this.flush(continuity, true)
     const watermark = integer(snapshot.last_sequence)
     if (this.cursor.sequence < watermark) {
       await this.reportProgressGap()
@@ -491,7 +496,7 @@ export class HermesSession implements BackendSession {
       throw cause
     } finally {
       input.acknowledged = true
-      if (input.rejected || input.admission && this.turns.get(input.admission.id)?.terminal) this.releaseInput(input)
+      this.releaseSettledInput(input, input.admission ? this.turns.get(input.admission.id)?.terminal : false)
     }
   }
   /** Enforce identity/count/byte budgets before native dispatch, evicting only acknowledged inputs with known outcomes. */
@@ -510,12 +515,12 @@ export class HermesSession implements BackendSession {
     this.submissions.set(params.submissionId, input)
     return input
   }
-  /** Recover evidence after a retryable submit failure. Return the recovered admission or reject with an unknown outcome. */
+  /** Recover admission evidence after an ambiguous submit failure, without retrying the mutation. */
   private async submitReceipt(submissionId: string, input: Submission): Promise<Receipt> {
     try {
       return this.parseReceipt(await this.channel().request('prompt.submit', { session_id: this.nativeId, text: input.input, submission_id: submissionId }, true))
     } catch (cause) {
-      if (!recoverable(cause) || (this.options.reconnectAttempts ?? 3) === 0) throw cause
+      if (!recoverable(cause) || !cause.outcomeUnknown || this.reconnectAttempts === 0) throw cause
       try { await this.recover() } catch (recovery) {
         const code = recovery instanceof HarnessSdkError ? recovery.code : 'CONNECTION_CLOSED'
         throw new HarnessSdkError(code, 'Hermes submission outcome is unknown after reconnect', false, true)
@@ -523,6 +528,9 @@ export class HermesSession implements BackendSession {
       if (!input.admission) throw new HarnessSdkError('RESULT_UNKNOWN', 'Hermes submission outcome is unknown; do not resend', false, true)
       return input.admission
     }
+  }
+  private releaseSettledInput(input: Submission, terminal = false): void {
+    if (input.acknowledged && (input.rejected || terminal)) this.releaseInput(input)
   }
   /** Release retained text idempotently without discarding the admission's replay/correlation guard. */
   private releaseInput(input: Submission): void { this.submissionBytes -= Buffer.byteLength(input.input); input.input = '' }

@@ -1,7 +1,7 @@
 // Adapts a subprocess to ACP's framed message streams and drains startup diagnostics.
 import * as acp from '@agentclientprotocol/sdk';
 import { HarnessSdkError, spawnHarnessProcess, type HarnessProcess } from '@anureo/sdk';
-import { StderrTail } from './diagnostics';
+import { DEFAULT_STDERR_TAIL_LINES, StderrTail } from './diagnostics';
 import type { AcpAdapterOptions, AcpChannel } from './options';
 
 /**
@@ -93,7 +93,7 @@ function frameGuard(options: AcpAdapterOptions, message: string): (chunk: Uint8A
  * and flushes buffered text without failing the protocol. Channel disposal does not await the drain.
  */
 function captureStderr(child: HarnessProcess, options: AcpAdapterOptions): StderrTail {
-  const tail = new StderrTail(options.stderrTailLines ?? 200, options.onStderr);
+  const tail = new StderrTail(options.stderrTailLines ?? DEFAULT_STDERR_TAIL_LINES, options.onStderr);
   const decoder = new TextDecoder();
   void (async () => {
     try {

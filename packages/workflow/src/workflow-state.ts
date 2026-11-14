@@ -59,6 +59,7 @@ export class RunState {
     if (!first) return undefined
     return new HarnessSdkError(first.code, first.message, false,
       failures.some(error => error.outcomeUnknown), {
+        ...first.details,
         failureCodes: [...new Set(failures.map(error => error.code))],
         cleanupFailed: failures.some(cleanupFailed),
       })

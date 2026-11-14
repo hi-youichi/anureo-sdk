@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
-import { BoundedEventQueue, createClient } from '@anureo/sdk'
+import { BoundedEventQueue, HarnessSdkError, createClient } from '@anureo/sdk'
 import type { AhpEvent, JsonSchema, SessionOpenParams } from '@anureo/protocol'
 import { createClaudeAdapter, type ClaudeAdapterOptions, type ClaudeQuery, type ClaudeQueryFactory } from './index'
 
@@ -302,21 +302,36 @@ test('switch admission spans asynchronous Query cleanup and rejects competing in
   } finally { cleanup.release(); await f.dispose() }
 })
 
-test('configuration in progress prevents switching and completed settings survive the replacement', async () => {
+test('configuration in progress prevents query replacement and completed settings survive the replacement', async () => {
   const entered = Promise.withResolvers<void>()
   const release = Promise.withResolvers<void>()
-  const f = await fixture()
+  const f = await fixture({ sessionStore: new InMemorySessionStore() })
   const initialQueryIndex = 0, answerQueryIndex = 1
   try {
     f.queries[initialQueryIndex]!.query.setModel = async () => { entered.resolve(); await release.promise }
     const configuring = f.session.request('session/config/set', { requestId: 'config', sessionId: f.session.id, patch: { model: 'later-model', fastMode: false } })
     await entered.promise
     await expect(f.session.submit({ input: 'schema', outputSchema: ANSWER })).rejects.toMatchObject({ code: 'SESSION_BUSY' })
+    await expect(f.session.request('session/revert', { requestId: 'revert', sessionId: f.session.id, scope: 'conversation', boundary: { turnId: 'old', relation: 'before' } })).rejects.toMatchObject({ code: 'SESSION_BUSY' })
     release.resolve(); await configuring
     await f.execute(ANSWER, answerQueryIndex, { structured_output: { answer: 1 } })
     expect(f.queries[answerQueryIndex]!.options.model).toBe('later-model')
     expect(f.queries[answerQueryIndex]!.options.settings).toEqual({ fastMode: false })
   } finally { release.resolve(); await f.dispose() }
+})
+
+test('query replacement retains acknowledged settings from a rejected patch', async () => {
+  const f = await fixture({}, { config: { permissionMode: 'default', fastMode: false, effort: 'low', maxThinkingTokens: 80 } })
+  try {
+    f.queries[0]!.query.setMaxThinkingTokens = async () => { throw new HarnessSdkError('NATIVE_THINKING_REJECTED') }
+    await expect(f.session.request('session/config/set', {
+      requestId: 'partial', sessionId: f.session.id,
+      patch: { permissionMode: 'plan', fastMode: true, effort: 'max', maxThinkingTokens: 100 },
+    })).rejects.toMatchObject({ code: 'NATIVE_THINKING_REJECTED', outcomeUnknown: false })
+    await f.execute(ANSWER, 1, { structured_output: { answer: 1 } })
+    expect(f.queries[1]!.options).toMatchObject({ permissionMode: 'plan', settings: { fastMode: true }, effort: 'max', maxThinkingTokens: 80 })
+    expect(f.session.snapshot.config).toEqual({ permissionMode: 'default', fastMode: false, effort: 'low', maxThinkingTokens: 80 })
+  } finally { await f.dispose() }
 })
 
 test('close during cleanup never starts a replacement Query or dispatches input', async () => {

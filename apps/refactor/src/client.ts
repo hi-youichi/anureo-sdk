@@ -1,5 +1,5 @@
 // Selects CLI adapters and their default permission modes.
-import { resolve } from 'node:path'
+import { basename, resolve } from 'node:path'
 import { approveWithNarrowestScope, createClient, type Client } from '@anureo/sdk'
 import { spawnHarnessProcess } from '@anureo/sdk/process'
 
@@ -33,11 +33,12 @@ export const harnessPermissions: Partial<Record<RefactorHarness, { readPermissio
  * executeRefactor passes failures to runCli and awaits disposal of a returned client. */
 export async function createRefactorClient(cwd: string, selection: HarnessSelection): Promise<Client> {
   const adapter = await createAdapter(cwd, selection)
+  // Allow the DSH preset's 120-second native initialize request plus subprocess startup.
   return createClient({
     adapter,
     identity: { adapterId: selection.id, runtimeConfigId: 'refactor' },
     interactions: { approval: approveWithNarrowestScope },
-  })
+  }, selection.id === 'dsh' ? { timeoutMs: 125_000 } : undefined)
 }
 
 const javaScriptEntry = /\.[cm]?js$/i
@@ -51,7 +52,8 @@ async function createAdapter(cwd: string, { id, command, args, url }: HarnessSel
       const executable = process.env.CODEX_BIN?.trim() || 'codex'
       const script = javaScriptEntry.test(executable) ? resolve(cwd, executable) : undefined
       return createCodexAdapter({
-        command: executable, cwd,
+        command: basename(executable) === executable ? executable : resolve(cwd, executable),
+        cwd,
         // The adapter uses this for version probes and session launches. Resolve the script
         // against the CLI target so it still works when a session launches in a worktree.
         processFactory: script ? options => spawnHarnessProcess({

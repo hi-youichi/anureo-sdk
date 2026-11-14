@@ -24,7 +24,7 @@ export async function submitOutput(server, prompt, answer) {
     const result = await rpc('tools/call', { name: 'submit_result', arguments: args })
     if (result.isError) throw new Error('output rejected')
   } finally {
-    if (connection.child) await closeChild(connection.child)
+    if (connection.child) await closeChild(connection.child, connection.exited)
   }
 }
 
@@ -69,6 +69,26 @@ function createStdioConnection(server) {
     stdio: ['pipe', 'pipe', 'ignore'],
   })
   const pending = new Map()
+  let childError
+  function failPending(error) {
+    childError ??= error
+    for (const request of pending.values()) {
+      clearTimeout(request.timer)
+      request.reject(childError)
+    }
+    pending.clear()
+  }
+  const exited = new Promise(resolve => {
+    child.once('error', error => {
+      failPending(error)
+      resolve()
+    })
+    child.once('exit', (code, signal) => {
+      failPending(new Error(`MCP bridge exited (${signal ?? code})`))
+      resolve()
+    })
+  })
+  child.stdin.on('error', failPending)
   let sequence = 0
   createInterface({ input: child.stdout }).on('line', line => {
     const message = JSON.parse(line)
@@ -81,6 +101,7 @@ function createStdioConnection(server) {
     else request.resolve(message.result)
   })
   const rpc = (method, params) => new Promise((resolve, reject) => {
+    if (childError) { reject(childError); return }
     const id = ++sequence
     const timer = setTimeout(() => {
       pending.delete(id)
@@ -89,12 +110,11 @@ function createStdioConnection(server) {
     pending.set(id, { resolve, reject, timer })
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
   })
-  return { child, rpc }
+  return { child, rpc, exited }
 }
 
 /** End the live bridge's stdin to allow graceful exit, then send SIGKILL if the exit is still pending after 1.5 seconds. */
-async function closeChild(child) {
-  const exited = new Promise(resolve => child.once('exit', resolve))
+async function closeChild(child, exited) {
   child.stdin.end()
   const timer = setTimeout(() => child.kill('SIGKILL'), 1500)
   await exited

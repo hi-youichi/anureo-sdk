@@ -4,7 +4,7 @@ import type { FileChange, Item, JsonValue } from '@anureo/protocol'
  * Project native Edit, MultiEdit and Write payloads into file evidence using only the supplied data.
  * Return undefined for other tools, an empty array when neither payload supplies a string path,
  * or one change. Prefer result.filePath over input.file_path and fall back to input evidence
- * when the result supplies no usable material.
+ * when the result supplies neither usable material nor a confirmed operation.
  * ClaudeBackendSession.blockItem attaches input evidence to live and history items.
  * completeClaudeTool projects evidence again when a matching native result arrives.
  */
@@ -78,7 +78,10 @@ function resultFileChange(path: string, name: string, output: Record<string, unk
   // An update can omit the original text. Null is evidence of an absent file only for create.
   const originalFile = output.originalFile
   const created = output.type === 'create'
-  if (typeof originalFile !== 'string' && !(created && originalFile === null)) return undefined
+  if (typeof originalFile !== 'string' && !(created && originalFile === null)) {
+    if (output.type !== 'update') return undefined
+    return { path, operation: 'modify', materials: [{ format: 'unavailable', reason: 'notProvided' }], completeness: 'partial' }
+  }
   return {
     path,
     operation: created ? 'add' : 'modify',

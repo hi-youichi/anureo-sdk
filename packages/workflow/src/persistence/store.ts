@@ -91,8 +91,9 @@ class FileRunHandle implements RunHandle {
    * The manifest comes last so it refers to an already published result. */
   async finish(status: 'completed' | 'incomplete', result: JsonValue): Promise<void> {
     await this.updateManifest(async () => {
+      const { journalDigest } = this.journal.checkpoint()
       await atomicPublish(join(this.path, checkpointFormat.result), result)
-      await this.publishManifest({ status, resultDigest: digest(result), failure: null })
+      await this.publishManifest({ status, journalDigest, resultDigest: digest(result), failure: null })
     })
   }
 
@@ -100,7 +101,11 @@ class FileRunHandle implements RunHandle {
    * even if finish left an earlier result file. */
   async abort(failure: StoredFailure): Promise<void> {
     await this.updateManifest(async () => {
-      await this.publishManifest({ status: 'failed', resultDigest: null, failure })
+      const { journalDigest, unpublishedUnknownFailures } = this.journal.checkpoint()
+      await this.publishManifest({ status: 'failed', journalDigest, resultDigest: null, failure: {
+        ...failure,
+        ...(unpublishedUnknownFailures.length ? { unpublishedUnknownFailures } : {}),
+      } })
     })
   }
 
@@ -140,7 +145,7 @@ class FileRunHandle implements RunHandle {
 
   /** Recompute the digest from payload only for every terminal transition, then publish it.
    * Keep the in-memory transition even if publication rejects, as abort may follow a failed finish. */
-  private async publishManifest(update: Pick<Manifest, 'status' | 'resultDigest' | 'failure'>): Promise<void> {
+  private async publishManifest(update: Pick<Manifest, 'status' | 'journalDigest' | 'resultDigest' | 'failure'>): Promise<void> {
     const { recordDigest: _, ...payload } = this.manifest
     this.manifest = record({ ...payload, ...update })
     await atomicPublish(join(this.path, checkpointFormat.manifest), this.manifest)
@@ -149,18 +154,27 @@ class FileRunHandle implements RunHandle {
 
 /** Throw INVALID_PARAMS for malformed target identity before copying input or touching storage. */
 function validateRunOptions(options: FileRunOptions): void {
-  if (!runIdSchema.safeParse(options.runId).success || typeof options.name !== 'string' || !options.name
-    || typeof options.revision !== 'string' || !options.revision || typeof options.directory !== 'string' || !options.directory) {
-    throw new HarnessSdkError('INVALID_PARAMS')
+  const issues: string[] = []
+  if (!runIdSchema.safeParse(options.runId).success) {
+    issues.push('runId must be a valid directory basename (at most 255 UTF-8 bytes)')
   }
+  if (typeof options.name !== 'string' || !options.name) issues.push('name must be a nonempty string')
+  if (typeof options.revision !== 'string' || !options.revision) issues.push('revision must be a nonempty string')
+  if (typeof options.directory !== 'string' || !options.directory) issues.push('directory must be a nonempty string')
+  if (issues.length) throw new HarnessSdkError('INVALID_PARAMS', `Invalid workflow options: ${issues.join(', ')}`)
 }
 
 /** Snapshot input, resolve parent/source paths, and create a real target directory before locking.
  * Flush the parent when creating the target. Initialization checks existing contents under the lock. */
 async function prepareRunStorage(options: FileRunOptions): Promise<PreparedRun> {
   const input = jsonCopy(options.input)
-  await mkdir(resolve(options.directory), { recursive: true, mode: 0o700 })
-  const directory = await realpath(resolve(options.directory))
+  const root = resolve(options.directory)
+  if (options.resumeFrom !== undefined && typeof options.resumeFrom !== 'string') {
+    const directory = await prospectiveDirectory(root)
+    await resolveSourceRun({ resumeFrom: options.resumeFrom, directory, path: join(directory, options.runId) })
+  }
+  await mkdir(root, { recursive: true, mode: 0o700 })
+  const directory = await realpath(root)
   const path = join(directory, options.runId)
   const source = await resolveSourceRun({ resumeFrom: options.resumeFrom, directory, path })
   try {
@@ -170,7 +184,21 @@ async function prepareRunStorage(options: FileRunOptions): Promise<PreparedRun> 
     if ((cause as NodeJS.ErrnoException).code !== 'EEXIST') throw cause
   }
   if (!(await lstat(path)).isDirectory()) invalidCheckpoint()
+  if (source && overlaps(await realpath(path), join(source.directory, source.runId))) {
+    throw new HarnessSdkError('WORKFLOW_OVERLAPPING_RUNS')
+  }
   return { directory, path, input, source }
+}
+
+/** Resolve existing ancestors so the overlap check can run before creating a missing root. */
+async function prospectiveDirectory(path: string): Promise<string> {
+  try {
+    return await realpath(path)
+  } catch (cause) {
+    const parent = dirname(path)
+    if ((cause as NodeJS.ErrnoException).code !== 'ENOENT' || parent === path) throw cause
+    return join(await prospectiveDirectory(parent), relative(parent, path))
+  }
 }
 
 /** Resolve optional replay coordinates before target creation so overlapping source/target trees
@@ -253,6 +281,7 @@ async function publishInitialRun({ options, prepared, lock }: {
     createdAt: new Date().toISOString(),
     resumedFrom: source,
     status: 'running',
+    journalDigest: null,
     resultDigest: null,
     failure: null,
   })

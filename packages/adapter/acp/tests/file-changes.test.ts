@@ -36,15 +36,19 @@ test('tool updates preserve omitted source, replace explicit empty content, and 
     () => {},
     false,
   )
-  await mapper.update({ sessionUpdate: 'tool_call', toolCallId: 'edit', kind: 'edit', content: [{ type: 'diff', path: 'a', oldText: 'old', newText: 'new' }] })
+  await mapper.update({
+    sessionUpdate: 'tool_call', toolCallId: 'edit', kind: 'edit', rawInput: { path: 'a' }, rawOutput: 'native output',
+    content: [{ type: 'diff', path: 'a', oldText: 'old', newText: 'new' }],
+  })
   await mapper.update({ sessionUpdate: 'tool_call_update', toolCallId: 'edit', title: 'Changed' })
   expect(events[1]).toMatchObject({ type: 'item/delta', payload: { kind: 'patch', value: { fileChanges: [{ path: 'a' }] } } })
   await mapper.update({
-    sessionUpdate: 'tool_call_update', toolCallId: 'edit', rawOutput: null,
+    sessionUpdate: 'tool_call_update', toolCallId: 'edit', rawInput: null, rawOutput: null,
     locations: [{ path: 'a', line: 0 }, { path: 'b', line: 'invalid' }, { line: 2 }, null],
   })
   expect(events[2]).toMatchObject({ type: 'item/delta', payload: { value: {
-    output: null,
+    input: { path: 'a' },
+    output: 'native output',
     fileChanges: [{ path: 'a' }],
     locations: [{ path: 'a', line: 0 }, { path: 'b' }],
   } } })
@@ -53,7 +57,7 @@ test('tool updates preserve omitted source, replace explicit empty content, and 
     content: [{ type: 'diff', path: 'replacement', newText: 'new' }],
   })
   expect(events[3]).toMatchObject({ type: 'item/delta', payload: { value: {
-    fileChanges: [{ path: 'replacement' }], output: null,
+    fileChanges: [{ path: 'replacement' }], output: [{ type: 'diff', path: 'replacement' }],
   } } })
   await mapper.update({ sessionUpdate: 'tool_call_update', toolCallId: 'edit', content: [], status: 'completed' })
   expect(events[4]).toMatchObject({ type: 'item/completed', payload: { item: {
@@ -72,4 +76,39 @@ test('tool updates preserve omitted source, replace explicit empty content, and 
     type: 'item/started',
     payload: { item: { id: 'edit', type: 'toolCall', kind: 'other', title: 'ACP tool', status: 'running' } },
   })
+})
+
+test('fallback output preserves block order and keeps large diff text only in file changes', async () => {
+  const events: AhpEventPayload[] = []
+  const eventSink = {
+    emit: async event => { events.push(event) },
+  } as SessionEventSink
+  const mapper = new AcpUpdateMapper(eventSink, () => 'turn', () => ({} as SessionState), () => {}, false)
+  const newText = 'x'.repeat(5 * 1024 * 1024)
+  const before = { type: 'content', content: { type: 'text', text: 'Before' } }
+  const after = { type: 'content', content: { type: 'text', text: 'After' } }
+  await mapper.update({
+    sessionUpdate: 'tool_call', toolCallId: 'edit',
+    content: [before, { type: 'diff', path: 'large', newText }, after],
+  })
+  expect(events[0]).toMatchObject({ type: 'item/started', payload: { item: {
+    output: [before, { type: 'diff', path: 'large' }, after],
+    fileChanges: [{ path: 'large', materials: [{ newText }] }],
+  } } })
+  expect(Buffer.byteLength(JSON.stringify(events[0]))).toBeLessThan(8 * 1024 * 1024)
+})
+
+test('native terminal compaction updates emit completion immediately', async () => {
+  const events: AhpEventPayload[] = []
+  const eventSink = {
+    emit: async event => { events.push(event) },
+  } as SessionEventSink
+  const mapper = new AcpUpdateMapper(eventSink, () => 'turn', () => ({} as SessionState), () => {}, false)
+  for (const [native, status] of [['completed', 'completed'], ['failed', 'failed'], ['cancelled', 'interrupted']]) {
+    await mapper.update({ sessionUpdate: 'compaction_update', compactionId: native, status: 'running' })
+    await mapper.update({ sessionUpdate: 'compaction_update', compactionId: native, status: native, summary: 'final summary' })
+    expect(events.at(-1)).toMatchObject({ type: 'item/completed', payload: { item: {
+      type: 'compaction', id: `compaction:${native}`, summary: 'final summary', status,
+    } } })
+  }
 })

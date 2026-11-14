@@ -1,16 +1,25 @@
 import { expect, test } from 'bun:test'
-import { readFile, readdir, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 import { correctnessAngle, defaultAngles, designAngle, formatReport, reviewCode, type ReviewProgress } from '../src'
 import { reviewFailure } from '../src/errors'
 import { createReviewClient } from '../src/client'
+import { reviewGit } from '../src/git'
+import { readGitStateFingerprint } from '../src/git-state'
 // Cross-package test dependency: hermes fake MCP server; coordinate changes
 // with packages/adapter/hermes/tests/helpers.ts.
 import { startFake } from '../../../packages/adapter/hermes/tests/helpers'
-import { finding, fixture, isAnalysis, isModule, plan } from './helpers'
+import { finding, fixture, isAnalysis, isModule, plan, stages } from './helpers'
 
 const angles = [correctnessAngle, { id: 'contracts', title: 'Contracts', instructions: 'Check caller contracts.' }]
+
+async function commitFixture(cwd: string): Promise<void> {
+  await reviewGit(cwd, 'init', '-q')
+  await reviewGit(cwd, 'add', 'a.ts', 'b.ts')
+  await reviewGit(cwd, '-c', 'user.name=test', '-c', 'user.email=test@example.com',
+    '-c', 'commit.gpgSign=false', 'commit', '-qm', 'Fixture sources')
+}
 
 test('Hermes submits analysis instructions through input instead of session options', async () => {
   const { cwd } = await fixture()
@@ -170,6 +179,7 @@ test('progress callback failure preserves results and releases the shared concur
   const report = await reviewCode({
     client, cwd, angles, concurrency: 1,
     onProgress: event => {
+      if (event.stage === 'workflow') throw Object.create(null)
       if (event.stage === 'review' && event.moduleId === 'a' && event.angleId === 'correctness' && event.status === 'started') {
         throw new Error('Progress sink failed')
       }
@@ -179,8 +189,11 @@ test('progress callback failure preserves results and releases the shared concur
   expect(report.modules[0]?.review.angles[0]).toMatchObject({
     angle: { id: 'correctness' }, status: 'completed', findings: [],
   })
-  expect(report.progressErrors).toEqual([{ message: 'Progress sink failed', code: null, outcomeUnknown: false }])
-  expect(formatReport(report)).toContain('Progress reporting errors\n- Progress sink failed')
+  expect(report.progressErrors).toEqual([
+    { message: 'Progress observer threw an unreadable value', code: null, outcomeUnknown: false },
+    { message: 'Progress sink failed', code: null, outcomeUnknown: false },
+  ])
+  expect(formatReport(report)).toContain('Progress reporting errors\n- Progress observer threw an unreadable value\n- Progress sink failed')
   expect(report.modules[0]?.review.angles[1]?.status).toBe('completed')
   expect(report.modules[1]?.review.angles.map(result => result.status)).toEqual(['completed', 'completed'])
   expect(report.modules.map(outcome => outcome.review.module.id)).toEqual(['a', 'b'])
@@ -200,6 +213,34 @@ test('failure normalization retains only valid issue paths and codes', () => {
   })
   expect(reviewFailure(error)).toEqual({ message: 'Invalid output', code: error.code, outcomeUnknown: false, issues })
   expect(reviewFailure(new Error('Ordinary failure'))).toEqual({ message: 'Ordinary failure', code: null, outcomeUnknown: false })
+  expect(reviewFailure({ get details() { throw new Error('Unreadable details') } })).toEqual({
+    message: 'Unreadable failure', code: null, outcomeUnknown: false,
+  })
+})
+
+test('forwards read permissions to each read phase and keeps review evidence when fix progress throws', async () => {
+  const { client, cwd, adapter } = await fixture(async (prompt, sessionCwd) => {
+    if (isAnalysis(prompt)) return plan
+    if (prompt.startsWith(stages.fix)) {
+      await writeFile(join(sessionCwd, 'a.ts'), 'export const fallback = (n: number) => n\n')
+      return { summary: 'Preserve zero.', changedFiles: ['a.ts'] }
+    }
+    return { findings: prompt.startsWith(stages.verify) ? [] : [finding] }
+  })
+  await commitFixture(cwd)
+  const report = await reviewCode({
+    client, cwd, fix: true, maxModules: 1, angles: [correctnessAngle],
+    readPermissionMode: 'read-only', fixPermissionMode: 'agent',
+    onProgress: event => {
+      if (event.stage === 'fix' && event.status === 'started') throw Object.create(null)
+    },
+  })
+  expect(adapter.opened.map(session => session.permissionMode)).toEqual(['read-only', 'read-only', 'agent', 'read-only'])
+  expect(report.status).toBe('completed')
+  expect(report.modules[0]?.review.angles[0]).toMatchObject({ status: 'completed', findings: [finding] })
+  expect(report.modules[0]?.fix).toMatchObject({ status: 'applied', changedFiles: ['a.ts'] })
+  expect(report.modules[0]?.verification?.angles[0]).toMatchObject({ status: 'completed', findings: [] })
+  expect(report.progressErrors).toHaveLength(1)
 })
 
 test('schema-invalid findings retain diagnostics in text and persisted JSON reports', async () => {
@@ -237,7 +278,7 @@ test('persists the run, validated analysis, every angle result, and the final re
   const report = await reviewCode({ client, cwd, workflowDirectory: directory })
   const path = join(report.workflowDirectory, report.runId)
   const manifest = JSON.parse(await readFile(join(path, 'run.json'), 'utf8'))
-  expect(manifest.identity).toMatchObject({ name: 'code-review', revision: '8', runId: report.runId })
+  expect(manifest.identity).toMatchObject({ name: 'code-review', revision: '9', runId: report.runId })
   expect(manifest.identity.input.analysisPrompt).toBe(prompts[0])
   expect(manifest.identity.input.concurrency).toBe(8)
   expect(manifest.status).toBe('completed')
@@ -245,11 +286,73 @@ test('persists the run, validated analysis, every angle result, and the final re
   expect(journal.filter((event: { type: string }) => event.type === 'result')).toHaveLength(prompts.length)
   expect(JSON.parse(await readFile(join(path, 'result.json'), 'utf8'))).toEqual(report)
   expect(await readdir(path)).not.toContain('writer.lock')
+  expect(await readdir(directory)).not.toContain('.gitignore')
 
   // Each invocation reviews current sources/configuration rather than silently reusing old claims.
   const second = await reviewCode({ client, cwd, workflowDirectory: directory })
   expect(second.runId).not.toBe(report.runId)
   expect(prompts).toHaveLength(2 * (1 + plan.modules.length * defaultAngles.length))
+})
+
+test('default workflow storage is ignored by Git and existing ignore rules are preserved', async () => {
+  const { client, cwd } = await fixture()
+  await commitFixture(cwd)
+  const options = { client, cwd, maxModules: 1, angles: [correctnessAngle] }
+  const report = await reviewCode(options)
+  expect(await reviewGit(cwd, 'ls-files', '--others', '--exclude-standard')).toBe('')
+  const ignore = join(report.workflowDirectory, '.gitignore')
+  expect(await readFile(ignore, 'utf8')).toBe('*\n')
+  await writeFile(ignore, '# Existing rules\n*\n')
+  await reviewCode(options)
+  expect(await readFile(ignore, 'utf8')).toBe('# Existing rules\n*\n')
+})
+
+test('source fingerprints detect tracked and untracked edits and ignore workflow storage', async () => {
+  const { cwd } = await fixture()
+  await commitFixture(cwd)
+  const directory = join(cwd, 'custom-workflows')
+  const tracked = join(cwd, 'a.ts')
+  const untracked = join(cwd, 'notes.md')
+  await writeFile(tracked, 'one')
+  await writeFile(untracked, 'one')
+  const first = await readGitStateFingerprint(cwd, directory)
+  expect(first).toMatch(/^[a-f0-9]{64}$/)
+  await writeFile(tracked, 'two')
+  const second = await readGitStateFingerprint(cwd, directory)
+  expect(second).toMatch(/^[a-f0-9]{64}$/)
+  expect(second).not.toBe(first)
+  await writeFile(untracked, 'two')
+  const third = await readGitStateFingerprint(cwd, directory)
+  expect(third).toMatch(/^[a-f0-9]{64}$/)
+  expect(third).not.toBe(second)
+  await mkdir(directory)
+  await writeFile(join(directory, 'result.json'), '{}')
+  expect(await readGitStateFingerprint(cwd, directory)).toBe(third)
+})
+
+test('source fingerprints ignore Git repository overrides inherited from hooks', async () => {
+  const { cwd } = await fixture()
+  const other = await fixture()
+  await writeFile(join(other.cwd, 'a.ts'), 'export const other = true\n')
+  await commitFixture(cwd)
+  await commitFixture(other.cwd)
+  const directory = join(cwd, '.anureo', 'workflows')
+  const expected = await readGitStateFingerprint(cwd, directory)
+  expect(expected).toMatch(/^[a-f0-9]{64}$/)
+  const overrides = { GIT_DIR: join(other.cwd, '.git'), GIT_WORK_TREE: other.cwd }
+  const previous = Object.entries(overrides).map(([key, value]) => {
+    const previousValue = process.env[key]
+    process.env[key] = value
+    return [key, previousValue] as const
+  })
+  try {
+    expect(await readGitStateFingerprint(cwd, directory)).toBe(expected)
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
 })
 
 test.each(['RECEIPT_LOST', 'RESOURCE_RELEASE_FAILED'])('fatal %s stops new agent dispatch and saves a failed run', async code => {
@@ -335,6 +438,29 @@ test('module paths cannot escape the review directory through symlinks', async (
   expect(inside.adapter.opened).toHaveLength(1)
 })
 
+test('module paths cannot traverse parent segments after a symlink', async () => {
+  const { client, cwd, adapter } = await fixture(() => ({
+    ...plan, modules: [{ ...plan.modules[0], files: ['link/../a.ts'] }],
+  }))
+  await mkdir(join(cwd, 'lib', 'sub'), { recursive: true })
+  await writeFile(join(cwd, 'lib', 'a.ts'), 'export const different = true\n')
+  await symlink(join(cwd, 'lib', 'sub'), join(cwd, 'link'), 'dir')
+  await expect(reviewCode({ client, cwd })).rejects.toMatchObject({
+    code: 'REVIEW_VALIDATION_FAILED', message: expect.stringContaining('Parent path segments'),
+  })
+  expect(adapter.opened).toHaveLength(1)
+})
+
+test('analysis rejects a module ID that is blank', async () => {
+  const { client, cwd, adapter } = await fixture(() => ({
+    ...plan, modules: [{ ...plan.modules[0], id: ' \t' }],
+  }))
+  await expect(reviewCode({ client, cwd })).rejects.toMatchObject({
+    code: 'REVIEW_VALIDATION_FAILED', message: 'Module id must not be blank',
+  })
+  expect(adapter.opened).toHaveLength(1)
+})
+
 test('null module analysis cannot become an empty successful report', async () => {
   const { client, cwd, adapter } = await fixture(() => new HarnessSdkError('RATE_LIMITED'))
   await expect(reviewCode({ client, cwd })).rejects.toThrow('Module analysis failed')
@@ -363,6 +489,20 @@ test.each([
   expect(report.status).toBe('incomplete')
   expect(report.modules[0]?.review.angles[0]?.status).toBe('failed')
   expect(report.modules[1]?.review.angles[0]).toMatchObject({ status: 'completed', findings: [] })
+})
+
+test('reports all independent finding location errors in response order', async () => {
+  const { client, cwd } = await fixture(prompt => isAnalysis(prompt) ? plan : {
+    findings: [{ ...finding, lineEnd: 2 }, { ...finding, file: 'b.ts' }, { ...finding, lineEnd: 3 }],
+  })
+  const report = await reviewCode({ client, cwd, maxModules: 1, angles: [correctnessAngle] })
+  expect(report.modules[0]?.review.angles[0]).toMatchObject({
+    status: 'failed', error: { code: 'REVIEW_VALIDATION_FAILED', message: [
+      'findings[0]: Invalid finding location: a.ts:1-2; expected 1 <= lineStart <= lineEnd <= 1',
+      'findings[1].file: Finding is outside module a: b.ts',
+      'findings[2]: Invalid finding location: a.ts:1-3; expected 1 <= lineStart <= lineEnd <= 1',
+    ].join('\n') },
+  })
 })
 
 test('invalid options are rejected before opening any sessions', async () => {

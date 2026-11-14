@@ -7,13 +7,16 @@ export const fixture = resolve(import.meta.dir, 'fixtures/fake-hermes.mjs')
 /**
  * Start a real child gateway and wait for its stdout URL. Hermes, code-review and refactor tests
  * own both their clients and the fixture and must dispose them separately. env configures the
- * server, while adapter options configure CLI children. Startup/read/JSON failures reject before
- * returning a disposal handle. Fixture stderr is drained without entering test output.
+ * server, while adapter options configure CLI children. Startup failures dispose the child
+ * before rejecting. Fixture stderr is drained without entering test output.
  */
 export async function startFake(scenario = 'lifecycle', env: Record<string, string> = {}) {
   const child = await spawnHarnessProcess({ command: process.execPath, args: [fixture, '--server'], env: { ...process.env, ...env, FAKE_HERMES_SCENARIO: scenario } })
-  void (async () => { for await (const _chunk of child.stderr) { /* no native stderr in public test output */ } })()
-  const url = await readFixtureUrl(child.stdout)
+  void (async () => { for await (const _chunk of child.stderr) { /* no native stderr in public test output */ } })().catch(() => {})
+  const url = await readFixtureUrl(child.stdout).catch(async cause => {
+    await child.dispose().catch(() => {})
+    throw cause
+  })
   return {
     /** Construct an independently owned adapter using this server's URL and the selected scenario. */
     adapter(options: HermesAdapterOptions = {}) {
@@ -57,11 +60,17 @@ interface FixtureState {
 /** Read the startup record without waiting for server exit or closing its stdout iterator. */
 async function readFixtureUrl(stdout: HarnessProcess['stdout']): Promise<string> {
   const iterator = stdout[Symbol.asyncIterator]()
+  const decoder = new TextDecoder()
   let output = ''
   for (;;) {
     const chunk = await iterator.next()
     if (chunk.done) throw new Error('Hermes fixture did not start')
-    output += new TextDecoder().decode(chunk.value)
-    if (output.includes('\n')) return (JSON.parse(output.trim()) as { url: string }).url
+    output += decoder.decode(chunk.value, { stream: true })
+    const end = output.indexOf('\n')
+    if (end !== -1) {
+      const record = JSON.parse(output.slice(0, end)) as { url?: unknown } | null
+      if (typeof record?.url !== 'string') throw new Error('Invalid Hermes fixture startup record')
+      return record.url
+    }
   }
 }

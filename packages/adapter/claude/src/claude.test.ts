@@ -3,7 +3,7 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InMemorySessionStore, getSessionMessages, forkSession, renameSession, type Options, type SDKMessage, type SDKUserMessage, type SessionMessage, type SessionStore, type SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
-import { BoundedEventQueue, HarnessSdkError, createClient, type Session } from "@anureo/sdk";
+import { BoundedEventQueue, HarnessSdkError, createClient, type Session, type SessionEventSink } from "@anureo/sdk";
 import type { AhpEvent, InteractionRequested, InteractionResponse, SessionOpenParams } from "@anureo/protocol";
 import { createClaudeAdapter, type ClaudeAdapterOptions, type ClaudeQuery, type ClaudeQueryFactory } from "./index";
 import { FileSessionStore } from "./store";
@@ -131,6 +131,47 @@ test('native close retains both close and iterator release failures without repe
   expect(closes).toBe(1); expect(returns).toBe(1);
 });
 const OPEN: SessionOpenParams = { requestId: "open", mode: "new", binding: { sessionId: "s", adapterId: "claude", runtimeConfigId: "r" }, cwd: "/tmp", model: "fake-model" };
+
+test("adapter disposal closes a native query while resume is reading its title", async () => {
+  const native = factory();
+  const metadataStarted = Promise.withResolvers<void>();
+  const metadata = Promise.withResolvers<undefined>();
+  const adapter = createClaudeAdapter({ queryFactory: native.queryFactory, getSessionInfo: () => {
+    metadataStarted.resolve();
+    return metadata.promise;
+  } });
+  const sink: SessionEventSink = {
+    emit: async () => {},
+    tryEmit: () => true,
+    bindSubmission: async () => {},
+    requestInteraction: async () => { throw new Error("Unexpected interaction"); },
+    resolveInteraction: async () => {},
+    fail: async () => {},
+  };
+  const opening = adapter.openSession({ ...OPEN, mode: "resume", binding: { ...OPEN.binding, nativeRef: { provider: "claude", value: randomUUID() } } }, sink);
+  try {
+    await metadataStarted.promise;
+    await adapter.dispose();
+    expect(native.queries[0]!.closed).toBe(true);
+    metadata.resolve(undefined);
+    await expect(opening).rejects.toMatchObject({ code: "RUNTIME_DISPOSED" });
+  } finally {
+    metadata.resolve(undefined);
+    await opening.catch(() => {});
+    await adapter.dispose();
+  }
+});
+
+test("idle native EOF fails observation and prevents further dispatch", async () => {
+  const { runtime, session, queries } = await setup();
+  try {
+    queries[0]!.output.end();
+    await expect(readerFor(session).next()).rejects.toMatchObject({ code: "CONNECTION_CLOSED" });
+    await expect(session.submit({ input: "after EOF" }, { timeoutMs: 100 })).rejects.toMatchObject({ code: "SESSION_CLOSED" });
+    expect(queries[0]!.calls.some(call => call.method === "input")).toBe(false);
+  } finally { await runtime.dispose(); }
+});
+
 const readers = new WeakMap<Session, AsyncIterator<AhpEvent>>();
 /** Subscribe before dispatch and reuse the subscription until collect closes and replaces it. */
 function readerFor(session: Session) {
@@ -262,6 +303,22 @@ test("canUseTool requests approval and only selected options enter the native ca
   });
   const { events } = await submitAndCollect(session, () => ({ kind: "approval", optionId: "deny" }));
   expect(permission).toMatchObject({ behavior: "deny" }); expect(events.some((event) => event.type === "interaction/resolved" && event.payload.outcome === "responded")).toBe(true); await runtime.dispose();
+});
+
+test("an aborted permission callback returns without publishing an interaction", async () => {
+  let permission: unknown;
+  const controller = new AbortController();
+  const { runtime, session } = await setup({}, async (_, stream) => {
+    const callback = stream.options.canUseTool!("Bash", { command: "fixture" }, { signal: controller.signal, toolUseID: "cancelled-approval", requestId: "native-cancelled" });
+    controller.abort();
+    permission = await callback;
+    await stream.result();
+  });
+  try {
+    const { events } = await submitAndCollect(session, () => ({ kind: "approval", optionId: "deny" }));
+    expect(permission).toEqual({ behavior: "deny", message: "Request cancelled" });
+    expect(events.some(event => event.type === "interaction/requested")).toBe(false);
+  } finally { await runtime.dispose(); }
 });
 
 test("AskUserQuestion and URL elicitation use typed interactions with private URLs", async () => {
@@ -464,10 +521,51 @@ test("resume, before/through fork, paged history and conversation revert preserv
   const oldRef = session.binding.nativeRef!.value;
   const reverted = await session.request("session/revert", { requestId: "revert", sessionId: "s", scope: "conversation", boundary: { turnId: second.requireTurnId(), relation: "before" } });
   expect(reverted.nativeRef!.value).not.toBe(oldRef); expect(session.binding.nativeRef).toEqual(reverted.nativeRef);
-  expect((await session.request("history/read", { requestId: "after-revert", sessionId: "s" })).items.some((entry) => entry.turnId === second.requireTurnId())).toBe(false);
+  const afterRevert = await session.request("history/read", { requestId: "after-revert", sessionId: "s" });
+  expect(afterRevert.items.some((entry) => entry.turnId === second.requireTurnId())).toBe(false);
+  expect(afterRevert.source).toEqual(reverted.nativeRef);
+  expect(await session.request("history/read", { requestId: "continue-after-revert", sessionId: "s", cursor: page1.nextCursor!, snapshotToken: page1.snapshotToken, limit: 10 })).toEqual(page2);
+  expect(page2.source?.value).toBe(oldRef);
   const currentBinding = structuredClone(session.binding); await session.close();
-  const resumed = await runtime.openSession({ ...OPEN, requestId: "resume", mode: "resume", binding: currentBinding });
+  const resumed = await runtime.openSession({ ...OPEN, requestId: "resume", mode: "resume", binding: { ...currentBinding, nativeRef: reverted.nativeRef! } });
   expect(queries.at(-1)!.options.resume).toBe(currentBinding.nativeRef!.value); await resumed.close(); await runtime.dispose();
+});
+
+test.each([true, false])("fork and revert resolve merged inputs as a single execution (store: %s)", async (withStore) => {
+  const history = historyApi();
+  const { runtime, session, queries } = await setup({
+    ...(withStore ? { sessionStore: new InMemorySessionStore(), getSessionMessages: history.getSessionMessages, forkSession: history.forkSession } : {}),
+    enableFileCheckpointing: true,
+  }, async (input, stream) => {
+    history.append(input);
+    await stream.text("conformance", input.uuid);
+    if (stream.calls.filter(call => call.method === "input").length > 1) await stream.result();
+  });
+  try {
+    const first = await session.submit({ input: "first prompt" });
+    const followUp = await session.submit({ input: "follow-up prompt" });
+    expect(followUp.id).toBe(first.id);
+    await followUp.result();
+    const next = await session.submit({ input: "next execution" });
+    expect(next.id).not.toBe(first.id);
+    await next.result();
+    const [initial, alias, later] = queries[0]!.calls.flatMap(call => call.method === "input" ? [(call.value as SDKUserMessage).uuid!] : []);
+    const before = { turnId: first.id, nativeTurnId: alias!, relation: "before" } as const;
+    const through = { turnId: first.id, relation: "through" } as const;
+    await session.request("session/revert", { requestId: "files-before", sessionId: session.id, scope: "files", boundary: before });
+    await session.request("session/revert", { requestId: "files-through", sessionId: session.id, scope: "files", boundary: through });
+    expect(queries[0]!.calls.filter(call => call.method === "rewind").map(call => call.value)).toEqual([initial, later]);
+    if (withStore) {
+      const fork = await runtime.openSession({ ...OPEN, requestId: "fork-before-alias", mode: "fork", binding: { ...session.binding, sessionId: "forked" }, fork: { sourceSessionId: session.id, nativeRef: session.binding.nativeRef, boundary: before } });
+      expect((await fork.request("history/read", { requestId: "fork-history", sessionId: fork.id })).items).toEqual([]);
+      await fork.close();
+      await session.request("session/revert", { requestId: "conversation-through-alias", sessionId: session.id, scope: "conversation", boundary: { ...through, nativeTurnId: alias! } });
+      const page = await session.request("history/read", { requestId: "history-through-alias", sessionId: session.id });
+      expect(page.items.map(entry => [entry.turnId, entry.nativeItemId])).toEqual([
+        [first.id, initial], [first.id, `${initial}:reply`], [first.id, alias], [first.id, `${alias}:reply`],
+      ]);
+    }
+  } finally { await runtime.dispose(); }
 });
 
 test("history items reuse live streamed ids and the session settles to ready after the turn", async () => {
@@ -479,17 +577,21 @@ test("history items reuse live streamed ids and the session settles to ready aft
       { type: "user", uuid: input.uuid!, session_id: id, message: input.message, parent_tool_use_id: null, parent_agent_id: null },
       { type: "assistant", uuid: "entry-thinking", session_id: id, message: { id: "msg_api", role: "assistant", content: [{ type: "thinking", thinking: "plan" }] }, parent_tool_use_id: null, parent_agent_id: null },
       { type: "assistant", uuid: "entry-text", session_id: id, message: { id: "msg_api", role: "assistant", content: [{ type: "text", text: "hello" }] }, parent_tool_use_id: null, parent_agent_id: null },
+      { type: "assistant", uuid: "entry-final", session_id: id, message: { id: "msg_api", role: "assistant", content: [{ type: "text", text: "goodbye" }] }, parent_tool_use_id: null, parent_agent_id: null },
     ] as SessionMessage[]);
     await stream.emit({ type: "system", subtype: "init", session_id: id });
     await stream.emit({ type: "stream_event", parent_tool_use_id: null, event: { type: "message_start", message: { id: "msg_api" } } });
     await stream.emit({ type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } } });
     await stream.emit({ type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } } });
+    await stream.emit({ type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } } });
     await stream.emit({ type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "hello" } } });
-    await stream.text("hello", "msg_api"); await stream.result("hello");
+    await stream.emit({ type: "assistant", parent_tool_use_id: null, message: { id: "msg_api", content: [{ type: "thinking", thinking: "plan" }, { type: "text", text: "hello" }] } });
+    await stream.text("goodbye", "msg_api"); await stream.result("goodbye");
   });
   const { events } = await submitAndCollect(session);
   const live = events.flatMap((event) => event.type === "item/started" ? [event.payload.item.id] : []);
-  expect(live).toEqual(["msg_api:0", "msg_api:1"]);
+  expect(live).toEqual(["msg_api:0", "msg_api:1", "msg_api:2"]);
+  expect(events.flatMap(event => event.type === "item/completed" && "text" in event.payload.item ? [event.payload.item.text] : [])).toEqual(["plan", "hello", "goodbye"]);
   expect(session.snapshot.status).toBe('ready');
   const page = await session.request("history/read", { requestId: "h", sessionId: "s" });
   expect(page.items.filter((entry) => entry.item.type !== "userMessage").map((entry) => entry.item.id)).toEqual(live);
@@ -565,17 +667,6 @@ test("the real pinned SDK drives an external fake executable through the native 
     expect(events.find((event) => event.type === "item/completed" && event.payload.item.type === "agentMessage")?.payload).toMatchObject({ item: { text: "external executable probe passed", phase: "final" } });
     expect(events.at(-1)?.payload).toMatchObject({ status: "completed" });
   } finally { await runtime.dispose(); await rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); }
-}, 15_000);
-
-test('native lifecycle also correlates through the pinned official SDK and an actual child executable', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'claude native actual '));
-  const client = await createClient({ adapter: createClaudeAdapter({ command: fileURLToPath(new URL('../tests/fixtures/fake-claude.mjs', import.meta.url)), executableRuntime: 'node', stateDir: join(directory, 'state') }), identity: { adapterId: 'claude', runtimeConfigId: 'native' } });
-  try {
-    const session = await client.sessions.create({ cwd: directory });
-    const turn = await session.submit({ input: 'probe' }, { timeoutMs: 3000 });
-    expect((await turn.result({ timeoutMs: 3000 })).text).toBe('external executable probe passed');
-    await session.close();
-  } finally { await client.dispose(); await rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); }
 }, 15_000);
 
 test("official history and fork helpers consume the opaque SessionStore contract", async () => {

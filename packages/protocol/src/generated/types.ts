@@ -17,12 +17,13 @@ export type SessionBinding = { "sessionId": string; "adapterId": string; "runtim
 export type HarnessError = { "code": string; "message": string; "retryable": boolean; "outcomeUnknown": boolean; "details"?: JsonObject };
 export type Usage = { "provider": string; "scope": "turn" | "session"; "source": "native"; "input"?: number; "output"?: number; "cacheRead"?: number; "cacheWrite"?: number; "total"?: number; "contextWindow"?: number; "contextUsed"?: number };
 export type TextBlock = { "type": "text"; "text": string };
-export type ImageBlock = { "type": "image"; "url"?: string; "data"?: string; "mimeType"?: string };
+export type ImageBlock = ({ "type": "image"; "url"?: string; "data"?: string; "mimeType"?: string }) & (({ "url": string }) | ({ "data": string; "mimeType": string }));
 export type FileBlock = { "type": "file"; "uri": string; "name"?: string; "mimeType"?: string };
 export type InputBlock = (TextBlock) | (ImageBlock) | (FileBlock);
 export type McpServer = ({ "type": "stdio"; "name": string; "command": string; "args"?: Array<string>; "env"?: { [key: string]: string } }) | ({ "type": "http"; "name": string; "url": string; "headers"?: { [key: string]: string } });
 export type SessionState = { "binding": SessionBinding; "status": "opening" | "ready" | "running" | "closed" | "recoveryRequired" | "closing"; "config": JsonObject; "capabilities": Capabilities; "capabilityRevision": number; "model"?: string; "goal"?: GoalState; "fastMode"?: { "state": "off" | "cooldown" | "on"; "reason"?: string }; "metadata"?: SessionMetadata; "activeTurnIds": Array<string> };
-export type SessionOpenParams = { "requestId": string; "mode": "new" | "resume" | "fork"; "binding": SessionBinding; "cwd": string; "model"?: string; "instructions"?: string; "mcpServers"?: Array<McpServer>; "permissionMode"?: string; "config"?: JsonObject; "fork"?: { "sourceSessionId": string; "nativeRef"?: NativeRef; "boundary": Boundary } };
+export type SessionForkDetails = { "sourceSessionId": string; "nativeRef"?: NativeRef; "boundary": Boundary };
+export type SessionOpenParams = ({ "requestId": string; "binding": SessionBinding; "cwd": string; "model"?: string; "instructions"?: string; "mcpServers"?: Array<McpServer>; "permissionMode"?: string; "config"?: JsonObject; "fork"?: SessionForkDetails }) & (({ "mode": "new" }) | ({ "mode": "resume"; "binding": { "nativeRef": NativeRef } }) | ({ "mode": "fork"; "fork": SessionForkDetails }));
 export type SessionOpenResult = { "binding": SessionBinding; "streamId": string; "state": SessionState; "capabilities": Capabilities };
 export type SessionCloseParams = { "requestId": string; "sessionId": string };
 export type SessionCloseResult = { "closed": true; "observationClosed": true; "executionStopped": "confirmed" | "unconfirmed" };
@@ -44,16 +45,17 @@ export type GoalClearParams = { "requestId": string; "sessionId": string };
 export type CompactStartParams = { "requestId": string; "sessionId": string };
 export type MaintenanceResult = { "maintenanceId": string; "status": "accepted" | "completed" };
 export type ReviewStartParams = { "requestId": string; "sessionId": string; "target": JsonObject; "submissionId": string };
-export type UserMessageItem = { "id": string; "status"?: "running" | "completed" | "failed" | "declined" | "interrupted"; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "userMessage"; "content": Array<InputBlock> };
-export type AgentMessageItem = { "id": string; "status"?: "running" | "completed" | "failed" | "declined" | "interrupted"; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "agentMessage"; "text": string; "phase"?: "commentary" | "final" };
-export type ReasoningItem = { "id": string; "status"?: "running" | "completed" | "failed" | "declined" | "interrupted"; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "reasoning"; "text"?: string; "summary"?: string };
-export type PlanItem = { "id": string; "status"?: "running" | "completed" | "failed" | "declined" | "interrupted"; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "plan"; "steps": Array<{ "id": string; "text": string; "status": "pending" | "inProgress" | "completed" }> };
-export type ToolCallItem = { "id": string; "status"?: "running" | "completed" | "failed" | "declined" | "interrupted"; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "toolCall"; "kind": "command" | "fileChange" | "mcp" | "dynamic" | "web" | "image" | "other"; "title": string; "input"?: JsonValue; "output"?: JsonValue; "locations"?: Array<{ "path": string; "line"?: number }>; "nativeType"?: string; "raw"?: JsonValue; "fileChanges"?: Array<FileChange>; "image"?: ToolImageOutput; "mcp"?: { "server": string; "tool": string }; "toolName"?: string };
-export type SubagentItem = { "id": string; "status"?: "running" | "completed" | "failed" | "declined" | "interrupted"; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "subagent"; "subagentId": string; "state": "pending" | "running" | "completed" | "failed" | "interrupted"; "name"?: string; "task"?: string; "nativeRef"?: NativeRef };
-export type ReviewItem = { "id": string; "status"?: "running" | "completed" | "failed" | "declined" | "interrupted"; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "review"; "state": "entered" | "exited"; "text"?: string };
-export type CompactionItem = { "id": string; "status"?: "running" | "completed" | "failed" | "declined" | "interrupted"; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "compaction"; "summary"?: string; "trigger"?: string };
-export type HookItem = { "id": string; "status"?: "running" | "completed" | "failed" | "declined" | "interrupted"; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "hook"; "name": string; "input"?: JsonValue; "output"?: JsonValue };
-export type NoticeItem = { "id": string; "status"?: "running" | "completed" | "failed" | "declined" | "interrupted"; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "notice"; "severity": "info" | "warning" | "error"; "code"?: string; "text": string };
+export type ItemStatus = "running" | "completed" | "failed" | "declined" | "interrupted";
+export type UserMessageItem = { "id": string; "status"?: ItemStatus; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "userMessage"; "content": Array<InputBlock> };
+export type AgentMessageItem = { "id": string; "status"?: ItemStatus; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "agentMessage"; "text": string; "phase"?: "commentary" | "final" };
+export type ReasoningItem = { "id": string; "status"?: ItemStatus; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "reasoning"; "text"?: string; "summary"?: string };
+export type PlanItem = { "id": string; "status"?: ItemStatus; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "plan"; "steps": Array<{ "id": string; "text": string; "status": "pending" | "inProgress" | "completed" }> };
+export type ToolCallItem = { "id": string; "status"?: ItemStatus; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "toolCall"; "kind": "command" | "fileChange" | "mcp" | "dynamic" | "web" | "image" | "other"; "title": string; "input"?: JsonValue; "output"?: JsonValue; "locations"?: Array<{ "path": string; "line"?: number }>; "nativeType"?: string; "raw"?: JsonValue; "fileChanges"?: Array<FileChange>; "image"?: ToolImageOutput; "mcp"?: { "server": string; "tool": string }; "toolName"?: string };
+export type SubagentItem = { "id": string; "status"?: ItemStatus; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "subagent"; "subagentId": string; "state": "pending" | "running" | "completed" | "failed" | "interrupted"; "name"?: string; "task"?: string; "nativeRef"?: NativeRef };
+export type ReviewItem = { "id": string; "status"?: ItemStatus; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "review"; "state": "entered" | "exited"; "text"?: string };
+export type CompactionItem = { "id": string; "status"?: ItemStatus; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "compaction"; "summary"?: string; "trigger"?: string };
+export type HookItem = { "id": string; "status"?: ItemStatus; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "hook"; "name": string; "input"?: JsonValue; "output"?: JsonValue };
+export type NoticeItem = { "id": string; "status"?: ItemStatus; "startedAt"?: string; "durationMs"?: number; "parentItemId"?: string; "extensions"?: JsonObject; "type": "notice"; "severity": "info" | "warning" | "error"; "code"?: string; "text": string };
 export type Item = (UserMessageItem) | (AgentMessageItem) | (ReasoningItem) | (PlanItem) | (ToolCallItem) | (SubagentItem) | (ReviewItem) | (CompactionItem) | (HookItem) | (NoticeItem);
 export type ApprovalOption = { "id": string; "label": string; "semantic"?: "allowOnce" | "allowSession" | "deny" | "allowWithRule" | "cancel"; "description"?: string };
 export type UserQuestion = { "id": string; "prompt": string; "options"?: Array<{ "id": string; "label": string }>; "secret"?: boolean; "required"?: boolean };
@@ -78,9 +80,12 @@ export type InteractionRequestedEvent = { "type": "interaction/requested"; "payl
 export type InteractionResolvedEvent = { "type": "interaction/resolved"; "payload": InteractionResult };
 export type NoticeEvent = { "type": "notice"; "payload": { "severity": "info" | "warning" | "error"; "code": string; "message": string; "raw"?: JsonValue } };
 export type ExtensionEvent = { "type": "extension"; "payload": { "name": string; "version": string; "method"?: string; "data": JsonValue } };
-export type AhpEventPayload = (SessionStateEvent) | (SessionMetadataEvent) | (TurnStartedEvent) | (TurnCompletedEvent) | (ItemStartedEvent) | (ItemDeltaEvent) | (ItemCompletedEvent) | (UsageUpdatedEvent) | (InteractionRequestedEvent) | (InteractionResolvedEvent) | (NoticeEvent) | (ExtensionEvent) | (SubmissionBoundEvent) | (SubmissionStatusEvent);
+export type NonItemEventPayload = (SessionStateEvent) | (SessionMetadataEvent) | (TurnStartedEvent) | (TurnCompletedEvent) | (UsageUpdatedEvent) | (InteractionRequestedEvent) | (InteractionResolvedEvent) | (NoticeEvent) | (ExtensionEvent) | (SubmissionBoundEvent) | (SubmissionStatusEvent);
+export type ItemEventPayload = (ItemStartedEvent) | (ItemDeltaEvent) | (ItemCompletedEvent);
+export type AhpEventPayload = (NonItemEventPayload) | (ItemEventPayload);
 export type SourceEnvelope = { "sessionId": string; "streamId": string; "seq": number; "timestamp": string; "turnId"?: string; "itemId"?: string };
-export type AhpEvent = (SourceEnvelope) & (AhpEventPayload);
+export type ItemEventEnvelope = (SourceEnvelope) & ({ "turnId": string });
+export type AhpEvent = ((SourceEnvelope) & (NonItemEventPayload)) | ((ItemEventEnvelope) & (ItemEventPayload));
 export type RpcId = (string) | (number);
 export type RpcError = { "code": number; "message": string; "data"?: HarnessError };
 export type InitializeRpcRequest = { "jsonrpc": "2.0"; "id": RpcId; "method": "initialize"; "params": InitializeParams };
@@ -98,8 +103,11 @@ export type GoalSetRpcRequest = { "jsonrpc": "2.0"; "id": RpcId; "method": "goal
 export type GoalClearRpcRequest = { "jsonrpc": "2.0"; "id": RpcId; "method": "goal/clear"; "params": GoalClearParams };
 export type CompactStartRpcRequest = { "jsonrpc": "2.0"; "id": RpcId; "method": "compact/start"; "params": CompactStartParams };
 export type ReviewStartRpcRequest = { "jsonrpc": "2.0"; "id": RpcId; "method": "review/start"; "params": ReviewStartParams };
-export type AhpRpcRequest = (InitializeRpcRequest) | (SessionOpenRpcRequest) | (SessionCloseRpcRequest) | (SessionConfigRpcRequest) | (SessionRevertRpcRequest) | (HistoryReadRpcRequest) | (InputSubmitRpcRequest) | (TurnSteerRpcRequest) | (TurnInterruptRpcRequest) | (InteractionRespondRpcRequest) | (InteractionCancelRpcRequest) | (GoalSetRpcRequest) | (GoalClearRpcRequest) | (CompactStartRpcRequest) | (ReviewStartRpcRequest) | (SessionInterruptRpcRequest);
-export type AhpRpcSuccess = { "jsonrpc": "2.0"; "id": RpcId; "result": (GoalState) | (HistoryPage) | (InitializeResult) | (InteractionResult) | (MaintenanceResult) | (RevertResult) | (SessionCloseResult) | (SessionOpenResult) | (SessionState) | (TurnInterruptResult) | (InputSubmitResult) | (TurnSteerResult) | (SessionInterruptResult) };
+export type EventsReadParams = { "sessionId": string; "streamId": string; "afterSeq": number; "throughSeq": number };
+export type EventsReadResult = { "events": Array<AhpEvent> };
+export type EventsReadRpcRequest = { "jsonrpc": "2.0"; "id": RpcId; "method": "x-anureo/events/read"; "params": EventsReadParams };
+export type AhpRpcRequest = (InitializeRpcRequest) | (SessionOpenRpcRequest) | (SessionCloseRpcRequest) | (SessionConfigRpcRequest) | (SessionRevertRpcRequest) | (HistoryReadRpcRequest) | (InputSubmitRpcRequest) | (TurnSteerRpcRequest) | (TurnInterruptRpcRequest) | (InteractionRespondRpcRequest) | (InteractionCancelRpcRequest) | (GoalSetRpcRequest) | (GoalClearRpcRequest) | (CompactStartRpcRequest) | (ReviewStartRpcRequest) | (SessionInterruptRpcRequest) | (EventsReadRpcRequest);
+export type AhpRpcSuccess = { "jsonrpc": "2.0"; "id": RpcId; "result": (GoalState) | (HistoryPage) | (InitializeResult) | (InteractionResult) | (MaintenanceResult) | (RevertResult) | (SessionCloseResult) | (SessionOpenResult) | (SessionState) | (TurnInterruptResult) | (InputSubmitResult) | (TurnSteerResult) | (SessionInterruptResult) | (EventsReadResult) };
 export type AhpRpcFailure = { "jsonrpc": "2.0"; "id": (RpcId) | (null); "error": RpcError };
 export type AhpRpcResponse = (AhpRpcSuccess) | (AhpRpcFailure);
 export type InitializedNotification = { "jsonrpc": "2.0"; "method": "initialized"; "params"?: {  } };
@@ -131,29 +139,20 @@ export type AhpEventNotification =
   | ({
     "jsonrpc": "2.0";
     "method": "item/started";
-    "params": (SourceEnvelope)
+    "params": (ItemEventEnvelope)
       & (ItemStartedEvent)
-      & ({
-        "turnId": string
-      })
   })
   | ({
     "jsonrpc": "2.0";
     "method": "item/delta";
-    "params": (SourceEnvelope)
+    "params": (ItemEventEnvelope)
       & (ItemDeltaEvent)
-      & ({
-        "turnId": string
-      })
   })
   | ({
     "jsonrpc": "2.0";
     "method": "item/completed";
-    "params": (SourceEnvelope)
+    "params": (ItemEventEnvelope)
       & (ItemCompletedEvent)
-      & ({
-        "turnId": string
-      })
   })
   | ({
     "jsonrpc": "2.0";

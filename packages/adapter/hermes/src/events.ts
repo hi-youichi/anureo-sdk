@@ -72,10 +72,11 @@ export class HermesTurn {
   }
   /** Report incomplete progress once and stop appending to the current partial segment; native snapshots can still replace its text. */
   async gap(): Promise<void> {
-    if (this.terminal || this.gapReported) return
+    if (this.terminal) return
+    if (this.current) this.current.incomplete = true
+    if (this.gapReported) return
     this.gapReported = true
     await this.start()
-    if (this.current) this.current.incomplete = true
     await this.complete({ id: `${this.id}:gap`, type: 'notice', severity: 'warning', code: 'HERMES_PROGRESS_GAP',
       text: 'Some intermediate Hermes progress was unavailable; the final answer requires native terminal evidence.', status: 'completed' })
   }

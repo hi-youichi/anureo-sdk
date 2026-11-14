@@ -1,13 +1,15 @@
 // Bounds the stderr tail included in ACP failure diagnostics and filters recognized credentials.
 
+export const DEFAULT_STDERR_TAIL_LINES = 200;
+
 /**
- * Prepare one stderr line for StderrTail.push. Truncate to 8,192 UTF-16 code units plus an
- * ellipsis when needed, then redact recognized credential patterns.
+ * Prepare one stderr line for StderrTail.push. Redact recognized credential patterns before
+ * truncating to 8,192 UTF-16 code units plus an ellipsis when needed.
  */
 export function redactLine(line: string): string {
-  let value = line.length > LINE_CODE_UNIT_LIMIT ? `${line.slice(0, LINE_CODE_UNIT_LIMIT)}…` : line;
+  let value = line;
   for (const [pattern, replacement] of REDACTIONS) value = value.replace(pattern, replacement);
-  return value;
+  return value.length > LINE_CODE_UNIT_LIMIT ? `${value.slice(0, LINE_CODE_UNIT_LIMIT)}…` : value;
 }
 
 /**
@@ -40,23 +42,34 @@ export class StderrTail {
 
   /**
    * Buffer decoded stderr across chunks and publish each LF-delimited line.
-   * Publish an unterminated fragment once it exceeds 8,192 code units to bound retained partial text.
+   * Replace an oversized unterminated line with a marker and discard its continuation through the next LF.
    */
   write(chunk: string): void {
     if (this.maxLines <= 0) return;
+    if (this.discardingLine) {
+      const index = chunk.indexOf('\n');
+      if (index < 0) return;
+      this.discardingLine = false;
+      chunk = chunk.slice(index + 1);
+    }
     this.partial += chunk;
     for (let index = this.partial.indexOf('\n'); index >= 0; index = this.partial.indexOf('\n')) {
       this.push(this.partial.slice(0, index));
       this.partial = this.partial.slice(index + 1);
     }
     // A child that never emits a newline must not grow the buffer without bound.
-    if (this.partial.length > LINE_CODE_UNIT_LIMIT) this.publishPartial();
+    if (this.partial.length > LINE_CODE_UNIT_LIMIT) {
+      this.partial = '';
+      this.discardingLine = true;
+      this.push('[stderr line truncated]');
+    }
   }
 
   /** Publish and clear any buffered fragment. captureStderr calls this when draining ends. */
   flush(): void {
-    if (!this.partial) return;
-    this.publishPartial();
+    if (this.partial) this.push(this.partial);
+    this.partial = '';
+    this.discardingLine = false;
   }
 
   /** Rendered tail, oldest first. Empty when capture is disabled or nothing arrived. */
@@ -71,20 +84,15 @@ export class StderrTail {
   private readonly lines: string[] = [];
   private retainedCodeUnits = 0;
   private partial = '';
-
-  /** Treat a fragment emitted by write or flush as one entry so both paths use the same redaction and bounds. */
-  private publishPartial(): void {
-    this.push(this.partial);
-    this.partial = '';
-  }
+  private discardingLine = false;
 }
 
 const LINE_CODE_UNIT_LIMIT = 8 * 1024;
 const TOTAL_CODE_UNIT_LIMIT = 32 * 1024;
 
 const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\b(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[redacted]@'],
   [/\b(sk-[A-Za-z0-9_-]{8,})/g, 'sk-[redacted]'],
   [/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[redacted]'],
   [/\b((?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*)\S+/gi, '$1[redacted]'],
-  [/\b(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[redacted]@'],
 ];

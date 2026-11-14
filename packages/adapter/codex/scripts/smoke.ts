@@ -5,7 +5,7 @@ import path from 'node:path'
 import { createClient, type Client, type Session } from '@anureo/sdk'
 import { createCodexAdapter, type CodexNativeAdapter } from '../src'
 
-/** Evidence that runSmoke prints after the session closes and any offline probe returns. */
+/** Evidence that runSmoke prints after teardown succeeds. */
 type SmokeResult = {
   status: 'passed'
   version: string
@@ -49,8 +49,8 @@ function readSmokeConfiguration(): SmokeConfiguration | undefined {
  * published interactions and return the first turn/completed payload. Propagate request and stream
  * rejections, or reject if the stream ends early. The subscription ends on return or failure.
  */
-async function observeNativeTurnCompletion(session: Session) {
-  for await (const event of session.events()) {
+async function observeNativeTurnCompletion(session: Session, signal: AbortSignal) {
+  for await (const event of session.events({ signal })) {
     if (event.type === 'interaction/requested') {
       await session.request('interaction/cancel', {
         requestId: `cancel:${event.payload.interactionId}`,
@@ -70,12 +70,18 @@ async function observeNativeTurnCompletion(session: Session) {
  * and reject any terminal status other than completed. collectSmokeEvidence closes on success.
  */
 async function runAuthenticatedTurn(session: Session): Promise<void> {
+  const observation = new AbortController()
   // Subscribe before submitting: native completion and interaction requests may precede the submit response.
-  const nativeTurnCompletion = observeNativeTurnCompletion(session)
-  const turn = await session.submit({ input: 'Reply with the single word OK. Do not run tools or change files.' })
-  await turn.result()
-  const nativeTurnOutcome = await nativeTurnCompletion
-  if (nativeTurnOutcome.status !== 'completed') throw new Error(`Native turn ended with ${nativeTurnOutcome.status}`)
+  const nativeTurnCompletion = observeNativeTurnCompletion(session, observation.signal)
+  void nativeTurnCompletion.catch(() => {})
+  try {
+    const turn = await session.submit({ input: 'Reply with the single word OK. Do not run tools or change files.' })
+    await turn.result()
+    const nativeTurnOutcome = await nativeTurnCompletion
+    if (nativeTurnOutcome.status !== 'completed') throw new Error(`Native turn ended with ${nativeTurnOutcome.status}`)
+  } finally {
+    observation.abort()
+  }
 }
 
 /**
@@ -148,21 +154,25 @@ async function createSmokeClient({ configuration, temporary }: {
 }
 
 /**
- * Run the selected CLI mode and print evidence before teardown. After client creation succeeds,
+ * Run the selected CLI mode and print evidence after teardown. After client creation succeeds,
  * await disposal before removing the temporary directory. Setup, smoke and cleanup errors reject.
  * A disposal rejection takes precedence over a smoke failure and prevents file removal.
  */
 async function runSmoke(configuration: SmokeConfiguration): Promise<void> {
   const temporary = await mkdtemp(path.join(tmpdir(), 'anureo codex smoke '))
-  const { adapter, client } = await createSmokeClient({ configuration, temporary })
+  const { adapter, client } = await createSmokeClient({ configuration, temporary }).catch(async cause => {
+    await rm(temporary, { recursive: true, force: true })
+    throw cause
+  })
+  let result: SmokeResult
   try {
-    const result = await collectSmokeEvidence({ adapter, client, temporary, mode: configuration.mode })
-    console.log(JSON.stringify(result))
+    result = await collectSmokeEvidence({ adapter, client, temporary, mode: configuration.mode })
   } finally {
     // Native processes must release cwd/state before its files are removed.
     await client.dispose()
     await rm(temporary, { recursive: true, force: true })
   }
+  console.log(JSON.stringify(result))
 }
 
 const configuration = readSmokeConfiguration()

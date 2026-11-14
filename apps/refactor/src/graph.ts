@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
+import { spawnHarnessProcess } from '@anureo/sdk/process'
 import { z } from 'zod'
-import { exec } from './process'
 
 /** Shape of a Repograph `--kind all` export. Node and edge properties can carry exporter metadata
  * such as symbol metrics, call lines and imported names. startLine and endLine allow null for
@@ -20,10 +20,26 @@ export type RepositoryGraph = z.infer<typeof graphSchema>
  * Finish temporary cleanup before the returned promise settles. */
 export type GraphLoader = (cwd: string) => Promise<RepositoryGraph>
 
+export class RepographNotInstalledError extends Error {}
+
+export class GraphCleanupError extends Error {
+  readonly code = 'RESOURCE_RELEASE_FAILED'
+}
+
 /** Resolve the optional Repograph package's CLI entry for loadGraph's default and live tests.
  * Throws if the package cannot be resolved. Deferring resolution allows source-only runs. */
 export function resolveRepographEntry(): string {
-  return join(dirname(createRequire(import.meta.url).resolve('@youichi/repograph')), 'cli.js')
+  try {
+    return join(dirname(createRequire(import.meta.url).resolve('@youichi/repograph')), 'cli.js')
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code !== 'MODULE_NOT_FOUND') throw cause
+    throw new RepographNotInstalledError('Cannot resolve the optional @youichi/repograph package', { cause })
+  }
+}
+
+/** Keep the supplied path as the index key so repeated exports reuse the same project. */
+export function repographProject(cwd: string): string {
+  return `anureo-refactor-${createHash('sha256').update(cwd).digest('hex').slice(0, 16)}`
 }
 
 /** Export a validated graph for an absolute target directory. Supply an absolute CLI entry to
@@ -40,12 +56,14 @@ export async function loadGraph(cwd: string, entry = resolveRepographEntry()): P
     await validateRepositoryGraph(graph, cwd)
     return graph
   } finally {
-    await rm(temporary, { recursive: true, force: true })
+    await rm(temporary, { recursive: true, force: true }).catch(cause => {
+      throw new GraphCleanupError(`Unable to remove temporary graph directory ${temporary}: ${cause.message}`, { cause })
+    })
   }
 }
 
-/** Validate the core export fields and retain language-specific node metadata. */
-const graphSchema = z.object({
+/** Validate the core export fields and retain exporter and language-specific node metadata. */
+const graphSchema = z.looseObject({
   schemaVersion: z.literal(1), repositoryPath: z.string(), kind: z.literal('all'),
   indexReport: z.record(z.string(), z.unknown()),
   nodes: z.array(z.looseObject({
@@ -62,18 +80,47 @@ const graphSchema = z.object({
   })),
 })
 
-/** Return the parsed CLI payload for loadGraph to validate. Await the subprocess before reading
- * graph.json from loadGraph's temporary directory. The subprocess has a five-minute timeout and
- * an 8 MiB output buffer limit. Process, filesystem, JSON and schema errors reject to loadGraph,
- * which removes the directory in either case. */
+const exportTimeout = 300_000
+const outputLimit = 8 << 20
+
+/** Return the parsed CLI payload after the exporter has exited and its process tree is disposed. */
 async function exportRepositoryGraph(input: { cwd: string; entry: string; temporary: string }): Promise<RepositoryGraph> {
   const { cwd, entry, temporary } = input
   const output = join(temporary, 'graph.json')
-  // Keep the supplied path as the index key so repeated exports reuse the same project.
-  const project = `anureo-refactor-${createHash('sha256').update(cwd).digest('hex').slice(0, 16)}`
-  await exec(process.execPath, [entry, 'export', cwd, '--kind', 'all', '--project', project, '--out', output],
-    { cwd: temporary, maxBuffer: 8 << 20, timeout: 300_000 })
+  const child = await spawnHarnessProcess({
+    command: process.execPath, cwd: temporary,
+    args: [entry, 'export', cwd, '--kind', 'all', '--project', repographProject(cwd), '--out', output],
+  })
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const completion = Promise.all([child.exited, drainOutput(child.stdout, 'stdout'), drainOutput(child.stderr, 'stderr')])
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`repograph export timed out after ${exportTimeout} ms`)), exportTimeout)
+    })
+    const [exit, , stderr] = await Promise.race([completion, deadline])
+    if (exit.code !== 0) {
+      const status = exit.signal ? `with signal ${exit.signal}` : `with code ${exit.code}`
+      throw new Error(`repograph exited ${status}${stderr ? `: ${stderr}` : ''}`)
+    }
+  } finally {
+    clearTimeout(timer)
+    await child.dispose().catch(cause => {
+      throw new GraphCleanupError(`Unable to dispose repograph process: ${cause.message}`, { cause })
+    })
+  }
   return graphSchema.parse(JSON.parse(await readFile(output, 'utf8')))
+}
+
+/** Enforce a byte limit on each pipe and retain stderr for exit diagnostics. */
+async function drainOutput(stream: AsyncIterable<Uint8Array>, name: 'stdout' | 'stderr'): Promise<string> {
+  let bytes = 0
+  const chunks: Uint8Array[] = []
+  for await (const chunk of stream) {
+    bytes += chunk.byteLength
+    if (bytes > outputLimit) throw new Error(`repograph ${name} exceeded the ${outputLimit}-byte output limit`)
+    if (name === 'stderr') chunks.push(chunk)
+  }
+  return Buffer.concat(chunks).toString('utf8')
 }
 
 /** Require a parsed graph to describe the same real directory and have unique node IDs and valid
@@ -81,8 +128,18 @@ async function exportRepositoryGraph(input: { cwd: string; entry: string; tempor
  * repository identity and graph integrity failures reject through loadGraph's cleanup. */
 async function validateRepositoryGraph(graph: RepositoryGraph, cwd: string): Promise<void> {
   if (await realpath(graph.repositoryPath) !== await realpath(cwd)) throw new Error('repograph returned a different repository')
-  const ids = new Set(graph.nodes.map(node => node.id))
-  if (ids.size !== graph.nodes.length || graph.edges.some(edge => !ids.has(edge.source) || !ids.has(edge.target))) {
-    throw new Error('repograph returned duplicate nodes or missing edge endpoints')
+  const ids = new Set<string>()
+  let duplicateId: string | undefined
+  for (const node of graph.nodes) {
+    if (ids.has(node.id)) duplicateId ??= node.id
+    ids.add(node.id)
   }
+  const edge = graph.edges.find(edge => !ids.has(edge.source) || !ids.has(edge.target))
+  const diagnostics: string[] = []
+  if (duplicateId !== undefined) diagnostics.push(`Duplicate node ID ${JSON.stringify(duplicateId)}`)
+  if (edge) {
+    const missingIds = [...new Set([edge.source, edge.target])].filter(id => !ids.has(id))
+    diagnostics.push(`Edge ${JSON.stringify(edge.id)} references missing node IDs ${JSON.stringify(missingIds)}`)
+  }
+  if (diagnostics.length) throw new Error(diagnostics.join('\n'))
 }

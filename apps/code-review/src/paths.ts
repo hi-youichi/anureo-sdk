@@ -1,4 +1,4 @@
-import { realpath, stat } from 'node:fs/promises'
+import { mkdir, realpath, stat, writeFile } from 'node:fs/promises'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 
@@ -9,6 +9,20 @@ export const OPERATIONAL_PATH_SEGMENTS = ['.git', '.anureo', 'node_modules'] as 
 /** Default durable run storage relative to the canonical review directory. Its first segment
  * stays in OPERATIONAL_PATH_SEGMENTS so old default records stay excluded when storage is overridden. */
 export const DEFAULT_WORKFLOW_DIRECTORY = '.anureo/workflows'
+
+/** Protect default run records from Git staging while preserving an existing ignore file. */
+export async function protectDefaultWorkflowDirectory(directory: string): Promise<void> {
+  try {
+    await mkdir(directory, { recursive: true, mode: 0o700 })
+    try { await writeFile(resolve(directory, '.gitignore'), '*\n', { flag: 'wx' }) }
+    catch (cause) {
+      if (!cause || typeof cause !== 'object' || !('code' in cause) || cause.code !== 'EEXIST') throw cause
+    }
+  } catch (cause) {
+    throw new HarnessSdkError('WORKFLOW_STORAGE_FAILED', 'Could not initialize default workflow storage',
+      false, false, { directory, cause })
+  }
+}
 
 /** Return an existing directory's canonical absolute path. Relative paths resolve from the
  * process working directory. Filesystem errors and non-directories reject. executeReviewCommand

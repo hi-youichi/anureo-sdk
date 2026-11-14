@@ -1,8 +1,9 @@
 import { test, expect } from 'bun:test';
 import { resolve } from 'node:path';
 import { createClient, HarnessSdkError, type Session } from '@anureo/sdk';
-import type { AhpEvent, InteractionRequested, InteractionResponse } from '@anureo/protocol';
+import type { AhpEvent, InitializeParams, InteractionRequested, InteractionResponse } from '@anureo/protocol';
 import { createAcpAdapter, type AcpAdapterOptions } from '../src/index';
+import { stopOutcome } from '../src/stop';
 import { rejectionOf } from './test-helpers';
 
 const executable = resolve(import.meta.dirname, './fixtures/fake-acp.mjs');
@@ -114,6 +115,20 @@ test('cancel is a native notification and waits for prompt cancelled before term
   } finally { await f.close(); }
 });
 
+test('a definite ACP prompt failure releases the lane before its result settles', async () => {
+  const f = await fixture();
+  try {
+    const failed = await f.session.submit({ input: 'fail-started' });
+    expect(await failed.result()).toMatchObject({ status: 'failed' });
+    const next = await f.session.submit({ input: 'next' });
+    expect(await next.result()).toMatchObject({ status: 'completed', text: 'Hello next' });
+  } finally { await f.close(); }
+});
+
+test('an inherited property is an unclassified ACP stop reason', () => {
+  expect(stopOutcome('toString')).toMatchObject({ status: 'failed', notice: { code: 'ACP_STOP_UNKNOWN' } });
+});
+
 test('mode/config native operations update declared schemas and load snapshots do not replay live events', async () => {
   const snapshots: unknown[] = [];
   const f = await fixture(['--load-only'], { onLoadSnapshot: (_binding, updates) => snapshots.push(updates) }); try {
@@ -144,6 +159,21 @@ for (const outcomeUnknown of [false, true]) test(`partial ACP config preserves c
       await f.session.request('session/config/set', { sessionId: 's', requestId: 'next', patch: { enabled: false } });
       expect(f.session.snapshot.config.enabled).toBe(false);
     }
+  } finally { await f.close(); }
+});
+
+test('configuration uses confirmed aliases and detects an option withdrawn mid-patch', async () => {
+  const f = await fixture(['--scenario', 'canonical-config']);
+  try {
+    await expect(f.session.request('session/config/set', {
+      requestId: 'canonical', sessionId: 's', patch: { model: 'second-model', enabled: true },
+    })).rejects.toMatchObject({
+      code: 'CONFIG_PARTIAL', outcomeUnknown: false,
+      details: { appliedKeys: ['model'], failedKey: 'enabled', cause: { code: 'CAPABILITY_UNSUPPORTED' } },
+    });
+    expect(f.session.snapshot.config).toMatchObject({ model: 'fake-model', 'model-id': 'fake-model' });
+    expect(f.session.snapshot.status).toBe('ready');
+    expect(f.session.capabilities.config?.options.find(option => option.id === 'model')?.value).toBe('fake-model');
   } finally { await f.close(); }
 });
 
@@ -214,16 +244,185 @@ test('unsupported ACP major version fails before opening a session', async () =>
   finally { await adapter.dispose(); }
 });
 
+test('concurrent adapter initialization shares acquisition and retries after failed release completes', async () => {
+  const params: InitializeParams = { protocolVersions: [1], protocolContract: 'native-lifecycle', clientInfo: { name: 'test', version: '1' } };
+  const { promise: releasing, resolve: startRelease } = Promise.withResolvers<void>();
+  const { promise: release, resolve: finishRelease } = Promise.withResolvers<void>();
+  let acquisitions = 0;
+  let disposals = 0;
+  const adapter = createAcpAdapter({
+    async connect() {
+      const attempt = ++acquisitions;
+      let incoming!: ReadableStreamDefaultController;
+      return {
+        stream: {
+          readable: new ReadableStream({ start: controller => { incoming = controller; } }),
+          writable: new WritableStream({ write: frame => {
+            incoming.enqueue({ jsonrpc: '2.0', id: frame.id, result: { protocolVersion: attempt === 1 ? 99 : 1 } });
+          } }),
+        },
+        async dispose() {
+          disposals++;
+          if (attempt === 1) { startRelease(); await release; }
+        },
+      };
+    },
+  });
+  try {
+    const first = rejectionOf(adapter.initialize(params));
+    const second = rejectionOf(adapter.initialize(params));
+    await releasing;
+    const duringCleanup = rejectionOf(adapter.initialize(params));
+    finishRelease();
+    for (const error of await Promise.all([first, second, duringCleanup])) {
+      expect(error).toMatchObject({ code: 'PROTOCOL_VERSION_UNSUPPORTED' });
+    }
+    expect(acquisitions).toBe(1);
+    expect(disposals).toBe(1);
+    const results = await Promise.all([adapter.initialize(params), adapter.initialize(params)]);
+    expect(results[0]).toEqual(results[1]);
+    expect(acquisitions).toBe(2);
+    expect(adapter.connected).toBe(true);
+  } finally { finishRelease(); await adapter.dispose(); }
+  expect(disposals).toBe(2);
+});
+
 test('invalid extension versions remain disabled and method-not-found updates the live capability snapshot', async () => {
   const unsupported = await fixture(['--extensions', '--bad-extension']);
-  try { expect(unsupported.initialized.capabilities.input?.steer).toBeUndefined(); expect(unsupported.initialized.capabilities.interactions).not.toContain('dynamicTool'); }
+  try { expect(unsupported.initialized.capabilities.session?.history).toBe(false); expect(unsupported.initialized.capabilities.interactions).not.toContain('dynamicTool'); }
   finally { await unsupported.close(); }
-  const f = await fixture(['--extensions', '--missing-steer']); try {
-    const pending=f.session.submit({input:'wait'});void pending.catch(()=>{});await Promise.resolve();
-    expect(await rejectionOf(f.session.request('turn/steer', { requestId: 'missing-steer', sessionId: 's', submissionId:'redirect-input',expectedTurnId: 'no-exact-target', input: [{ type: 'text', text: 'redirect' }] }))).toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
-    expect(f.session.capabilities.input?.steer).toBeUndefined();
-    await f.session.interrupt();await f.finished((await pending).id);
+  const f = await fixture(['--extensions', '--missing-history']); try {
+    const sibling = await f.runtime.sessions.create({ cwd: process.cwd(), config: { mode: 'plan' } });
+    expect(f.session.capabilities.session?.history).toBe(true);
+    expect(sibling.capabilities.session?.history).toBe(true);
+    await expect(f.session.request('history/read', { requestId: 'missing-history', sessionId: 's' })).rejects.toMatchObject({
+      code: 'CAPABILITY_UNSUPPORTED', details: { nativeCode: -32601 },
+    });
+    const later = await f.runtime.sessions.create({ cwd: process.cwd() });
+    expect(f.session.capabilities.session?.history).toBe(false);
+    expect(sibling.capabilities.session?.history).toBe(false);
+    expect(sibling.snapshot.config.mode).toBe('plan');
+    expect(later.capabilities.session?.history).toBe(false);
   } finally { await f.close(); }
+});
+
+test('a malformed mutation result leaves the native outcome unknown', async () => {
+  const f = await fixture(['--extensions', '--scenario', 'malformed-goal']);
+  try {
+    await expect(f.session.request('goal/set', { requestId: 'malformed', sessionId: 's', goal: { text: 'finish' } })).rejects.toMatchObject({
+      code: 'PROTOCOL_ERROR', outcomeUnknown: true,
+    });
+    expect(f.session.snapshot.status).toBe('recoveryRequired');
+  } finally { await f.close(); }
+});
+
+test('a permission option ID cannot substitute for the policy kind', async () => {
+  const f = await fixture([], { autoRespondPermission: 'allow-once' });
+  try {
+    f.respondWith(() => ({ kind: 'approval', optionId: 'deny' }));
+    const events = await f.finished(await f.start('permission-id-collision'));
+    expect(events.some(event => event.type === 'interaction/resolved')).toBe(true);
+    expect(events.some(event => event.type === 'notice' && event.payload.code === 'ACP_PERMISSION_AUTO_ANSWERED')).toBe(false);
+  } finally { await f.close(); }
+});
+
+test('duplicate attachments preserve the live owner and its native routing', async () => {
+  const f = await fixture();
+  try {
+    const reference = f.session.reference;
+    const otherId = { ...reference.binding, sessionId: 'duplicate' };
+    const otherNative = { ...reference.binding, nativeRef: { provider: 'acp', value: 'other-native' } };
+    for (const binding of [reference.binding, otherId, otherNative]) {
+      await expect(f.runtime.sessions.resume({ ...reference, binding })).rejects.toMatchObject({ code: 'SESSION_ALREADY_OPEN' });
+    }
+    expect((await (await f.session.submit({ input: 'still owned' })).result()).text).toBe('Hello still owned');
+    await f.resume();
+    expect((await (await f.session.submit({ input: 'resumed' })).result()).text).toBe('Hello resumed');
+  } finally { await f.close(); }
+});
+
+test('closing a session drops late peer traffic and preserves fork lookup', async () => {
+  const f = await fixture(['--extensions', '--scenario', 'no-close'], {
+    terminal: {
+      createTerminal: async () => { throw new Error('retired session reached the terminal port'); },
+      terminalOutput: async () => ({ output: '', truncated: false }),
+      waitForTerminalExit: async () => ({ exitCode: 0 }),
+      killTerminal: async () => {},
+      releaseTerminal: async () => {},
+    },
+  });
+  try {
+    const retired = await f.runtime.sessions.create({ cwd: process.cwd() });
+    const binding = retired.binding;
+    await retired.close();
+    expect(await f.adapter.call('_test/late-traffic', { sessionId: binding.nativeRef?.value })).toEqual({ terminalRejected: true });
+    await f.until(() => f.events.some(event => event.type === 'notice' && event.payload.code === 'ACP_ELICITATION_COMPLETE'));
+    expect(f.events.some(event => event.type === 'notice' && event.payload.code === 'ACP_UNKNOWN_NOTIFICATION')).toBe(true);
+    expect(f.events.some(event => event.type === 'session/metadata' && event.payload.title === 'Late title')).toBe(false);
+    const fork = await f.runtime.openSession({
+      requestId: 'fork-closed', mode: 'fork', cwd: process.cwd(), binding: { ...f.runtime.identity, sessionId: 'fork-closed' },
+      fork: { sourceSessionId: binding.sessionId, boundary: { turnId: 'native-turn', relation: 'through' } },
+    });
+    expect(fork.binding.nativeRef?.value).toStartWith('fork-');
+  } finally { await f.close(); }
+});
+
+test('failed initial configuration closes the acquired native session', async () => {
+  const f = await fixture(['--scenario', 'observe-close']);
+  try {
+    await expect(f.runtime.sessions.create({ cwd: process.cwd(), config: { missing: true } })).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
+    await f.until(() => f.events.some(event => event.type === 'notice' && event.payload.code === 'ACP_UNKNOWN_NOTIFICATION'
+      && JSON.stringify(event.payload.raw).includes('native-2')));
+    expect(f.adapter.sessions.size).toBe(1);
+  } finally { await f.close(); }
+});
+
+test('an open deadline retains correlation until its late native reply is drained', async () => {
+  const adapter = createAcpAdapter({ command: process.execPath, args: [executable, '--scenario', 'slow-first-open'] });
+  const client = await createClient({ adapter, identity: { adapterId: 'acp', runtimeConfigId: 'fixture' } });
+  const closedSessions: unknown[] = [];
+  const original = adapter.call.bind(adapter);
+  adapter.call = (async (method: string, params: unknown) => {
+    const result = await original(method, params);
+    if (method === 'session/close') closedSessions.push(params);
+    return result;
+  }) as typeof adapter.call;
+  try {
+    adapter.options.requestTimeoutMs = 40;
+    await expect(client.sessions.create({ cwd: process.cwd() })).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT', outcomeUnknown: true });
+    adapter.options.requestTimeoutMs = 1_000;
+    const next = await client.sessions.create({ cwd: process.cwd() });
+    expect(next.binding.nativeRef?.value).toBe('native-2');
+    expect(next.snapshot.metadata?.title).toBeUndefined();
+    expect(closedSessions).toEqual([{ sessionId: 'native-1' }]);
+    expect(adapter.sessions.size).toBe(1);
+  } finally { await client.dispose(); }
+});
+
+test('session disposal releases a terminal whose creation is still pending', async () => {
+  const { promise: entered, resolve: begin } = Promise.withResolvers<void>();
+  const { promise: creating, resolve: finish } = Promise.withResolvers<{ terminalId: string }>();
+  const released: string[] = [];
+  const f = await fixture([], { terminal: {
+    createTerminal: () => { begin(); return creating; },
+    terminalOutput: async () => ({ output: '', truncated: false }),
+    waitForTerminalExit: async () => ({ exitCode: 0 }),
+    killTerminal: async () => {},
+    releaseTerminal: async ({ terminalId }) => { released.push(terminalId); },
+  } });
+  try {
+    const pending = f.session.submit({ input: 'terminal-create-only' }).catch(() => {});
+    await entered;
+    const closing = f.session.close();
+    await f.until(() => f.adapter.sessions.get('s')?.disposed === true);
+    finish({ terminalId: 'pending-terminal' });
+    await closing;
+    expect(released).toEqual(['pending-terminal']);
+    await pending;
+  } finally {
+    finish({ terminalId: 'pending-terminal' });
+    await f.close();
+  }
 });
 
 test('native authentication requirements remain diagnosable without propagating raw provider data', async () => {

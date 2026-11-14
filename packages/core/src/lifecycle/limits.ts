@@ -1,5 +1,7 @@
 import { HarnessSdkError } from '../errors';
 
+export const DEFAULT_MAX_RESULT_BYTES = 16 * 1024 * 1024;
+
 /**
  * Validate the selected retention budget as a positive safe integer, using the caller's fallback
  * for an omitted value. Throw INVALID_PARAMS on failure. assertClientOptions checks configured
