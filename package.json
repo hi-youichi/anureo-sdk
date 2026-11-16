@@ -38,6 +38,7 @@
     "@anureo/adapter-codex": "workspace:*",
     "@anureo/adapter-hermes": "workspace:*",
     "@anureo/adapter-pi": "workspace:*",
+    "@anureo/adapter-swarm": "workspace:*",
     "@anureo/code-review": "workspace:*",
     "@anureo/conformance": "workspace:*",
     "@anureo/protocol": "workspace:*",

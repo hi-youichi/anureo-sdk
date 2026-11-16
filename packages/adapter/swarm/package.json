@@ -1,0 +1,24 @@
+{
+  "name": "@anureo/adapter-swarm",
+  "description": "Route Anureo SDK turns to a single harness session or a team",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit --pretty false",
+    "test": "bun test tests"
+  },
+  "dependencies": {
+    "@anureo/protocol": "workspace:*",
+    "@anureo/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@anureo/adapter-codex": "workspace:*"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

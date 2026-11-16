@@ -1,0 +1,28 @@
+{
+  "name": "@anureo/cli",
+  "version": "0.2.0",
+  "description": "Single-turn agent runner printing the unified AHP event stream for Codex, Claude, Hermes, Pi, ACP, and Swarm",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
+    "directory": "apps/cli"
+  },
+  "publishConfig": { "access": "public" },
+  "type": "module",
+  "bin": { "anureo": "./bin/anureo.ts" },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --pretty false"
+  },
+  "dependencies": {
+    "@anureo/adapter-acp": "workspace:*",
+    "@anureo/adapter-claude": "workspace:*",
+    "@anureo/adapter-codex": "workspace:*",
+    "@anureo/adapter-hermes": "workspace:*",
+    "@anureo/adapter-pi": "workspace:*",
+    "@anureo/adapter-swarm": "workspace:*",
+    "@anureo/protocol": "workspace:*",
+    "@anureo/sdk": "workspace:*"
+  }
+}
