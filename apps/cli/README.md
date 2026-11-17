@@ -84,7 +84,7 @@ Save this example as `.anureo/bees/tester.json`:
 }
 ```
 
-The filename provides the profile ID. Both origins remain available when IDs match. Without an explicit scope, the project profile takes precedence over the entire user profile; fields are not merged. Set `model` to a model on the selected backend, or leave it out for the backend default. Swarm can select profiles automatically or accept an explicit assignment at the start of the prompt:
+The filename provides the profile ID. Both origins remain available when IDs match. Without an explicit scope, the project profile takes precedence over the entire user profile; fields are not merged. Set `model` to a model on the selected backend and optionally `effort` to a supported effort ID, or omit them for backend defaults. Fixed bees cannot override these settings at creation. Swarm can select profiles automatically or accept an explicit assignment at the start of the prompt:
 
 ```bash
 anureo --harness swarm:codex --sandbox read-only "@tester Review the current diff for missing regression tests."
@@ -97,6 +97,36 @@ Explicit `@user/<id>` and `@project/<id>` selections fail if that origin is abse
 ### Swarm model selection
 
 Swarm automatically discovers models for Codex, Claude, and Pi using the selected executable/configuration and working directory, then includes the normalized directory in main instructions. Discovery connections are released by their owner. Unsupported discovery (including ACP and Hermes) or a failed query leaves the catalog unavailable and preserves backend-default execution; `--verbose` reports query failures on stderr. Hidden models are omitted from the main catalog display. The main assistant may choose an exact model with `bee_create({ role, name, model })`; fixed bees use their profile model. `--model` continues to select the main model. See [Swarm model selection](../../packages/adapter/swarm/README.md#model-selection) for catalog policies and lifecycle behavior.
+
+Codex discovery preserves native descriptions, input modalities, supported effort IDs/descriptions, default effort and service tiers. Claude discovery retains supported effort levels when provided; Pi discovery preserves its native thinking-level IDs as effort options. These are picker metadata; catalog defaults do not override the backend's configured execution settings.
+
+The main assistant can explicitly select effort with `bee_create({ role, name, model, effort: 'low', selectionReason })`. The CLI configures the mapping automatically for Codex/Claude (`config.effort`) and Pi (`config.thinkingLevel`), including when model discovery fails. ACP/Hermes have no configured effort mapping and reject explicit effort. Known model effort lists are checked before creation; otherwise the backend validates support. Omitted effort retains the backend default; `recommendedEffort` is advice and is not applied automatically. Temporary bees keep their effort for their lifetime, and fixed bees use the optional `effort` in their profile JSON. Main Session config is never inherited by members. Reports expose `requestedEffort` and `effortSource`; these record requests, not observed native settings. This adds no top-level CLI effort flag for the main assistant.
+
+To add your own model selection advice, save UTF-8 JSON in `~/.anureo/model-guidance.json` for cross-project use or `<project>/.anureo/model-guidance.json` for project policy. Project-root discovery follows the same nearest-Git-ancestor rule as profiles. Files are read once at startup in Swarm mode. For example:
+
+```json
+{
+  "version": 1,
+  "backends": {
+    "codex": {
+      "gpt-6.1-sol": {
+        "summary": "Preferred for this project's ordinary code reviews.",
+        "relativeCost": "unknown",
+        "preferredTasks": ["Code review", "Routine debugging"],
+        "limitations": ["No project benchmark yet; verify findings"],
+        "source": "Project maintainer recommendation",
+        "reviewedAt": "2026-11-17"
+      }
+    }
+  }
+}
+```
+
+The [common-model example](examples/model-guidance.json) includes application recommendations for three Codex models based on native picker descriptions. Review it before copying it into either location; it is not loaded automatically and contains no measured results or price rankings. Native descriptions are available without a guidance file.
+
+Entries match the selected CLI backend name (`codex`, `claude`, `pi`, `hermes`, or `acp`) and exact model ID. The executable's discovered catalog remains authoritative for listing availability; a guidance entry never adds a missing model or replaces native capabilities. Each project entry replaces the entire matching user entry, including its provenance; unrelated entries remain. Set an entry to `null` to remove inherited advice. Advice on unknown model IDs is retained only in configuration and omitted from the live catalog. Known relative cost tiers (`low`, `medium`, `high`) require a `comparisonGroup` naming the billing environment; `unknown` needs no group. See the linked Swarm guide for all guidance fields and limits.
+
+Missing files are allowed. Malformed files, invalid advice or a recommendation for an effort absent from a discovered model fail startup with an error; guidance errors do not silently become discovery failures. Each file is limited to 2 MiB. When a backend has visible guidance, temporary `bee_create` requires `selectionReason`, including for default-model fallbacks. Creation, task reports and member events retain that reason and a content revision for the explicitly chosen model's guidance, when present. They record requested settings, not the actual provider model. The main assistant continues to choose models; the CLI adds no automatic router or price lookup.
 
 ### Profile review
 
@@ -185,6 +215,7 @@ The events you see per harness, as a verification contract. The mapping lives in
 - [`src/cli.ts`](src/cli.ts) — argument parsing/validation and help text; owns no client lifecycle.
 - [`src/run.ts`](src/run.ts) — client assembly (adapter selection, identity, sandbox mapping) and turn execution.
 - [`src/models.ts`](src/models.ts) — backend-specific model ID normalization and discovery-failure handling for Swarm instructions.
+- [`src/model-guidance.ts`](src/model-guidance.ts) — user/project model advice loading, whole-entry precedence and overlays onto discovered models.
 - [`src/profiles.ts`](src/profiles.ts) — user and project profile discovery and precedence.
 - [`src/profile-review.ts`](src/profile-review.ts) — atomic writes for project profile proposals.
 - [`src/project.ts`](src/project.ts) — event → JSONL projection for stream mode and the single-object writer for result mode.

@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -10,13 +10,16 @@ test('catalog normalization uses backend execution IDs and preserves hidden/defa
   expect(codexModels([{ id: 'execution-id', name: 'Display', hidden: true, isDefault: true }])).toEqual([{ id: 'execution-id', name: 'Display', hidden: true, isDefault: true }])
   expect(claudeModels([{ value: 'claude-value', displayName: 'Claude display', description: 'Description' }])).toEqual([{ id: 'claude-value', name: 'Claude display', description: 'Description' }])
   expect(claudeModels([{ value: 'id', displayName: '', description: '' }])).toEqual([{ id: 'id' }])
-  expect(piModels([{ ref: 'provider/path/model', name: 'Pi display', reasoning: true, thinkingLevels: [] }])).toEqual([{ id: 'provider/path/model', name: 'Pi display' }])
+  expect(claudeModels([{ value: 'thinking', displayName: '', description: '', supportedEffortLevels: ['low', 'max'] }, { value: 'no-effort', displayName: '', description: '', supportsEffort: false }])).toEqual([{ id: 'thinking', efforts: [{ id: 'low' }, { id: 'max' }] }, { id: 'no-effort', efforts: [] }])
+  expect(piModels([{ ref: 'provider/path/model', name: 'Pi display', reasoning: true, thinkingLevels: ['off', 'high'] }])).toEqual([{ id: 'provider/path/model', name: 'Pi display', efforts: [{ id: 'off' }, { id: 'high' }] }])
+  expect(codexModels([{ id: 'native', name: 'Native', description: 'Coding', efforts: [{ id: 'high', description: 'Deep' }], defaultEffort: 'high', serviceTiers: ['', 'priority'], inputModalities: ['text', 'image'] }])[0]).toMatchObject({ description: 'Coding', efforts: [{ id: 'high', description: 'Deep' }], defaultEffort: 'high', serviceTiers: ['priority'], inputModalities: ['text', 'image'] })
 })
 
 test('discovery absence, empty results and failure remain distinct and keep legacy defaults usable', async () => {
   const diagnostics: string[] = []
   const log = (message: string) => { diagnostics.push(message) }
   expect((await loadSwarmModelCatalog(undefined, log)).default?.status).toBe('unavailable')
+  expect((await loadSwarmModelCatalog(undefined, log, 'effort')).default).toMatchObject({ status: 'unavailable', effortConfigKey: 'effort' })
   expect(await loadSwarmModelCatalog(async () => [], log)).toEqual({ default: { status: 'available', models: [] } })
   expect((await loadSwarmModelCatalog(async () => { throw new Error('private native message') }, log)).default?.status).toBe('unavailable')
   expect(diagnostics).toHaveLength(1)
@@ -32,6 +35,15 @@ test('Codex CLI discovers with its launch settings, injects the catalog and surv
   const originalLog = process.env.FAKE_LOG_FILE
   const originalScenario = process.env.FAKE_SCENARIO
   try {
+    const nested = join(directory, 'nested')
+    const homeDirectory = join(directory, 'home')
+    await mkdir(nested)
+    await mkdir(join(directory, '.anureo'))
+    await writeFile(join(directory, '.git'), 'gitdir: unused')
+    await writeFile(join(directory, '.anureo', 'model-guidance.json'), JSON.stringify({ version: 1, backends: { codex: {
+      'gpt-6.1-sol': { summary: 'Project-specific review guidance', relativeCost: 'unknown', recommendedEffort: 'low', source: 'Project policy', reviewedAt: '2026-11-17' },
+      'not-discovered': { summary: 'Must not appear', source: 'Project policy', reviewedAt: '2026-11-17' },
+    } } }))
     for (const scenario of ['normal', 'model-loop']) {
       const log = join(directory, `${scenario}.jsonl`)
       process.env.FAKE_LOG_FILE = log
@@ -39,22 +51,30 @@ test('Codex CLI discovers with its launch settings, injects the catalog and surv
       let stdout = '', stderr = ''
       expect(await runCli([
         '--harness', 'swarm:codex', '--command', process.execPath, '--args', JSON.stringify([fixture]),
-        '--cd', directory, '--model', 'main-choice', '--output', 'result', '--verbose', 'Inspect',
-      ], { stdout: text => { stdout += text }, stderr: text => { stderr += text } })).toBe(0)
+        '--cd', nested, '--model', 'main-choice', '--output', 'result', '--verbose', 'Inspect',
+      ], { homeDirectory, stdout: text => { stdout += text }, stderr: text => { stderr += text } })).toBe(0)
       expect(JSON.parse(stdout).status).toBe('completed')
       const calls = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
       expect(calls.some(call => call.method === 'model/list')).toBe(true)
       const threads = calls.filter(call => call.method === 'thread/start')
       expect(threads).toHaveLength(1)
-      expect(threads[0].params).toMatchObject({ cwd: directory, model: 'main-choice' })
+      expect(threads[0].params).toMatchObject({ cwd: nested, model: 'main-choice' })
       const instructions: string = threads[0].params.developerInstructions
       expect(instructions).toContain('Backend model catalogs:')
+      expect(instructions).toContain('"effortConfigKey":"effort"')
       if (scenario === 'normal') {
         expect(instructions).toContain('"id":"gpt-6.1-sol"')
+        expect(instructions).toContain('Native task description')
+        expect(instructions).toContain('"inputModalities":["text","image"]')
+        expect(instructions).toContain('"defaultEffort":"low"')
+        expect(instructions).toContain('"serviceTiers":["standard","priority"]')
+        expect(instructions).toContain('Project-specific review guidance')
+        expect(instructions).not.toContain('not-discovered')
         expect(instructions).not.toContain('gpt-reserve')
         expect(stderr).not.toContain('discovery failed')
       } else {
         expect(instructions).toContain('"status":"unavailable"')
+        expect(instructions).not.toContain('Project-specific review guidance')
         expect(stderr).toContain('Model discovery failed')
       }
     }

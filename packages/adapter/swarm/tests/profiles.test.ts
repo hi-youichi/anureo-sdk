@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { BeeProfileRegistry } from '../src/profiles'
+import { BeeProfileRegistry, parseBeeProfile } from '../src/profiles'
 import { profile } from './evolution-fixture'
 
 test('registry retains same-ID origins and uses project, user, then legacy defaults', () => {
@@ -25,4 +25,9 @@ test('registry rejects duplicate origins and invalid source metadata', () => {
     { profile, source: { scope: 'user', namespace: 'home-b' } },
   ])).toThrow('Duplicate profile')
   expect(() => new BeeProfileRegistry([{ profile, source: { scope: 'project', namespace: '' } }])).toThrow('namespace')
+})
+
+test('profiles preserve exact effort IDs and reject malformed values', () => {
+  expect(parseBeeProfile({ ...profile, effort: 'low' }).effort).toBe('low')
+  for (const effort of [null, 1, '', ' ', ' low', 'low ', 'x'.repeat(129)]) expect(() => parseBeeProfile({ ...profile, effort })).toThrow('effort ID')
 })

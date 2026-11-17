@@ -24,7 +24,7 @@ export function profileStorageInstructions(project: string, homeDirectory = home
       project: resolve(project, '.anureo', 'bees'),
     }),
     'For an authorized request to save a profile, choose user for cross-project reusable instructions and project for repository-specific instructions, then write <id>.json in that scope\'s directory. The project directory above is rooted at the nearest Git ancestor, or the CLI working directory when there is none; do not substitute a nested working directory.',
-    'Use a UTF-8 JSON object with nonempty name, description and instructions, and optional model. The filename supplies id: a lowercase slug starting with a letter, at most 40 letters, digits or hyphens. Create missing directories as needed. Inspect an existing target before updating it and preserve unrelated profiles.',
+    'Use a UTF-8 JSON object with nonempty name, description and instructions, and optional model and effort. Effort must be an exact supported ID on the selected backend and requires its effortConfigKey mapping; omitted effort retains that backend\'s configured default. The filename supplies id: a lowercase slug starting with a letter, at most 40 letters, digits or hyphens. Create missing directories as needed. Inspect an existing target before updating it and preserve unrelated profiles.',
     'Profiles are loaded once at CLI startup. Newly created or changed files become available in the next CLI invocation; do not claim bee_create has already loaded them in this session. Provide the saved path and the next invocation\'s @user/<id> or @project/<id> selector.',
   ].join('\n\n')
 }

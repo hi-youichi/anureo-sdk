@@ -169,7 +169,7 @@ test('scoped creation preserves instructions, status, snapshots, reviews and evo
         const task = await mcp.call('bee_delegate', assignment(bee.beeId))
         const report = await mcp.call('bee_wait', { taskId: task.taskId })
         expect(report).toMatchObject({ state: 'completed', profileScope: selected, profileSource: sources[selected] })
-        expect(report.execution).toMatchObject({ requestedModel: `${selected}-model`, modelSource: 'profile' })
+        expect(report.execution).toMatchObject({ requestedModel: `${selected}-model`, modelSource: 'profile', requestedEffort: selected === 'user' ? 'low' : 'high', effortSource: 'profile' })
         expect(report.text).toContain(`${selected} instructions`)
         expect((await mcp.call('bee_status')).bees.find((entry: { beeId: string }) => entry.beeId === bee.beeId).profileScope).toBe(selected)
         await mcp.call('bee_close', { beeId: bee.beeId })
@@ -178,8 +178,9 @@ test('scoped creation preserves instructions, status, snapshots, reviews and evo
       return 'Compared both origins'
     } finally { await mcp.client.close() }
   }, true, 'backend', undefined, true)
-  const entries = (['user', 'project'] as const).map(scope => ({ profile: { ...tester, instructions: `${scope} instructions`, model: `${scope}-model` }, source: sources[scope], sourceFile: `/${scope}/tester.json` }))
+  const entries = (['user', 'project'] as const).map(scope => ({ profile: { ...tester, instructions: `${scope} instructions`, model: `${scope}-model`, effort: scope === 'user' ? 'low' : 'high' }, source: sources[scope], sourceFile: `/${scope}/tester.json` }))
   const client = await createClient({ adapter: createSwarmAdapter({ backend: backend.client,
+    modelCatalog: { default: { status: 'unavailable', effortConfigKey: 'effort' } },
     profileEntries: [...entries, { profile: { ...tester, id: 'reviewer' }, source: sources.user }],
     evolution: { controller }, profileReview: { onResult(review) { received.push(review) } },
     hooks: { afterTask(event) { snapshots.push(event.profileSource!.scope); expect(event.sourceFile).toBe(`/${event.profileSource!.scope}/tester.json`); expect(event.execution?.requestedModel).toBe(`${event.profileSource!.scope}-model`) } },
@@ -194,6 +195,8 @@ test('scoped creation preserves instructions, status, snapshots, reviews and evo
     ])
     expect(backend.opened.filter(p => !p.mcpServers?.length && p.mode !== 'fork').map(p => p.model)).toEqual(['user-model', 'project-model', 'project-model'])
     expect(backend.opened.filter(p => p.mode === 'fork').map(p => p.model)).toEqual(['user-model', 'project-model', 'project-model'])
+    expect(backend.opened.filter(p => !p.mcpServers?.length && p.mode !== 'fork').map(p => p.config)).toEqual([{ effort: 'low' }, { effort: 'high' }, { effort: 'high' }])
+    expect(backend.opened.filter(p => p.mode === 'fork').map(p => p.config)).toEqual([{ effort: 'low' }, { effort: 'high' }, { effort: 'high' }])
     await client.dispose()
     await controller.drain()
     expect(snapshots).toEqual(['user', 'project', 'project'])
@@ -783,13 +786,14 @@ test('afterTurn runs once for invalid requests with an empty current-turn snapsh
   } finally { await client.dispose(); await backend.client.dispose() }
 })
 
-test('three concurrent model choices reach member sessions and survive reuse across turns', async () => {
+test('guided concurrent model choices retain reasons and revisions through hooks, reports, events and reuse', async () => {
   let release!: () => void, entered!: () => void
   const gate = new Promise<void>(resolve => { release = resolve })
   const ready = new Promise<void>(resolve => { entered = resolve })
   let started = 0
   const ids: string[] = []
   const choices = ['fast', 'deep', undefined]
+  const reasons = ['Bounded extraction matches fast guidance', 'Cross-module reasoning needs deep model', 'Task-specific guidance is incomplete; use backend default']
   const selections: (string | undefined)[] = []
   const backend = await fixture(async (_input, _schema, _prior, params) => {
     if (!params.mcpServers?.length) {
@@ -800,12 +804,20 @@ test('three concurrent model choices reach member sessions and survive reuse acr
     expect(params.instructions).toContain('"id":"fast"')
     expect(params.instructions).not.toContain('hidden-model')
     expect(params.instructions).not.toContain('mutated-model')
+    expect(params.instructions).toContain('Bounded tasks')
     const mcp = await management(params)
     try {
-      if (!ids.length) for (const model of choices) {
-        const bee = await mcp.call('bee_create', { role: 'worker', name: 'Worker', ...(model ? { model } : {}) })
+      if (!ids.length) {
+        for (const model of choices) await expect(mcp.call('bee_create', { role: 'worker', name: 'Worker', ...(model ? { model } : {}) })).rejects.toThrow('selectionReason')
+        expect((await mcp.call('bee_status')).bees).toHaveLength(0)
+      }
+      if (!ids.length) for (const [index, model] of choices.entries()) {
+        const bee = await mcp.call('bee_create', { role: 'worker', name: 'Worker', ...(model ? { model } : {}), selectionReason: reasons[index] })
         expect(bee.execution).toMatchObject({ backend: backend.client.identity, route: { kind: 'default' }, modelSource: model ? 'bee' : 'backend-default' })
         expect(bee.execution.requestedModel).toBe(model)
+        expect(bee.execution.selectionReason).toBe(reasons[index])
+        if (model === 'fast') expect(bee.execution.guidanceRevision).toMatch(/^[a-f0-9]{64}$/)
+        else expect(bee.execution.guidanceRevision).toBeUndefined()
         ids.push(bee.beeId)
       }
       expect(backend.opened.filter(p => !p.mcpServers?.length)).toHaveLength(started ? 3 : 0)
@@ -815,15 +827,15 @@ test('three concurrent model choices reach member sessions and survive reuse acr
       if (started === 3) expect((await mcp.call('bee_status')).tasks.map((task: { state: string }) => task.state)).toEqual(['running', 'running', 'running'])
       release()
       for (const [index, task] of tasks.entries()) {
-        expect(await mcp.call('bee_wait', { taskId: task.taskId })).toMatchObject({ state: 'completed', text: choices[index] ?? 'backend default' })
+        expect(await mcp.call('bee_wait', { taskId: task.taskId })).toMatchObject({ state: 'completed', text: choices[index] ?? 'backend default', execution: { selectionReason: reasons[index] } })
       }
       return 'Model choices checked'
     } finally { release(); await mcp.client.close() }
   })
-  const catalog = { default: { status: 'available' as const, policy: 'allowlist' as const, models: [{ id: 'fast' }, { id: 'deep' }, { id: 'hidden-model', hidden: true }] } }
+  const catalog = { default: { status: 'available' as const, policy: 'allowlist' as const, models: [{ id: 'fast', guidance: { summary: 'Bounded tasks', preferredTasks: ['extraction'], source: 'Application policy', reviewedAt: '2026-11-17' } }, { id: 'deep' }, { id: 'hidden-model', hidden: true }] } }
   const client = await createClient({ adapter: createSwarmAdapter({ backend: backend.client, modelCatalog: catalog, hooks: {
-    beforeDelegate(event) { expect(event.execution?.backend).toEqual(backend.client.identity) },
-    afterTask(event) { selections.push(event.execution?.requestedModel) },
+    beforeDelegate(event) { expect(event.execution?.backend).toEqual(backend.client.identity); expect(reasons).toContain(event.execution?.selectionReason ?? '') },
+    afterTask(event) { selections.push(event.execution?.requestedModel); expect(reasons).toContain(event.execution?.selectionReason ?? '') },
   } }), identity: { adapterId: 'swarm', runtimeConfigId: 'model-selection' } })
   catalog.default.models[0].id = 'mutated-model'
   try {
@@ -833,6 +845,7 @@ test('three concurrent model choices reach member sessions and survive reuse acr
       expect(result.status).toBe('completed')
       const members = result.items.filter(item => item.type === 'subagent')
       expect(members.map(item => (item.extensions?.swarm as { execution: { requestedModel?: string } }).execution.requestedModel)).toEqual(choices)
+      expect(members.map(item => (item.extensions?.swarm as { execution: { selectionReason?: string } }).execution.selectionReason)).toEqual(reasons)
     }
     expect(backend.opened.filter(p => !p.mcpServers?.length).map(p => p.model)).toEqual(choices)
     expect(selections).toEqual([...choices, ...choices])
@@ -883,6 +896,53 @@ test('model catalogs follow backend routes and never override fixed profiles', a
     expect((await (await session.submit({ input: 'Inspect' })).result()).status).toBe('completed')
     expect(backend.opened.filter(p => !p.mcpServers?.length).map(p => p.model)).toEqual(['default-only', tester.model])
     expect(alternate.opened.map(p => p.model)).toEqual(['member-only', 'not-in-default'])
+  } finally { await client.dispose(); await backend.client.dispose(); await alternate.client.dispose() }
+})
+
+test('effort mappings stay with backend routes, preserve defaults and reject invalid choices before admission', async () => {
+  const alternate = await fixture((_input, _schema, _prior, params) => {
+    expect(params.config).toEqual({ thinkingLevel: 'high' })
+    return 'Pi evidence'
+  }, true, 'custom-alternate-identity')
+  const backend = await fixture(async (_input, _schema, _prior, params) => {
+    if (!params.mcpServers?.length) {
+      expect(params.config === undefined || params.config.effort === 'low').toBe(true)
+      expect(params.config?.thinkingLevel).toBeUndefined()
+      return 'Default evidence'
+    }
+    const mcp = await management(params)
+    try {
+      for (const args of [
+        { role: 'worker', name: 'Unsupported effort', model: 'routine', effort: 'high' },
+        { role: 'unsupported', name: 'No mapping', effort: 'low' },
+        { role: 'worker', name: 'Invalid exact ID', effort: ' low' },
+      ]) await expect(mcp.call('bee_create', args)).rejects.toThrow()
+      expect((await mcp.call('bee_status')).bees).toHaveLength(0)
+      for (const [role, model, effort] of [['worker', 'routine', 'low'], ['thinking', 'reasoning', 'high'], ['worker', 'routine', undefined]] as const) {
+        const bee = await mcp.call('bee_create', { role, name: role, model, ...(effort ? { effort } : {}) })
+        expect(bee.execution.requestedEffort).toBe(effort)
+        expect(bee.execution.effortSource).toBe(effort ? 'bee' : 'backend-default')
+        const task = await mcp.call('bee_delegate', assignment(bee.beeId))
+        const report = await mcp.call('bee_wait', { taskId: task.taskId })
+        expect(report.state).toBe('completed')
+        expect(report.execution).toEqual(bee.execution)
+        await mcp.call('bee_close', { beeId: bee.beeId })
+        expect((await mcp.call('bee_status', { taskId: task.taskId })).execution).toEqual(bee.execution)
+      }
+      return 'Mappings checked'
+    } finally { await mcp.client.close() }
+  })
+  const client = await createClient({ adapter: createSwarmAdapter({ backend: backend.client, memberBackends: { thinking: alternate.client, unsupported: alternate.client }, modelCatalog: {
+    default: { status: 'available', effortConfigKey: 'effort', models: [{ id: 'routine', efforts: [{ id: 'low' }] }] },
+    members: { thinking: { status: 'available', effortConfigKey: 'thinkingLevel', models: [{ id: 'reasoning', efforts: [{ id: 'high' }] }] } },
+  } }), identity: { adapterId: 'swarm', runtimeConfigId: 'effort-mapping' } })
+  try {
+    const session = await client.sessions.create({ cwd, config: { effort: 'max', thinkingLevel: 'max' } })
+    const result = await (await session.submit({ input: 'Check effort mappings' })).result()
+    expect(result.status).toBe('completed')
+    expect(result.items.filter(item => item.type === 'subagent').map(item => (item.extensions?.swarm as { execution: { requestedEffort?: string } }).execution.requestedEffort)).toEqual(['low', 'high', undefined])
+    expect(backend.opened.filter(params => !params.mcpServers?.length).map(params => params.config)).toEqual([{ effort: 'low' }, undefined])
+    expect(alternate.opened).toHaveLength(1)
   } finally { await client.dispose(); await backend.client.dispose(); await alternate.client.dispose() }
 })
 
@@ -945,7 +1005,7 @@ test('cancelling during model session opening releases the late backend without 
   } finally { release(); await client.dispose(); await backend.client.dispose() }
 })
 
-test('a selected member model reaches the native Codex thread without leaking main config', async () => {
+test('member model and effort reach native Codex turns without leaking main config and survive session reuse', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'swarm-native-model-'))
   const log = join(directory, 'calls.jsonl')
   const codex = await createClient({ adapter: createCodexAdapter({ command: process.execPath,
@@ -955,18 +1015,23 @@ test('a selected member model reaches the native Codex thread without leaking ma
   const backend = await fixture(async (_input, _schema, _prior, params) => {
     const mcp = await management(params)
     try {
-      const bee = await mcp.call('bee_create', { role: 'worker', name: 'Worker', model: 'Selected/Exact' })
-      const task = await mcp.call('bee_delegate', assignment(bee.beeId))
-      expect(await mcp.call('bee_wait', { taskId: task.taskId })).toMatchObject({ state: 'completed', execution: { requestedModel: 'Selected/Exact', backend: codex.identity } })
+      const bee = await mcp.call('bee_create', { role: 'worker', name: 'Worker', model: 'Selected/Exact', effort: 'low' })
+      expect(bee.execution).toMatchObject({ requestedEffort: 'low', effortSource: 'bee' })
+      for (let index = 0; index < 2; index++) {
+        const task = await mcp.call('bee_delegate', assignment(bee.beeId))
+        expect(await mcp.call('bee_wait', { taskId: task.taskId })).toMatchObject({ state: 'completed', execution: { requestedModel: 'Selected/Exact', requestedEffort: 'low', effortSource: 'bee', backend: codex.identity } })
+      }
       return 'Native model checked'
     } finally { await mcp.client.close() }
   })
-  const client = await createClient({ adapter: createSwarmAdapter({ backend: backend.client, memberBackends: { worker: codex } }), identity: { adapterId: 'swarm', runtimeConfigId: 'native-model' } })
+  const client = await createClient({ adapter: createSwarmAdapter({ backend: backend.client, memberBackends: { worker: codex }, modelCatalog: { members: { worker: { status: 'available', effortConfigKey: 'effort', models: [{ id: 'Selected/Exact', efforts: [{ id: 'low' }] }] } } } }), identity: { adapterId: 'swarm', runtimeConfigId: 'native-model' } })
   try {
-    const session = await client.sessions.create({ cwd: directory, model: 'main-model', config: { model: 'main-config' } })
+    const session = await client.sessions.create({ cwd: directory, model: 'main-model', config: { model: 'main-config', effort: 'high' } })
     expect((await (await session.submit({ input: 'Inspect' })).result()).status).toBe('completed')
     const calls = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
     expect(calls.find(call => call.method === 'thread/start').params.model).toBe('Selected/Exact')
+    expect(calls.filter(call => call.method === 'thread/start')).toHaveLength(1)
+    expect(calls.filter(call => call.method === 'turn/start').map(call => call.params.effort)).toEqual(['low', 'low'])
     expect(calls.find(call => call.method === 'turn/start').params.model).toBeUndefined()
   } finally { await client.dispose(); await backend.client.dispose(); await codex.dispose(); await rm(directory, { recursive: true, force: true }) }
 }, 15_000)

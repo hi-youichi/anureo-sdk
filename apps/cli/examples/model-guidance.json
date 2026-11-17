@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "backends": {
+    "codex": {
+      "gpt-6-luna": {
+        "summary": "Candidate for simple, bounded assignments, following the native description of a fast and affordable model for easier tasks.",
+        "relativeCost": "unknown",
+        "recommendedEffort": "low",
+        "preferredTasks": ["Locate files and extract facts", "Summarize a short input", "Perform a check with explicit rules"],
+        "limitations": ["No application benchmark yet; verify findings and escalate incomplete evidence", "Native affordability wording does not establish exact account pricing"],
+        "source": "Application recommendation based on Codex 0.169.0 model/list description, not measured task results",
+        "reviewedAt": "2026-11-17"
+      },
+      "gpt-6.1-sol": {
+        "summary": "Candidate for ordinary coding and review work, following the native description of the latest workhorse for coding and everyday work.",
+        "relativeCost": "unknown",
+        "preferredTasks": ["Review code changes", "Investigate routine bugs", "Explain implementation behavior"],
+        "limitations": ["No application benchmark yet; task suitability is an application recommendation"],
+        "source": "Application recommendation based on Codex 0.169.0 model/list description, not measured task results",
+        "reviewedAt": "2026-11-17"
+      },
+      "gpt-6-astra": {
+        "summary": "Candidate for demanding reasoning, following the native description of frontier intelligence for the most demanding work.",
+        "relativeCost": "unknown",
+        "preferredTasks": ["Evaluate architecture tradeoffs", "Investigate difficult cross-module bugs", "Reconcile conflicting evidence"],
+        "limitations": ["No application benchmark yet; choosing this model does not establish correctness"],
+        "source": "Application recommendation based on Codex 0.169.0 model/list description, not measured task results",
+        "reviewedAt": "2026-11-17"
+      }
+    }
+  }
+}

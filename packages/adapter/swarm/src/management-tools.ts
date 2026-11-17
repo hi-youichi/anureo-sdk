@@ -8,13 +8,13 @@ function tool(name: string, description: string, properties: Record<string, obje
 export const MANAGEMENT_TOOLS: Tool[] = [
   {
     name: 'bee_create',
-    description: 'Create a read-only bee. Fixed: supply profileId and optional profileScope (user/project); explicit scope never falls back, omitted scope prefers project then user. Temporary: supply role/name and optional exact model ID for that role backend. Omit model for the backend default. Fixed profiles cannot be overridden. Returns beeId, profile origin and requested execution settings; backend availability is checked on first delegation.',
+    description: 'Create a read-only bee. Fixed: supply profileId and optional profileScope (user/project); explicit scope never falls back, omitted scope prefers project then user. Temporary: supply role/name, optional exact model and effort IDs for that role backend, and selectionReason explaining the choice or default fallback. Effort requires a backend effortConfigKey; supported model efforts are checked when known. A reason is required when that backend has visible model guidance. Omit model/effort for backend defaults. Fixed profiles cannot be overridden. Returns beeId, profile origin and requested execution settings; backend availability is checked on first delegation.',
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     inputSchema: {
       type: 'object', additionalProperties: false,
-      properties: { profileId: { type: 'string', pattern: '^[a-z][a-z0-9-]{0,39}$' }, profileScope: { type: 'string', enum: ['user', 'project'] }, role: { type: 'string', pattern: '^[a-z][a-z0-9-]{0,39}$' }, name: string, model: { type: 'string', minLength: 1, maxLength: 512 }, operationKey: { type: 'string', minLength: 1, maxLength: 256 } },
+      properties: { profileId: { type: 'string', pattern: '^[a-z][a-z0-9-]{0,39}$' }, profileScope: { type: 'string', enum: ['user', 'project'] }, role: { type: 'string', pattern: '^[a-z][a-z0-9-]{0,39}$' }, name: string, model: { type: 'string', minLength: 1, maxLength: 512 }, effort: { type: 'string', minLength: 1, maxLength: 128 }, selectionReason: { type: 'string', minLength: 1, maxLength: 2000 }, operationKey: { type: 'string', minLength: 1, maxLength: 256 } },
       oneOf: [
-        { required: ['profileId'], not: { anyOf: [{ required: ['role'] }, { required: ['name'] }, { required: ['model'] }] } },
+        { required: ['profileId'], not: { anyOf: [{ required: ['role'] }, { required: ['name'] }, { required: ['model'] }, { required: ['effort'] }, { required: ['selectionReason'] }] } },
         { required: ['role', 'name'], not: { anyOf: [{ required: ['profileId'] }, { required: ['profileScope'] }] } },
       ],
     },

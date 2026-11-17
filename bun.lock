@@ -116,7 +116,7 @@
     },
     "packages/adapter/codex": {
       "name": "@anureo/adapter-codex",
-      "version": "0.3.3",
+      "version": "0.3.4",
       "dependencies": {
         "@anureo/protocol": "workspace:*",
         "@anureo/sdk": "workspace:*",

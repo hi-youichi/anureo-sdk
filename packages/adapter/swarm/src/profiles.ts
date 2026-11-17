@@ -7,6 +7,7 @@ export interface BeeProfile {
   description: string
   instructions: string
   model?: string
+  effort?: string
 }
 
 export type BeeProfileScope = 'user' | 'project'
@@ -76,17 +77,19 @@ export function parseBeeProfile(value: unknown): BeeProfile {
   const invalid = (message: string) => new HarnessSdkError('SWARM_INVALID_PROFILE', message)
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw invalid('Expected a profile object')
   const fields = value as Record<string, unknown>
-  const { id, name, description, instructions, model } = fields
+  const { id, name, description, instructions, model, effort } = fields
   if (!isBeeId(id)) throw invalid('Expected a lowercase profile id of up to 40 letters, digits, or hyphens')
   const required = (key: string, text: unknown) => {
     if (typeof text !== 'string' || !text.trim()) throw invalid(`Expected a nonempty string for "${key}"`)
     return text.trim()
   }
+  if (effort !== undefined && (typeof effort !== 'string' || !effort.trim() || effort !== effort.trim() || effort.length > 128)) throw invalid('Expected an exact backend effort ID of at most 128 characters')
   return {
     id,
     name: required('name', name),
     description: required('description', description),
     instructions: required('instructions', instructions),
     ...(model === undefined ? {} : { model: required('model', model) }),
+    ...(effort === undefined ? {} : { effort: effort as string }),
   }
 }

@@ -52,6 +52,8 @@ Use `resolveCodexProfile(version)` and `codexCapabilities(version)` to inspect t
 | `@anureo/adapter-codex/mapping` | Native record → AHP item/usage mapping helpers |
 | `@anureo/adapter-codex/catalog` | Model catalog session (`createCodexCatalogSession`) |
 
+`CodexModel` preserves the native ID and display name, optional picker `description`, `inputModalities`, default/hidden flags, supported `efforts` with descriptions, `defaultEffort`, and `serviceTiers`. These describe discovery results, not account prices, measured quality, or the effective settings of a running thread. Applications may use them to build model selection guidance without inferring capability from model names.
+
 `CodexAdapterOptions` extends the JSONL options (`timeoutMs`, `maxFrameBytes`, `maxPending`, `maxServerRequests`) with `command`, `args`, `cwd`, `env`, `version`, `processFactory` (for injected transports and tests), `diagnostic`, and `maxHistoryItems`.
 
 ## Configuration options

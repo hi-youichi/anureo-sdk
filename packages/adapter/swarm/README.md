@@ -74,7 +74,7 @@ const adapter = createSwarmAdapter({
 
 ### Model selection
 
-Applications can pass `modelCatalog` to `createSwarmAdapter`. Import `SwarmModel`, `SwarmBackendModelCatalog`, and `SwarmModelCatalog` from `@anureo/adapter-swarm` to describe the snapshot. Each model has an exact execution `id` and optional `name`, `description`, `isDefault`, and `hidden`. Preserve the owning backend's execution value, including Claude model values and Pi's full `provider/model` references. Applications query and release their catalog resources; Swarm receives the data and creates no discovery connections.
+Applications can pass `modelCatalog` to `createSwarmAdapter`. Import `SwarmModel`, `SwarmBackendModelCatalog`, and `SwarmModelCatalog` from `@anureo/adapter-swarm` to describe the snapshot. Each model has an exact execution `id` and optional `name`, `description`, `isDefault`, and `hidden`. Native metadata may also include `efforts` (`id`, optional `description`), `defaultEffort`, `serviceTiers`, and `inputModalities`. Preserve the owning backend's execution value, including Claude model values and Pi's full `provider/model` references. Effort IDs retain their backend meaning; they are not a universal cross-backend scale. Applications query and release their catalog resources; Swarm receives the data and creates no discovery connections.
 
 ```ts
 // backend is the initialized Client from the quick start.
@@ -92,9 +92,41 @@ const adapter = createSwarmAdapter({
 
 Swarm copies and validates the snapshot at adapter construction. The same snapshot supplies main instructions and tool validation. Catalogs have `status: 'available'` with a `models` array, or `status: 'unavailable'` with an optional diagnostic `reason`. `default` describes `backend`; `members` describes `memberBackends` using the same keys. For example, `memberBackends.reviewer` uses `modelCatalog.members.reviewer`. Member catalogs without a matching backend route are rejected. A mapped member without a catalog has unknown discovery status; unmapped roles retain the default-backend fallback. Catalog display omits hidden entries and failure reasons.
 
-The main assistant calls `bee_create({ role, name, model? })` for a temporary bee. The selected backend and explicit model stay with that bee; its first assignment opens the Session and subsequent assignments reuse it. Changing model requires another bee. Omit `model` to let that backend choose its default. Members do not inherit the main Session's model or config. `isDefault` is display metadata and does not populate a model parameter. Fixed bees use `bee_create({ profileId, profileScope? })`, prohibit model overrides, and use the model in the pinned profile revision. Revision rotation, origin selection, and review forks retain their existing behavior.
+The main assistant calls `bee_create({ role, name, model?, effort?, selectionReason? })` for a temporary bee. The selected backend, explicit model and effort stay with that bee; its first assignment opens the Session and subsequent assignments reuse it. Changing model or effort requires another bee. Omit either option to use that backend's configured default. Members do not inherit the main Session's model or config. `isDefault` and `defaultEffort` are catalog metadata and do not populate execution parameters. Fixed bees use `bee_create({ profileId, profileScope? })`, prohibit model/effort overrides, and use `model` and `effort` from the pinned profile revision. Revision rotation, origin selection, and review forks retain these settings.
+
+Applications enable effort control separately on each backend catalog with `effortConfigKey: 'effort'` (Codex/Claude adapters) or `'thinkingLevel'` (Pi adapter). This mapping can accompany either available or unavailable discovery; only declare it for a backend that honors that Session config key. Swarm never derives mappings from model names or Client identity labels. For example:
+
+```ts
+const adapter = createSwarmAdapter({
+  backend,
+  modelCatalog: { default: {
+    status: 'available', effortConfigKey: 'effort',
+    models: [{ id: 'gpt-6-luna', efforts: [{ id: 'low' }, { id: 'high' }] }],
+  } },
+})
+// Main-agent tool call:
+// bee_create({ role: 'extractor', name: 'Extract facts',
+//   model: 'gpt-6-luna', effort: 'low', selectionReason: 'Simple bounded extraction' })
+```
+
+Effort IDs are exact, nonblank strings of at most 128 characters, without surrounding whitespace. Missing mappings reject explicit effort with `SWARM_EFFORT_UNSUPPORTED`. A known model's `efforts` list constrains explicit effort regardless of recommend/allowlist model policy; an empty list rejects every explicit effort with `SWARM_EFFORT_NOT_ALLOWED`. When the model is omitted or unknown, or its efforts are undiscovered, support is left to the backend; Swarm does not assume the catalog's default model is the effective default. Backend failures propagate without removing effort or retrying on another model. Fixed profile JSON accepts optional `effort` with the same ID syntax; routing and support are checked when creating the bee and again when resolving a pinned revision. Profile reviews preserve the resolved effort. Advice in `recommendedEffort` applies only when explicitly selected, never automatically.
 
 Main instructions guide delegated model selection by task complexity: use the lowest-cost suitable model for simple, bounded assignments, and prioritize greater reasoning capability and reliability for complex assignments. Supply relative cost and capability information in model descriptions or application guidance; model names alone do not establish either. Explicit model requests, backend policies, and fixed-profile contracts take precedence. Insufficient results can be escalated to a new bee with a more capable model, carrying forward the findings and gaps for verification. Simple work can still be handled directly when delegation adds unnecessary cost.
+
+For application owners, attach `guidance: ModelGuidance` to individual catalog models. This is application-authored advice, separate from native facts:
+
+| Field | Contract |
+| --- | --- |
+| `summary` | Required nonempty explanation, at most 2,000 characters. |
+| `relativeCost` | Optional `low`, `medium`, `high`, or `unknown`; no prices are inferred from names. |
+| `comparisonGroup` | Required for a known cost tier; only compare tiers within the same billing environment/group. |
+| `preferredTasks`, `limitations` | Optional arrays of up to 32 nonempty strings, each at most 512 characters. Task fit is advice, not a guarantee. |
+| `recommendedEffort` | Optional exact native effort ID, checked against `efforts` when supplied. Advisory only: explicit `bee_create.effort` or profile `effort` configures execution. Catalog defaults can differ from the backend's configured execution default. |
+| `source`, `reviewedAt` | Required provenance (at most 2,000 characters) and valid `YYYY-MM-DD` review date. The application owns freshness and accuracy. |
+
+`parseModelGuidance(value)` validates and returns a detached copy; it rejects unknown guidance fields. `parseModelCatalog(value, memberKeys?)` validates and copies a complete catalog; supply the configured member route keys when using `members`. Both are synchronous package-root exports for application configuration loaders, and both report `SWARM_INVALID_MODEL_CATALOG`. Adapter construction validates again. Arrays and nested advice are copied, so later mutations cannot alter the running catalog.
+
+The main assistant is instructed to supply `selectionReason` for every temporary bee, explaining task fit or backend-default fallback. When the selected backend has at least one visible model with guidance, the runtime requires a nonblank reason (at most 2,000 characters), even if `model` is omitted or selects an unguided model. Missing reasons fail with `SWARM_INVALID_ARGUMENTS` before bee creation. Catalogs without visible guidance preserve compatibility with older callers that omit reasons. Fixed-profile creation prohibits `selectionReason` overrides. Reasons are explanations supplied by the caller, not verified assessments.
 
 | Catalog policy | Explicit temporary model | Omitted model |
 | --- | --- | --- |
@@ -104,7 +136,7 @@ Main instructions guide delegated model selection by task complexity: use the lo
 
 Absent or failed discovery preserves legacy default-model behavior. Allowlists apply to explicit temporary choices; existing fixed profiles remain application-configured. IDs are case-sensitive, at most 512 characters, and cannot have surrounding whitespace. Duplicate IDs and malformed catalogs fail with `SWARM_INVALID_MODEL_CATALOG`; invalid tool fields fail with `SWARM_INVALID_ARGUMENTS`, and excluded choices fail with `SWARM_MODEL_NOT_ALLOWED`. Backend model failures propagate without changing model or backend.
 
-`BeeExecutionSelection`, exported from the package root, describes the requested backend identity, route, optional `requestedModel`, and `modelSource` (`bee`, `profile`, or `backend-default`). Creation responses, bee/task status, lifecycle snapshots, and `subagent.extensions.swarm.execution` expose it. Task snapshots retain their choice after the bee closes. These values record requests; creating a bee does not verify provider access or confirm the actual model used. `beforeDelegate` can observe and deny the request; its enrichment contract only changes assignment text.
+`BeeExecutionSelection`, exported from the package root, describes the requested backend identity, route, optional `requestedModel` and `requestedEffort`, plus `modelSource` and `effortSource` (each `bee`, `profile`, or `backend-default`). Optional `selectionReason` records the caller's explanation. For an explicitly requested catalog model with guidance, `guidanceRevision` is the SHA-256 of its validated guidance JSON; omitted models have no guidance revision because the actual backend default is unknown. Creation responses, bee/task status, lifecycle snapshots, and `subagent.extensions.swarm.execution` expose these fields. Task snapshots retain their choice after the bee closes. These values record requests; creating a bee does not verify provider access or confirm the actual model or effort used. `beforeDelegate` can observe and deny the request; its enrichment contract only changes assignment text.
 
 ## Management tools
 
@@ -112,7 +144,7 @@ Swarm injects a session-isolated, authenticated local HTTP MCP server named `anu
 
 | Tool | Contract |
 | --- | --- |
-| `bee_create` | Provide `profileId` and optional `profileScope` (`user` or `project`), or temporary `role`, `name`, and optional exact `model`. Omitted scope uses default precedence; explicit scope never falls back. Temporary bees cannot specify a scope. Returns `beeId`, `name`, requested execution settings and the resolved profile origin when fixed. |
+| `bee_create` | Provide `profileId` and optional `profileScope` (`user` or `project`), or temporary `role`, `name`, optional exact `model` and `effort`, and `selectionReason` (required when that backend has visible guidance). Omitted scope uses default precedence; explicit scope never falls back. Temporary bees cannot specify a scope. Returns `beeId`, `name`, requested execution settings and the resolved profile origin when fixed. |
 | `bee_delegate` | Provide `beeId`, `task`, `context`, `constraints`, and `expectedOutput`; reserves work and returns `taskId`, `attemptId` and `operationScope` immediately. |
 | `bee_status` | Inspects `taskId`, or lists current tasks and bees. List `history: true` includes retained past tasks; `limit` defaults to 16 (maximum 32), and `cursor` takes the previous `nextCursor`. Reports expose preparation/execution/settlement `phase`, messaging capability and requested execution settings. |
 | `bee_wait` | Use `taskId` for the compatible single-task report, or `taskIds` (1–32 unique IDs) and `mode: 'any' \| 'all'` for a batch result with `tasks`, `remainingTaskIds`, `reason` and `timedOut`. `timeoutMs` defaults to 30000, accepts 0–30000; zero polls immediately. Timeout or request cancellation leaves tasks running. |

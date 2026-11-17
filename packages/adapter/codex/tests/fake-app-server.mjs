@@ -263,7 +263,7 @@ function handleMessage(msg) {
         break
       }
       sendResult(msg, { data: [
-        { id: 'test-model', displayName: 'Test model' },
+        { id: 'test-model', displayName: 'Test model', description: 'Native task description', inputModalities: ['text', 'image'] },
         { id: 'gpt-6.1-sol', displayName: 'GPT-6.1-Sol', isDefault: true, hidden: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'ultra', description: 'Deepest' }], serviceTiers: [{ id: 'standard' }, { id: 'priority' }] },
         ...(msg.params?.includeHidden ? [{ id: 'gpt-reserve', displayName: 'GPT-Reserve', hidden: true }] : []),
       ], nextCursor: null })

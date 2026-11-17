@@ -459,7 +459,7 @@ test('maps every native content family without relying on titles', () => {
 /** Query a separate fake probe after session opening and inspect wire calls; discovery must include hidden entries without creating another thread. */
 test('model discovery is read-only and owns its short-lived process', async () => {
   const s = await setup({ scenario: 'hold' }); expect(await s.adapter.listModels(s.dir)).toEqual([
-    { id: 'test-model', name: 'Test model' },
+    { id: 'test-model', name: 'Test model', description: 'Native task description', inputModalities: ['text', 'image'] },
     { id: 'gpt-6.1-sol', name: 'GPT-6.1-Sol', isDefault: true, efforts: [{ id: 'low', description: 'Fast' }, { id: 'ultra', description: 'Deepest' }], defaultEffort: 'low', serviceTiers: ['standard', 'priority'] },
     { id: 'gpt-reserve', name: 'GPT-Reserve', hidden: true },
   ]);

@@ -45,20 +45,20 @@ export interface RunOptions {
 export interface RunIo { out: (text: string) => void; err: (text: string) => void }
 
 /** Dynamically imported so a missing harness dependency only fails when that harness is selected. */
-async function createAdapter(harness: BackendHarness, options: RunOptions, io: RunIo): Promise<{ adapter: HarnessAdapter; models?: () => Promise<SwarmModel[]> }> {
+async function createAdapter(harness: BackendHarness, options: RunOptions, io: RunIo): Promise<{ adapter: HarnessAdapter; models?: () => Promise<SwarmModel[]>; effortConfigKey?: 'effort' | 'thinkingLevel' }> {
   const { command } = options
   try {
     switch (harness) {
       case 'codex': {
         const { createCodexAdapter } = await import('@anureo/adapter-codex')
         const adapter = createCodexAdapter({ command: command ?? 'codex', ...(options.harnessArgs?.length ? { args: options.harnessArgs } : {}) })
-        return { adapter, models: async () => codexModels(await adapter.listModels(options.cwd)) }
+        return { adapter, effortConfigKey: 'effort', models: async () => codexModels(await adapter.listModels(options.cwd)) }
       }
       case 'claude': {
         const { createClaudeAdapter } = await import('@anureo/adapter-claude')
         // defaultHome uses the Claude CLI's own login; the CLI is a local developer tool.
         const launch = { defaultHome: true, ...(command && { command }), ...(options.harnessArgs?.length && { args: options.harnessArgs }) }
-        return { adapter: createClaudeAdapter(launch), models: async () => {
+        return { adapter: createClaudeAdapter(launch), effortConfigKey: 'effort', models: async () => {
           const { createClaudeCatalogSession } = await import('@anureo/adapter-claude/catalog')
           const catalog = createClaudeCatalogSession({ ...launch, cwd: options.cwd })
           try { return claudeModels(await catalog.listModels()) } finally { await catalog.dispose() }
@@ -70,7 +70,7 @@ async function createAdapter(harness: BackendHarness, options: RunOptions, io: R
       }
       case 'pi': {
         const { createPiAdapter } = await import('@anureo/adapter-pi')
-        return { adapter: createPiAdapter({}), models: async () => {
+        return { adapter: createPiAdapter({}), effortConfigKey: 'thinkingLevel', models: async () => {
           const { createPiCatalogSession } = await import('@anureo/adapter-pi/catalog')
           return piModels((await createPiCatalogSession({ cwd: options.cwd })).models)
         } }
@@ -106,6 +106,7 @@ export async function runTurn(options: RunOptions, io: RunIo): Promise<number> {
     if (harness.name === 'swarm') {
       const { createSwarmAdapter } = await import('@anureo/adapter-swarm')
       const { findProjectRoot, loadBeeProfiles, profileStorageInstructions } = await import('./profiles')
+      const { applyModelGuidance } = await import('./model-guidance')
       const project = await findProjectRoot(options.cwd)
       sessionInstructions = profileStorageInstructions(project, options.homeDirectory)
       const profiles = await loadBeeProfiles(options.cwd, options.homeDirectory)
@@ -138,7 +139,8 @@ export async function runTurn(options: RunOptions, io: RunIo): Promise<number> {
           },
         }
       }
-      const modelCatalog = await loadSwarmModelCatalog(native.models, message => { if (options.verbose) io.err(`anureo: ${message}\n`) })
+      const discoveredModels = await loadSwarmModelCatalog(native.models, message => { if (options.verbose) io.err(`anureo: ${message}\n`) }, native.effortConfigKey)
+      const modelCatalog = await applyModelGuidance(discoveredModels, backendName, project, options.homeDirectory)
       adapter = createSwarmAdapter({ backend, profileEntries: profiles, profileReview, modelCatalog })
     } else {
       adapter = nativeAdapter

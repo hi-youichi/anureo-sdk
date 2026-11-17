@@ -16,7 +16,7 @@ export type { SwarmHooks, SwarmHookOptions, HookContext, HookDiagnostic, SwarmAs
 
 export { parseBeeProfile, type BeeProfile, type BeeProfileScope, type BeeProfileSource, type BeeProfileRegistration, type BeeProfileReference } from './profiles'
 export type { BeeProfileReview } from './profile-review'
-export type { SwarmModel, SwarmBackendModelCatalog, SwarmModelCatalog, BeeExecutionSelection } from './models'
+export { parseModelGuidance, parseModelCatalog, type ModelGuidance, type SwarmModel, type SwarmBackendModelCatalog, type SwarmModelCatalog, type BeeExecutionSelection } from './models'
 export type { SwarmResultOptions, ResultDescriptor } from './results'
 export type { SwarmMailboxOptions, CompletionNotice } from './coordination/mailbox'
 

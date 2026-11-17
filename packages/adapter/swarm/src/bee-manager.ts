@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { HarnessSdkError, sdkError, type Session, type SessionEventSink, type Turn, type TurnResult } from '@anureo/sdk'
 import type { Boundary, HarnessError, SessionOpenParams, SubagentItem } from '@anureo/protocol'
 import { executionError, instructionsUnsupported, releaseSession, SwarmExecution } from './execution'
-import { executionSelection, selectTemporaryModel, type MemberBackend, type BeeExecutionSelection } from './models'
+import { executionSelection, selectTemporaryModel, selectEffort, effortConfig, parseSelectionReason, type MemberBackend, type BeeExecutionSelection } from './models'
 import type { BeeProfile, BeeProfileRegistry, BeeProfileSource, BeeProfileScope } from './profiles'
 import { isBeeId } from './profiles'
 import { relayMemberItems } from './events'
@@ -94,7 +94,9 @@ export class BeeManager {
       if (!isBeeId(role)) throw new HarnessSdkError('SWARM_INVALID_ARGUMENTS', 'role must be a lowercase slug matching ^[a-z][a-z0-9-]{0,39}$')
       const backend = this.backendFor(role)
       const requestedModel = profile ? profile.model : selectTemporaryModel(args.model, backend)
-      const bee: Bee = { id: randomUUID(), role, name: profile?.name ?? text('name'), backend, requestedModel, selection: executionSelection(backend, requestedModel, !!profile), profile, profileSource: registration?.source, sourceFile: registration?.sourceFile }
+      const requestedEffort = selectEffort(profile ? profile.effort : args.effort, requestedModel, backend)
+      const selectionReason = profile ? undefined : parseSelectionReason(args.selectionReason, backend)
+      const bee: Bee = { id: randomUUID(), role, name: profile?.name ?? text('name'), backend, requestedModel, selection: executionSelection(backend, requestedModel, !!profile, selectionReason, requestedEffort), profile, profileSource: registration?.source, sourceFile: registration?.sourceFile }
       this.bees.set(bee.id, bee)
       return { beeId: bee.id, name: bee.name, ...profileDetails(bee), execution: bee.selection, operationScope: this.operations.scope() }
     }
@@ -240,7 +242,8 @@ export class BeeManager {
     const relay = relayMemberItems(this.sink, task.turnId, task.id, bee.id)
     const backend = bee.backend.client
     let instructions = ['Perform only the assigned read-only task. Do not edit files or change external state. Report findings and evidence.', profile?.instructions].filter(Boolean).join('\n\n')
-    let open = { cwd: this.params.cwd, permissionMode: this.params.permissionMode, model: bee.requestedModel, instructions }
+    let requestedEffort = bee.selection.requestedEffort
+    let open = { cwd: this.params.cwd, permissionMode: this.params.permissionMode, model: bee.requestedModel, instructions, config: effortConfig(requestedEffort, bee.backend) }
     let boundary: Boundary | undefined
     let submitted = false
     let dispatched = false
@@ -256,7 +259,8 @@ export class BeeManager {
         task.pin = snapshot({ revisionId: resolved.revision.id, generation: resolved.head.generation, headId: resolved.head.id })
         instructions = ['Perform only the assigned read-only task. Do not edit files or change external state. Report findings and evidence.', profile.instructions,
           experiences.length ? 'Reusable experience:\n' + experiences.join('\n\n') : undefined].filter(Boolean).join('\n\n')
-        open = { cwd: this.params.cwd, permissionMode: this.params.permissionMode, model: profile.model, instructions }
+        requestedEffort = selectEffort(profile.effort, profile.model, bee.backend)
+        open = { cwd: this.params.cwd, permissionMode: this.params.permissionMode, model: profile.model, instructions, config: effortConfig(requestedEffort, bee.backend) }
       }
       for (const message of bee.pending ?? []) {
         if (message.state === 'queued' && message.revisionId !== task.pin?.revisionId) { message.state = 'rejected'; message.reasonCode = 'SWARM_MESSAGE_PROFILE_CHANGED' }
@@ -264,7 +268,7 @@ export class BeeManager {
       carried = (bee.pending ?? []).filter(message => message.state === 'queued' && !message.reservedBy)
       for (const message of carried) message.reservedBy = task.id
       if (carried.length) assignment.context += '\n\nSupplemental task data:\n' + JSON.stringify(carried.map(message => ({ originatingTaskId: message.taskId, originatingAttemptId: message.attemptId, messageId: message.messageId, message: message.message })))
-      bee.selection = executionSelection(bee.backend, open.model, !!profile)
+      bee.selection = executionSelection(bee.backend, open.model, !!profile, bee.selection.selectionReason, requestedEffort)
       task.selection = snapshot(bee.selection)
       item.extensions = { swarm: { kind: profile ? 'fixed' : 'temporary', attemptId: task.attemptId, ...profileDetails(bee), ...(task.pin ? { pin: task.pin } : {}), execution: task.selection } }
       itemStarted = true
