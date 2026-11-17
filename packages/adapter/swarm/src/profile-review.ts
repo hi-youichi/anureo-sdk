@@ -2,11 +2,14 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { Boundary, Usage } from '@anureo/protocol'
 import type { Client, Session } from '@anureo/sdk'
 import { executionError, releaseSession, SwarmExecution } from './execution'
-import type { BeeProfile } from './profiles'
+import type { BeeProfile, BeeProfileSource } from './profiles'
+import { bounded, HookRunner, type HookContext } from './hooks'
 
 type Patch = { op: 'append'; anchor: null; text: string } | { op: 'replace'; anchor: string; text: string }
 type ReviewContext = {
   profileId: string
+  profileSource?: BeeProfileSource
+  sourceFile?: string
   cwd: string
   sourceTurnId: string
   baseInstructionsHash: string
@@ -70,27 +73,33 @@ export class ProfileReviews {
   private readonly pending = new Set<Promise<void>>()
 
   constructor(
-    private readonly onReview: (review: BeeProfileReview) => void | Promise<void>,
+    private readonly onReview: (review: BeeProfileReview, context: HookContext) => void | Promise<void>,
     private readonly feedback?: string,
+    private readonly hooks = new HookRunner(),
   ) {}
 
-  /** Transfer ownership of the parent until the fork has been opened. */
-  start(client: Client, parent: Session, params: OpenOptions, profile: BeeProfile, boundary: Boundary): void {
+  /** Returns only source preservation readiness (fork acquisition). Full analysis/callback work
+   * is independently owned by pending and awaited by drain(); it never occupies the parent. */
+  start(client: Client, parent: Session, params: OpenOptions, profile: BeeProfile, boundary: Boundary, releaseParent = true, origin: Pick<ReviewContext, 'profileSource' | 'sourceFile'> = {}): Promise<void> {
     const context = {
+      ...origin,
       profileId: profile.id,
       cwd: params.cwd,
       sourceTurnId: boundary.turnId,
       baseInstructionsHash: createHash('sha256').update(profile.instructions).digest('hex'),
     }
-    const job = this.review(client, parent, params, profile, boundary, context)
-      .then(result => this.onReview(result))
-      .catch(() => { /* Review and host callback failures cannot change the completed assignment. */ })
+    let preserved!: () => void
+    const ready = new Promise<void>(resolve => { preserved = resolve })
+    const job = this.review(client, parent, params, profile, boundary, context, releaseParent, preserved)
+      .then(result => bounded(context => this.onReview(result, context), this.hooks.timeoutMs))
+      .catch(cause => this.hooks.error('profileReview.onResult', cause))
       .finally(() => { this.pending.delete(job) })
     this.pending.add(job)
+    return ready
   }
 
   private async review(
-    client: Client, parent: Session, params: OpenOptions, profile: BeeProfile, boundary: Boundary, context: ReviewContext,
+    client: Client, parent: Session, params: OpenOptions, profile: BeeProfile, boundary: Boundary, context: ReviewContext, releaseParent: boolean, preserved: () => void,
   ): Promise<BeeProfileReview> {
     let fork: Session | undefined
     try {
@@ -107,7 +116,8 @@ export class ProfileReviews {
           fork: { sourceSessionId: source.sessionId, nativeRef: source.nativeRef, boundary },
         }, { timeoutMs: reviewTimeoutMs })
       } finally {
-        await releaseSession(parent).catch(() => {})
+        try { if (releaseParent) await releaseSession(parent).catch(() => {}) }
+        finally { preserved() }
       }
       // Keep the parent's request configuration. The review is a single appended user message.
       const result = await new SwarmExecution().submit(fork, { input: reviewPrompt(profile, this.feedback) }, undefined, reviewTimeoutMs)

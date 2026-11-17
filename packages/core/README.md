@@ -183,9 +183,13 @@ key with value `undefined` enables manual responses through session events and
 
 [`TurnResult`](src/types.ts) is an immutable snapshot with text, items,
 and any available usage. Its status is `completed`, `interrupted`, or `failed`.
+Its `text` joins final assistant messages outside subagent branches. Member
+messages remain in `items`, linked beneath their subagent by `parentItemId`.
 An interrupted result can carry a native error reason.
 
 [`RequestOptions`](src/types.ts) sets a caller's wait deadline and abort signal.
+Set `timeoutMs: null` to wait without a deadline; the abort signal and handle
+disposal still end the wait. Omitting `timeoutMs` uses the operation's default.
 A timeout after dispatch can leave the native outcome unknown. Check
 `HarnessSdkError.outcomeUnknown` before retrying to avoid duplicate work.
 [`EventSubscriptionOptions`](src/types.ts) controls cancellation and

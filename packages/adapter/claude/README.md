@@ -62,6 +62,20 @@ It may join the same execution or reach a later one. Session input delivery is
 distinct from atomic exact-turn steering. See the
 [Claude example](../../../docs/native-harness-lifecycle.md#42-claude追加会话指导与精确-steer-分开).
 
+### Background subagents
+
+`turn.result()` settles when Claude completes the execution that accepted the
+input. To observe background work, subscribe to `session.events()` before
+submitting and keep the session open. A background subagent's terminal
+`item/completed` event keeps the spawning turn ID and the parent tool-call ID
+when Claude supplied one. Its native summary is available under
+`item.extensions.native.summary`.
+
+Claude can generate a reply after processing a background-task notification.
+The session stream exposes that reply as a separate turn. When Claude reports
+its origin, the final `agentMessage` carries
+`extensions.native.origin.kind === 'task-notification'`.
+
 ## Structured output
 
 Pass a self-contained draft-07 JSON Schema with `type: 'object'` at its root:
@@ -125,7 +139,7 @@ Resume, fork, and history need the official `SessionStore` contract. `FileSessio
 
 ### Model catalog
 
-`createClaudeCatalogSession(options)` opens a prompt-less connection to list supported models (including effort levels per model) without creating a product session; `adapter.listModels(cwd)` is the one-shot variant.
+`createClaudeCatalogSession(options)` opens a prompt-less connection to list supported models (including effort levels per model) without creating a product session. Set `options.cwd` to match the execution working directory; omission uses `process.cwd()`. `adapter.listModels(cwd)` is the one-shot variant.
 
 ## Configuration options
 

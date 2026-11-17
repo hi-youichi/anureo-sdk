@@ -50,7 +50,7 @@ test.each(['old-contract', 'code-mismatch', 'legacy', 'bad-stdout'])('incompatib
 test('unsupported instructions, permissions, MCP and output constraints are rejected before native mutation', async () => {
   await withFixture('lifecycle', async (fixture, client) => {
     for (const extra of [{ instructions: 'system instructions' }, { permissionMode: 'read-only' }, { mcpServers: [] }, { config: { arbitrary: true } }]) {
-      await expect(client.sessions.create({ cwd: tmpdir(), ...extra })).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' })
+      await expect(client.sessions.create({ cwd: tmpdir(), ...extra })).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED', ...('instructions' in extra ? { details: { capability: 'session.instructions' } } : {}) })
     }
     expect((await fixture.state()).creates).toBe(0)
     const session = await client.sessions.create({ cwd: tmpdir() })

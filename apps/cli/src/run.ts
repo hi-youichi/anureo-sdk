@@ -1,8 +1,9 @@
 // Assembles the harness adapter, runs one turn and emits the output contract; it must not parse CLI input.
 import { createClient, type Client, type HarnessAdapter } from '@anureo/sdk'
-import type { SwarmAdapterOptions } from '@anureo/adapter-swarm'
+import type { SwarmAdapterOptions, SwarmModel } from '@anureo/adapter-swarm'
 import type { AhpEvent } from '@anureo/protocol'
 import { printEvent, printResult } from './project'
+import { codexModels, claudeModels, piModels, loadSwarmModelCatalog } from './models'
 
 /** Native harnesses available directly or as the backend for a swarm. */
 export const BACKEND_HARNESSES = ['codex', 'claude', 'hermes', 'pi', 'acp'] as const
@@ -13,7 +14,7 @@ export const SANDBOX_VALUES = ['read-only', 'workspace', 'full'] as const
 export type Sandbox = (typeof SANDBOX_VALUES)[number]
 export type OutputMode = 'stream' | 'result'
 
-/** Dispatch timeout for session open/submit/result; generous enough for boot-heavy agents (real dsh mounts plugin bundles for ~10s, cold starts longer). */
+/** Dispatch timeout for session open/submit and non-Swarm result waits; Swarm execution waits without a deadline. */
 const DISPATCH_TIMEOUT_MS = 180_000
 
 /** --sandbox → native permissionMode per harness; harnesses without an entry reject the flag in cli.ts. */
@@ -44,30 +45,39 @@ export interface RunOptions {
 export interface RunIo { out: (text: string) => void; err: (text: string) => void }
 
 /** Dynamically imported so a missing harness dependency only fails when that harness is selected. */
-async function createAdapter(harness: BackendHarness, options: RunOptions, io: RunIo): Promise<HarnessAdapter> {
+async function createAdapter(harness: BackendHarness, options: RunOptions, io: RunIo): Promise<{ adapter: HarnessAdapter; models?: () => Promise<SwarmModel[]> }> {
   const { command } = options
   try {
     switch (harness) {
       case 'codex': {
         const { createCodexAdapter } = await import('@anureo/adapter-codex')
-        return createCodexAdapter({ command: command ?? 'codex' })
+        const adapter = createCodexAdapter({ command: command ?? 'codex', ...(options.harnessArgs?.length ? { args: options.harnessArgs } : {}) })
+        return { adapter, models: async () => codexModels(await adapter.listModels(options.cwd)) }
       }
       case 'claude': {
         const { createClaudeAdapter } = await import('@anureo/adapter-claude')
         // defaultHome uses the Claude CLI's own login; the CLI is a local developer tool.
-        return createClaudeAdapter({ defaultHome: true, ...(command && { command }), ...(options.harnessArgs?.length && { args: options.harnessArgs }) })
+        const launch = { defaultHome: true, ...(command && { command }), ...(options.harnessArgs?.length && { args: options.harnessArgs }) }
+        return { adapter: createClaudeAdapter(launch), models: async () => {
+          const { createClaudeCatalogSession } = await import('@anureo/adapter-claude/catalog')
+          const catalog = createClaudeCatalogSession({ ...launch, cwd: options.cwd })
+          try { return claudeModels(await catalog.listModels()) } finally { await catalog.dispose() }
+        } }
       }
       case 'hermes': {
         const { createHermesAdapter } = await import('@anureo/adapter-hermes')
-        return createHermesAdapter({ ...(command && { command }), ...(options.harnessArgs?.length && { args: options.harnessArgs }) })
+        return { adapter: createHermesAdapter({ ...(command && { command }), ...(options.harnessArgs?.length && { args: options.harnessArgs }) }) }
       }
       case 'pi': {
         const { createPiAdapter } = await import('@anureo/adapter-pi')
-        return createPiAdapter({})
+        return { adapter: createPiAdapter({}), models: async () => {
+          const { createPiCatalogSession } = await import('@anureo/adapter-pi/catalog')
+          return piModels((await createPiCatalogSession({ cwd: options.cwd })).models)
+        } }
       }
       case 'acp': {
         const { createAcpAdapter } = await import('@anureo/adapter-acp')
-        return createAcpAdapter({ command: command as string, ...(options.harnessArgs?.length && { args: options.harnessArgs }) })
+        return { adapter: createAcpAdapter({ command: command as string, ...(options.harnessArgs?.length && { args: options.harnessArgs }) }) }
       }
     }
   } catch (cause) {
@@ -85,18 +95,22 @@ export async function runTurn(options: RunOptions, io: RunIo): Promise<number> {
   try {
     const { harness } = options
     const backendName = harness.name === 'swarm' ? harness.backend : harness.name
-    const nativeAdapter = await createAdapter(backendName, options, io)
+    const native = await createAdapter(backendName, options, io)
+    const nativeAdapter = native.adapter
     const identity = {
       adapterId: harness.name,
       runtimeConfigId: harness.name === 'swarm' ? `cli:${backendName}` : 'cli',
     }
     let adapter: HarnessAdapter
+    let sessionInstructions: string | undefined
     if (harness.name === 'swarm') {
       const { createSwarmAdapter } = await import('@anureo/adapter-swarm')
-      const { findProjectRoot, loadBeeProfiles } = await import('./profiles')
+      const { findProjectRoot, loadBeeProfiles, profileStorageInstructions } = await import('./profiles')
+      const project = await findProjectRoot(options.cwd)
+      sessionInstructions = profileStorageInstructions(project, options.homeDirectory)
       const profiles = await loadBeeProfiles(options.cwd, options.homeDirectory)
       if (options.verbose) {
-        for (const { profile, file } of profiles) io.err(`anureo: bee @${profile.id} from ${file}\n`)
+        for (const { profile, source, sourceFile } of profiles) io.err(`anureo: bee @${source.scope}/${profile.id} from ${sourceFile}\n`)
       }
       backend = await createClient({
         adapter: nativeAdapter,
@@ -104,17 +118,15 @@ export async function runTurn(options: RunOptions, io: RunIo): Promise<number> {
       })
       let profileReview: SwarmAdapterOptions['profileReview']
       if (options.reviewProfile) {
-        const project = await findProjectRoot(options.cwd)
         const { saveProfileProposal } = await import('./profile-review')
         profileReview = {
           feedback: options.reviewFeedback,
           async onResult(review) {
-            const label = `anureo: profile review @${review.profileId}`
+            const label = `anureo: profile review @${review.profileSource ? review.profileSource.scope + '/' : ''}${review.profileId}`
             const usage = review.usage?.cacheRead === undefined ? '' : ` (cacheRead=${review.usage.cacheRead})`
             if (review.status === 'proposed') {
-              const source = profiles.find(({ profile }) => profile.id === review.profileId)?.file
               try {
-                const file = await saveProfileProposal(project, review, source)
+                const file = await saveProfileProposal(project, review, review.sourceFile)
                 io.err(`${label}: saved ${file}${usage}\n`)
               } catch (cause) {
                 io.err(`${label}: cannot save proposal: ${(cause as Error).message}\n`)
@@ -126,7 +138,8 @@ export async function runTurn(options: RunOptions, io: RunIo): Promise<number> {
           },
         }
       }
-      adapter = createSwarmAdapter({ backend, profiles: profiles.map(({ profile }) => profile), profileReview })
+      const modelCatalog = await loadSwarmModelCatalog(native.models, message => { if (options.verbose) io.err(`anureo: ${message}\n`) })
+      adapter = createSwarmAdapter({ backend, profileEntries: profiles, profileReview, modelCatalog })
     } else {
       adapter = nativeAdapter
     }
@@ -139,6 +152,7 @@ export async function runTurn(options: RunOptions, io: RunIo): Promise<number> {
         }, { timeoutMs: DISPATCH_TIMEOUT_MS })
       : await client.sessions.create({
           cwd: options.cwd,
+          ...(sessionInstructions && { instructions: sessionInstructions }),
           ...(options.model && { model: options.model }),
           ...(permissionMode && { permissionMode }),
         }, { timeoutMs: DISPATCH_TIMEOUT_MS })
@@ -161,7 +175,7 @@ export async function runTurn(options: RunOptions, io: RunIo): Promise<number> {
       input: options.prompt,
       ...(options.outputSchema !== undefined ? { outputSchema: options.outputSchema as never } : {}),
     }, { timeoutMs: DISPATCH_TIMEOUT_MS })
-    const result = await turn.result({ timeoutMs: DISPATCH_TIMEOUT_MS })
+    const result = await turn.result({ timeoutMs: harness.name === 'swarm' ? null : DISPATCH_TIMEOUT_MS })
     await draining
 
     if (options.output === 'result') printResult(result, session.binding, io.out)

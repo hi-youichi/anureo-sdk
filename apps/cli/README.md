@@ -51,7 +51,7 @@ anureo [options] [prompt]          # prompt omitted or "-" reads stdin
   -h, -V                           Help / version
 ```
 
-There are no config files, no daemon, no interactive mode, and no passthrough escape hatch. One invocation runs one turn. Each dispatch (session open, submit, result wait) allows 180 seconds — slow-booting ACP agents (real dsh mounts plugin bundles for ~10 s) fit comfortably.
+There are no config files, no daemon, no interactive mode, and no passthrough escape hatch. One invocation runs one turn. Session opening and submission allow 180 seconds — slow-booting ACP agents (real dsh mounts plugin bundles for ~10 s) fit comfortably. Swarm result waits have no deadline; other harnesses allow 180 seconds for the result.
 
 ### Choosing the harness
 
@@ -72,6 +72,8 @@ The `ahp` protocol adapter (WebSocket, host-to-host) is intentionally not expose
 
 Store reusable bee profiles as UTF-8 JSON files in `~/.anureo/bees/` or `<project>/.anureo/bees/`. Swarm starts at the CLI working directory (`--cd`, if supplied) and uses the nearest ancestor marked by a `.git` directory or file. In a plain directory it uses the working directory itself.
 
+When asked to create a reusable profile, the main assistant saves general methods reusable across projects in the user directory, and repository-specific architecture, conventions, commands or domain rules in the project directory. It honors an explicit destination, keeps project details out of user profiles, and prefers project scope when cross-project reuse is uncertain. The CLI supplies both absolute storage directories even before they exist. The main assistant performs authorized file writes itself; `bee_create` only creates an instance from a loaded profile. New or changed files are loaded by the next CLI invocation.
+
 Save this example as `.anureo/bees/tester.json`:
 
 ```json
@@ -82,13 +84,19 @@ Save this example as `.anureo/bees/tester.json`:
 }
 ```
 
-The filename provides the profile ID. A project file replaces the entire user profile with the same ID. Set `model` to a model on the selected backend, or leave it out for the backend default. Swarm can select profiles automatically or accept an explicit assignment at the start of the prompt:
+The filename provides the profile ID. Both origins remain available when IDs match. Without an explicit scope, the project profile takes precedence over the entire user profile; fields are not merged. Set `model` to a model on the selected backend, or leave it out for the backend default. Swarm can select profiles automatically or accept an explicit assignment at the start of the prompt:
 
 ```bash
 anureo --harness swarm:codex --sandbox read-only "@tester Review the current diff for missing regression tests."
+anureo --harness swarm:codex --sandbox read-only "@user/tester Review using my reusable profile."
+anureo --harness swarm:codex --sandbox read-only "@project/tester Review using the project profile."
 ```
 
-`--verbose` prints the effective profile paths to stderr.
+Explicit `@user/<id>` and `@project/<id>` selections fail if that origin is absent; they never fall back. `@<id>` prefers the project profile, then the user profile. `--verbose` prints all discovered profiles with scoped names and paths to stderr. Assignment events include the resolved `profileId`, `profileScope`, `profileSource` and `sourceFile` under `extensions.swarm`.
+
+### Swarm model selection
+
+Swarm automatically discovers models for Codex, Claude, and Pi using the selected executable/configuration and working directory, then includes the normalized directory in main instructions. Discovery connections are released by their owner. Unsupported discovery (including ACP and Hermes) or a failed query leaves the catalog unavailable and preserves backend-default execution; `--verbose` reports query failures on stderr. Hidden models are omitted from the main catalog display. The main assistant may choose an exact model with `bee_create({ role, name, model })`; fixed bees use their profile model. `--model` continues to select the main model. See [Swarm model selection](../../packages/adapter/swarm/README.md#model-selection) for catalog policies and lifecycle behavior.
 
 ### Profile review
 
@@ -98,7 +106,7 @@ anureo --harness swarm:codex --sandbox read-only --review-feedback "Include the 
 
 Use `--review-profile` for a review based on the completed assignment alone. Swarm forks the member's completed turn and appends a review request. The CLI writes the foreground answer to stdout and finishes pending reviews before exit. It reports the review outcome and the backend's `cacheRead` count, when available, on stderr.
 
-Validated candidates are saved under the project root at `.anureo/evolution/<profile-id>/proposals/<id>.json`. Each includes the source profile, baseline instructions hash, patch, proposed instructions, evidence and a check for a future task. Edit the profile file with a candidate you decide to adopt.
+Validated candidates are saved under the project root at `.anureo/evolution/<user|project>/<profile-id>/proposals/<id>.json`. Each includes the exact `sourceFile` and `profileSource`, baseline instructions hash, patch, proposed instructions, evidence and a check for a future task. Existing unscoped proposal files remain in their original locations. Edit the profile file with a candidate you decide to adopt.
 
 ### Controlling tool permissions
 
@@ -176,6 +184,7 @@ The events you see per harness, as a verification contract. The mapping lives in
 - [`bin/anureo.ts`](bin/anureo.ts) — executable entry; delegates to `runCli`.
 - [`src/cli.ts`](src/cli.ts) — argument parsing/validation and help text; owns no client lifecycle.
 - [`src/run.ts`](src/run.ts) — client assembly (adapter selection, identity, sandbox mapping) and turn execution.
+- [`src/models.ts`](src/models.ts) — backend-specific model ID normalization and discovery-failure handling for Swarm instructions.
 - [`src/profiles.ts`](src/profiles.ts) — user and project profile discovery and precedence.
 - [`src/profile-review.ts`](src/profile-review.ts) — atomic writes for project profile proposals.
 - [`src/project.ts`](src/project.ts) — event → JSONL projection for stream mode and the single-object writer for result mode.

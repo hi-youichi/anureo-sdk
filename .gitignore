@@ -10,3 +10,5 @@ coverage/
 .idea
 
 draft
+log/
+work/

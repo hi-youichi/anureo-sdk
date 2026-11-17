@@ -11,8 +11,8 @@ export type TurnResult = { text: string; items: readonly Item[]; usage?: Usage }
 export interface RequestOptions {
   /** Stops this caller waiting; does not interrupt accepted native execution. */
   signal?: AbortSignal;
-  /** Positive observation deadline in milliseconds; omission uses the operation default. */
-  timeoutMs?: number;
+  /** Positive observation deadline in milliseconds; null waits without a deadline, omission uses the operation default. */
+  timeoutMs?: number | null;
 }
 
 /** Per-observer cancellation and buffering; signal ends only this subscription and queue overflow never pauses the shared native producer. */

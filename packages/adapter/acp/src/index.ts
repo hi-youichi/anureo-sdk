@@ -384,7 +384,7 @@ export class AcpAdapter implements HarnessAdapter {
     const session = new AcpBackendSession(this, params, sink);
     this.openingSession = session;
     try {
-      if (params.instructions && !this.extension.instructions) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'ACP peer did not negotiate instructions');
+      if (params.instructions && !this.extension.instructions) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'ACP peer did not negotiate instructions', false, false, { capability: 'session.instructions' });
       const common = { cwd: params.cwd, mcpServers: mcp(params.mcpServers), ...(params.instructions ? { _meta: { ahp: { version: 1, instructions: params.instructions } } } : {}) };
       let response: Record<string, unknown>;
       if (params.mode === 'new') response = record(await this.call('session/new', common));
@@ -414,7 +414,18 @@ export class AcpAdapter implements HarnessAdapter {
       if (Object.keys(patch).length) await session.setConfiguration(patch);
       if (session.snapshot().metadata) await sink.emit({ type: 'session/metadata', payload: session.snapshot().metadata! });
       return session;
-    } catch (error) { for (const [id, value] of this.nativeSessions) if (value === session) this.nativeSessions.delete(id); this.sessions.delete(params.binding.sessionId); throw error; }
+    } catch (error) {
+      try {
+        // Configuration (including model selection) can fail after native session creation.
+        if (session.nativeId) await session.dispose();
+      } catch (cleanup) {
+        throw new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'ACP session setup and cleanup failed', false, true, { errors: [sdkError(error), sdkError(cleanup)].map(value => ({ code: value.code, outcomeUnknown: value.outcomeUnknown })) });
+      } finally {
+        for (const [id, value] of this.nativeSessions) if (value === session) this.nativeSessions.delete(id);
+        this.sessions.delete(params.binding.sessionId);
+      }
+      throw error;
+    }
     finally {
       this.openingSession = undefined;
       releaseOpenSlot();

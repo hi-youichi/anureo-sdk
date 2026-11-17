@@ -1,11 +1,12 @@
 {
   "name": "@anureo/adapter-swarm",
-  "description": "Route Anureo SDK turns to a single harness session or a team",
+  "description": "A conversational main agent that creates and manages independent bee sessions",
   "version": "0.2.0",
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./evolution": "./src/evolution/index.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit --pretty false",
@@ -13,7 +14,8 @@
   },
   "dependencies": {
     "@anureo/protocol": "workspace:*",
-    "@anureo/sdk": "workspace:*"
+    "@anureo/sdk": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.32.2"
   },
   "devDependencies": {
     "@anureo/adapter-codex": "workspace:*"

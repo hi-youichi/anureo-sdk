@@ -2,8 +2,19 @@ import { HarnessSdkError, sdkError, type Client, type Session, type SubmitOption
 import type { AhpEvent, HarnessError } from '@anureo/protocol'
 
 const stopTimeoutMs = 5_000
-export const routingTimeoutMs = 15_000
-const executionTimeoutMs = 300_000
+
+export interface ExecutionHooks {
+  /** Called synchronously immediately before handing input to the SDK. */
+  onDispatch?(): void
+  /** Transfers ownership of an independent Turn observer to this internal callback. */
+  onBound?(turn: Turn): void
+}
+
+/** Only a definite instruction-capability failure permits retrying without instructions. */
+export function instructionsUnsupported(cause: unknown): boolean {
+  const error = sdkError(cause)
+  return error.code === 'CAPABILITY_UNSUPPORTED' && error.details?.capability === 'session.instructions'
+}
 
 export function executionError(cause: unknown): HarnessError {
   const { code, retryable, outcomeUnknown } = sdkError(cause, 'SWARM_EXECUTION_FAILED', true)
@@ -22,6 +33,7 @@ export async function releaseSession(session: Session) {
 export class SwarmExecution {
   private readonly stop = new AbortController()
   get stopped() { return this.stop.signal.aborted }
+  get signal() { return this.stop.signal }
 
   cancel() { this.stop.abort() }
 
@@ -38,7 +50,7 @@ export class SwarmExecution {
     const wait = { signal: this.stop.signal }
     let promptInstructions: string | undefined
     const session = await client.sessions.create(params, wait).catch(cause => {
-      if (!options.allowPromptInstructions || !params.instructions || sdkError(cause).code !== 'CAPABILITY_UNSUPPORTED') throw cause
+      if (!options.allowPromptInstructions || !params.instructions || !instructionsUnsupported(cause)) throw cause
       const { instructions, ...sessionParams } = params
       promptInstructions = instructions
       return client.sessions.create(sessionParams, wait)
@@ -70,7 +82,8 @@ export class SwarmExecution {
     session: Session,
     options: SubmitOptions,
     relay?: (event: AhpEvent) => Promise<void>,
-    timeoutMs = executionTimeoutMs,
+    timeoutMs?: number,
+    hooks?: ExecutionHooks,
   ): Promise<TurnResult> {
     if (this.stopped) return { status: 'interrupted', text: '', items: [] }
     const observation = new AbortController()
@@ -79,6 +92,7 @@ export class SwarmExecution {
     let turn: Turn | undefined
     let interruption: Promise<void> | undefined
     let terminal: TurnResult | undefined
+    let observationDone: Promise<void> | undefined
     const resultWait = new AbortController()
     let stopTimer: ReturnType<typeof setTimeout> | undefined
     const requestInterrupt = (target: Turn) => interruption ??= Promise.resolve()
@@ -91,9 +105,14 @@ export class SwarmExecution {
     }
     try {
       // Keep waiting for association on interrupt, so a late handle can still be stopped.
-      turn = await session.submit(options, { timeoutMs: Math.min(timeoutMs, 30_000) })
+      hooks?.onDispatch?.()
+      turn = await session.submit(options, { timeoutMs: Math.min(timeoutMs ?? 30_000, 30_000) })
       this.stop.signal.addEventListener('abort', onStop, { once: true })
       if (this.stopped) onStop()
+      if (hooks?.onBound) {
+        const observer = turn.observe()
+        try { hooks.onBound(observer) } catch (cause) { await observer.dispose(); throw cause }
+      }
       const targetId = turn.id
       const view = async () => {
         if (!events || !relay) return
@@ -103,9 +122,11 @@ export class SwarmExecution {
           await relay(event)
         }
       }
+      observationDone = view()
       const [result] = await Promise.all([
-        turn.result({ signal: resultWait.signal, timeoutMs }).then(value => terminal = value),
-        view(),
+        // Execution has no default deadline; cancellation still bounds stop confirmation.
+        turn.result({ signal: resultWait.signal, timeoutMs: timeoutMs ?? null }).then(value => terminal = value),
+        observationDone,
       ])
       return result
     } catch (cause) {
@@ -121,6 +142,8 @@ export class SwarmExecution {
       clearTimeout(stopTimer)
       observation.abort()
       resultWait.abort()
+      // No member item may arrive after its assignment has been finalized.
+      await observationDone?.catch(() => {})
       await turn?.dispose()
     }
   }

@@ -4,7 +4,7 @@ import { catalogPhase, type CatalogProbeOptions } from '@anureo/sdk/diagnostics'
 import { createClaudeAdapter, type ClaudeAdapterOptions, type ClaudeQuery } from './index'
 
 /** This query receives no prompt and owns no product session. */
-export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
+export function createClaudeCatalogSession(options: ClaudeAdapterOptions & { cwd?: string }) {
   const adapter = createClaudeAdapter(options)
   let stream: ClaudeQuery | undefined, input: BoundedEventQueue<SDKUserMessage> | undefined
   let pendingHandshakeModels: Awaited<ReturnType<Query['supportedModels']>> | undefined
@@ -49,7 +49,7 @@ export function createClaudeCatalogSession(options: ClaudeAdapterOptions) {
     if (stream) return
     await (preparing ??= (async () => {
       input = new BoundedEventQueue<SDKUserMessage>()
-      await catalogPhase(context, 'spawn', async () => { stream = (options.queryFactory ?? query)({ prompt: input!, options: { ...adapter.queryOptions(process.cwd()), persistSession: false, sessionStore: undefined, enableFileCheckpointing: false, mcpServers: {}, settingSources: [] } }) })
+      await catalogPhase(context, 'spawn', async () => { stream = (options.queryFactory ?? query)({ prompt: input!, options: { ...adapter.queryOptions(options.cwd ?? process.cwd()), persistSession: false, sessionStore: undefined, enableFileCheckpointing: false, mcpServers: {}, settingSources: [] } }) })
       pendingHandshakeModels = await catalogPhase(context, 'handshake', () => stream!.supportedModels())
     })().catch(async cause => { await closeConnection(); throw cause }).finally(() => { preparing = undefined }))
   })

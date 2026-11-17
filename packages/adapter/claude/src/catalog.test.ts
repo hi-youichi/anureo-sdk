@@ -12,7 +12,7 @@ test('directory Query stays resident, reinitializes models and receives no promp
   let settings: Options | undefined
   const stream = { supportedModels: async () => { handshakes++; return [{ value: 'initial', displayName: 'Initial', description: '' }] },
     reinitialize: async () => { refreshed++; return { models: [{ value: 'updated', displayName: 'Updated', description: '' }] } }, close: () => { closed++ } } as unknown as ClaudeQuery
-  const session = createClaudeCatalogSession({ queryFactory: ({ options, prompt }) => {
+  const session = createClaudeCatalogSession({ cwd: process.cwd(), queryFactory: ({ options, prompt }) => {
     queries++; settings = options
     void (async () => { for await (const _input of prompt as AsyncIterable<SDKUserMessage>) inputs++ })()
     return stream
@@ -24,6 +24,7 @@ test('directory Query stays resident, reinitializes models and receives no promp
     expect({ queries, handshakes, refreshed, inputs }).toEqual({ queries: 1, handshakes: 1, refreshed: 1, inputs: 0 })
     expect(settings).toMatchObject({ persistSession: false, enableFileCheckpointing: false, mcpServers: {}, settingSources: [] })
     expect(settings?.sessionStore).toBeUndefined()
+    expect(settings?.cwd).toBe(process.cwd())
   } finally { await session.dispose(); await session.dispose() }
   expect(closed).toBe(1)
 })

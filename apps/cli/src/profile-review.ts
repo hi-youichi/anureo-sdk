@@ -6,9 +6,9 @@ import type { BeeProfileReview } from '@anureo/adapter-swarm'
 export async function saveProfileProposal(
   project: string,
   review: Extract<BeeProfileReview, { status: 'proposed' }>,
-  sourceFile?: string,
+  sourceFile = review.sourceFile,
 ): Promise<string> {
-  const directory = join(project, '.anureo', 'evolution', review.profileId, 'proposals')
+  const directory = join(project, '.anureo', 'evolution', ...(review.profileSource ? [review.profileSource.scope] : []), review.profileId, 'proposals')
   const id = randomUUID()
   const file = join(directory, `${id}.json`)
   const temporary = join(directory, `.${id}.tmp`)

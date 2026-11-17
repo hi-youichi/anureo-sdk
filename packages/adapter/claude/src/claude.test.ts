@@ -157,8 +157,13 @@ test("Claude streams partial text and authoritative final output with native UUI
 
 test("native tool results, task/hook lifecycle, compaction and unknown blocks remain structured", async () => {
   const { runtime, session } = await setup({}, async (_, stream) => {
-    await stream.emit({ type: "assistant", uuid: "a", parent_tool_use_id: null, message: { id: "tool-message", content: [{ type: "tool_use", id: "tool", name: "Bash", input: { command: "echo fixture", apiKey: "PRIVATE" } }] } });
-    await stream.emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tool", content: "done" }] } });
+    await stream.emit({ type: "assistant", uuid: "a", parent_tool_use_id: null, message: { id: "tool-message", content: [
+      { type: "tool_use", id: "shell", name: "Bash", input: { command: "echo fixture", apiKey: "PRIVATE" } },
+      { type: "tool_use", id: "tool", name: "Agent", input: { prompt: "Read a file" } },
+    ] } });
+    await stream.emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "shell", content: "done" }] } });
+    await stream.emit({ type: "system", subtype: "task_started", task_id: "shell-task", description: "Shell", tool_use_id: "shell" });
+    await stream.emit({ type: "system", subtype: "task_notification", task_id: "shell-task", status: "completed", tool_use_id: "shell" });
     await stream.emit({ type: "assistant", parent_tool_use_id: "tool", message: { id: "child-message", content: [{ type: "tool_use", id: "child-read", name: "Read", input: { file_path: "package.json" } }] } });
     await stream.emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "child-read", content: "child result" }] } });
     await stream.emit({ type: "system", subtype: "task_started", task_id: "child", description: "Work", tool_use_id: "tool" });
@@ -174,7 +179,58 @@ test("native tool results, task/hook lifecycle, compaction and unknown blocks re
   await submitAndYield(session, "t"); const events = await collect(session); const completed = events.filter((event) => event.type === "item/completed").map((event) => event.payload.item);
   expect(completed).toEqual(expect.arrayContaining([expect.objectContaining({ type: "toolCall", kind: "command", output: "done" }), expect.objectContaining({ type: "subagent", subagentId: "child", state: "completed", parentItemId: "tool" }), expect.objectContaining({ type: "hook", name: "PreToolUse", status: "completed" }), expect.objectContaining({ type: "compaction", trigger: "auto" }), expect.objectContaining({ type: "toolCall", kind: "other", nativeType: "futureContent" })]));
   expect(completed).toEqual(expect.arrayContaining([expect.objectContaining({ id: "child-read", parentItemId: "tool", output: "child result" })]));
+  expect(events.flatMap(event => event.type === "item/started" && event.payload.item.type === "subagent" ? [event.payload.item.id] : [])).toEqual(["task:child"]);
   expect(JSON.stringify(events)).not.toContain("PRIVATE"); await runtime.dispose();
+});
+
+test("background subagents settle on the spawning turn and Claude's replies stream on subsequent turns", async () => {
+  const { runtime, session, queries } = await setup({}, async (_, stream) => {
+    await stream.text("Launching readers");
+    for (const id of ["alpha", "beta"]) {
+      await stream.emit({ type: "system", subtype: "task_started", task_type: "local_agent", task_id: id, tool_use_id: `agent-${id}`, description: `Read ${id}`, is_backgrounded: true });
+    }
+    await stream.result("Both readers are running");
+  });
+  const reader = readerFor(session);
+  try {
+    const launch = await session.submit({ input: "Read two files in the background" });
+    expect((await launch.result()).text).toBe("Both readers are running");
+    const stream = queries[0]!;
+    await stream.emit({ type: "system", subtype: "task_updated", task_id: "alpha", patch: { status: "completed" } });
+    await stream.emit({ type: "system", subtype: "task_notification", task_id: "alpha", status: "completed", summary: "Value A" });
+    await stream.emit({ type: "assistant", parent_tool_use_id: null, message: { id: "follow-up", content: [{ type: "text", text: "Alpha finished" }] } });
+    await stream.emit({ type: "system", subtype: "task_updated", task_id: "beta", patch: { status: "completed" } });
+    await stream.emit({ type: "system", subtype: "task_notification", task_id: "beta", status: "completed", summary: "Value B" });
+    await stream.emit({ type: "result", subtype: "success", origin: { kind: "task-notification" }, is_error: false, result: "Alpha finished" });
+    await stream.emit({ type: "result", subtype: "success", origin: { kind: "task-notification" }, is_error: false, result: "Alpha and beta finished" });
+
+    const events: AhpEvent[] = [];
+    let turns = 0;
+    for (let i = 0; i < 100 && turns < 3; i++) {
+      const entry = await reader.next();
+      if (entry.done) break;
+      events.push(entry.value);
+      if (entry.value.type === "turn/completed") turns++;
+    }
+    const completedTurns = events.filter(event => event.type === "turn/completed").map(event => event.payload.turnId);
+    expect(completedTurns).toHaveLength(3);
+    expect(new Set(completedTurns).size).toBe(3);
+    expect(completedTurns[0]).toBe(launch.id);
+    expect(events.filter(event => event.type === "item/completed" && event.payload.item.type === "subagent")).toMatchObject(
+      [["alpha", "A"], ["beta", "B"]].map(([id, value]) => ({
+        turnId: launch.id,
+        payload: { item: { subagentId: id, parentItemId: `agent-${id}`, state: "completed", task: `Read ${id}`, extensions: { native: { summary: `Value ${value}` } } } },
+      })),
+    );
+    expect(events.filter(event => event.type === "item/completed" && event.payload.item.type === "agentMessage" && event.payload.item.phase === "final")).toMatchObject(
+      ["Both readers are running", "Alpha finished", "Alpha and beta finished"].map((text, i) => ({
+        turnId: completedTurns[i], payload: { item: { text, ...(i > 0 ? { extensions: { native: { origin: { kind: "task-notification" } } } } : {}) } },
+      })),
+    );
+  } finally {
+    await reader.return?.();
+    await runtime.dispose();
+  }
 });
 
 test("steer never appends Claude input; interrupt preserves the current turn identity", async () => {

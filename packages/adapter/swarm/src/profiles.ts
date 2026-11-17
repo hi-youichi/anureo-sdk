@@ -1,12 +1,70 @@
 import { HarnessSdkError } from '@anureo/sdk'
 
-/** Reusable configuration for a fixed bee. Each assignment starts a fresh Session. */
+/** Reusable source configuration for a fixed bee; sessions persist until revision rotation or closure. */
 export interface BeeProfile {
   id: string
   name: string
   description: string
   instructions: string
   model?: string
+}
+
+export type BeeProfileScope = 'user' | 'project'
+/** Origin metadata supplied by the embedding application, separate from JSON profile content. */
+export interface BeeProfileSource {
+  scope: BeeProfileScope
+  /** Stable origin namespace, e.g. the absolute profile directory. Distinguishes projects in shared stores. */
+  namespace?: string
+}
+export interface BeeProfileRegistration {
+  profile: BeeProfile
+  source?: BeeProfileSource
+  sourceFile?: string
+}
+/** A string addresses legacy unscoped data; an object addresses a specific origin. */
+export type BeeProfileReference = string | { id: string; source?: BeeProfileSource }
+
+export function parseProfileSource(value: BeeProfileSource): BeeProfileSource {
+  if (!value || !['user', 'project'].includes(value.scope) ||
+      (value.namespace !== undefined && (typeof value.namespace !== 'string' || !value.namespace.trim()))) {
+    throw new HarnessSdkError('SWARM_INVALID_PROFILE', 'Expected a user or project source with an optional nonempty namespace')
+  }
+  return { scope: value.scope, ...(value.namespace !== undefined ? { namespace: value.namespace } : {}) }
+}
+
+export function profileReference(value: BeeProfileReference): { id: string; source?: BeeProfileSource } {
+  const ref = typeof value === 'string' ? { id: value } : value
+  if (!ref || !isBeeId(ref.id)) throw new HarnessSdkError('SWARM_INVALID_PROFILE', 'Invalid profile reference')
+  return { id: ref.id, ...(ref.source !== undefined ? { source: parseProfileSource(ref.source) } : {}) }
+}
+
+export function profileReferenceKey(value: BeeProfileReference): string {
+  const { id, source } = profileReference(value)
+  return JSON.stringify([id, source?.scope ?? null, source?.namespace ?? null])
+}
+
+/** Keeps all origins; default lookup prefers project, then user, then unscoped registrations. */
+export class BeeProfileRegistry {
+  readonly entries: readonly BeeProfileRegistration[]
+  private readonly byScope = new Map<string, BeeProfileRegistration>()
+  constructor(entries: readonly BeeProfileRegistration[]) {
+    this.entries = entries.map(entry => {
+      const profile = parseBeeProfile(entry.profile)
+      const source = entry.source !== undefined ? parseProfileSource(entry.source) : undefined
+      if (entry.sourceFile !== undefined && (typeof entry.sourceFile !== 'string' || !entry.sourceFile.trim())) {
+        throw new HarnessSdkError('SWARM_INVALID_PROFILE', 'Expected a nonempty sourceFile')
+      }
+      const key = `${source?.scope ?? ''}/${profile.id}`
+      if (this.byScope.has(key)) throw new HarnessSdkError('SWARM_INVALID_PROFILE', `Duplicate profile ${key}`)
+      const registration = { profile, ...(source ? { source } : {}), ...(entry.sourceFile ? { sourceFile: entry.sourceFile } : {}) }
+      this.byScope.set(key, registration)
+      return registration
+    })
+  }
+  resolve(id: string, scope?: BeeProfileScope): BeeProfileRegistration | undefined {
+    if (scope !== undefined) return this.byScope.get(`${scope}/${id}`)
+    return this.byScope.get(`project/${id}`) ?? this.byScope.get(`user/${id}`) ?? this.byScope.get(`/${id}`)
+  }
 }
 
 export function isBeeId(value: unknown): value is string {

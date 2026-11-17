@@ -41,7 +41,7 @@ test('requires a swarm harness for profile review', async () => {
 })
 
 test('runs Swarm with the selected ACP backend and its command arguments', async () => {
-  const fixture = fileURLToPath(new URL('../../../packages/adapter/acp/tests/fixtures/fake-acp.mjs', import.meta.url))
+  const fixture = fileURLToPath(new URL('../../../packages/adapter/swarm/tests/fake-acp.mjs', import.meta.url))
   const { code, stdout, stderr } = await invoke([
     '--harness', 'swarm:acp', '--command', 'node', '--args', JSON.stringify([fixture]),
     '--output', 'result', 'from CLI',
@@ -55,7 +55,7 @@ test('runs Swarm with the selected ACP backend and its command arguments', async
   })
 }, 15_000)
 
-test('loads user bees and replaces matching profiles with project files from the Git root', async () => {
+test('retains both profile origins from the Git root and supports default and scoped CLI mentions', async () => {
   const root = await mkdtemp(join(tmpdir(), 'anureo-bees-'))
   try {
     const homeDirectory = join(root, 'home')
@@ -68,7 +68,7 @@ test('loads user bees and replaces matching profiles with project files from the
       mkdir(userBees, { recursive: true }),
       mkdir(projectBees, { recursive: true }),
     ])
-    const userProfile = { name: 'User tester', description: 'Test coverage', instructions: 'User instructions', model: 'user-model' }
+    const userProfile = { name: 'User tester', description: 'Test coverage', instructions: 'User instructions' }
     const projectProfile = { name: 'Project tester', description: 'Test coverage', instructions: 'Project instructions' }
     await Promise.all([
       writeFile(join(project, '.git'), 'gitdir: ../main/.git/worktrees/project'),
@@ -78,25 +78,39 @@ test('loads user bees and replaces matching profiles with project files from the
     ])
 
     expect(await loadBeeProfiles(cwd, homeDirectory)).toEqual([
-      { profile: { ...userProfile, id: 'reviewer', name: 'Reviewer' }, file: join(userBees, 'reviewer.json') },
-      { profile: { ...projectProfile, id: 'tester' }, file: join(projectBees, 'tester.json') },
+      { profile: { ...userProfile, id: 'reviewer', name: 'Reviewer' }, source: { scope: 'user', namespace: userBees }, sourceFile: join(userBees, 'reviewer.json') },
+      { profile: { ...projectProfile, id: 'tester' }, source: { scope: 'project', namespace: projectBees }, sourceFile: join(projectBees, 'tester.json') },
+      { profile: { ...userProfile, id: 'tester' }, source: { scope: 'user', namespace: userBees }, sourceFile: join(userBees, 'tester.json') },
     ])
 
-    const fixture = fileURLToPath(new URL('../../../packages/adapter/acp/tests/fixtures/fake-acp.mjs', import.meta.url))
-    const { code, stdout, stderr } = await invoke([
+    const fixture = fileURLToPath(new URL('../../../packages/adapter/swarm/tests/fake-acp.mjs', import.meta.url))
+    for (const [mention, scope, name] of [
+      ['@tester', 'project', 'Project tester'],
+      ['@user/tester', 'user', 'User tester'],
+      ['@project/tester', 'project', 'Project tester'],
+      ['@reviewer', 'user', 'Reviewer'],
+    ]) {
+      const { code, stdout, stderr } = await invoke([
+        '--harness', 'swarm:acp', '--command', 'node', '--args', JSON.stringify([fixture]),
+        '--cd', 'src', '--output', 'result', '--verbose', `${mention} Check tests`,
+      ], { cwd: project, homeDirectory })
+      expect({ mention, code, stderr }).toMatchObject({ code: 0 })
+      expect(stderr).toContain(`bee @project/tester from ${join(projectBees, 'tester.json')}`)
+      expect(stderr).toContain(`bee @user/tester from ${join(userBees, 'tester.json')}`)
+      const result = JSON.parse(stdout)
+      expect(result.status).toBe('completed')
+      expect(result.items.find((item: { type: string }) => item.type === 'subagent')).toMatchObject({
+        name, task: 'Check tests', state: 'completed',
+        extensions: { swarm: { kind: 'fixed', profileScope: scope } },
+      })
+    }
+    const missing = await invoke([
       '--harness', 'swarm:acp', '--command', 'node', '--args', JSON.stringify([fixture]),
-      '--cd', 'src', '--output', 'result', '--verbose', '@tester Check tests',
+      '--output', 'result', '@project/reviewer Check tests',
     ], { cwd: project, homeDirectory })
-    expect(code).toBe(0)
-    expect(stderr).toContain(`bee @tester from ${join(projectBees, 'tester.json')}`)
-    expect(JSON.parse(stdout)).toMatchObject({
-      status: 'completed',
-      items: expect.arrayContaining([expect.objectContaining({
-        type: 'subagent', name: 'Project tester', task: 'Check tests', state: 'completed',
-        extensions: { swarm: { kind: 'fixed', profileId: 'tester' } },
-      })]),
-    })
+    expect(missing.code).toBe(2)
+    expect(JSON.parse(missing.stdout).error.code).toBe('SWARM_UNKNOWN_BEE')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
-}, 15_000)
+}, 30_000)

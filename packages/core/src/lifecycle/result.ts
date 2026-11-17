@@ -105,7 +105,22 @@ export class ResultAccumulator {
     const items = [...this.items.values()].map(({ snapshot, bufferedText }) => bufferedText
       ? { ...snapshot, [bufferedText.field]: bufferedText.chunks.join('') } as Item
       : snapshot);
-    const text = items.filter((item): item is Extract<Item, { type: 'agentMessage' }> => item.type === 'agentMessage' && item.phase === 'final').map(item => item.text).join('\n');
+    const memberItems = new Map<string, boolean>();
+    const isMemberItem = (item: Item): boolean => {
+      const path = new Set<string>();
+      let current: Item | undefined = item;
+      let member = false;
+      while (current && !path.has(current.id)) {
+        if (current.type === 'subagent') { member = true; break; }
+        const cached = memberItems.get(current.id);
+        if (cached !== undefined) { member = cached; break; }
+        path.add(current.id);
+        current = current.parentItemId ? this.items.get(current.parentItemId)?.snapshot : undefined;
+      }
+      for (const id of path) memberItems.set(id, member);
+      return member;
+    };
+    const text = items.filter((item): item is Extract<Item, { type: 'agentMessage' }> => item.type === 'agentMessage' && item.phase === 'final' && !isMemberItem(item)).map(item => item.text).join('\n');
     const usage = payload.usage?.scope === 'turn' ? payload.usage : this.usage;
     const common = { text, items, ...(usage ? { usage } : {}) };
     if (payload.status === 'failed') return immutable({ ...common, status: 'failed', error: payload.error ?? { code: 'TURN_FAILED', message: 'Turn failed', retryable: false, outcomeUnknown: false } });

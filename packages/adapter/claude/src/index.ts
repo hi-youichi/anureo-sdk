@@ -144,10 +144,12 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
   }
 }
 
-interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageIds: Map<string, string>; otherTasks: Set<string>; blockIndex: number; apiError?: Extract<SDKMessage, { type: 'assistant' }>['error']; stopExtended?: boolean }
+interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageIds: Map<string, string>; blockIndex: number; apiError?: Extract<SDKMessage, { type: 'assistant' }>['error']; stopExtended?: boolean }
+interface SubagentTask { turnId: string; item: Extract<Item, { type: "subagent" }> }
 export class ClaudeBackendSession implements BackendSession {
   private release?: Promise<void>;
   private readonly nativeInputs = new Map<string, { submissionId: string; turnId?: string }>();
+  private readonly subagentTasks = new Map<string, SubagentTask>();
   binding: SessionBinding;
   readonly capabilities: Capabilities;
   private query?: ClaudeQuery;
@@ -257,6 +259,7 @@ export class ClaudeBackendSession implements BackendSession {
   private async startQuery(fresh: boolean, resumeAt?: string): Promise<void> {
     if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
     const generation = ++this.generation;
+    this.subagentTasks.clear();
     this.hookLifetime.abort();
     this.hookLifetime = new AbortController();
     this.queryFresh = fresh;
@@ -310,7 +313,7 @@ export class ClaudeBackendSession implements BackendSession {
     if (!this.active) {
       this.queryFresh = false;
       this.queryResumeAt = undefined;
-      this.active = { id: randomUUID(), userUuid, consumed: new Set(), output: new Map(), stoppedTools: new Map(), streamMessageIds: new Map(), otherTasks: new Set(), blockIndex: 0 };
+      this.active = { id: randomUUID(), userUuid, consumed: new Set(), output: new Map(), stoppedTools: new Map(), streamMessageIds: new Map(), blockIndex: 0 };
       await this.sink.emit({ type: 'turn/started', payload: { turnId: this.active.id } });
     }
     return this.active;
@@ -323,11 +326,17 @@ export class ClaudeBackendSession implements BackendSession {
       await this.sink.emit({ type: 'submission/status', payload: { submissionId: pending.submissionId, status: 'rejected', error: { code: 'NATIVE_INPUT_REJECTED', message: 'Native input rejected', retryable: false, outcomeUnknown: false } } });
       this.nativeInputs.delete(refused); return;
     }
-    const mainReply = !value.parent_tool_use_id && (message.type === 'assistant' || message.type === 'stream_event' || message.type === 'result');
+    const parentToolUseId = str(value.parent_tool_use_id);
+    const mainReply = !parentToolUseId && (message.type === 'assistant' || message.type === 'stream_event' || message.type === 'result');
     const uuids = Array.isArray(value.user_message_uuids) ? value.user_message_uuids.filter((id): id is string => typeof id === 'string') : str(value.user_message_uuid) ? [String(value.user_message_uuid)] : [];
     // A message UUID is input identity. New UUID echoes inside an active native
     // loop bind additional inputs to that loop; they never create another turn.
-    if (mainReply && (this.active || uuids.some(id => this.nativeInputs.has(id)) || this.nativeInputs.size && message.type !== 'result')) {
+    // Claude also runs turns in response to background-task notifications. These
+    // can start without a submitted input and must still surface on the session.
+    const executionEvidence = message.type === 'assistant' ||
+      (message.type === 'stream_event' && record(message.event).type !== 'ping') ||
+      (message.type === 'result' && message.origin?.kind === 'task-notification');
+    if (mainReply && (this.active || executionEvidence || uuids.some(id => this.nativeInputs.has(id)))) {
       if (message.type === 'result' && value.num_turns === 0 && !this.active) {
         for (const id of uuids) {
           const pending = this.nativeInputs.get(id); if (!pending) continue;
@@ -345,7 +354,9 @@ export class ClaudeBackendSession implements BackendSession {
           await this.sink.bindSubmission(pending.submissionId, execution.id);
         }
       }
-      this.adapter.turnMaps.set(this.nativeId, this.turns); await this.fileStore?.saveTurnMap(this.nativeId, this.turns);
+      if (uuids.length) {
+        this.adapter.turnMaps.set(this.nativeId, this.turns); await this.fileStore?.saveTurnMap(this.nativeId, this.turns);
+      }
     }
     const active = this.active;
     if (message.type === "system" && message.subtype === "init") {
@@ -356,13 +367,23 @@ export class ClaudeBackendSession implements BackendSession {
       }
       await this.sink.emit({ type: "session/state", payload: this.snapshot() }); return;
     }
+    if (message.type === "system" && ["task_started", "task_progress", "task_updated", "task_notification"].includes(message.subtype)) {
+      await this.mapSubagentTask(value, active); return;
+    }
+    if (parentToolUseId) {
+      for (const task of this.subagentTasks.values()) {
+        if (task.item.parentItemId === parentToolUseId && task.turnId !== active?.id) {
+          await this.notice(value, task.turnId); return;
+        }
+      }
+    }
     if (!active) { await this.notice(value); return; }
     if (message.type === "assistant") {
-      if (!message.parent_tool_use_id) active.apiError = message.error;
-      for (const block of message.message.content) await this.completeBlock(record(block), message.message.id, str(message.parent_tool_use_id));
+      if (!parentToolUseId) active.apiError = message.error;
+      for (const block of message.message.content) await this.completeBlock(record(block), message.message.id, parentToolUseId);
       return;
     }
-    if (message.type === "stream_event") { await this.streamEvent(record(message.event), str(message.parent_tool_use_id)); return; }
+    if (message.type === "stream_event") { await this.streamEvent(record(message.event), parentToolUseId); return; }
     if (message.type === "user") {
       const body = record(message.message).content;
       if (Array.isArray(body)) for (const part of body) {
@@ -374,29 +395,36 @@ export class ClaudeBackendSession implements BackendSession {
       return;
     }
     if (message.type === "result") {
+      const backgroundReply = message.origin?.kind === "task-notification";
+      const origin = backgroundReply ? { origin: { kind: "task-notification" } } : undefined;
       const interrupted = str(message.stop_reason) === "interrupted" || str(value.terminal_reason) === "interrupted";
       let error = claudeTurnError(message, active.apiError);
+      const outputSchema = active.consumed.size || value.structured_output !== undefined ? this.outputSchema : undefined;
       let structuredText: string | undefined;
-      if (this.outputSchema && !error && !interrupted) {
+      if (outputSchema && !error && !interrupted) {
         if (value.structured_output === undefined) {
           error = { code: 'CLAUDE_STRUCTURED_OUTPUT_MISSING', message: 'Claude completed without the requested structured output', retryable: false, outcomeUnknown: false };
-        } else if (!this.outputSchema.validate(value.structured_output)) {
+        } else if (!outputSchema.validate(value.structured_output)) {
           error = { code: 'CLAUDE_STRUCTURED_OUTPUT_INVALID', message: 'Claude structured output does not match outputSchema', retryable: false, outcomeUnknown: false };
         } else structuredText = JSON.stringify(value.structured_output);
       }
-      const resultText = !this.outputSchema && message.subtype === "success" ? message.result : undefined;
-      const textItems = [...active.output.values()].filter((item) => item.type === "agentMessage" && item.status !== "completed");
+      const resultText = !outputSchema && message.subtype === "success" ? message.result : undefined;
+      const textItems = [...active.output.values()].filter((item) => item.type === "agentMessage" && !item.parentItemId && item.status !== "completed");
       for (let index = 0; index < textItems.length; index++) {
         const item = textItems[index]!; if (item.type !== "agentMessage") continue;
-        const completed: Item = { ...item, text: index === textItems.length - 1 && resultText !== undefined ? resultText : item.text, phase: !this.outputSchema && index === textItems.length - 1 ? "final" : "commentary", status: "completed" };
+        const final = !outputSchema && index === textItems.length - 1;
+        const completed: Item = {
+          ...item, text: final && resultText !== undefined ? resultText : item.text, phase: final ? "final" : "commentary", status: "completed",
+          ...(final && origin ? { extensions: { ...item.extensions, native: origin } } : {}),
+        };
         active.output.set(item.id, completed); await this.sink.emit({ type: "item/completed", payload: { item: completed } }, { turnId: active.id });
       }
       if (!textItems.length && resultText) {
-        const item: Item = { id: `${active.userUuid}:final`, type: "agentMessage", phase: "final", text: resultText, status: "completed" };
+        const item: Item = { id: `${active.userUuid}:final`, type: "agentMessage", phase: "final", text: resultText, status: "completed", ...(origin ? { extensions: { native: origin } } : {}) };
         await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
       }
       if (structuredText !== undefined) {
-        const item: Item = { id: `${active.id}:structured-output`, type: 'agentMessage', phase: 'final', text: structuredText, status: 'completed' };
+        const item: Item = { id: `${active.id}:structured-output`, type: 'agentMessage', phase: 'final', text: structuredText, status: 'completed', ...(origin ? { extensions: { native: origin } } : {}) };
         await this.sink.emit({ type: 'item/completed', payload: { item } }, { turnId: active.id });
       }
       const nativeUsage = record(message.usage);
@@ -420,27 +448,6 @@ export class ClaudeBackendSession implements BackendSession {
     }
     if (message.type === "system" && typeof value.subtype === "string") {
       const subtype = value.subtype;
-      if (subtype.startsWith("task_")) {
-        const id = str(value.task_id); if (!id) return this.notice(value);
-        const previous = active.output.get(`task:${id}`); const patch = record(value.patch);
-        // Native tasks also represent shells, MCP calls and workflows.
-        if (value.task_type !== undefined && value.task_type !== "local_agent") active.otherTasks.add(id);
-        if (active.otherTasks.has(id)) return this.notice(value);
-        if (!previous && subtype !== "task_started" && !value.subagent_type && !value.tool_use_id) return this.notice(value);
-        const status = str(value.status) ?? str(patch.status) ?? (previous?.type === "subagent" ? previous.state : "running");
-        const final = ["completed", "failed", "stopped", "killed"].includes(status);
-        const item: Item = { ...previous, id: `task:${id}`, type: "subagent", subagentId: id, state: status === "completed" ? "completed" : status === "failed" ? "failed" : final ? "interrupted" : status === "pending" ? "pending" : "running", status: final ? status === "completed" ? "completed" : "failed" : "running", task: str(value.description) ?? str(patch.description) ?? str(value.summary) ?? (previous?.type === "subagent" ? previous.task : undefined), ...(str(value.tool_use_id) ? { parentItemId: str(value.tool_use_id) } : {}) };
-        const native = { ...record(previous?.extensions?.native) };
-        for (const key of ["task_type", "subagent_type", "is_backgrounded", "spawn_depth", "prompt", "usage", "summary", "output_file", "last_tool_name", "skip_transcript", "ambient"]) if (value[key] !== undefined) native[key] = value[key];
-        Object.assign(native, patch);
-        item.extensions = { ...previous?.extensions, native: safe(native) };
-        if (typeof record(value.usage).duration_ms === "number") item.durationMs = record(value.usage).duration_ms as number;
-        active.output.set(item.id, item);
-        if (final) await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
-        else if (!previous) await this.sink.emit({ type: "item/started", payload: { item } }, { turnId: active.id });
-        else await this.sink.emit({ type: "item/delta", payload: { itemId: item.id, kind: "patch", value: safe(item) } }, { turnId: active.id });
-        return;
-      }
       if (subtype.startsWith("hook_")) {
         const id = str(value.hook_id); if (!id) return this.notice(value);
         const previous = active.output.get(`hook:${id}`);
@@ -453,6 +460,52 @@ export class ClaudeBackendSession implements BackendSession {
       if (subtype === "compact_boundary") { await this.sink.emit({ type: "item/completed", payload: { item: { id: str(value.uuid) ?? randomUUID(), type: "compaction", status: "completed", summary: str(value.summary), trigger: str(record(value.compact_metadata).trigger) } } }, { turnId: active.id }); return; }
     }
     await this.notice(value);
+  }
+  private async mapSubagentTask(value: Record<string, unknown>, active?: ActiveTurn): Promise<void> {
+    const taskId = str(value.task_id);
+    if (!taskId) return this.notice(value);
+    const previous = this.subagentTasks.get(taskId);
+    const parentItemId = str(value.tool_use_id) ?? previous?.item.parentItemId;
+    const tool = parentItemId ? active?.output.get(parentItemId) : undefined;
+    const isAgent = value.task_type === "local_agent" || (value.task_type === undefined &&
+      (previous || str(value.subagent_type) || (tool?.type === "toolCall" && (tool.nativeType === "Agent" || tool.nativeType === "Task"))));
+    const turnId = previous?.turnId ?? active?.id;
+    if (!isAgent || !turnId) return this.notice(value);
+    const baseId = `task:${taskId}`;
+    if (!previous && active?.output.has(baseId) && value.subtype !== "task_started") return;
+    const itemId = previous?.item.id ?? (active?.output.has(baseId) ? `${baseId}:${randomUUID()}` : baseId);
+    const patch = record(value.patch);
+    const status = str(value.status) ?? str(patch.status);
+    // The terminal patch often precedes the notification, which adds the
+    // authoritative summary and usage. Keep that patch for the final item.
+    const terminalPatch = value.subtype === "task_updated" && (status === "completed" || status === "failed" || status === "killed");
+    const final = value.subtype === "task_notification" && (status === "completed" || status === "failed" || status === "stopped" || status === "killed");
+    const state = final
+      ? status === "completed" ? "completed" : status === "failed" ? "failed" : "interrupted"
+      : status === "pending" ? "pending" : status === "running" || value.subtype === "task_progress" ? "running" : previous?.item.state ?? "running";
+    const native = { ...record(previous?.item.extensions?.native), ...patch };
+    for (const key of ["task_type", "subagent_type", "is_backgrounded", "spawn_depth", "prompt", "usage", "summary", "output_file", "last_tool_name", "skip_transcript", "ambient"]) {
+      if (value[key] !== undefined) native[key] = value[key];
+    }
+    const durationMs = record(value.usage).duration_ms;
+    const item: SubagentTask["item"] = {
+      ...previous?.item, id: itemId, type: "subagent", subagentId: taskId, state,
+      status: state === "pending" ? "running" : state,
+      task: str(value.description) ?? str(patch.description) ?? previous?.item.task ?? str(value.summary),
+      ...(parentItemId ? { parentItemId } : {}),
+      ...(typeof durationMs === "number" ? { durationMs } : {}),
+      extensions: { native: safe(native) },
+    };
+    if (active?.id === turnId) active.output.set(item.id, item);
+    if (final) {
+      this.subagentTasks.delete(taskId);
+      await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId });
+    } else {
+      this.subagentTasks.set(taskId, { turnId, item });
+      if (active?.id !== turnId) return;
+      if (!previous) await this.sink.emit({ type: "item/started", payload: { item } }, { turnId });
+      else if (!terminalPatch) await this.sink.emit({ type: "item/delta", payload: { itemId: item.id, kind: "patch", value: safe(item) } }, { turnId });
+    }
   }
   private async streamEvent(event: Record<string, unknown>, parentToolUseId?: string): Promise<void> {
     const active = this.active!; const type = event.type;
@@ -513,9 +566,9 @@ export class ClaudeBackendSession implements BackendSession {
     else if (block.type === "tool_use") await this.sink.emit({ type: "item/delta", payload: { itemId: item.id, kind: "patch", value: safe(item) } }, { turnId: active.id });
     if ((item.type !== "agentMessage" || parentToolUseId) && block.type !== "tool_use") await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
   }
-  private async notice(value: Record<string, unknown>): Promise<void> {
+  private async notice(value: Record<string, unknown>, turnId = this.active?.id): Promise<void> {
     const subtype = str(value.subtype) ?? str(value.type) ?? "unknown";
-    await this.sink.emit({ type: "notice", payload: { severity: /error|denied|retry|rate_limit/.test(subtype) ? "warning" : "info", code: `CLAUDE_${subtype.toUpperCase().replace(/[^A-Z0-9_]/g, "_")}`, message: str(value.content) ?? str(value.message) ?? subtype, raw: safe(value) } }, this.active ? { turnId: this.active.id } : {});
+    await this.sink.emit({ type: "notice", payload: { severity: /error|denied|retry|rate_limit/.test(subtype) ? "warning" : "info", code: `CLAUDE_${subtype.toUpperCase().replace(/[^A-Z0-9_]/g, "_")}`, message: str(value.content) ?? str(value.message) ?? subtype, raw: safe(value) } }, turnId ? { turnId } : {});
   }
   private async permissionRequest(toolName: string, input: Record<string, unknown>, details: Parameters<NonNullable<Options["canUseTool"]>>[2]): Promise<PermissionResult> {
     // A native tool permission request is execution evidence even when the SDK
