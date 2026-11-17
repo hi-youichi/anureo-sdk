@@ -55,7 +55,8 @@ async function memoizedAgent<S extends z.ZodObject>(
   const call = {
     prompt,
     canonical: canonicalOptions(options, output?.schema),
-    inputHookRevision: options.client.inputHookRevision,
+    // Older SDK clients have no input-hook revision; the journal key tolerates undefined.
+    inputHookRevision: (options.client as { inputHookRevision?: string }).inputHookRevision,
   }
   const execute = () => executeAgent(prompt, options) as Promise<JsonValue | null>
   if (output) return journaledCall(call, execute, stored => output.parse(canonicalJson(stored)) as z.output<S>)

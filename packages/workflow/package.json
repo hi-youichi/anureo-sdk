@@ -1,6 +1,6 @@
 {
   "name": "@anureo/workflow",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Agent execution, composition, and durable workflow steps over the Anureo SDK",
   "license": "Apache-2.0",
   "repository": {
