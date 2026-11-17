@@ -23,13 +23,18 @@ export const MANAGEMENT_TOOLS: Tool[] = [
   tool('bee_assess', 'Record main-agent acceptance of a terminal current-turn task. Unassessed is not accepted; acceptance is not validation of an improvement.', { taskId: string, verdict: { type: 'string', enum: ['accepted', 'needs_revision', 'rejected'] }, reason: string, evidence: { type: 'array', maxItems: 32, items: string } }, ['taskId', 'verdict', 'reason', 'evidence']),
   tool('bee_status', 'Inspect a task, or list current tasks and bees. Lists are paginated with nextCursor; history=true includes bounded retained history. Reports include messaging capability and operationScope for retry keys.', { taskId: string, history: { type: 'boolean' }, cursor: string, limit: { type: 'integer', minimum: 1, maximum: 32 } }, []),
   {
-    ...tool('bee_wait', 'Wait for one task, or any/all of taskIds. Timeout leaves work running. Batch returns tasks, remainingTaskIds and timedOut; single taskId preserves the task report.', {}, []),
+    ...tool('bee_wait', 'Wait for one task, or for any/all of several tasks. Pass exactly one argument shape: single {"taskId":"<id>"} (no mode, no taskIds) or batch {"taskIds":["<id>"],"mode":"any"|"all"} (mode required, no taskId). timeoutMs is optional in both shapes (0-30000, default 30000). A timeout leaves work running; call again to keep waiting. Batch returns tasks, remainingTaskIds and timedOut; single taskId preserves the task report.', {}, []),
     inputSchema: {
       type: 'object', additionalProperties: false,
-      properties: { taskId: string, taskIds: { type: 'array', minItems: 1, maxItems: 32, uniqueItems: true, items: string }, mode: { type: 'string', enum: ['any', 'all'] }, timeoutMs: { type: 'integer', minimum: 0, maximum: 30000 } },
+      properties: {
+        taskId: { ...string, description: 'Single-task form: a taskId returned by bee_delegate. taskIds and mode are forbidden beside it.' },
+        taskIds: { type: 'array', minItems: 1, maxItems: 32, uniqueItems: true, items: string, description: 'Batch form: 1-32 taskIds. Requires mode and forbids taskId.' },
+        mode: { type: 'string', enum: ['any', 'all'], description: 'Batch form only: unblock when any or all listed tasks reach a terminal phase.' },
+        timeoutMs: { type: 'integer', minimum: 0, maximum: 30000, description: 'Optional wait budget in milliseconds for either form; defaults to 30000.' },
+      },
       oneOf: [
-        { required: ['taskId'], not: { anyOf: [{ required: ['taskIds'] }, { required: ['mode'] }] } },
-        { required: ['taskIds', 'mode'], not: { required: ['taskId'] } },
+        { description: 'Single-task form: taskId alone; taskIds and mode are forbidden.', required: ['taskId'], not: { anyOf: [{ required: ['taskIds'] }, { required: ['mode'] }] } },
+        { description: 'Batch form: taskIds with a required mode; taskId is forbidden.', required: ['taskIds', 'mode'], not: { required: ['taskId'] } },
       ],
     },
   },

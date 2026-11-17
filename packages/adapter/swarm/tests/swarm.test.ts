@@ -443,6 +443,35 @@ test('main creates fixed and temporary bees, delegates concurrently and reuses s
   expect(alternate.released).toHaveLength(1)
 })
 
+test('main and member sessions inherit the swarm session permission mode', async () => {
+  let beeId: string | undefined
+  const alternate = await fixture(input => `alternate ${JSON.parse(input).task}`, true, 'alternate')
+  const backend = await fixture(async (input, _structured, prior, params) => {
+    if (!params.mcpServers?.some(server => server.name === 'anureo-swarm')) return `worker ${prior.length}: ${JSON.parse(input).task}`
+    const mcp = await management(params)
+    try {
+      if (!beeId) {
+        beeId = (await mcp.call('bee_create', { profileId: 'tester' })).beeId
+        const other = await mcp.call('bee_create', { role: 'reviewer', name: 'Reviewer' })
+        const a = await mcp.call('bee_delegate', assignment(beeId!))
+        const b = await mcp.call('bee_delegate', assignment(other.beeId, 'Check API'))
+        expect((await mcp.call('bee_wait', { taskId: a.taskId })).text).toContain('alternate')
+        expect((await mcp.call('bee_wait', { taskId: b.taskId })).text).toContain('worker 0')
+      }
+      return 'Integrated answer'
+    } finally { await mcp.client.close() }
+  })
+  const client = await swarm(backend, { tester: alternate.client }, [tester])
+  try {
+    const session = await client.sessions.create({ cwd, permissionMode: 'agent' })
+    expect((await (await session.submit({ input: 'Investigate' })).result()).status).toBe('completed')
+    // The main session, the temporary bee and the fixed-profile bee on the member
+    // backend all carry the swarm session's permission mode verbatim.
+    expect(backend.opened.map(params => params.permissionMode)).toEqual(['agent', 'agent'])
+    expect(alternate.opened.map(params => params.permissionMode)).toEqual(['agent'])
+  } finally { await client.dispose(); await backend.client.dispose(); await alternate.client.dispose() }
+})
+
 test('validates tools, enforces limits, cancels a member and expires the endpoint', async () => {
   let endpoint: SessionOpenParams | undefined
   const backend = await fixture(async (_input, _structured, _prior, params) => {

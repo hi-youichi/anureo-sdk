@@ -382,6 +382,20 @@ test("resume, before/through fork, paged history and conversation revert preserv
   expect(queries.at(-1)!.options.resume).toBe(currentBinding.nativeRef!.value); await resumed.close(); await runtime.dispose();
 });
 
+test("fork resolves a host-echoed execution id boundary to its transcript prompt", async () => {
+  const history = historyApi();
+  const { runtime, session } = await setup({ sessionStore: new InMemorySessionStore(), getSessionMessages: history.getSessionMessages, forkSession: history.forkSession }, async (input, stream) => { history.append(input); await stream.text("conformance"); await stream.result(); });
+  await submitAndYield(session, "t1"); const events = await collect(session);
+  const started = events.find((event) => event.type === "turn/started")!;
+  const executionId = started.payload.turnId;
+  // Hosts round-trip the turn/started identity back as boundary.nativeTurnId, but the
+  // transcript prompt keeps its own uuid; the fork must resolve the execution id to it.
+  const through = await runtime.openSession({ ...OPEN, requestId: "echoed", mode: "fork", binding: { ...session.binding, sessionId: "echoed" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: executionId, nativeTurnId: executionId, relation: "through" } } });
+  const items = await through.request("history/read", { requestId: "echoed-history", sessionId: "echoed" });
+  expect(items.items.some((entry) => entry.turnId === requireBoundTurnId(session, "t1"))).toBe(true);
+  await through.close(); await runtime.dispose();
+});
+
 test("history items reuse live streamed ids and the session settles to ready after the turn", async () => {
   const history = historyApi();
   const { runtime, session } = await setup({ sessionStore: new InMemorySessionStore(), getSessionMessages: history.getSessionMessages, forkSession: history.forkSession }, async (input, stream) => {

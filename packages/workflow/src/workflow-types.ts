@@ -1,7 +1,8 @@
 export interface WorkflowOptions<Input> {
   name: string
   revision: string
-  directory: string
+  /** Run directory for the journal and manifest; omit for a memory-only run that cannot be resumed after exit. */
+  directory?: string
   runId?: string
   input: Input
   resumeFrom?: string | { directory: string; runId: string }

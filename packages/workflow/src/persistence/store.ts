@@ -103,13 +103,26 @@ class FileRunHandle implements RunHandle {
   }
 }
 
+class MemoryRunHandle implements RunHandle {
+  constructor(readonly identity: RunIdentity, readonly journal: AgentJournal) {}
+  async finish(): Promise<void> { /* No checkpoint: the run lives only for this process. */ }
+  async abort(): Promise<void> { /* No checkpoint: the run lives only for this process. */ }
+  async close(): Promise<void> { /* No lock was acquired. */ }
+}
+
 export async function openFileRun(
   options: WorkflowOptions<JsonValue> & { runId: string },
 ): Promise<RunHandle> {
   if (!runIdSchema.safeParse(options.runId).success || typeof options.name !== 'string' || !options.name
-    || typeof options.revision !== 'string' || !options.revision || typeof options.directory !== 'string' || !options.directory) {
+    || typeof options.revision !== 'string' || !options.revision) {
     throw new HarnessSdkError('INVALID_PARAMS')
   }
+  if (options.directory === undefined) {
+    if (options.resumeFrom !== undefined) throw new HarnessSdkError('WORKFLOW_RESUME_NOT_FOUND')
+    const identity = { runId: options.runId, directory: '', name: options.name, revision: options.revision, input: jsonCopy(options.input) }
+    return new MemoryRunHandle(identity, new AgentJournal(`memory:${options.runId}`, [], false))
+  }
+  if (typeof options.directory !== 'string' || !options.directory) throw new HarnessSdkError('INVALID_PARAMS')
   let lock: FileHandle | undefined
   let lockPath: string | undefined
   try {

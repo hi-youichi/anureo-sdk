@@ -147,7 +147,10 @@ arguments still reject the call.
 journaled automatically: identical calls on a `resumeFrom` run return their
 saved results without opening new sessions, and any changed call invalidates
 the calls after it. Existing three-primitive functions keep their independent
-behavior, and `agent()` outside `workflow()` is unchanged.
+behavior, and `agent()` outside `workflow()` is unchanged. Omitting `directory`
+starts a memory-only run: it journals for its own lifetime (memoization and
+chain keys) but writes no files and cannot be resumed after exit; resuming a
+memory run fails with `WORKFLOW_RESUME_NOT_FOUND`.
 
 Live calls use the client's [input and native hooks](../core/README.md#input-hooks).
 The journal records the client's `inputHookRevision` with each started call.
@@ -163,6 +166,18 @@ journal contract, cache keys, error handling and file guarantees.
 Try `bun run example:workflow-persistence` and then repeat with its printed run
 ID: the resumed run opens zero new sessions. This example uses a scripted
 backend and makes no model requests.
+
+## Adapter-facing helpers
+
+Root exports also include three functions for adapter authors composing their
+own journaled step primitives (for example `beer()` in
+[`@anureo/adapter-swarm`](../adapter/swarm/README.md#workflow-execution)).
+`journaledCall({ prompt, canonical, inputHookRevision?, droppedCode?,
+failureCode? }, execute, revive?)` runs one memoized step with exactly the
+`agent()` journal semantics: it executes unbundled outside a `workflow()` body.
+`prepareOutputSchema(schema)` turns a zod object into the canonical JSON schema
+plus `parse` used by structured-output steps, and `isDroppedOutcome(error,
+status)` detects drop-class turn failures that map to a journaled null result.
 
 ## Examples
 

@@ -1,13 +1,11 @@
-import { randomUUID } from 'node:crypto'
 import { HarnessSdkError, sdkError, type Client } from '@anureo/sdk'
 import type { z } from 'zod'
 import { prepareOutputSchema } from './output-schema'
 import { isDroppedOutcome, isStartupBlockException } from './agent-outcome'
-import { currentRun, type RunContext } from './run-context'
-import { isFatal } from './workflow-state'
-import { canonicalJson, jsonCopy, type JsonValue } from './persistence/json'
+import { currentRun } from './run-context'
+import { journaledCall } from './journal-call'
+import { canonicalJson, type JsonValue } from './persistence/json'
 import type { JsonObject } from '@anureo/protocol'
-import type { PriorFailure } from './persistence/journal'
 
 // Do not impose the SDK's short observation timeout on model execution.
 const LONG_OBSERVATION_TIMEOUT_MS = 0x7fffffff
@@ -33,7 +31,7 @@ export function agent<S extends z.ZodObject>(prompt: string, options: AgentOptio
 /** Execute one fresh session, validate its terminal output, and release its observation resources. */
 export async function agent(prompt: string, options: AgentOptions): Promise<string | Record<string, unknown> | null> {
   const context = currentRun()
-  if (context) return memoizedAgent(context, prompt, options)
+  if (context) return memoizedAgent(prompt, options)
   return executeAgent(prompt, options)
 }
 
@@ -50,52 +48,18 @@ function canonicalOptions(options: AgentOptions, schema: JsonObject | undefined)
 }
 
 async function memoizedAgent<S extends z.ZodObject>(
-  context: RunContext,
   prompt: string,
   options: AgentOptions<S>,
 ): Promise<string | z.output<S> | null> {
-  const { journal, state } = context
   const output = options.schema === undefined ? undefined : prepareOutputSchema(options.schema)
-  // The key advances synchronously here: host invocation order fixes the chain.
-  const key = journal.nextKey(prompt, canonicalOptions(options, output?.schema))
-  return state.track(async () => {
-    state.assertDispatch()
-    const inputHookRevision = options.client.inputHookRevision
-    const conflict = journal.resumeConflict(key, inputHookRevision)
-    if (conflict) {
-      state.stop(conflict)
-      throw conflict
-    }
-    const hit = journal.resultFor(key)
-    if (hit !== undefined) {
-      return output ? output.parse(canonicalJson(hit)) : hit as string
-    }
-    journal.beginExecution(key)
-    const agentId = randomUUID()
-    await journal.append({ type: 'started', key, agentId, ...(inputHookRevision === undefined ? {} : { inputHookRevision }) })
-    state.assertDispatch()
-    try {
-      const value = await executeAgent(prompt, options)
-      if (value === null) {
-        await journal.append({ type: 'failed', key, agentId, code: 'AGENT_DROPPED', outcomeUnknown: false })
-        state.noteIncomplete()
-        return null
-      }
-      const stored = jsonCopy(value) as JsonValue
-      await journal.append({ type: 'result', key, agentId, result: stored })
-      return jsonCopy(stored) as string | z.output<S>
-    } catch (cause) {
-      const error = sdkError(cause, 'AGENT_FAILED')
-      if (isFatal(error)) state.stop(error)
-      // The storage layer may have published a terminal record already; never
-      // append a contradictory failure after a storage error.
-      if (error.code !== 'WORKFLOW_STORAGE_FAILED') {
-        await journal.append({ type: 'failed', key, agentId,
-          code: error.code, outcomeUnknown: error.outcomeUnknown === true })
-      }
-      throw error
-    }
-  })
+  const call = {
+    prompt,
+    canonical: canonicalOptions(options, output?.schema),
+    inputHookRevision: options.client.inputHookRevision,
+  }
+  const execute = () => executeAgent(prompt, options) as Promise<JsonValue | null>
+  if (output) return journaledCall(call, execute, stored => output.parse(canonicalJson(stored)) as z.output<S>)
+  return journaledCall(call, execute) as Promise<string | z.output<S> | null>
 }
 
 async function executeAgent(prompt: string, options: AgentOptions): Promise<string | Record<string, unknown> | null> {

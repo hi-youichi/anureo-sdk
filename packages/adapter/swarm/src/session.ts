@@ -6,6 +6,7 @@ import { executionError, releaseSession, SwarmExecution } from './execution'
 import type { BeeProfileRegistry, BeeProfileScope } from './profiles'
 import type { BeeManager } from './bee-manager'
 import type { ManagementBridgeLease } from './management-bridge'
+import { parseWorkflowDirective, type WorkflowRunner } from './workflow/runner'
 
 type ActiveTurn = { id: string; execution: SwarmExecution; done: Promise<void> }
 type Terminal = Omit<TurnCompletedEvent['payload'], 'turnId'>
@@ -29,6 +30,7 @@ export class SwarmSession implements BackendSession {
     private readonly bridge: ManagementBridgeLease,
     private readonly profiles: BeeProfileRegistry,
     private readonly onClosed: () => void,
+    private readonly runner?: WorkflowRunner,
   ) {
     this.binding = params.binding
   }
@@ -89,21 +91,41 @@ export class SwarmSession implements BackendSession {
 
   private async run(id: string, execution: SwarmExecution, input: AhpRequestMap['input/submit']['input'], text: string): Promise<TurnResult> {
     this.members.begin(id)
-    const mention = /^\s*@(?:(user|project)\/)?([a-z][a-z0-9-]{0,39})(?=\s|$)/.exec(text)
-    const request = mention ? text.slice(mention[0].length).trim() : text
-    const registration = mention && this.profiles.resolve(mention[2], mention[1] as BeeProfileScope | undefined)
-    const label = mention && `${mention[1] ? mention[1] + '/' : ''}${mention[2]}`
-    if (mention && !registration) return assignmentFailure('SWARM_UNKNOWN_BEE', `Unknown fixed bee @${label}`)
-    if (mention && !request) return assignmentFailure('SWARM_BEE_TASK_REQUIRED', `Provide a task after @${label}`)
+    this.runner?.beginTurn()
+    const directive = this.runner ? parseWorkflowDirective(text) : undefined
     try {
+      if (directive === 'invalid') {
+        return assignmentFailure('SWARM_INVALID_ARGUMENTS', 'Malformed /workflow directive; use /workflow list, /workflow run <id> [json] or /workflow resume <id> <runId>')
+      }
+      if (directive) {
+        const result = await this.runner!.runHostDirective(directive)
+        // The outer TurnResult text is derived from final items: publish the run payload as one.
+        if (result.text !== undefined) {
+          const item = { id: randomUUID(), type: 'agentMessage' as const, phase: 'final' as const, text: result.text }
+          await this.sink.emit({ type: 'item/started', payload: { item: { ...item, text: '' } } }, { turnId: id })
+          await this.sink.emit({ type: 'item/completed', payload: { item } }, { turnId: id })
+        }
+        return result
+      }
+      const mention = /^\s*@(?:(user|project)\/)?([a-z][a-z0-9-]{0,39})(?=\s|$)/.exec(text)
+      const request = mention ? text.slice(mention[0].length).trim() : text
+      const registration = mention && this.profiles.resolve(mention[2], mention[1] as BeeProfileScope | undefined)
+      const label = mention && `${mention[1] ? mention[1] + '/' : ''}${mention[2]}`
+      if (mention && !registration) return assignmentFailure('SWARM_UNKNOWN_BEE', `Unknown fixed bee @${label}`)
+      if (mention && !request) return assignmentFailure('SWARM_BEE_TASK_REQUIRED', `Provide a task after @${label}`)
       const result = await execution.submit(this.main, {
         input: mention ? `Delegate this request to fixed bee ${mention[2]}${registration?.source ? ` with profileScope=${registration.source.scope}` : ''} before answering.\n${request}` : input,
       }, relayMessages(this.sink, id))
       return result
     } finally {
-      await this.members.settle()
-      if (this.members.uncertain) throw new HarnessSdkError('SWARM_MEMBER_OUTCOME_UNKNOWN', undefined, false, true)
+      await this.settle(id)
     }
+  }
+
+  private async settle(id: string) {
+    await this.members.settle()
+    await this.runner?.settleTurn()
+    if (this.members.uncertain) throw new HarnessSdkError('SWARM_MEMBER_OUTCOME_UNKNOWN', undefined, false, true)
   }
 
   private close() {
@@ -112,7 +134,7 @@ export class SwarmSession implements BackendSession {
       active?.execution.cancel()
       this.members.stop()
       await active?.done
-      const cleanup = await Promise.allSettled([this.members.close(), releaseSession(this.main), this.bridge.dispose()])
+      const cleanup = await Promise.allSettled([this.members.close(), this.runner ? this.runner.close() : Promise.resolve(), releaseSession(this.main), this.bridge.dispose()])
       this.onClosed()
       if (cleanup.some(result => result.status === 'rejected')) throw new HarnessSdkError('RESOURCE_RELEASE_FAILED')
       return {

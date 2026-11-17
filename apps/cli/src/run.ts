@@ -141,7 +141,20 @@ export async function runTurn(options: RunOptions, io: RunIo): Promise<number> {
       }
       const discoveredModels = await loadSwarmModelCatalog(native.models, message => { if (options.verbose) io.err(`anureo: ${message}\n`) }, native.effortConfigKey)
       const modelCatalog = await applyModelGuidance(discoveredModels, backendName, project, options.homeDirectory)
-      adapter = createSwarmAdapter({ backend, profileEntries: profiles, profileReview, modelCatalog })
+      const { loadSwarmWorkflows, workflowJournalDirectory } = await import('./workflows')
+      const workflows = await loadSwarmWorkflows(options.cwd, options.homeDirectory)
+      if (options.verbose) {
+        for (const workflow of workflows) io.err(`anureo: workflow ${workflow.id} (${workflow.scope}) from ${workflow.sourceFile}\n`)
+      }
+      adapter = createSwarmAdapter({
+        backend, profileEntries: profiles, profileReview, modelCatalog,
+        ...(workflows.length > 0 ? {
+          workflows: {
+            registrations: workflows.map(({ scope: _scope, sourceFile: _sourceFile, ...registration }) => registration),
+            journalDirectory: workflowJournalDirectory(project),
+          },
+        } : {}),
+      })
     } else {
       adapter = nativeAdapter
     }

@@ -1,6 +1,6 @@
 import type { BeeProfileRegistry } from './profiles'
 
-export function mainInstructions(profiles: BeeProfileRegistry, roles: readonly string[], custom?: string, models?: string): string {
+export function mainInstructions(profiles: BeeProfileRegistry, roles: readonly string[], custom?: string, models?: string, workflows?: readonly { id: string; description: string; revision: string }[]): string {
   return [
     'You are the main assistant of a swarm. Maintain a continuous conversation with the user and own the final outcome.',
     'Understand the goal, constraints, authorization, and prior decisions. Act on clear requests; clarify only material missing information.',
@@ -36,6 +36,11 @@ export function mainInstructions(profiles: BeeProfileRegistry, roles: readonly s
     `Available fixed profiles: ${JSON.stringify(profiles.entries.map(entry => ({ id: entry.profile.id, name: entry.profile.name, description: entry.profile.description, profileScope: entry.source?.scope, default: profiles.resolve(entry.profile.id) === entry, model: entry.profile.model, effort: entry.profile.effort })))}`,
     `Configured temporary backend roles: ${JSON.stringify(roles)}`,
     models ? `Backend model catalogs: ${models}` : '',
+    ...(workflows ? [
+      `Registered workflows: ${JSON.stringify(workflows.map(({ id, description, revision }) => ({ id, description, revision })))}.`,
+      'Start a registered workflow with workflow_run (id plus an optional JSON args object); it returns a runId immediately and its steps execute as normal bee tasks you can watch via workflow_status, bee_status or bee_wait.',
+      'workflow_status reads a run with an optional bounded timeoutMs like bee_wait; statuses are running, completed, incomplete, failed or interrupted. When your turn ends, queued and running steps are cancelled but every completed step stays journaled; resume with workflow_run and resumeFrom in a later turn.',
+    ] : []),
     custom ? `Application instructions:\n${custom}` : '',
   ].filter(Boolean).join('\n\n')
 }

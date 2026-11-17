@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { HarnessSdkError, sdkError, type Session, type SessionEventSink, type Turn, type TurnResult } from '@anureo/sdk'
-import type { Boundary, HarnessError, SessionOpenParams, SubagentItem } from '@anureo/protocol'
+import type { Boundary, HarnessError, JsonSchema, SessionOpenParams, SubagentItem } from '@anureo/protocol'
 import { executionError, instructionsUnsupported, releaseSession, SwarmExecution } from './execution'
 import { executionSelection, selectTemporaryModel, selectEffort, effortConfig, parseSelectionReason, type MemberBackend, type BeeExecutionSelection } from './models'
 import type { BeeProfile, BeeProfileRegistry, BeeProfileSource, BeeProfileScope } from './profiles'
 import { isBeeId } from './profiles'
 import { relayMemberItems } from './events'
+import { ChangeSignal } from './coordination/change-signal'
 import type { ProfileReviews } from './profile-review'
 import type { EvolutionController } from './evolution/types'
 import { HookRunner, snapshot, bounded, type AssignmentRevisionPin, type SwarmAssignment, type TaskSnapshot, type AssessmentSnapshot, type Immutable } from './hooks'
@@ -14,11 +15,19 @@ import { ResultStore, preview, type ResultDescriptor, type SwarmResultOptions } 
 import { CompletionMailbox, type SwarmMailboxOptions } from './coordination/mailbox'
 import { OperationStore } from './coordination/operations'
 import { managementArguments } from './management-dispatch'
+import type { ManagementBridgeLease } from './management-bridge'
 
 export interface SwarmLimits { maxBees: number; maxConcurrentTasks: number; maxTasksPerTurn: number }
-type Message = { messageId: string; taskId: string; attemptId: string; beeId: string; message: string; delivery: 'currentTurn' | 'nextAssignment'; state: 'queued' | 'submitted' | 'rejected' | 'unknown'; reasonCode?: string; reservedBy?: string; revisionId?: string; targetTaskId?: string; targetAttemptId?: string }
-type Bee = { id: string; name: string; role: string; backend: MemberBackend; requestedModel?: string; selection: BeeExecutionSelection; profile?: BeeProfile; profileSource?: BeeProfileSource; sourceFile?: string; session?: Session; sessionRevision?: string; fallback?: string; busy?: string; poisoned?: boolean; closing?: boolean; review?: Promise<void>; pending?: Message[] }
-type Task = { id: string; attemptId: string; beeId: string; turnId: string; phase: TaskPhase; origin: Pick<Bee, 'profile' | 'profileSource' | 'sourceFile'>; execution: SwarmExecution; selection: Immutable<BeeExecutionSelection>; state: 'running' | TurnResult['status']; result?: TurnResult; error?: HarnessError; output?: ResultDescriptor; done: Promise<void>; assignment: SwarmAssignment; pin?: Immutable<AssignmentRevisionPin>; snapshot?: Immutable<TaskSnapshot>; assessment?: Immutable<AssessmentSnapshot>; assessing?: Promise<unknown>; activeTurn?: Turn; messages: Message[]; messageTail: Promise<void> }
+/** Workflow coordinator attached after construction; it supplies per-bee member tool servers. */
+export interface WorkflowCoordinator {
+  attachMemberServer(beeId: string): Promise<ManagementBridgeLease | undefined>
+}
+type Message = { messageId: string; taskId: string; attemptId: string; beeId: string; message: string; delivery: 'currentTurn' | 'nextAssignment'; state: 'queued' | 'submitted' | 'rejected' | 'unknown'; reasonCode?: string; reservedBy?: string; revisionId?: string; targetTaskId?: string; targetAttemptId?: string; runId?: string }
+type Bee = { id: string; name: string; role: string; backend: MemberBackend; requestedModel?: string; selection: BeeExecutionSelection; profile?: BeeProfile; profileSource?: BeeProfileSource; sourceFile?: string; workflowInstructions?: string; memberServer?: ManagementBridgeLease; session?: Session; sessionRevision?: string; fallback?: string; busy?: string; poisoned?: boolean; closing?: boolean; review?: Promise<void>; pending?: Message[] }
+type WorkflowTaskMeta = { runId: string; parentTaskId?: string; depth: number; outputSchema?: JsonSchema }
+type Task = { id: string; attemptId: string; beeId: string; turnId: string; phase: TaskPhase; origin: Pick<Bee, 'profile' | 'profileSource' | 'sourceFile'>; execution: SwarmExecution; selection: Immutable<BeeExecutionSelection>; state: 'running' | TurnResult['status']; result?: TurnResult; error?: HarnessError; output?: ResultDescriptor; done: Promise<void>; assignment: SwarmAssignment; workflow?: WorkflowTaskMeta; pin?: Immutable<AssignmentRevisionPin>; snapshot?: Immutable<TaskSnapshot>; assessment?: Immutable<AssessmentSnapshot>; assessing?: Promise<unknown>; activeTurn?: Turn; messages: Message[]; messageTail: Promise<void> }
+
+const MEMBER_TOOLS_INSTRUCTIONS = 'Workflow execution tools are served on the anureo-swarm-member MCP server: workflow_list, workflow_run, workflow_status and workflow_send. Use them when your assignment calls for a registered workflow; steps you start are tracked as tasks under your own assignment. workflow_send may only target tasks of runs you started.'
 
 function profileDetails(bee?: Pick<Bee, 'profile' | 'profileSource' | 'sourceFile'>) {
   return bee?.profile ? { profileId: bee.profile.id, ...(bee.profileSource ? { profileScope: bee.profileSource.scope, profileSource: bee.profileSource } : {}), ...(bee.sourceFile ? { sourceFile: bee.sourceFile } : {}) } : {}
@@ -30,6 +39,7 @@ export class BeeManager {
   private readonly tasks: TaskStore<Task>
   private readonly results: ResultStore
   private readonly mailbox: CompletionMailbox
+  private readonly beeChanges = new ChangeSignal()
   private waiting = new AbortController()
   private waiters = 0
   private readonly operations = new OperationStore()
@@ -37,6 +47,7 @@ export class BeeManager {
   private accepting = false
   private closed = false
   uncertain = false
+  workflow?: WorkflowCoordinator
 
   constructor(private readonly params: SessionOpenParams, private readonly sink: SessionEventSink,
     private readonly backendFor: (role: string) => MemberBackend, private readonly profiles: BeeProfileRegistry,
@@ -98,6 +109,8 @@ export class BeeManager {
       const selectionReason = profile ? undefined : parseSelectionReason(args.selectionReason, backend)
       const bee: Bee = { id: randomUUID(), role, name: profile?.name ?? text('name'), backend, requestedModel, selection: executionSelection(backend, requestedModel, !!profile, selectionReason, requestedEffort), profile, profileSource: registration?.source, sourceFile: registration?.sourceFile }
       this.bees.set(bee.id, bee)
+      this.beeChanges.touch()
+      await this.attachServer(bee)
       return { beeId: bee.id, name: bee.name, ...profileDetails(bee), execution: bee.selection, operationScope: this.operations.scope() }
     }
     if (name === 'bee_assess') {
@@ -151,12 +164,7 @@ export class BeeManager {
     const bee = this.bees.get(text('beeId'))
     if (!bee) throw new HarnessSdkError('SWARM_UNKNOWN_BEE')
     if (name === 'bee_close') {
-      if (bee.closing) throw new HarnessSdkError('SWARM_BEE_UNAVAILABLE')
-      bee.closing = true
-      for (const message of bee.pending ?? []) { message.state = 'rejected'; message.reasonCode = 'SWARM_BEE_CLOSED' }
-      if (bee.busy) { const task = this.task(bee.busy); task.execution.cancel(); await task.done }
-      await this.release(bee)
-      this.bees.delete(bee.id)
+      await this.closeBee(bee)
       return { closed: true }
     }
     if (bee.busy || bee.poisoned || bee.closing) throw new HarnessSdkError('SWARM_BEE_UNAVAILABLE')
@@ -170,11 +178,95 @@ export class BeeManager {
     return { taskId: task.id, beeId: bee.id, attemptId: task.attemptId, operationScope: this.operations.scope() }
   }
 
+  /** Programmatic workflow paths; admission budgets are owned by the workflow runner. */
+  get beeSlots() { return this.beeChanges }
+
+  async createWorkflowBee(spec: { role: string; name: string; model?: string; instructions?: string }): Promise<string> {
+    if (this.closed) throw new HarnessSdkError('SWARM_TOOLS_INACTIVE')
+    if (this.bees.size >= this.limits.maxBees) throw new HarnessSdkError('SWARM_BEE_LIMIT')
+    if (!isBeeId(spec.role)) throw new HarnessSdkError('SWARM_INVALID_ARGUMENTS', 'role must be a lowercase slug matching ^[a-z][a-z0-9-]{0,39}$')
+    if (typeof spec.name !== 'string' || !spec.name.trim() || spec.name.length > 512) throw new HarnessSdkError('SWARM_INVALID_ARGUMENTS', 'name must be a nonempty string of at most 512 characters')
+    if (spec.instructions !== undefined && (typeof spec.instructions !== 'string' || spec.instructions.length > 64000)) throw new HarnessSdkError('SWARM_INVALID_ARGUMENTS', 'instructions must be a string of at most 64000 characters')
+    const backend = this.backendFor(spec.role)
+    const requestedModel = spec.model === undefined ? undefined : selectTemporaryModel(spec.model, backend)
+    const bee: Bee = { id: randomUUID(), role: spec.role, name: spec.name, backend, requestedModel, workflowInstructions: spec.instructions, selection: executionSelection(backend, requestedModel, false, 'Swarm workflow step') }
+    this.bees.set(bee.id, bee)
+    this.beeChanges.touch()
+    await this.attachServer(bee)
+    return bee.id
+  }
+
+  async closeWorkflowBee(beeId: string): Promise<void> {
+    const bee = this.bees.get(beeId)
+    if (!bee || bee.busy || bee.closing) return
+    await this.closeBee(bee).catch(() => {})
+  }
+
+  workflowDelegate(beeId: string, step: { task: string; context?: string; constraints?: string; expectedOutput?: string; outputSchema?: JsonSchema }, meta: WorkflowTaskMeta): { taskId: string; outcome: Promise<{ state: Task['state']; result?: TurnResult }> } {
+    if (this.closed || !this.accepting || !this.turnId) throw new HarnessSdkError('SWARM_WORKFLOW_TURN_ENDED')
+    const bee = this.bees.get(beeId)
+    if (!bee) throw new HarnessSdkError('SWARM_UNKNOWN_BEE')
+    if (bee.busy || bee.poisoned || bee.closing) throw new HarnessSdkError('SWARM_BEE_UNAVAILABLE')
+    const text = (value: string | undefined): string => {
+      if (value !== undefined && (typeof value !== 'string' || Buffer.byteLength(value) > 256 * 1024)) throw new HarnessSdkError('SWARM_INVALID_ARGUMENTS', 'workflow step fields must be strings of at most 256 KiB')
+      return value ?? ''
+    }
+    if (typeof step.task !== 'string' || !step.task.trim() || Buffer.byteLength(step.task) > 256 * 1024) throw new HarnessSdkError('SWARM_INVALID_ARGUMENTS', 'task must be a nonempty string of at most 256 KiB')
+    const assignment: SwarmAssignment = {
+      task: step.task,
+      context: text(step.context) || 'Provided by a swarm workflow step.',
+      constraints: text(step.constraints) || 'Read-only. Complete the assigned step and report evidence.',
+      expectedOutput: text(step.expectedOutput) || 'A plain-text report answering the step prompt.',
+    }
+    const task: Task = { id: randomUUID(), attemptId: randomUUID(), beeId: bee.id, turnId: this.turnId, phase: 'accepted', origin: structuredClone({ profile: bee.profile, profileSource: bee.profileSource, sourceFile: bee.sourceFile }), execution: new SwarmExecution(), selection: snapshot(bee.selection), state: 'running', done: Promise.resolve(), assignment, workflow: { runId: meta.runId, ...(meta.parentTaskId ? { parentTaskId: meta.parentTaskId } : {}), depth: meta.depth, ...(step.outputSchema ? { outputSchema: step.outputSchema } : {}) }, messages: [], messageTail: Promise.resolve() }
+    this.mailbox.reserve(task.id)
+    try { this.tasks.add(task, 'workflow') } catch (cause) { this.mailbox.rollback(task.id); throw cause }
+    bee.busy = task.id
+    task.done = Promise.resolve().then(() => this.run(bee, task, assignment)).catch(() => { this.uncertain = true; bee.poisoned = true; this.tasks.changes.touch() })
+    return { taskId: task.id, outcome: task.done.then(() => ({ state: task.state, result: task.result })) }
+  }
+
+  currentTaskOf(beeId: string): { taskId: string; depth: number } | undefined {
+    const bee = this.bees.get(beeId)
+    if (!bee?.busy) return undefined
+    const task = this.tasks.get(bee.busy)
+    return task ? { taskId: task.id, depth: task.workflow?.depth ?? 0 } : undefined
+  }
+
+  workflowTaskRun(taskId: string): string | undefined { return this.tasks.get(taskId)?.workflow?.runId }
+
+  workflowSend(runId: string, taskId: string, message: string, delivery: Message['delivery']): Message | Promise<Message> {
+    if (this.workflowTaskRun(taskId) !== runId) throw new HarnessSdkError('SWARM_UNKNOWN_TASK', 'Task does not belong to this workflow run')
+    return this.send(taskId, message, delivery, runId)
+  }
+
+  expireRunMessages(runId: string) {
+    for (const bee of this.bees.values()) for (const message of bee.pending ?? []) {
+      if (message.runId === runId && message.state === 'queued') { message.state = 'rejected'; message.reasonCode = 'SWARM_WORKFLOW_ENDED' }
+    }
+  }
+
   private task(id: string) { const task = this.tasks.get(id); if (!task) throw new HarnessSdkError('SWARM_UNKNOWN_TASK'); return task }
+
+  private async closeBee(bee: Bee) {
+    if (bee.closing) throw new HarnessSdkError('SWARM_BEE_UNAVAILABLE')
+    bee.closing = true
+    for (const message of bee.pending ?? []) { message.state = 'rejected'; message.reasonCode = 'SWARM_BEE_CLOSED' }
+    if (bee.busy) { const task = this.task(bee.busy); task.execution.cancel(); await task.done }
+    await this.release(bee)
+    this.bees.delete(bee.id)
+    this.beeChanges.touch()
+  }
+
+  private async attachServer(bee: Bee) {
+    if (!this.workflow || bee.memberServer) return
+    bee.memberServer = await this.workflow.attachMemberServer(bee.id)
+  }
   private report(task: Task, budget = 16 * 1024) {
     let text = task.output ? preview(task.output.preview, Math.max(0, budget)) : undefined
     while (text?.text && Buffer.byteLength(JSON.stringify(text.text)) * 2 > budget) text = { text: preview(text.text, Math.floor(Buffer.byteLength(text.text) / 2)).text, truncated: true }
     return { taskId: task.id, beeId: task.beeId, attemptId: task.attemptId, outerTurnId: task.turnId, phase: task.phase, ...profileDetails(task.origin), execution: task.selection, state: task.state, pin: task.pin, assessment: task.assessment,
+      ...(task.workflow ? { workflow: { runId: task.workflow.runId, ...(task.workflow.parentTaskId ? { parentTaskId: task.workflow.parentTaskId } : {}), depth: task.workflow.depth } } : {}),
       text: text?.text, textTruncated: text ? text.truncated || task.output!.previewTruncated : undefined,
       result: task.output ? { ...task.output, preview: text!.text, previewTruncated: text!.truncated || task.output.previewTruncated } : undefined,
       messaging: { currentTurn: task.phase === 'running' && !!task.activeTurn && this.bees.get(task.beeId)?.session?.capabilities.input?.steer?.atomicMatch === true, nextAssignment: this.bees.has(task.beeId) },
@@ -196,11 +288,11 @@ export class BeeManager {
     try { return await read() } finally { this.waiters-- }
   }
 
-  private send(taskId: string, message: string, delivery: Message['delivery']): Message | Promise<Message> {
+  private send(taskId: string, message: string, delivery: Message['delivery'], runId?: string): Message | Promise<Message> {
     const task = this.task(taskId)
     const bee = this.bees.get(task.beeId)
     if (!bee || bee.closing || bee.poisoned) throw new HarnessSdkError('SWARM_BEE_UNAVAILABLE')
-    const receipt: Message = { messageId: randomUUID(), taskId, attemptId: task.attemptId, beeId: bee.id, message, delivery, state: 'queued', revisionId: task.pin?.revisionId }
+    const receipt: Message = { messageId: randomUUID(), taskId, attemptId: task.attemptId, beeId: bee.id, message, delivery, state: 'queued', revisionId: task.pin?.revisionId, ...(runId ? { runId } : {}) }
     if (delivery === 'nextAssignment') {
       const pendingBytes = [...this.bees.values()].flatMap(member => member.pending ?? []).reduce((bytes, item) => bytes + Buffer.byteLength(item.message), 0)
       if ((bee.pending?.length ?? 0) >= 16 || pendingBytes + Buffer.byteLength(message) > 256 * 1024) throw new HarnessSdkError('SWARM_MESSAGE_QUEUE_FULL')
@@ -238,12 +330,14 @@ export class BeeManager {
     let profile = bee.profile
     let experiences: readonly string[] = []
     const started = Date.now()
-    const item: SubagentItem = { id: task.id, type: 'subagent', subagentId: bee.id, name: bee.name, task: assignment.task, state: 'running', status: 'running', startedAt: new Date(started).toISOString(), extensions: { swarm: { kind: profile ? 'fixed' : 'temporary', attemptId: task.attemptId, ...profileDetails(bee), execution: task.selection } } }
+    const item: SubagentItem = { id: task.id, type: 'subagent', subagentId: bee.id, name: bee.name, task: assignment.task, state: 'running', status: 'running', startedAt: new Date(started).toISOString(), ...(task.workflow?.parentTaskId ? { parentItemId: task.workflow.parentTaskId } : {}), extensions: { swarm: { kind: profile ? 'fixed' : 'temporary', attemptId: task.attemptId, ...profileDetails(bee), ...(task.workflow ? { workflow: { runId: task.workflow.runId, depth: task.workflow.depth } } : {}), execution: task.selection } } }
     const relay = relayMemberItems(this.sink, task.turnId, task.id, bee.id)
     const backend = bee.backend.client
-    let instructions = ['Perform only the assigned read-only task. Do not edit files or change external state. Report findings and evidence.', profile?.instructions].filter(Boolean).join('\n\n')
+    const assemble = (profileInstructions: string | undefined, reusable?: readonly string[]) => ['Perform only the assigned read-only task. Do not edit files or change external state. Report findings and evidence.', profileInstructions, bee.workflowInstructions,
+      reusable?.length ? 'Reusable experience:\n' + reusable.join('\n\n') : undefined, bee.memberServer ? MEMBER_TOOLS_INSTRUCTIONS : undefined].filter(Boolean).join('\n\n')
+    let instructions = assemble(profile?.instructions)
     let requestedEffort = bee.selection.requestedEffort
-    let open = { cwd: this.params.cwd, permissionMode: this.params.permissionMode, model: bee.requestedModel, instructions, config: effortConfig(requestedEffort, bee.backend) }
+    let open = { cwd: this.params.cwd, permissionMode: this.params.permissionMode, model: bee.requestedModel, instructions, config: effortConfig(requestedEffort, bee.backend), ...(bee.memberServer ? { mcpServers: [bee.memberServer.config] } : {}) }
     let boundary: Boundary | undefined
     let submitted = false
     let dispatched = false
@@ -257,20 +351,19 @@ export class BeeManager {
         profile = resolved.revision.profile
         experiences = resolved.revision.experiences
         task.pin = snapshot({ revisionId: resolved.revision.id, generation: resolved.head.generation, headId: resolved.head.id })
-        instructions = ['Perform only the assigned read-only task. Do not edit files or change external state. Report findings and evidence.', profile.instructions,
-          experiences.length ? 'Reusable experience:\n' + experiences.join('\n\n') : undefined].filter(Boolean).join('\n\n')
+        instructions = assemble(profile.instructions, experiences)
         requestedEffort = selectEffort(profile.effort, profile.model, bee.backend)
-        open = { cwd: this.params.cwd, permissionMode: this.params.permissionMode, model: profile.model, instructions, config: effortConfig(requestedEffort, bee.backend) }
+        open = { cwd: this.params.cwd, permissionMode: this.params.permissionMode, model: profile.model, instructions, config: effortConfig(requestedEffort, bee.backend), ...(bee.memberServer ? { mcpServers: [bee.memberServer.config] } : {}) }
       }
       for (const message of bee.pending ?? []) {
         if (message.state === 'queued' && message.revisionId !== task.pin?.revisionId) { message.state = 'rejected'; message.reasonCode = 'SWARM_MESSAGE_PROFILE_CHANGED' }
       }
-      carried = (bee.pending ?? []).filter(message => message.state === 'queued' && !message.reservedBy)
+      carried = (bee.pending ?? []).filter(message => message.state === 'queued' && !message.reservedBy && (message.runId === undefined || message.runId === task.workflow?.runId))
       for (const message of carried) message.reservedBy = task.id
       if (carried.length) assignment.context += '\n\nSupplemental task data:\n' + JSON.stringify(carried.map(message => ({ originatingTaskId: message.taskId, originatingAttemptId: message.attemptId, messageId: message.messageId, message: message.message })))
       bee.selection = executionSelection(bee.backend, open.model, !!profile, bee.selection.selectionReason, requestedEffort)
       task.selection = snapshot(bee.selection)
-      item.extensions = { swarm: { kind: profile ? 'fixed' : 'temporary', attemptId: task.attemptId, ...profileDetails(bee), ...(task.pin ? { pin: task.pin } : {}), execution: task.selection } }
+      item.extensions = { swarm: { kind: profile ? 'fixed' : 'temporary', attemptId: task.attemptId, ...profileDetails(bee), ...(task.workflow ? { workflow: { runId: task.workflow.runId, depth: task.workflow.depth } } : {}), ...(task.pin ? { pin: task.pin } : {}), execution: task.selection } }
       itemStarted = true
       await this.sink.emit({ type: 'item/started', payload: { item } }, { turnId: task.turnId })
       const change = await this.hooks.invoke('beforeDelegate', {
@@ -309,7 +402,7 @@ export class BeeManager {
       }
       submitted = !!bee.session && !task.execution.stopped
       task.phase = submitted ? 'starting' : 'stopping'
-      task.result = bee.session ? await task.execution.submit(bee.session, { input: [bee.fallback, JSON.stringify(assignment)].filter(Boolean).join('\n\n') }, async event => {
+      task.result = bee.session ? await task.execution.submit(bee.session, { input: [bee.fallback, JSON.stringify(assignment)].filter(Boolean).join('\n\n'), ...(task.workflow?.outputSchema ? { outputSchema: task.workflow.outputSchema } : {}) }, async event => {
         if (event.type === 'turn/started') boundary = { turnId: event.payload.turnId, nativeTurnId: event.payload.nativeTurnId, relation: 'through' }
         await relay.accept(event)
       }, undefined, {
@@ -388,6 +481,11 @@ export class BeeManager {
 
   private async release(bee: Bee) {
     await bee.review
+    const server = bee.memberServer
+    bee.memberServer = undefined
+    try {
+      if (server) await server.dispose()
+    } catch (cause) { this.uncertain = true; bee.poisoned = true; throw cause }
     if (!bee.session) return
     try {
       // Completed task results are our stop evidence. Some backends conservatively

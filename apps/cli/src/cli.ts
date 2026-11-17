@@ -25,6 +25,8 @@ Options:
   --output <mode>        stream (default) | result (one final JSON object)
   --review-profile       Fork completed fixed bees to propose profile improvements (swarm)
   --review-feedback <text>  Enable profile review and include user feedback
+  --workflow <id>        Run a registered .anureo/workflows/ file as a host turn; prompt becomes its JSON args (swarm)
+  --resume-workflow <runId>  Resume an interrupted workflow run from its journal (swarm)
   --verbose              CLI diagnostics on stderr (default: silent)
   -h, -V                 Show help / version
 
@@ -59,6 +61,22 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
   if (parsed.kind === 'version') { out(`${VERSION}\n`); return 0 }
 
   let prompt = dependencies.prompt ?? parsed.prompt
+  if (parsed.workflow !== undefined || parsed.resumeWorkflow !== undefined) {
+    let argsText = '{}'
+    if (prompt?.trim()) {
+      try {
+        const candidate: unknown = JSON.parse(prompt)
+        if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) throw new Error('not an object')
+        argsText = prompt
+      } catch {
+        err('anureo: with --workflow, the prompt or stdin must be a JSON args object\n')
+        return 2
+      }
+    }
+    prompt = parsed.workflow !== undefined
+      ? `/workflow run ${parsed.workflow} ${argsText}`
+      : `/workflow resume ${parsed.resumeWorkflow!} ${argsText}`
+  }
   if (!prompt || prompt === '-') prompt = await readStdin()
   if (!prompt?.trim()) { err('anureo: a prompt argument or piped stdin is required\n'); return 2 }
 
@@ -93,7 +111,7 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
 /** Validated parse outcome; help/version bypass run-only validation. */
 type Parsed =
   | { kind: 'help' } | { kind: 'version' }
-  | { kind: 'run'; harness: RunOptions['harness']; command?: string; harnessArgs?: string[]; cd?: string; model?: string; resume?: string; sandbox?: Sandbox; schemaPath?: string; output: OutputMode; reviewProfile: boolean; reviewFeedback?: string; verbose: boolean; prompt?: string }
+  | { kind: 'run'; harness: RunOptions['harness']; command?: string; harnessArgs?: string[]; cd?: string; model?: string; resume?: string; sandbox?: Sandbox; schemaPath?: string; output: OutputMode; reviewProfile: boolean; reviewFeedback?: string; verbose: boolean; workflow?: string; resumeWorkflow?: string; prompt?: string }
 
 function parseInput(args: string[]): Parsed {
   const { values, positionals } = parseArgs({
@@ -110,6 +128,8 @@ function parseInput(args: string[]): Parsed {
       sandbox: { type: 'string' },
       schema: { type: 'string' },
       output: { type: 'string' },
+      workflow: { type: 'string' },
+      'resume-workflow': { type: 'string' },
       'review-profile': { type: 'boolean' },
       'review-feedback': { type: 'string' },
       verbose: { type: 'boolean' },
@@ -132,6 +152,18 @@ function parseInput(args: string[]): Parsed {
   const reviewFeedback = values['review-feedback']
   const reviewProfile = values['review-profile'] === true || reviewFeedback !== undefined
   if (reviewProfile && !isSwarm) throw new Error('profile review requires a swarm harness')
+  const workflow = values.workflow
+  const resumeWorkflow = values['resume-workflow']
+  if ((workflow !== undefined || resumeWorkflow !== undefined) && !isSwarm) throw new Error('--workflow requires a swarm harness')
+  if (workflow !== undefined && resumeWorkflow !== undefined) throw new Error('use either --workflow or --resume-workflow, not both')
+  const workflowArgs = positionals[0]
+  if (workflow !== undefined && workflowArgs !== undefined) {
+    try {
+      const parsed = JSON.parse(workflowArgs)
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object')
+    } catch { throw new Error('with --workflow, the prompt argument must be a JSON args object') }
+  }
+  if (resumeWorkflow !== undefined && !/^[^\s]+$/.test(resumeWorkflow)) throw new Error('--resume-workflow must be a runId')
   if (backend === 'acp' && !values.command) throw new Error(`--command is required with --harness ${name}`)
   let harnessArgs: string[] | undefined
   if (values.args !== undefined) {
@@ -158,7 +190,8 @@ function parseInput(args: string[]): Parsed {
   return {
     kind: 'run', harness, command: values.command, harnessArgs, cd: values.cd, model: values.model,
     resume: values.resume, sandbox, schemaPath: values.schema, output, reviewProfile, reviewFeedback,
-    verbose: values.verbose ?? false, prompt: positionals[0],
+    verbose: values.verbose ?? false, ...(workflow !== undefined ? { workflow } : {}), ...(resumeWorkflow !== undefined ? { resumeWorkflow } : {}),
+    prompt: workflow === undefined && resumeWorkflow === undefined ? positionals[0] : undefined,
   }
 }
 

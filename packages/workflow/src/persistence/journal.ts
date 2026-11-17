@@ -51,6 +51,8 @@ export class AgentJournal {
   constructor(
     private readonly path: string,
     source: readonly JournalEvent[],
+    /** Memory-only journals keep their event/index state but never touch the filesystem. */
+    private readonly persist = true,
   ) {
     this.events.push(...jsonCopy(source))
     this.index = indexJournal(this.events)
@@ -94,17 +96,19 @@ export class AgentJournal {
 
   async append(event: JournalEvent): Promise<void> {
     this.events.push(jsonCopy(event))
-    // Concurrent callers must not race atomic renames: an earlier snapshot
-    // landing last would silently drop later events from the published file.
-    const publish = this.publishQueue.catch(() => {}).then(async () => {
-      try { await atomicPublish(this.path, this.events) }
-      catch (cause) {
-        if (cause instanceof HarnessSdkError) throw cause
-        throw new HarnessSdkError('WORKFLOW_STORAGE_FAILED')
-      }
-    })
-    this.publishQueue = publish
-    await publish
+    if (this.persist) {
+      // Concurrent callers must not race atomic renames: an earlier snapshot
+      // landing last would silently drop later events from the published file.
+      const publish = this.publishQueue.catch(() => {}).then(async () => {
+        try { await atomicPublish(this.path, this.events) }
+        catch (cause) {
+          if (cause instanceof HarnessSdkError) throw cause
+          throw new HarnessSdkError('WORKFLOW_STORAGE_FAILED')
+        }
+      })
+      this.publishQueue = publish
+      await publish
+    }
     if (event.type === 'started') this.index.inputHookRevisions.set(event.key, event.inputHookRevision)
     else if (event.type === 'result') this.index.results.set(event.key, event.result)
     else if (event.type === 'failed') this.index.failures.set(event.key, { code: event.code, outcomeUnknown: event.outcomeUnknown })

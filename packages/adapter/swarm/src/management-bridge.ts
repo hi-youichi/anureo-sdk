@@ -5,6 +5,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import type { McpServer } from '@anureo/protocol'
+import type { Tool } from '@modelcontextprotocol/sdk/types.js'
 import { MANAGEMENT_TOOLS } from './management-tools'
 import { HarnessSdkError } from '@anureo/sdk'
 const MANAGEMENT_SERVER_NAME = 'anureo-swarm'
@@ -19,7 +20,7 @@ export interface ManagementBridgeLease {
 }
 type Handler = (name: string, args: unknown, signal?: AbortSignal) => Promise<CallToolResult>
 /** One lease's secret, submission handler and live protocol instances; requests counts admitted HTTP bodies until their response settles. */
-interface Lease { credential: string; handler: Handler; active: Set<Server>; disposed: boolean; requests: number }
+interface Lease { credential: string; handler: Handler; serverName: string; tools: readonly Tool[]; active: Set<Server>; disposed: boolean; requests: number }
 
 /** One listener per swarm adapter; independent leases and protocol instances prevent cross-session state. */
 export class ManagementBridgeManager {
@@ -86,11 +87,11 @@ export class ManagementBridgeManager {
   }
   /** Create and connect an independent MCP server/transport for this HTTP response; response close removes and closes the server. */
   private async dispatchRequest(req: IncomingMessage, res: ServerResponse, body: unknown, lease: Lease): Promise<void> {
-    const server = new Server({ name: MANAGEMENT_SERVER_NAME, version: '1.0.0' }, { capabilities: { tools: {} } })
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: MANAGEMENT_TOOLS }))
+    const server = new Server({ name: lease.serverName, version: '1.0.0' }, { capabilities: { tools: {} } })
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: lease.tools }))
     server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       if (lease.disposed) return toolError('SWARM_TOOLS_EXPIRED')
-      if (!MANAGEMENT_TOOLS.some(tool => tool.name === request.params.name)) return toolError('UNKNOWN_TOOL')
+      if (!lease.tools.some(tool => tool.name === request.params.name)) return toolError('UNKNOWN_TOOL')
       return lease.handler(request.params.name, request.params.arguments, extra.signal)
     })
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true })
@@ -100,16 +101,18 @@ export class ManagementBridgeManager {
     await transport.handleRequest(req, res, body)
   }
   /** Allocate an unguessable authenticated session endpoint and HTTP MCP config; reject disposed managers, listener failure. Caller must dispose the returned lease. */
-  async create(handler: Handler): Promise<ManagementBridgeLease> {
+  async create(handler: Handler, options: { name?: string; tools?: readonly Tool[] } = {}): Promise<ManagementBridgeLease> {
     if (this.closed) throw new HarnessSdkError('CLIENT_DISPOSED')
     const port = await this.listen()
     if (this.closed) throw new HarnessSdkError('CLIENT_DISPOSED')
+    const name = options.name ?? MANAGEMENT_SERVER_NAME
+    const tools = options.tools ?? MANAGEMENT_TOOLS
     const path = `/mcp/${randomBytes(24).toString('hex')}`
     const credential = randomBytes(32).toString('hex')
-    const lease: Lease = { credential, handler, active: new Set(), disposed: false, requests: 0 }
+    const lease: Lease = { credential, handler, serverName: name, tools, active: new Set(), disposed: false, requests: 0 }
     this.leases.set(path, lease)
     const url = `http://127.0.0.1:${port}${path}`
-    const config: McpServer = { type: 'http', name: MANAGEMENT_SERVER_NAME, url, headers: { Authorization: `Bearer ${credential}` } }
+    const config: McpServer = { type: 'http', name, url, headers: { Authorization: `Bearer ${credential}` } }
     return { config, dispose: async () => {
       if (lease.disposed) return
       lease.disposed = true; this.leases.delete(path)

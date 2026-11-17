@@ -682,7 +682,12 @@ export class ClaudeBackendSession implements BackendSession {
     }
     const messages = await this.messages(nativeId);
     const turns = this.fileStore ? await this.fileStore.loadTurnMap(nativeId) : this.adapter.turnMaps.get(nativeId) ?? this.turns;
-    const promptUuid = boundary.nativeTurnId ?? Object.entries(turns).find(([, id]) => id === boundary.turnId)?.[0];
+    let promptUuid = boundary.nativeTurnId ?? Object.entries(turns).find(([, id]) => id === boundary.turnId)?.[0];
+    if (promptUuid && !messages.some((message) => message.uuid === promptUuid && isPrompt(message))) {
+      // Hosts echo the turn/started execution id back as boundary.nativeTurnId while Claude
+      // transcripts keep their own prompt uuids, so resolve an execution id to its prompt.
+      promptUuid = Object.entries(turns).find(([, id]) => id === promptUuid)?.[0] ?? promptUuid;
+    }
     if (!promptUuid) throw new HarnessSdkError("TURN_NOT_FOUND", "No verified native turn boundary");
     const index = messages.findIndex((message) => message.uuid === promptUuid && isPrompt(message));
     if (index < 0) throw new HarnessSdkError("TURN_NOT_FOUND");

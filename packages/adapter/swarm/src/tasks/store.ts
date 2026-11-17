@@ -17,6 +17,7 @@ export class TaskStore<T extends StoredTask> {
   private readonly currentIds = new Set<string>()
   private readonly pins = new Map<string, number>()
   private readonly turns: string[] = []
+  private readonly budgets = new Map<string, 'manual' | 'workflow'>()
   private turnId?: string
   private count = 0
   private waiters = 0
@@ -36,17 +37,20 @@ export class TaskStore<T extends StoredTask> {
   }
 
   checkCapacity() {
-    if (this.count >= this.limits.maxTasksPerTurn || [...this.values()].filter(task => task.state === 'running').length >= this.limits.maxConcurrentTasks) {
+    const runningManual = [...this.values()].filter(task => this.budgets.get(task.id) !== 'workflow' && task.state === 'running').length
+    if (this.count >= this.limits.maxTasksPerTurn || runningManual >= this.limits.maxConcurrentTasks) {
       throw new HarnessSdkError('SWARM_TASK_LIMIT')
     }
   }
 
-  add(task: T) {
-    this.checkCapacity()
+  /** Workflow-budget admissions queue ahead of this store; their limits are enforced by the workflow runner. */
+  add(task: T, budget: 'manual' | 'workflow' = 'manual') {
+    if (budget === 'manual') this.checkCapacity()
     if (task.turnId !== this.turnId || this.records.has(task.id)) throw new HarnessSdkError('SWARM_INVALID_ARGUMENTS')
     this.records.set(task.id, task)
     this.currentIds.add(task.id)
-    this.count++
+    this.budgets.set(task.id, budget)
+    if (budget === 'manual') this.count++
   }
 
   get(id: string) { return this.records.get(id) }
@@ -88,6 +92,7 @@ export class TaskStore<T extends StoredTask> {
       if (this.pins.has(id) || task.phase !== 'terminal') continue
       if (!retainedTurns.has(task.turnId) || historical > this.historyTasks) {
         this.records.delete(id)
+        this.budgets.delete(id)
         historical--
         this.evict(task)
       }

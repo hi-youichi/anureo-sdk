@@ -154,14 +154,55 @@ Swarm injects a session-isolated, authenticated local HTTP MCP server named `anu
 | `bee_assess` | Records the main agent's assessment of a terminal current-turn task: `taskId`, `verdict` (`accepted`, `needs_revision`, `rejected`), `reason`, and `evidence` string array. Identical retries are idempotent; conflicting retries fail. Unassessed tasks are not accepted. Acceptance does not validate improvement. |
 | `bee_cancel` | Cancels `taskId` and waits for its terminal outcome. |
 | `bee_close` | Cancels a bee's current task and releases its session. |
+| `workflow_list` | Lists registered workflows (`id`, `description`, `revision`). Served only when `workflows` is configured. |
+| `workflow_run` | Starts a registered workflow (`workflowId`, optional JSON `args`, optional `resumeFrom` runId) and returns `runId` immediately; steps execute as bee tasks in the background within the current turn. |
+| `workflow_status` | Reads one run (`runId`, optional `timeoutMs` 0–30000 that waits like `bee_wait`): `status` (`running`, `completed`, `incomplete`, `failed`, `interrupted`), step counts, `taskIds` and a bounded `result`. |
 
-Members receive explicit task context rather than the main conversation history. Their prompts request read-only work; backend permissions enforce the actual sandbox. Only management tools are injected automatically; configure other member tools on their backends. Profile reviews run in background forks. Reusing or closing a reviewed member waits only for fork acquisition to preserve the source; full analysis and callbacks are drained at adapter disposal.
+Members receive explicit task context rather than the main conversation history. Their prompts request read-only work; backend permissions enforce the actual sandbox. Only management tools are injected automatically; configure other member tools on their backends. When workflow execution is configured, every bee also receives a dedicated `anureo-swarm-member` server (see Workflow execution). Profile reviews run in background forks. Reusing or closing a reviewed member waits only for fork acquisition to preserve the source; full analysis and callbacks are drained at adapter disposal.
 
 Task waits and completion reads are independent, non-consuming observations of the same work; de-duplicate by task/attempt ID. They share at most 16 concurrent waiters per Session, leaving bridge request capacity for control tools. Batch reports share a 32 KiB serialized-preview budget, complete MCP responses are bounded to 128 KiB, and unusually large metadata can fail with `SWARM_RESPONSE_TOO_LARGE`. Omitted/expired text is not an empty successful report. The public root exports `SwarmResultOptions`, `ResultDescriptor`, `SwarmMailboxOptions` and `CompletionNotice` for applications; the text store and waiting implementations are internal.
 
 `bee_send` receipts report backend acceptance, not model comprehension. Session-level input and `afterTurn` delivery are not substituted for atomic current-turn steering. At most 16 current-turn messages are accepted per task, and next-assignment queues retain at most 16 messages per bee and 256 KiB per Session. Failed preparation keeps queued next-assignment data available; dispatch binds it to that new attempt. A changed fixed-profile revision rejects carried data rather than silently applying it to new instructions. Closing a bee rejects its remaining queued data. An unknown current-turn delivery blocks later messages for that attempt; it is never automatically resent or moved to another task.
 
 Mutating tools also accept optional `operationKey`, while `bee_send` requires it. Obtain `operationScope` from creation, delegation or status and form `<operationScope>:<unique nonce>`. Retrying the same tool/key and arguments reuses its command/receipt; changing arguments produces `SWARM_OPERATION_CONFLICT`. New commands require the current scope. Keep the same key after a transport timeout, because cancellation of the caller's observation does not undo an admitted command. Scopes are bounded (128 commands each, normally eight scopes); queued/unknown message receipts pin their scope, with a hard limit of 64 scopes. Expired scopes fail rather than start duplicate work. These records are in-memory; operations without a key have no business-level retry guarantee.
+
+## Workflow execution
+
+Set `workflows` on adapter options to register workflow files whose steps run as bees. A registration is a plain object validated by `parseSwarmWorkflowRegistration`; the CLI discovers them from `.anureo/workflows/` (project files override user files with the same id).
+
+```ts
+import { parallel } from '@anureo/workflow'
+import { createSwarmAdapter } from '@anureo/adapter-swarm'
+import { beer } from '@anureo/adapter-swarm/workflow'
+
+const adapter = createSwarmAdapter({
+  backend,
+  workflows: {
+    registrations: [{
+      id: 'review-files',
+      description: 'Review a file list with one bee per file',
+      revision: '1',
+      run: async (args: { files: string[] }, ctx) =>
+        parallel(args.files.map(file => () => beer(`Review ${file} and report defects.`, { client: ctx.client, cwd: ctx.cwd, instructions: 'You are a careful reviewer.' }))),
+    }],
+    journalDirectory: './.anureo/workflow-runs',
+  },
+})
+```
+
+`ctx.client` is a swarm façade client: `beer(prompt, { ...options, client: ctx.client })` — and plain `agent(prompt, { client: ctx.client })` — execute each call as one bee task of the outer turn instead of an isolated session. Bees pool per `(backend route, model, instructions)`; identical keys reuse one bee and its member session across steps of the same turn. `beer()` without a swarm client degrades to `agent()`, and bee-only options (`role`, `name`, `context`, `constraints`, `expectedOutput`) on a non-swarm client fail with `SWARM_OPTION_REQUIRES_SWARM` instead of being ignored. Structured output is advertised optimistically (set `workflows.outputSchema: false` to disable) and passes the prepared schema to the member turn.
+
+Three entry points share one runner per session:
+
+- **Host** — submit a directive turn: `/workflow run <id> <json-args>`, `/workflow resume <id> <runId>`, `/workflow list`. The main agent is bypassed; the turn result text is the run status JSON. `runSwarmWorkflow(session, id, args)` from `@anureo/adapter-swarm/workflow` wraps this.
+- **Main agent** — the `workflow_list`/`workflow_run`/`workflow_status` tools above; runs continue in the background while the main agent works and steps appear as normal bee tasks.
+- **Members** — every bee gets its own `anureo-swarm-member` MCP server (unique credential per bee) exposing `workflow_list`, `workflow_run`, `workflow_status` and `workflow_send`. A member-triggered run's step tasks nest under the triggering task (`parentItemId`) and count one nesting level of `maxDepth`; `workflow_send` may only target tasks of runs that bee started, with `nextAssignment` data bound to that run and rejected when it ends.
+
+Admission and lifecycle contracts:
+
+- Steps beyond `maxConcurrentSteps` (default 8) queue (up to `maxQueueDepthPerRun`, default 64) instead of failing; per-run delegations are capped by `maxStepsPerRun` (default 128). Workflow tasks do not consume the manual `maxTasksPerTurn`/`maxConcurrentTasks` budgets but do share the `maxBees` ceiling, waiting on bee release when full.
+- When the outer turn ends, queued and running steps are cancelled and the run is marked `interrupted`. With a `journalDirectory`, every completed step is journaled (the `@anureo/workflow` journal: manifest, chained keys by prompt plus canonical options); `workflow_run` with `resumeFrom` (or `/workflow resume`) replays completed steps from the longest unchanged prefix and runs only the remainder. Resumed runs continue in a fresh journal directory; `workflow_status` reports it as `journalRunId`. Runs without `journalDirectory` journal in memory only and cannot be resumed.
+- Step prompts/fields are bounded to 256 KiB on the programmatic path (the 16 KiB MCP limits still apply to model-called tools), run results are bounded to 64 KiB, and status previews to 16 KiB. Step items carry `extensions.swarm.workflow` (`runId`, `depth`) and respect the existing subagent nesting pipeline.
 
 ## Application lifecycle hooks
 
@@ -219,6 +260,8 @@ Applications implement/configure the SDK backend Clients; Swarm calls their Sess
 
 ## Code structure
 
+`src/index.ts` owns adapter construction, backend routing and bridge wiring; `session.ts` one swarm session per SDK session including `/workflow` directives; `bee-manager.ts` the bee/task lifecycle and programmatic workflow delegation; `tasks/store.ts` turn admission with separate workflow budgets; `results.ts` and `coordination/` the result store, mailbox, operation store and signals; `management-bridge.ts` per-session/per-bee authenticated MCP leases; `instructions.ts`, `profiles.ts`, `models.ts` and `hooks.ts` guidance, profile registry, model catalogs and lifecycle hooks; `evolution/` persistent profile analysis; `workflow/` the workflow runner, bee pool, façade client, `beer()` and tool surfaces re-exported through `@anureo/adapter-swarm/workflow`.
+
 | Module | Responsibility |
 | --- | --- |
 | [src/index.ts](src/index.ts) | Exports the adapter factory, validates configuration, and opens the main session with its management endpoint. |
@@ -238,5 +281,6 @@ Applications implement/configure the SDK backend Clients; Swarm calls their Sess
 | [src/profile-review.ts](src/profile-review.ts) | Forks completed member turns, validates proposals, and drains reviews. |
 | [src/hooks.ts](src/hooks.ts) | Defines immutable lifecycle snapshots, callback deadlines and hook diagnostics. |
 | [src/evolution/](src/evolution/) | Separate public evolution entry point: controller owns background analysis; store owns immutable records, exclusive journal CAS and history; types define application extension contracts. |
+| [src/workflow/](src/workflow/) | Workflow runner, bee pool, façade client, `beer()` and tool surfaces; re-exported for authors through `@anureo/adapter-swarm/workflow`. |
 | [src/execution.ts](src/execution.ts) | Observes backend turns, forwards cancellation, and releases sessions. |
 | [src/events.ts](src/events.ts) | Maps main messages to outer identities, nests member items, and settles unfinished child streams. |

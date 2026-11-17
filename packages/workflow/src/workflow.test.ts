@@ -41,7 +41,7 @@ function failingExecute(error: HarnessError): NonNullable<FakeAdapterOptions['ex
 }
 
 test('root runtime exports contain the four independently usable primitives', async () => {
-  expect(Object.keys(await import('./index')).sort()).toEqual(['agent', 'parallel', 'pipeline', 'workflow'])
+  expect(Object.keys(await import('./index')).sort()).toEqual(['agent', 'isDroppedOutcome', 'journaledCall', 'parallel', 'pipeline', 'prepareOutputSchema', 'workflow'])
 })
 
 test('run identity is durable before body, inputs are isolated, and results are persisted', async () => {

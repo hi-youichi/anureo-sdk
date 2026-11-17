@@ -6,12 +6,17 @@ import { ProfileReviews, type BeeProfileReview } from './profile-review'
 import { SwarmSession } from './session'
 import { BeeManager, type SwarmLimits } from './bee-manager'
 import { ManagementBridgeManager } from './management-bridge'
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import { mainInstructions } from './instructions'
 import { modelInstructions, parseModelCatalog, type SwarmModelCatalog, type MemberBackend } from './models'
 import { ResultStore, type SwarmResultOptions } from './results'
 import { CompletionMailbox, type SwarmMailboxOptions } from './coordination/mailbox'
 import type { EvolutionController } from './evolution/types'
 import { HookRunner, type SwarmHookOptions, type HookContext } from './hooks'
+import { parseSwarmWorkflowOptions, type SwarmWorkflowOptions } from './workflow/types'
+import { WorkflowRunner } from './workflow/runner'
+import { MANAGEMENT_TOOLS } from './management-tools'
+import { MEMBER_SERVER_NAME, MEMBER_WORKFLOW_TOOLS, WORKFLOW_TOOLS } from './workflow/tools'
 export type { SwarmHooks, SwarmHookOptions, HookContext, HookDiagnostic, SwarmAssignment, AssignmentRevisionPin, DelegationSnapshot, TaskSnapshot, AssessmentSnapshot, TurnSnapshot, BeforeDelegateResult, Immutable } from './hooks'
 
 export { parseBeeProfile, type BeeProfile, type BeeProfileScope, type BeeProfileSource, type BeeProfileRegistration, type BeeProfileReference } from './profiles'
@@ -19,6 +24,8 @@ export type { BeeProfileReview } from './profile-review'
 export { parseModelGuidance, parseModelCatalog, type ModelGuidance, type SwarmModel, type SwarmBackendModelCatalog, type SwarmModelCatalog, type BeeExecutionSelection } from './models'
 export type { SwarmResultOptions, ResultDescriptor } from './results'
 export type { SwarmMailboxOptions, CompletionNotice } from './coordination/mailbox'
+export type { SwarmWorkflowRegistration, SwarmWorkflowOptions, SwarmWorkflowLimits, SwarmWorkflowRunContext } from './workflow/types'
+export { parseSwarmWorkflowOptions, parseSwarmWorkflowRegistration } from './workflow/types'
 
 export interface SwarmAdapterOptions extends SwarmHookOptions {
   /** Initialized SDK Client. The caller owns it and releases it after the swarm client. */
@@ -49,6 +56,8 @@ export interface SwarmAdapterOptions extends SwarmHookOptions {
     onResult: (review: BeeProfileReview, context: HookContext) => void | Promise<void>
     feedback?: string
   }
+  /** Register workflow files executable by the host, the main agent and every bee. */
+  workflows?: SwarmWorkflowOptions
 }
 
 const capabilities: Capabilities = {
@@ -76,6 +85,7 @@ export function createSwarmAdapter(options: SwarmAdapterOptions): HarnessAdapter
   const availableModels = modelInstructions(defaultBackend, [...memberBackends.keys()].map(key => ({ key, backend: backendFor(key) })))
   const reviewHooks = new HookRunner(options)
   const reviews = options.profileReview && new ProfileReviews(options.profileReview.onResult, options.profileReview.feedback, reviewHooks)
+  const workflows = parseSwarmWorkflowOptions(options.workflows)
   if (options.profiles !== undefined && options.profileEntries !== undefined) throw new HarnessSdkError('SWARM_INVALID_PROFILE', 'Use either profiles or profileEntries')
   const profiles = new BeeProfileRegistry(options.profileEntries ?? (options.profiles ?? []).map(profile => ({ profile })))
   let disposed = false
@@ -97,22 +107,32 @@ export function createSwarmAdapter(options: SwarmAdapterOptions): HarnessAdapter
       const { cwd, model, instructions, permissionMode, config, mcpServers } = params
       if (mcpServers?.some(server => server.name === 'anureo-swarm')) throw new HarnessSdkError('SWARM_RESERVED_MCP_NAME')
       const members = new BeeManager(params, sink, backendFor, profiles, limits, reviews, new HookRunner(options, options.evolution?.controller.hooks), options.evolution?.controller, runtime)
-      const bridge = await bridges.create(async (name, args, signal) => {
+      const wrapTool = async (promise: Promise<unknown>): Promise<CallToolResult> => {
         try {
-          const response = { content: [{ type: 'text' as const, text: JSON.stringify(await members.call(name, args, signal)) }] }
+          const response = { content: [{ type: 'text' as const, text: JSON.stringify(await promise) }] }
           if (Buffer.byteLength(JSON.stringify(response)) > 128 * 1024) throw new HarnessSdkError('SWARM_RESPONSE_TOO_LARGE')
           return response
         }
-        catch (cause) { return { isError: true, content: [{ type: 'text', text: `${sdkError(cause).code}: ${cause instanceof Error ? cause.message : 'SWARM_TOOL_FAILED'}` }] } }
-      })
+        catch (cause) { return { isError: true, content: [{ type: 'text' as const, text: `${sdkError(cause).code}: ${cause instanceof Error ? cause.message : 'SWARM_TOOL_FAILED'}` }] } }
+      }
+      const runner = workflows ? new WorkflowRunner({ members, params, sink, options: workflows, resolveBackend: backendFor }) : undefined
+      if (runner) members.workflow = {
+        attachMemberServer: async beeId => bridges.create(
+          (name, args, signal) => wrapTool(runner.memberCall(beeId, name, args, signal)),
+          { name: MEMBER_SERVER_NAME, tools: MEMBER_WORKFLOW_TOOLS }),
+      }
+      const bridge = await bridges.create((name, args, signal) => wrapTool(
+        runner && name.startsWith('workflow_') ? runner.callMain(name, args, signal) : members.call(name, args, signal)),
+        ...(workflows ? [{ tools: [...MANAGEMENT_TOOLS, ...WORKFLOW_TOOLS] }] : []))
       try {
-        const main = await backend.sessions.create({ cwd, model, instructions: mainInstructions(profiles, [...memberBackends.keys()], instructions, availableModels), permissionMode, config, mcpServers: [...(mcpServers ?? []), bridge.config] })
+        const main = await backend.sessions.create({ cwd, model, instructions: mainInstructions(profiles, [...memberBackends.keys()], instructions, availableModels, workflows?.registrations), permissionMode, config, mcpServers: [...(mcpServers ?? []), bridge.config] })
         if (disposed) { await releaseSession(main); throw new HarnessSdkError('RUNTIME_DISPOSED') }
-        const session = new SwarmSession(params, sink, capabilities, main, members, bridge, profiles, () => { sessions.delete(session) })
+        const session = new SwarmSession(params, sink, capabilities, main, members, bridge, profiles, () => { sessions.delete(session) }, runner)
         sessions.add(session)
         return session
       } catch (cause) {
         await bridge.dispose()
+        await runner?.close()
         await members.close()
         throw cause
       }
