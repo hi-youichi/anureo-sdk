@@ -159,6 +159,8 @@ test("native tool results, task/hook lifecycle, compaction and unknown blocks re
   const { runtime, session } = await setup({}, async (_, stream) => {
     await stream.emit({ type: "assistant", uuid: "a", parent_tool_use_id: null, message: { id: "tool-message", content: [{ type: "tool_use", id: "tool", name: "Bash", input: { command: "echo fixture", apiKey: "PRIVATE" } }] } });
     await stream.emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tool", content: "done" }] } });
+    await stream.emit({ type: "assistant", parent_tool_use_id: "tool", message: { id: "child-message", content: [{ type: "tool_use", id: "child-read", name: "Read", input: { file_path: "package.json" } }] } });
+    await stream.emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "child-read", content: "child result" }] } });
     await stream.emit({ type: "system", subtype: "task_started", task_id: "child", description: "Work", tool_use_id: "tool" });
     await stream.emit({ type: "system", subtype: "task_progress", task_id: "child", description: "Working" });
     await stream.emit({ type: "system", subtype: "task_notification", task_id: "child", status: "completed", summary: "Finished" });
@@ -170,7 +172,8 @@ test("native tool results, task/hook lifecycle, compaction and unknown blocks re
     await stream.result();
   });
   await submitAndYield(session, "t"); const events = await collect(session); const completed = events.filter((event) => event.type === "item/completed").map((event) => event.payload.item);
-  expect(completed).toEqual(expect.arrayContaining([expect.objectContaining({ type: "toolCall", kind: "command", output: "done" }), expect.objectContaining({ type: "subagent", subagentId: "child", state: "completed" }), expect.objectContaining({ type: "hook", name: "PreToolUse", status: "completed" }), expect.objectContaining({ type: "compaction", trigger: "auto" }), expect.objectContaining({ type: "toolCall", kind: "other", nativeType: "futureContent" })]));
+  expect(completed).toEqual(expect.arrayContaining([expect.objectContaining({ type: "toolCall", kind: "command", output: "done" }), expect.objectContaining({ type: "subagent", subagentId: "child", state: "completed", parentItemId: "tool" }), expect.objectContaining({ type: "hook", name: "PreToolUse", status: "completed" }), expect.objectContaining({ type: "compaction", trigger: "auto" }), expect.objectContaining({ type: "toolCall", kind: "other", nativeType: "futureContent" })]));
+  expect(completed).toEqual(expect.arrayContaining([expect.objectContaining({ id: "child-read", parentItemId: "tool", output: "child result" })]));
   expect(JSON.stringify(events)).not.toContain("PRIVATE"); await runtime.dispose();
 });
 
@@ -540,4 +543,28 @@ test("official Claude rename and info helpers deliver titles through the observe
     }
     expect(title).toBe('Official renamed title');
   } finally { await reader.return?.(); await f.runtime.dispose(); }
+});
+
+
+test("interleaved child streams keep ownership and never replace the parent final answer", async () => {
+  const { runtime, session, queries } = await setup({}, async (_, stream) => {
+    for (const [parent, id] of [[null, "parent"], ["agent-a", "child-a"], ["agent-b", "child-b"]]) {
+      await stream.emit({ type: "stream_event", parent_tool_use_id: parent, event: { type: "message_start", message: { id } } });
+      await stream.emit({ type: "stream_event", parent_tool_use_id: parent, event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } });
+    }
+    for (const [parent, id, text] of [["agent-a", "child-a", "A"], [null, "parent", "P"], ["agent-b", "child-b", "B"]]) {
+      await stream.emit({ type: "stream_event", parent_tool_use_id: parent, event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } } });
+      await stream.emit({ type: "assistant", parent_tool_use_id: parent, message: { id, content: [{ type: "text", text }] } });
+    }
+    await stream.result("parent final");
+  });
+  await submitAndYield(session, "t"); const events = await collect(session);
+  const completed = events.filter(e => e.type === "item/completed").map(e => e.payload.item);
+  expect(completed).toEqual(expect.arrayContaining([
+    expect.objectContaining({ id: "child-a:0", parentItemId: "agent-a", text: "A", phase: "commentary" }),
+    expect.objectContaining({ id: "child-b:0", parentItemId: "agent-b", text: "B", phase: "commentary" }),
+    expect.objectContaining({ id: "parent:0", text: "parent final", phase: "final" }),
+  ]));
+  expect(queries[0]!.options.forwardSubagentText).toBe(true);
+  await runtime.dispose();
 });

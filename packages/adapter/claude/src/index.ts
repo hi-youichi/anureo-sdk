@@ -128,7 +128,7 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
   queryOptions(cwd: string): Options {
     return {
       cwd, env: this.env, settingSources: [], persistSession: true,
-      includePartialMessages: true, includeHookEvents: true,
+      includePartialMessages: true, includeHookEvents: true, forwardSubagentText: true,
       ...(this.options.command ?? this.options.executable ? { pathToClaudeCodeExecutable: this.options.command ?? this.options.executable } : {}),
       ...(this.options.executableRuntime ? { executable: this.options.executableRuntime } : {}),
       ...(this.options.args?.length ? { spawnClaudeCodeProcess: (options) => spawn(options.command, [...options.args, ...this.options.args!], { cwd: options.cwd, env: options.env, signal: options.signal, stdio: ["pipe", "pipe", "pipe"], shell: false, windowsHide: true }) } : {}),
@@ -144,7 +144,7 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
   }
 }
 
-interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageId?: string; blockIndex: number; apiError?: Extract<SDKMessage, { type: 'assistant' }>['error']; stopExtended?: boolean }
+interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageIds: Map<string, string>; otherTasks: Set<string>; blockIndex: number; apiError?: Extract<SDKMessage, { type: 'assistant' }>['error']; stopExtended?: boolean }
 export class ClaudeBackendSession implements BackendSession {
   private release?: Promise<void>;
   private readonly nativeInputs = new Map<string, { submissionId: string; turnId?: string }>();
@@ -310,7 +310,7 @@ export class ClaudeBackendSession implements BackendSession {
     if (!this.active) {
       this.queryFresh = false;
       this.queryResumeAt = undefined;
-      this.active = { id: randomUUID(), userUuid, consumed: new Set(), output: new Map(), stoppedTools: new Map(), blockIndex: 0 };
+      this.active = { id: randomUUID(), userUuid, consumed: new Set(), output: new Map(), stoppedTools: new Map(), streamMessageIds: new Map(), otherTasks: new Set(), blockIndex: 0 };
       await this.sink.emit({ type: 'turn/started', payload: { turnId: this.active.id } });
     }
     return this.active;
@@ -359,10 +359,10 @@ export class ClaudeBackendSession implements BackendSession {
     if (!active) { await this.notice(value); return; }
     if (message.type === "assistant") {
       if (!message.parent_tool_use_id) active.apiError = message.error;
-      for (const block of message.message.content) await this.completeBlock(record(block), message.message.id, message.parent_tool_use_id !== null);
+      for (const block of message.message.content) await this.completeBlock(record(block), message.message.id, str(message.parent_tool_use_id));
       return;
     }
-    if (message.type === "stream_event") { await this.streamEvent(record(message.event)); return; }
+    if (message.type === "stream_event") { await this.streamEvent(record(message.event), str(message.parent_tool_use_id)); return; }
     if (message.type === "user") {
       const body = record(message.message).content;
       if (Array.isArray(body)) for (const part of body) {
@@ -423,9 +423,18 @@ export class ClaudeBackendSession implements BackendSession {
       if (subtype.startsWith("task_")) {
         const id = str(value.task_id); if (!id) return this.notice(value);
         const previous = active.output.get(`task:${id}`); const patch = record(value.patch);
-        const status = str(value.status) ?? str(patch.status) ?? (subtype === "task_started" ? "running" : "running");
+        // Native tasks also represent shells, MCP calls and workflows.
+        if (value.task_type !== undefined && value.task_type !== "local_agent") active.otherTasks.add(id);
+        if (active.otherTasks.has(id)) return this.notice(value);
+        if (!previous && subtype !== "task_started" && !value.subagent_type && !value.tool_use_id) return this.notice(value);
+        const status = str(value.status) ?? str(patch.status) ?? (previous?.type === "subagent" ? previous.state : "running");
         const final = ["completed", "failed", "stopped", "killed"].includes(status);
-        const item: Item = { id: `task:${id}`, type: "subagent", subagentId: id, state: status === "completed" ? "completed" : status === "failed" ? "failed" : final ? "interrupted" : "running", status: final ? status === "completed" ? "completed" : "failed" : "running", task: str(value.description) ?? str(patch.description) ?? str(value.summary), ...(str(value.tool_use_id) ? { parentItemId: str(value.tool_use_id) } : {}) };
+        const item: Item = { ...previous, id: `task:${id}`, type: "subagent", subagentId: id, state: status === "completed" ? "completed" : status === "failed" ? "failed" : final ? "interrupted" : status === "pending" ? "pending" : "running", status: final ? status === "completed" ? "completed" : "failed" : "running", task: str(value.description) ?? str(patch.description) ?? str(value.summary) ?? (previous?.type === "subagent" ? previous.task : undefined), ...(str(value.tool_use_id) ? { parentItemId: str(value.tool_use_id) } : {}) };
+        const native = { ...record(previous?.extensions?.native) };
+        for (const key of ["task_type", "subagent_type", "is_backgrounded", "spawn_depth", "prompt", "usage", "summary", "output_file", "last_tool_name", "skip_transcript", "ambient"]) if (value[key] !== undefined) native[key] = value[key];
+        Object.assign(native, patch);
+        item.extensions = { ...previous?.extensions, native: safe(native) };
+        if (typeof record(value.usage).duration_ms === "number") item.durationMs = record(value.usage).duration_ms as number;
         active.output.set(item.id, item);
         if (final) await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
         else if (!previous) await this.sink.emit({ type: "item/started", payload: { item } }, { turnId: active.id });
@@ -445,16 +454,18 @@ export class ClaudeBackendSession implements BackendSession {
     }
     await this.notice(value);
   }
-  private async streamEvent(event: Record<string, unknown>): Promise<void> {
+  private async streamEvent(event: Record<string, unknown>, parentToolUseId?: string): Promise<void> {
     const active = this.active!; const type = event.type;
-    if (type === "message_start") { active.streamMessageId = str(record(event.message).id); return; }
+    const streamKey = parentToolUseId ?? "";
+    if (type === "message_start") { const messageId = str(record(event.message).id); if (messageId) active.streamMessageIds.set(streamKey, messageId); return; }
     const index = typeof event.index === "number" ? event.index : 0;
-    const id = `${active.streamMessageId ?? active.userUuid}:${index}`;
+    const id = `${active.streamMessageIds.get(streamKey) ?? parentToolUseId ?? active.userUuid}:${index}`;
     if (type === "content_block_start") {
       const block = record(event.content_block);
       const blockId = str(block.id) ?? id;
       const status = this.active?.stoppedTools.get(blockId) ?? "running";
       const item = this.blockItem(block, blockId, status);
+      if (parentToolUseId) { item.parentItemId = parentToolUseId; item.extensions = { ...item.extensions, nativeParentTool: "subagent" }; }
       active.output.set(item.id, item); await this.sink.emit({ type: "item/started", payload: { item } }, { turnId: active.id });
     } else if (type === "content_block_delta") {
       const delta = record(event.delta); const previous = active.output.get(id);
@@ -489,18 +500,18 @@ export class ClaudeBackendSession implements BackendSession {
     const fallbackId = `${messageId}:${active.blockIndex++}`;
     return fallbackId;
   }
-  private async completeBlock(block: Record<string, unknown>, messageId: string, subagent: boolean): Promise<void> {
+  private async completeBlock(block: Record<string, unknown>, messageId: string, parentToolUseId?: string): Promise<void> {
     const active = this.active!;
     const id = this.resolveCompleteBlockId(block, messageId, active);
     const previous = active.output.get(id);
     const running = block.type === "text" || block.type === "tool_use";
     const status = this.active?.stoppedTools.get(id) ?? (running ? "running" : "completed");
-    const item = this.blockItem(block, id, status);
-    if (subagent) item.extensions = { ...(item.extensions ?? {}), nativeParentTool: "subagent" };
+    const item = this.blockItem(block, id, parentToolUseId && block.type === "text" ? "completed" : status);
+    if (parentToolUseId) { item.parentItemId = parentToolUseId; item.extensions = { ...(item.extensions ?? {}), nativeParentTool: "subagent" }; }
     active.output.set(id, item);
     if (!previous) await this.sink.emit({ type: "item/started", payload: { item: { ...item, status: "running" } } }, { turnId: active.id });
     else if (block.type === "tool_use") await this.sink.emit({ type: "item/delta", payload: { itemId: item.id, kind: "patch", value: safe(item) } }, { turnId: active.id });
-    if (item.type !== "agentMessage" && block.type !== "tool_use") await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
+    if ((item.type !== "agentMessage" || parentToolUseId) && block.type !== "tool_use") await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
   }
   private async notice(value: Record<string, unknown>): Promise<void> {
     const subtype = str(value.subtype) ?? str(value.type) ?? "unknown";
@@ -825,6 +836,8 @@ export class ClaudeBackendSession implements BackendSession {
           const running = block.type === "tool_use";
           const status = this.active?.stoppedTools.get(id) ?? (running ? "running" : "completed");
           const item = this.blockItem(block, id, status);
+          const parentToolUseId = str(record(message).parent_tool_use_id);
+          if (parentToolUseId) { item.parentItemId = parentToolUseId; item.extensions = { ...item.extensions, nativeParentTool: "subagent" }; }
           if (block.type === "tool_use") delete item.status;
           items.push({ turnId: currentTurn, ...(currentNativeTurn ? { nativeTurnId: currentNativeTurn } : {}), nativeItemId: message.uuid, item });
         }
