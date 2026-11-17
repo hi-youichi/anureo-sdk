@@ -63,6 +63,11 @@ export function completeClaudeTool(previous: Extract<Item, { type: 'toolCall' }>
     ...previousFields,
     status,
     output: block.content as import('@anureo/protocol').JsonValue,
+    // A matched native tool_result supplies success evidence even without an exit code.
+    extensions: {
+      ...previous.extensions,
+      toolExecution: { ...record(previous.extensions?.toolExecution), success: status === 'completed' } as import('@anureo/protocol').JsonValue,
+    },
     ...(fileChanges !== undefined ? { fileChanges } : {}),
   }
 }
