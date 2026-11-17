@@ -17,15 +17,19 @@ export interface JournalIndex {
   results: Map<string, JsonValue>
   started: Set<string>
   failures: Map<string, PriorFailure>
+  inputHookRevisions: Map<string, string | undefined>
 }
 
 export function indexJournal(events: readonly JournalEvent[]): JournalIndex {
-  const index: JournalIndex = { results: new Map(), started: new Set(), failures: new Map() }
+  const index: JournalIndex = { results: new Map(), started: new Set(), failures: new Map(), inputHookRevisions: new Map() }
   for (const event of events) {
     index.started.delete(event.key)
     index.failures.delete(event.key)
     index.results.delete(event.key)
-    if (event.type === 'started') index.started.add(event.key)
+    if (event.type === 'started') {
+      index.started.add(event.key)
+      index.inputHookRevisions.set(event.key, event.inputHookRevision)
+    }
     else if (event.type === 'failed') index.failures.set(event.key, { code: event.code, outcomeUnknown: event.outcomeUnknown })
     else index.results.set(event.key, event.result)
   }
@@ -61,6 +65,17 @@ export class AgentJournal {
     return key
   }
 
+  /** Check the source of a matching logical call before cache lookup or execution. */
+  resumeConflict(key: string, inputHookRevision: string | undefined): HarnessSdkError | undefined {
+    if (this.index.failures.get(key)?.outcomeUnknown) {
+      return new HarnessSdkError('WORKFLOW_RECONCILIATION_REQUIRED',
+        'A previous run left this agent call with an unknown outcome; reconcile it before resuming', false, true)
+    }
+    if (this.index.inputHookRevisions.has(key) && this.index.inputHookRevisions.get(key) !== inputHookRevision) {
+      return new HarnessSdkError('WORKFLOW_INPUT_POLICY_CHANGED')
+    }
+  }
+
   /** Returns a copy of the cached result, or undefined when this call must execute. */
   resultFor(key: string): JsonValue | undefined {
     if (!this.reuseOpen) return undefined
@@ -71,12 +86,10 @@ export class AgentJournal {
   /**
    * Marks a cache miss. A source entry with only `started` (crash during a call)
    * is a respawnable prefix: it stays reuse-eligible for later calls, matching
-   * the "longest unchanged prefix" semantics. Returns the prior terminal
-   * failure of this exact key, if any.
+   * the "longest unchanged prefix" semantics.
    */
-  beginExecution(key: string): PriorFailure | undefined {
+  beginExecution(key: string): void {
     if (!this.index.started.has(key)) this.reuseOpen = false
-    return this.index.failures.get(key)
   }
 
   async append(event: JournalEvent): Promise<void> {
@@ -92,7 +105,8 @@ export class AgentJournal {
     })
     this.publishQueue = publish
     await publish
-    if (event.type === 'result') this.index.results.set(event.key, event.result)
+    if (event.type === 'started') this.index.inputHookRevisions.set(event.key, event.inputHookRevision)
+    else if (event.type === 'result') this.index.results.set(event.key, event.result)
     else if (event.type === 'failed') this.index.failures.set(event.key, { code: event.code, outcomeUnknown: event.outcomeUnknown })
   }
 }

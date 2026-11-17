@@ -47,7 +47,7 @@ Use `resolveCodexProfile(version)` and `codexCapabilities(version)` to inspect t
 
 | Entry | Contents |
 |---|---|
-| `@anureo/adapter-codex` | `createCodexAdapter`, `CodexAdapterOptions`, `CodexProfile`, `resolveCodexProfile`, `codexCapabilities`, `createCodexCatalogSession`, `CodexModel`, `CodexJsonlClient`, `CodexRpcError`, `mapItems`, `mapUsage` |
+| `@anureo/adapter-codex` | `createCodexAdapter`, `CodexAdapterOptions`, `CodexProfile`, `resolveCodexProfile`, `codexCapabilities`, `createCodexCatalogSession`, `CodexModel`, `CodexThreadSummary`, `CodexThreadListParams`, `CodexThreadPage`, `CodexJsonlClient`, `CodexRpcError`, `mapItems`, `mapUsage` |
 | `@anureo/adapter-codex/jsonl` | The low-level JSONL client over the child process |
 | `@anureo/adapter-codex/mapping` | Native record → AHP item/usage mapping helpers |
 | `@anureo/adapter-codex/catalog` | Model catalog session (`createCodexCatalogSession`) |
@@ -57,6 +57,35 @@ Use `resolveCodexProfile(version)` and `codexCapabilities(version)` to inspect t
 ## Configuration options
 
 The adapter exposes session-scoped config options through AHP: `permissionMode` (`read-only` / `agent` / `agent-full-access`, mapped onto Codex approval policies and sandboxes), `model`, `effort`, `summary`, `approvalPolicy`, and `fastMode` (mapped to Codex's `priority` service tier). Turn-level overrides are supported for model, effort, summary, approval/sandbox policy, and service tier.
+
+## Subagent protocol
+
+Codex spawns subagent threads from the model through collab tools (there is no client-side spawn method). The adapter surfaces them on three planes, gated by the `subagents` capability (`events: 'nested'`, plus `threadDiscovery` and `tree` flags per profile):
+
+- **Nested items.** `collabAgentToolCall` items expand into one nested `SubagentItem` per receiver thread (`state`, `task`, `parentItemId`), with raw evidence such as `tool`, `model`, `reasoningEffort`, `senderThreadId` and per-agent `errorMessage`/`resultMessage` under `item.extensions.native`. `subAgentActivity` lifecycle items (`started`/`interacted`/`interrupted`/`completed`, carrying `agentThreadId`/`agentPath`) project into the same vocabulary. Documented singular legacy wire words (`receiverThreadId`, `newThreadId`, `agentStatus`) are tolerated as a fallback.
+- **Discovery.** `thread/started` notifications for spawned children surface as a session `notice` event with code `SUBAGENT_THREAD_STARTED`; its `extensions` carry the child's `nativeThreadId`, `parentThreadId`, `agentNickname`, `agentRole` and `forkedFromId`. Spawn children that declare `canAcceptDirectInput: false` (parent-owned Multi-Agent V2) degrade the advertised `input` capability to no delivery — direct input is rejected natively for them, and the mapped error is `SUBAGENT_DIRECT_INPUT_REJECTED` (definite, non-retryable). `turn/interrupt` remains available for such threads.
+- **Thread tree.** `adapter.listThreads(params)` pages stored threads with optional relation filters (`parentThreadId` for direct children, `ancestorThreadId` for any-depth descendants — mutually exclusive), `sourceKinds`, `cwd` and cursor pagination, returning `CodexThreadSummary` entries (`parentThreadId`/`agentNickname`/`agentRole` where native supplies them, enriched from locally observed spawns when the page omits them). Review and guardian threads never participate in relation filters (native behavior). Method-not-found downgrades every registered session's `subagents.tree` capability.
+
+Session metadata exposes the same linkage on opened and resumed threads via `snapshot.metadata.extensions` (`parentThreadId`, `agentNickname`, `agentRole`, `forkedFromId`, `nativeSource`). Resumed child threads keep Codex's paginated-history semantics: their history contains only their own turns.
+
+Late native completions (`subAgentActivity` `completed` arriving after the spawning turn completed) keep their original turn attribution; the core admits them as late completions of tracked items instead of rejecting the event stream.
+
+## Native hook events
+
+Synchronous Codex hook runs with an active turn appear as `hook` items.
+Session-level runs appear as `NATIVE_HOOK_STARTED` and
+`NATIVE_HOOK_COMPLETED` notices. See [Codex App Server](https://learn.chatgpt.com/docs/app-server)
+for native notification coverage and [Codex Hooks](https://learn.chatgpt.com/docs/hooks)
+for configuration and trust management.
+
+## Code structure
+
+| Source | Responsibility |
+| --- | --- |
+| [`src/index.ts`](src/index.ts), [`src/adapter.ts`](src/adapter.ts) | Assemble the package exports and manage native App Server sessions. |
+| [`src/session.ts`](src/session.ts), [`src/mapping.ts`](src/mapping.ts) | Dispatch session requests and project native turns, items, and hook notifications. |
+| [`src/jsonl.ts`](src/jsonl.ts), [`src/profile.ts`](src/profile.ts) | Run the JSON-RPC transport and resolve version-specific native capabilities. |
+| [`src/catalog.ts`](src/catalog.ts), [`src/threads.ts`](src/threads.ts) | Discover models and list native threads. |
 
 ## Development
 

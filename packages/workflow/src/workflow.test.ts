@@ -1,10 +1,10 @@
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createClient, HarnessSdkError, type Client, type SessionEventSink } from '@anureo/sdk'
+import { createClient, HarnessSdkError, type Client, type ClientOptions, type SessionEventSink } from '@anureo/sdk'
 import { createScriptedAdapter, type FakeAdapterOptions, type FakeCall } from '@anureo/conformance'
 import type { HarnessError } from '@anureo/protocol'
 import { z } from 'zod'
@@ -22,9 +22,9 @@ async function setup() {
   roots.push(directory)
   return { directory, name: 'test', revision: '1', input: {} }
 }
-async function fixture(options?: FakeAdapterOptions) {
+async function fixture(options?: FakeAdapterOptions, clientOptions?: Partial<Pick<ClientOptions, 'identity' | 'hooks'>>) {
   const adapter = createScriptedAdapter(options)
-  const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: randomUUID() } })
+  const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: randomUUID() }, ...clientOptions })
   clients.push(client)
   return { client, adapter }
 }
@@ -82,6 +82,43 @@ test('resumed runs replay identical agent calls from the journal without new ses
     agent('{"value":1}', { client, cwd: options.directory, schema: z.strictObject({ value: z.number() }) }))
   expect(adapter.opened).toHaveLength(1)
   expect(third.result).toEqual({ value: 1 })
+})
+
+test('workflow reuses results only under the same input hook revision', async () => {
+  const options = await setup()
+  const identity = { adapterId: 'scripted', runtimeConfigId: 'input-policy' }
+  const without = await fixture(undefined, { identity })
+  const calls: string[] = []
+  const withPolicy = (inputRevision: string) => fixture(undefined, { identity, hooks: {
+    inputRevision,
+    transformInput: [() => {
+      calls.push(inputRevision)
+      return [{ type: 'text', text: 'transformed' }]
+    }],
+  } })
+  const v1 = await withPolicy('1')
+  const same = await withPolicy('1')
+  const v2 = await withPolicy('2')
+  const execute = (client: Client) => agent('original', { client, cwd: options.directory })
+  const original = await workflow(options, () => execute(without.client))
+  const policy = await workflow(options, () => execute(v1.client))
+  expect(policy.result).toBe('transformed')
+  await expect(workflow({ ...options, resumeFrom: policy.runId }, () => execute(same.client)))
+    .resolves.toMatchObject({ result: 'transformed' })
+  expect(same.adapter.opened).toHaveLength(0)
+  const scenarios = [
+    [original.runId, v1.client], [policy.runId, without.client], [policy.runId, v2.client],
+  ] as const
+  for (const [runId, client] of scenarios) {
+    await expect(workflow({ ...options, resumeFrom: runId }, async () => {
+      try { await execute(client) } catch {}
+      try { await agent('later', { client, cwd: options.directory }) } catch {}
+    })).rejects.toMatchObject({ code: 'WORKFLOW_INPUT_POLICY_CHANGED', outcomeUnknown: false })
+  }
+  expect(v1.adapter.opened).toHaveLength(1)
+  expect(without.adapter.opened).toHaveLength(1)
+  expect(v2.adapter.opened).toHaveLength(0)
+  expect(calls).toEqual(['1'])
 })
 
 test('chained keys invalidate the downstream prefix when any call changes', async () => {
@@ -173,7 +210,13 @@ test('unknown previous outcomes require reconciliation instead of silent re-exec
   await expect(workflow({ ...options, resumeFrom: failure.details.runId }, () =>
     agent('unknown', { client, cwd: options.directory })))
     .rejects.toMatchObject({ code: 'WORKFLOW_RECONCILIATION_REQUIRED' })
+  const revised = await fixture(undefined, { identity: client.identity,
+    hooks: { inputRevision: 'new', beforeInput: [() => undefined] } })
+  await expect(workflow({ ...options, resumeFrom: failure.details.runId }, () =>
+    agent('unknown', { client: revised.client, cwd: options.directory })))
+    .rejects.toMatchObject({ code: 'WORKFLOW_RECONCILIATION_REQUIRED' })
   expect(adapter.opened).toHaveLength(1)
+  expect(revised.adapter.opened).toHaveLength(0)
 })
 
 test('storage failure is sticky and blocks subsequent agent dispatch', async () => {
@@ -182,8 +225,10 @@ test('storage failure is sticky and blocks subsequent agent dispatch', async () 
   let id = ''
   await expect(workflow(options, async run => {
     id = run.runId
-    // Moving the run directory breaks every subsequent journal publication.
-    await rename(join(options.directory, id), join(options.directory, `${id}-moved`))
+    // Block atomic replacement of the journal while leaving the open writer lock alone.
+    const journal = join(options.directory, id, 'journal.json')
+    await rm(journal)
+    await mkdir(journal)
     try { await agent('first', { client, cwd: options.directory }) } catch {}
     try { await agent('second', { client, cwd: options.directory }) } catch {}
     return 'caught'

@@ -149,6 +149,15 @@ saved results without opening new sessions, and any changed call invalidates
 the calls after it. Existing three-primitive functions keep their independent
 behavior, and `agent()` outside `workflow()` is unchanged.
 
+Live calls use the client's [input and native hooks](../core/README.md#input-hooks).
+The journal records the client's `inputHookRevision` with each started call.
+Resume can reuse a matching result under the same policy revision without
+running callbacks. A different revision, including adding or removing the
+policy, stops resume for that call with `WORKFLOW_INPUT_POLICY_CHANGED`.
+Start a new run after confirming the previous execution's outcome. For a
+matching call whose previous outcome is already known to be uncertain,
+`WORKFLOW_RECONCILIATION_REQUIRED` takes precedence.
+
 The [persistence reference](../../docs/workflow/persistence.md) defines the
 journal contract, cache keys, error handling and file guarantees.
 Try `bun run example:workflow-persistence` and then repeat with its printed run

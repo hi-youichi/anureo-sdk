@@ -131,7 +131,30 @@ Resume, fork, and history need the official `SessionStore` contract. `FileSessio
 
 Session-scoped config options exposed through AHP: `model`, `permissionMode` (`default` / `acceptEdits` / `bypassPermissions` / `plan` / `dontAsk` / `auto`), `effort` (`low`–`max`, per-model support reported by the catalog), `fastMode`, and `maxThinkingTokens`. Text and image inputs are supported.
 
+### Native control hooks
+
+Configure these through [the client's hooks](../../core/README.md#native-control-hooks).
+`beforeTool` can select Claude's `Read`, `Write`, `Edit`, `Glob`, and `Grep`
+built-ins. Coverage is limited to these exact native tool calls. Claude's
+permission handling still applies when the host callback lets the call proceed.
+`beforeStop` runs on primary text turns and can ask Claude to continue the
+same turn once. Structured-output turns follow their existing schema validation
+path. Interruption and query teardown cancel in-flight callbacks.
+
+The pinned Claude Agent SDK delivers decisions through its native callback
+channel. Use Claude's native permission settings for enforcement that must
+survive a disconnected or unresponsive callback channel.
+
 For script-based Claude executables, `executableRuntime: 'node' | 'bun' | 'deno'` names the interpreter; native binaries need none. Tests can inject `queryFactory` and the store/history functions — that is how `@anureo/conformance` drives this adapter without credentials.
+
+## Code structure
+
+| Source | Responsibility |
+| --- | --- |
+| [`src/index.ts`](src/index.ts) | Exports the adapter, constructs Claude SDK queries, and projects session events and interactions. |
+| [`src/hooks.ts`](src/hooks.ts) | Validates Claude hook coverage and translates local hook callbacks into native SDK decisions. |
+| [`src/output-schema.ts`](src/output-schema.ts), [`src/file-changes.ts`](src/file-changes.ts) | Validate structured results and project native tool and file-change data. |
+| [`src/catalog.ts`](src/catalog.ts), [`src/store.ts`](src/store.ts) | Implement model discovery and session persistence. |
 
 ## Development
 

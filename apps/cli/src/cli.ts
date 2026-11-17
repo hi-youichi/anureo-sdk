@@ -14,6 +14,7 @@ Run one agent turn and print the unified AHP event stream (JSONL) to stdout.
 Options:
   --harness <name>       Required: ${BACKEND_HARNESSES.join(' | ')} | swarm | swarm:<name>
                         swarm defaults to swarm:codex; use a native name after the colon
+                        swarm loads fixed bees from user and project .anureo/bees/
   --command <exe>        Backend executable override; required for acp and swarm:acp
   --args <json>          Extra harness args as a JSON array, e.g. '["agent.mjs"]'
   -C, --cd <dir>         Working directory for the session (default: cwd)
@@ -22,6 +23,8 @@ Options:
   --sandbox <mode>       read-only | workspace | full (codex or claude backend)
   --schema <file>        JSON Schema file constraining the final message
   --output <mode>        stream (default) | result (one final JSON object)
+  --review-profile       Fork completed fixed bees to propose profile improvements (swarm)
+  --review-feedback <text>  Enable profile review and include user feedback
   --verbose              CLI diagnostics on stderr (default: silent)
   -h, -V                 Show help / version
 
@@ -35,6 +38,8 @@ export interface CliDependencies {
   stderr?: (text: string) => void
   /** Base directory for relative --cd paths; defaults to process.cwd(). */
   cwd?: string
+  /** Override the user directory for profile discovery. Defaults to the OS home directory. */
+  homeDirectory?: string
   /** Prompt override for tests; when omitted, stdin is read per the prompt rules. */
   prompt?: string
 }
@@ -72,11 +77,14 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
     command: parsed.command,
     harnessArgs: parsed.harnessArgs,
     cwd: resolve(dependencies.cwd ?? process.cwd(), parsed.cd ?? '.'),
+    homeDirectory: dependencies.homeDirectory,
     model: parsed.model,
     resume: parsed.resume,
     sandbox: parsed.sandbox,
     outputSchema,
     output: parsed.output,
+    reviewProfile: parsed.reviewProfile,
+    reviewFeedback: parsed.reviewFeedback,
     verbose: parsed.verbose,
     prompt: prompt as string,
   }, { out, err })
@@ -85,7 +93,7 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
 /** Validated parse outcome; help/version bypass run-only validation. */
 type Parsed =
   | { kind: 'help' } | { kind: 'version' }
-  | { kind: 'run'; harness: RunOptions['harness']; command?: string; harnessArgs?: string[]; cd?: string; model?: string; resume?: string; sandbox?: Sandbox; schemaPath?: string; output: OutputMode; verbose: boolean; prompt?: string }
+  | { kind: 'run'; harness: RunOptions['harness']; command?: string; harnessArgs?: string[]; cd?: string; model?: string; resume?: string; sandbox?: Sandbox; schemaPath?: string; output: OutputMode; reviewProfile: boolean; reviewFeedback?: string; verbose: boolean; prompt?: string }
 
 function parseInput(args: string[]): Parsed {
   const { values, positionals } = parseArgs({
@@ -102,6 +110,8 @@ function parseInput(args: string[]): Parsed {
       sandbox: { type: 'string' },
       schema: { type: 'string' },
       output: { type: 'string' },
+      'review-profile': { type: 'boolean' },
+      'review-feedback': { type: 'string' },
       verbose: { type: 'boolean' },
     },
   })
@@ -119,6 +129,9 @@ function parseInput(args: string[]): Parsed {
     throw new Error(`unknown harness "${name}"; backend names: ${BACKEND_HARNESSES.join(' | ')}`)
   }
   const harness: RunOptions['harness'] = isSwarm ? { name: 'swarm', backend } : { name: backend }
+  const reviewFeedback = values['review-feedback']
+  const reviewProfile = values['review-profile'] === true || reviewFeedback !== undefined
+  if (reviewProfile && !isSwarm) throw new Error('profile review requires a swarm harness')
   if (backend === 'acp' && !values.command) throw new Error(`--command is required with --harness ${name}`)
   let harnessArgs: string[] | undefined
   if (values.args !== undefined) {
@@ -144,7 +157,7 @@ function parseInput(args: string[]): Parsed {
   }
   return {
     kind: 'run', harness, command: values.command, harnessArgs, cd: values.cd, model: values.model,
-    resume: values.resume, sandbox, schemaPath: values.schema, output,
+    resume: values.resume, sandbox, schemaPath: values.schema, output, reviewProfile, reviewFeedback,
     verbose: values.verbose ?? false, prompt: positionals[0],
   }
 }

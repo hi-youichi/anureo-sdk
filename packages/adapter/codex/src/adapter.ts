@@ -2,13 +2,14 @@
 import { AHP_PROTOCOL_CONTRACT, assertRequest, negotiateVersion, type InitializeParams, type InitializeResult, type SessionBinding, type SessionOpenParams } from '@anureo/protocol'
 import { HarnessSdkError, type BackendSession, type HarnessAdapter, type SessionEventSink } from '@anureo/sdk'
 import { spawnHarnessProcess, type HarnessProcess } from '@anureo/sdk/process'
-import { CodexJsonlClient } from './jsonl'
+import { CodexJsonlClient, CodexRpcError } from './jsonl'
 import { record, type NativeRecord } from './native-values'
 import type { CodexAdapterOptions } from './options'
 import { CODEX_PROFILES, codexCapabilities, resolveCodexProfile } from './profile'
 import { probeVersion } from './version'
 import { readAccountStatus } from './account'
 import { readCodexModels, type CodexModel } from './models'
+import { readCodexThreads, type CodexThreadListParams, type CodexThreadPage } from './threads'
 import { CodexBackendSession } from './session'
 
 /** Reconciliation evidence returned to SDK hosts; an inconclusive read must never claim execution stopped. */
@@ -58,6 +59,31 @@ export class CodexNativeAdapter implements HarnessAdapter {
     try {
       await this.initializeClient(client, this.clientInfo ?? { name: 'anureo-harness-models', version: '0.1.0' })
       return await readCodexModels(client)
+    } finally { await client.dispose() }
+  }
+  /** For host discovery after initialization, page stored threads with optional spawn-edge relation filters on a fresh read-only client. Reject conflicting relation filters, uninitialized adapters and launch/query errors; method-not-found downgrades every registered session's tree capability before rejecting unsupported, and the created client is always disposed without creating a thread. */
+  async listThreads(params: CodexThreadListParams = {}): Promise<CodexThreadPage> {
+    if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
+    if (!this.clientInfo) throw new HarnessSdkError('NOT_INITIALIZED')
+    if (params.parentThreadId && params.ancestorThreadId) throw new HarnessSdkError('SUBAGENT_FILTER_CONFLICT', 'Codex thread/list accepts only one of parentThreadId and ancestorThreadId')
+    if (!codexCapabilities(this.version).subagents?.tree) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
+    const child = await this.launchProcess(this.options.cwd)
+    const client = this.createProbeClient(child, { interactionError: 'No interactive surface during thread discovery', diagnostic: this.options.diagnostic })
+    try {
+      await this.initializeClient(client, this.clientInfo)
+      return await readCodexThreads(client, params, threadId => {
+        for (const session of this.sessions) {
+          const metadata = session.subagentMetadata(threadId)
+          if (metadata) return metadata
+        }
+        return undefined
+      })
+    } catch (cause) {
+      if (cause instanceof CodexRpcError && cause.rpcCode === -32601) {
+        for (const session of this.sessions) await session.disableSubagentTree()
+        throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
+      }
+      throw cause
     } finally { await client.dispose() }
   }
   /** For host readiness checks, query a fresh client in the configured environment without requiring initialization or authenticating. Propagate launch errors; mark SDK handshake/query failures definite and always dispose the created client, propagating cleanup errors. */

@@ -1,5 +1,6 @@
 // Assembles the harness adapter, runs one turn and emits the output contract; it must not parse CLI input.
 import { createClient, type Client, type HarnessAdapter } from '@anureo/sdk'
+import type { SwarmAdapterOptions } from '@anureo/adapter-swarm'
 import type { AhpEvent } from '@anureo/protocol'
 import { printEvent, printResult } from './project'
 
@@ -28,11 +29,14 @@ export interface RunOptions {
   command?: string
   harnessArgs?: string[]
   cwd: string
+  homeDirectory?: string
   model?: string
   resume?: string
   sandbox?: Sandbox
   outputSchema?: unknown
   output: OutputMode
+  reviewProfile?: boolean
+  reviewFeedback?: string
   verbose: boolean
   prompt: string
 }
@@ -89,11 +93,40 @@ export async function runTurn(options: RunOptions, io: RunIo): Promise<number> {
     let adapter: HarnessAdapter
     if (harness.name === 'swarm') {
       const { createSwarmAdapter } = await import('@anureo/adapter-swarm')
+      const { findProjectRoot, loadBeeProfiles } = await import('./profiles')
+      const profiles = await loadBeeProfiles(options.cwd, options.homeDirectory)
+      if (options.verbose) {
+        for (const { profile, file } of profiles) io.err(`anureo: bee @${profile.id} from ${file}\n`)
+      }
       backend = await createClient({
         adapter: nativeAdapter,
         identity: { adapterId: backendName, runtimeConfigId: 'cli-swarm' },
       })
-      adapter = createSwarmAdapter({ backend })
+      let profileReview: SwarmAdapterOptions['profileReview']
+      if (options.reviewProfile) {
+        const project = await findProjectRoot(options.cwd)
+        const { saveProfileProposal } = await import('./profile-review')
+        profileReview = {
+          feedback: options.reviewFeedback,
+          async onResult(review) {
+            const label = `anureo: profile review @${review.profileId}`
+            const usage = review.usage?.cacheRead === undefined ? '' : ` (cacheRead=${review.usage.cacheRead})`
+            if (review.status === 'proposed') {
+              const source = profiles.find(({ profile }) => profile.id === review.profileId)?.file
+              try {
+                const file = await saveProfileProposal(project, review, source)
+                io.err(`${label}: saved ${file}${usage}\n`)
+              } catch (cause) {
+                io.err(`${label}: cannot save proposal: ${(cause as Error).message}\n`)
+              }
+            } else {
+              const detail = review.status === 'skipped' ? review.reason : review.code
+              io.err(`${label}: ${review.status}: ${detail}${usage}\n`)
+            }
+          },
+        }
+      }
+      adapter = createSwarmAdapter({ backend, profiles: profiles.map(({ profile }) => profile), profileReview })
     } else {
       adapter = nativeAdapter
     }

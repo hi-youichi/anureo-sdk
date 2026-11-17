@@ -2,7 +2,7 @@
 import { HarnessSdkError } from '@anureo/sdk'
 import type { HarnessProcess } from '@anureo/sdk/process'
 
-import { record, type NativeRecord } from './native-values'
+import { record, string, type NativeRecord } from './native-values'
 /** Keep value helpers available through the public JSONL entry point while their interpretation remains owned by native-values. */
 export { record, string, type NativeRecord } from './native-values'
 /** Envelope passed by the transport to an owner's interaction handler; params are unvalidated and response ownership is claimed before writing. */
@@ -35,10 +35,18 @@ export interface JsonlOptions {
   /** Maximum concurrent server handlers until their full completion, default 32. */
   maxServerRequests?: number
 }
-/** Definite native rejection returned to RPC callers; retain only the numeric code so native error messages cannot disclose payloads. */
+/** Fixed native denial text for parent-owned Multi-Agent V2 subagent threads; classified without retaining native message bytes. */
+const SUBAGENT_DIRECT_INPUT_DENIAL = 'direct app-server input is not allowed for multi-agent v2 sub-agents'
+/** Definite native rejection returned to RPC callers; retain only the numeric code plus a sanitized denial flag so native error messages cannot disclose payloads. */
 export class CodexRpcError extends HarnessSdkError {
-  /** For response decoding, map a numeric native code to a safe SDK error without I/O; method-not-found stays distinguishable from other definite failures. */
-  constructor(readonly rpcCode: number) { super(rpcCode === -32601 ? 'METHOD_NOT_FOUND' : 'NATIVE_RPC_ERROR', 'Native Codex request failed', false, false, { rpcCode }) }
+  /** For response decoding, map a numeric native code and a -32600 denial prefix to a safe SDK error without I/O; method-not-found and the multi-agent direct-input denial stay distinguishable from other definite failures. */
+  constructor(readonly rpcCode: number, readonly subagentDirectInputDenied = false) {
+    super(
+      rpcCode === -32601 ? 'METHOD_NOT_FOUND' : rpcCode === -32600 && subagentDirectInputDenied ? 'SUBAGENT_DIRECT_INPUT_REJECTED' : 'NATIVE_RPC_ERROR',
+      rpcCode === -32600 && subagentDirectInputDenied ? 'Native Codex rejected direct input for a parent-owned subagent thread' : 'Native Codex request failed',
+      false, false, { rpcCode },
+    )
+  }
 }
 /** Process-backed transport for adapter, catalog and session owners. Construction starts readers; writes are serialized and replies correlated until explicit disposal. Native frames omit the public AHP JSON-RPC header. */
 export class CodexJsonlClient {
@@ -92,7 +100,7 @@ export class CodexJsonlClient {
         reject(new HarnessSdkError('REQUEST_TIMEOUT', 'Native request outcome is unknown', false, true))
       }, this.options.timeoutMs ?? 30_000)
       this.pending.set(id, { resolve: value => resolve(value as T), reject, timer })
-      void this.write({ id, method, params }).catch(() => {
+      void this.write({ id, method, params }).catch(cause => {
         const waiting = this.pending.get(id)
         if (!waiting) return
         clearTimeout(waiting.timer)
@@ -176,7 +184,13 @@ export class CodexJsonlClient {
     if (!waiting) return // timed-out/duplicate response is observed and not replayed
     this.pending.delete(id)
     clearTimeout(waiting.timer)
-    if (Object.hasOwn(message, 'error')) waiting.reject(new CodexRpcError(Number(record(message.error).code ?? -32603)))
+    if (Object.hasOwn(message, 'error')) {
+      const error = record(message.error)
+      waiting.reject(new CodexRpcError(
+        Number(error.code ?? -32603),
+        error.code === -32600 && string(error.message)?.startsWith(SUBAGENT_DIRECT_INPUT_DENIAL) === true,
+      ))
+    }
     else if (Object.hasOwn(message, 'result')) waiting.resolve(message.result)
     else waiting.reject(new HarnessSdkError('PROTOCOL_ERROR'))
   }

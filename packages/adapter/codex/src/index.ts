@@ -3,6 +3,7 @@
 export { CodexNativeAdapter, createCodexAdapter } from './adapter'
 export type { CodexAdapterOptions } from './options'
 export type { CodexModel } from './models'
+export type { CodexThreadSummary, CodexThreadListParams, CodexThreadPage } from './threads'
 export { resolveCodexProfile, codexCapabilities, type CodexProfile } from './profile'
 export { createCodexCatalogSession } from './catalog'
 export { CodexJsonlClient, CodexRpcError } from './jsonl'

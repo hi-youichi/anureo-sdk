@@ -10,7 +10,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   BoundedEventQueue, HarnessSdkError, sdkError, capHistoryEntry, pageEndWithinBudget, DEFAULT_HISTORY_PAGE_BYTES,
-  type BackendSession, type HarnessAdapter, type SessionEventSink, type SessionMethod,
+  type BackendSession, type HarnessAdapter, type NativeHookCallbacks, type SessionEventSink, type SessionMethod,
 } from "@anureo/sdk";
 import {
   AHP_PROTOCOL_CONTRACT, assertRequest, negotiateVersion, publicValue, validateJsonSchema,
@@ -21,6 +21,7 @@ import {
 import { FileSessionStore } from "./store";
 import { compileOutputSchema, type OutputSchema } from './output-schema';
 import { claudeTurnError } from './turn-error';
+import { claudeNativeHooks, validateNativeHooks } from './hooks';
 
 export type ClaudeQuery = AsyncIterable<SDKMessage> & Pick<Query, "interrupt" | "setModel" | "setPermissionMode" | "setMaxThinkingTokens" | "applyFlagSettings" | "rewindFiles" | "supportedModels" | "close">;
 export type ClaudeQueryFactory = (params: Parameters<typeof query>[0]) => ClaudeQuery;
@@ -111,10 +112,12 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
     if (!this.env.CLAUDE_CONFIG_DIR && !this.options.defaultHome && !this.options.queryFactory) throw new HarnessSdkError("HARNESS_CONFIG_INVALID", "Claude requires an explicit isolated CLAUDE_CONFIG_DIR");
     return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: "claude", version: "0.3.265", adapter: "claude-native/0.1.0" }, capabilities: this.capabilities };
   }
-  async openSession(params: SessionOpenParams, sink: SessionEventSink): Promise<BackendSession> {
+  validateNativeHooks(_params: SessionOpenParams, hooks: NativeHookCallbacks): void { validateNativeHooks(hooks); }
+  async openSession(params: SessionOpenParams, sink: SessionEventSink, hooks?: NativeHookCallbacks): Promise<BackendSession> {
     if (this.disposed) throw new HarnessSdkError("RUNTIME_DISPOSED");
     if (params.binding.adapterId !== "claude" && params.binding.adapterId !== "claude-native") throw new HarnessSdkError("SESSION_BINDING_MISMATCH");
-    const session = new ClaudeBackendSession(this, params, sink, this.defaultStore);
+    if (hooks) this.validateNativeHooks(params, hooks);
+    const session = new ClaudeBackendSession(this, params, sink, this.defaultStore, hooks);
     await session.open(); this.sessions.add(session); return session;
   }
   async listModels(cwd = process.cwd()): Promise<Awaited<ReturnType<Query["supportedModels"]>>> {
@@ -141,7 +144,7 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
   }
 }
 
-interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageId?: string; blockIndex: number; apiError?: Extract<SDKMessage, { type: 'assistant' }>['error'] }
+interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageId?: string; blockIndex: number; apiError?: Extract<SDKMessage, { type: 'assistant' }>['error']; stopExtended?: boolean }
 export class ClaudeBackendSession implements BackendSession {
   private release?: Promise<void>;
   private readonly nativeInputs = new Map<string, { submissionId: string; turnId?: string }>();
@@ -159,6 +162,7 @@ export class ClaudeBackendSession implements BackendSession {
   private input?: BoundedEventQueue<SDKUserMessage>;
   private active?: ActiveTurn;
   private generation = 0;
+  private hookLifetime = new AbortController();
   private closed = false;
   private reverting = false;
   private config: JsonObject;
@@ -215,7 +219,7 @@ export class ClaudeBackendSession implements BackendSession {
     this.metadataTail = pending.promise;
     return pending.promise;
   }
-  constructor(private readonly adapter: ClaudeNativeAdapter, private readonly params: SessionOpenParams, private readonly sink: SessionEventSink, private readonly fileStore?: FileSessionStore) {
+  constructor(private readonly adapter: ClaudeNativeAdapter, private readonly params: SessionOpenParams, private readonly sink: SessionEventSink, private readonly fileStore?: FileSessionStore, private readonly nativeHooks?: NativeHookCallbacks) {
     this.binding = { ...params.binding, nativeRef: params.binding.nativeRef ?? { provider: "claude", value: randomUUID() } };
     this.capabilities = adapter.capabilities; this.config = structuredClone(params.config ?? {}); this.model = params.model ?? str(this.config.model);
     for (const [key, value] of Object.entries(this.config)) {
@@ -253,6 +257,8 @@ export class ClaudeBackendSession implements BackendSession {
   private async startQuery(fresh: boolean, resumeAt?: string): Promise<void> {
     if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
     const generation = ++this.generation;
+    this.hookLifetime.abort();
+    this.hookLifetime = new AbortController();
     this.queryFresh = fresh;
     this.queryResumeAt = resumeAt;
     this.input = new BoundedEventQueue<SDKUserMessage>({ maxEvents: 64 });
@@ -273,6 +279,20 @@ export class ClaudeBackendSession implements BackendSession {
       ...(typeof this.config.fastMode === 'boolean' ? { settings: { fastMode: this.config.fastMode } } : {}),
       ...(this.outputSchema ? { outputFormat: { type: 'json_schema' as const, schema: this.outputSchema.schema } } : {}),
       mcpServers,
+      ...(this.nativeHooks ? { hooks: claudeNativeHooks(this.nativeHooks, {
+        sessionId: this.params.binding.sessionId,
+        current: () => generation === this.generation ? this.active : undefined,
+        stopTurn: async () => {
+          if (generation !== this.generation) return;
+          if (this.active) return this.active;
+          // A native Stop callback is execution evidence, even if the SDK has
+          // not delivered the buffered assistant messages to the query iterator.
+          const userUuid = this.nativeInputs.keys().next().value;
+          if (userUuid) return await this.beginExecution(userUuid);
+        },
+        mayContinue: () => generation === this.generation && !this.outputSchema,
+        signal: () => generation === this.generation ? this.hookLifetime.signal : AbortSignal.abort(),
+      }) } : {}),
       canUseTool: async (toolName, input, details) => this.permissionRequest(toolName, input, details),
       onElicitation: async (request, details) => this.elicitationRequest(request, details),
     };
@@ -631,6 +651,9 @@ export class ClaudeBackendSession implements BackendSession {
     switch (method) {
       case 'input/submit': return await this.submitInput(params as AhpRequestMap['input/submit']) as AhpResultMap[M];
       case 'session/interrupt': {
+        if (this.active) this.active.stopExtended = true;
+        this.hookLifetime.abort();
+        this.hookLifetime = new AbortController();
         const receipt = await this.query!.interrupt();
         const stillQueued = receipt?.still_queued?.flatMap(id => { const pending = this.nativeInputs.get(id); return pending ? [pending.submissionId] : []; });
         result = { accepted: true, ...(stillQueued ? { stillQueued } : {}) }; break;
@@ -705,7 +728,7 @@ export class ClaudeBackendSession implements BackendSession {
           if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
           const native = point.uuid ? await (this.adapter.options.forkSession ?? forkSession)(this.nativeId, { dir: this.params.cwd, sessionStore: this.adapter.sessionStore, upToMessageId: point.uuid }) : { sessionId: randomUUID() };
           if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
-          this.generation++; this.input?.end();
+          this.generation++; this.hookLifetime.abort(); this.input?.end();
           await this.releaseQuery(query); await this.pumping;
           if (this.closed) throw new HarnessSdkError('SESSION_CLOSED');
           this.binding = { ...this.binding, nativeRef: { provider: 'claude', value: native.sessionId } };
@@ -748,6 +771,7 @@ export class ClaudeBackendSession implements BackendSession {
   private async replaceOutputFormat(outputSchema?: OutputSchema): Promise<void> {
     const query = this.query!, pumping = this.pumping;
     this.generation++;
+    this.hookLifetime.abort();
     this.input?.end();
     try {
       // Query.return() awaits the official SDK's mirror flush and cleanup.
@@ -840,7 +864,7 @@ export class ClaudeBackendSession implements BackendSession {
   }
   async dispose(): Promise<void> {
     return this.release ??= (async () => {
-      this.closed = true; this.generation++;
+      this.closed = true; this.generation++; this.hookLifetime.abort();
       this.nativeInputs.clear(); this.input?.end();
       if (this.query) await this.releaseQuery(this.query);
     })();

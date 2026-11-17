@@ -2,7 +2,7 @@
 /** Host lifecycle entry points; Client owns adapter/session cleanup, while Session owns execution observation. */
 export { createClient, Client } from './client';
 export { Session } from './session';
-export type { ClientOptions, InteractionHandlers, SubmitOptions } from './client-options';
+export type { BeforeInputDecision, BeforeInputEvent, BeforeInputHook, BeforeStopEvent, BeforeStopHook, BeforeToolEvent, BeforeToolHook, BeforeToolPolicy, ClientHooks, ClientOptions, InputTransformHook, InteractionHandlers, SubmitOptions } from './client-options';
 export { Turn } from './turn';
 export type { EventSubscriptionOptions, Input, RequestOptions, TurnResult } from './types';
 export type * from './ports';

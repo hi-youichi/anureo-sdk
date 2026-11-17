@@ -1,13 +1,25 @@
 import { HarnessSdkError, type Client, type HarnessAdapter } from '@anureo/sdk'
 import { AHP_PROTOCOL_CONTRACT, AHP_PROTOCOL_VERSION, assertRequest, negotiateVersion, type Capabilities } from '@anureo/protocol'
 import { releaseSession } from './execution'
+import { parseBeeProfile, type BeeProfile } from './profiles'
+import { ProfileReviews, type BeeProfileReview } from './profile-review'
 import { SwarmSession } from './session'
+
+export { parseBeeProfile, type BeeProfile } from './profiles'
+export type { BeeProfileReview } from './profile-review'
 
 export interface SwarmAdapterOptions {
   /** Initialized SDK Client. The caller owns it and releases it after the swarm client. */
   backend: Client
-  /** Optional SDK Clients keyed by member role. Other roles use backend. */
+  /** Optional SDK Clients keyed by fixed profile ID or temporary member role. */
   memberBackends?: Readonly<Record<string, Client>>
+  /** Fixed bees available to the router and to explicit @id assignments. */
+  profiles?: readonly BeeProfile[]
+  /** Enable detached fixed-bee reviews. Client disposal awaits pending reviews and callbacks. */
+  profileReview?: {
+    onResult: (review: BeeProfileReview) => void | Promise<void>
+    feedback?: string
+  }
 }
 
 const capabilities: Capabilities = {
@@ -19,6 +31,13 @@ const capabilities: Capabilities = {
 export function createSwarmAdapter(options: SwarmAdapterOptions): HarnessAdapter {
   const { backend } = options
   const memberBackends = new Map(Object.entries(options.memberBackends ?? {}))
+  const reviews = options.profileReview && new ProfileReviews(options.profileReview.onResult, options.profileReview.feedback)
+  const profiles = new Map<string, BeeProfile>()
+  for (const value of options.profiles ?? []) {
+    const profile = parseBeeProfile(value)
+    if (profiles.has(profile.id)) throw new HarnessSdkError('SWARM_INVALID_PROFILE', `Duplicate profile id "${profile.id}"`)
+    profiles.set(profile.id, profile)
+  }
   let disposed = false
   return {
     async initialize(params) {
@@ -41,10 +60,11 @@ export function createSwarmAdapter(options: SwarmAdapterOptions): HarnessAdapter
         await releaseSession(main)
         throw new HarnessSdkError('RUNTIME_DISPOSED')
       }
-      return new SwarmSession(params, sink, capabilities, main, backend, memberBackends)
+      return new SwarmSession(params, sink, capabilities, main, backend, memberBackends, profiles, reviews)
     },
     async dispose() {
       disposed = true
+      await reviews?.drain()
     },
   }
 }

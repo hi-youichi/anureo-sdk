@@ -1,6 +1,18 @@
 // Defines native adapter ports and host runtime hooks; must not implement transport, dispatch or lifecycle behavior.
 import type { AhpEventPayload, AhpMethod, AhpRequestMap, AhpResultMap, Capabilities, HarnessError, InitializeParams, InitializeResult, InteractionRequested, InteractionResponse, JsonSchema, SessionBinding, SessionOpenParams } from '@anureo/protocol';
 import type { QueueLimits } from './queue';
+import type { BeforeStopEvent, BeforeToolEvent } from './client-options';
+
+/** Optional local control callbacks. Invoke only while the native runtime is awaiting a decision. */
+export interface NativeHookCallbacks {
+  /** Host callback budget in milliseconds. Native response delivery requires its own margin. */
+  readonly timeoutMs: number;
+  readonly beforeTool?: {
+    readonly toolNames: readonly string[];
+    invoke(event: BeforeToolEvent, signal: AbortSignal): Promise<'continue' | 'deny'>;
+  };
+  readonly beforeStop?: (event: BeforeStopEvent, signal: AbortSignal) => Promise<string | undefined>;
+}
 /**
  * Adapter callback invoked by the runtime to deliver a response to the native peer.
  * null requests cancellation (for example, on expiry or teardown); reason explains why.
@@ -75,12 +87,14 @@ export interface BackendSession {
 }
 /** Client-owned adapter lifecycle; initialize before opening sessions and release session resources before adapter disposal. */
 export interface HarnessAdapter {
+  /** Validate requested native hook coverage synchronously, before acquiring session resources. */
+  validateNativeHooks?(params: SessionOpenParams, hooks: NativeHookCallbacks): void;
   /** Synchronously select a reachable bridge for these open params, or return undefined to disable fallback; opt in only when session-scoped MCP configuration is supported. */
   outputBridgeTransport?(params: SessionOpenParams): 'http' | 'stdio' | undefined;
   /** Negotiate native capabilities/protocol before opens; reject unsupported contracts or native setup failure. */
   initialize(params: InitializeParams): Promise<InitializeResult>;
   /** Open a native session bound to params and callbacks; events may precede the returned backend. Reject setup failure and release partially owned resources. */
-  openSession(params: SessionOpenParams, sink: SessionEventSink): Promise<BackendSession>;
+  openSession(params: SessionOpenParams, sink: SessionEventSink, hooks?: NativeHookCallbacks): Promise<BackendSession>;
   /** Release client-wide adapter resources after owned session cleanup; reject release failure. */
   dispose(): Promise<void>;
 }

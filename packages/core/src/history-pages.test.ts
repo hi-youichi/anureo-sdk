@@ -41,13 +41,13 @@ describe('capItem', () => {
   })
   test('stubs oversized structured values and preserves the original size', () => {
     const big = { result: 'z'.repeat(100_000) }
-    const item = capItem({ id: 't', type: 'toolCall', kind: 'other', output: big })
+    const item = capItem({ id: 't', type: 'toolCall', kind: 'other', title: 'big output', output: big })
     expect(item.extensions).toMatchObject({ historyTruncated: true })
     expect(item.type === 'toolCall' && item.output !== null && typeof item.output === 'object' && !Array.isArray(item.output) ? item.output.truncated : undefined).toBe(true)
     expect(item.type === 'toolCall' && item.output !== null && typeof item.output === 'object' && !Array.isArray(item.output) && typeof item.output.originalBytes === 'number' ? item.output.originalBytes : 0).toBeGreaterThan(100_000)
     // Small structured values keep their identity so pages without oversized items allocate nothing.
     const smallOutput = { ok: true }
-    const untouched = capItem({ id: 't2', type: 'toolCall', kind: 'other', output: smallOutput })
+    const untouched = capItem({ id: 't2', type: 'toolCall', kind: 'other', title: 'small output', output: smallOutput })
     expect(untouched.type === 'toolCall' ? untouched.output : undefined).toBe(smallOutput)
   })
   test('capHistoryEntry replaces the envelope only when its item changed', () => {

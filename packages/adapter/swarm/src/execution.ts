@@ -28,25 +28,41 @@ export class SwarmExecution {
   async fresh(
     client: Client,
     params: Parameters<Client['sessions']['create']>[0],
-    task: (session: Session) => Promise<TurnResult>,
+    task: (session: Session, promptInstructions?: string) => Promise<TurnResult>,
+    options: {
+      allowPromptInstructions?: boolean
+      /** Returning true transfers ownership of this completed session to the caller. */
+      handoff?: (session: Session, promptInstructions?: string) => boolean
+    } = {},
   ): Promise<TurnResult> {
-    const session = await client.sessions.create(params, { signal: this.stop.signal }).catch(cause => {
+    const wait = { signal: this.stop.signal }
+    let promptInstructions: string | undefined
+    const session = await client.sessions.create(params, wait).catch(cause => {
+      if (!options.allowPromptInstructions || !params.instructions || sdkError(cause).code !== 'CAPABILITY_UNSUPPORTED') throw cause
+      const { instructions, ...sessionParams } = params
+      promptInstructions = instructions
+      return client.sessions.create(sessionParams, wait)
+    }).catch(cause => {
       // Opening cannot have submitted this task. The SDK owns release if opening finishes late.
       const { code, retryable } = executionError(cause)
       throw new HarnessSdkError(code, code, retryable)
     })
     let outcomeUnknown = false
+    let transferred = false
     try {
-      const result = await task(session)
+      const result = await task(session, promptInstructions)
       outcomeUnknown = result.status !== 'completed' && result.error?.outcomeUnknown === true
+      if (result.status === 'completed') transferred = options.handoff?.(session, promptInstructions) === true
       return result
     } catch (cause) {
       outcomeUnknown = executionError(cause).outcomeUnknown
       throw cause
     } finally {
-      await releaseSession(session).catch(cause => {
-        if (!outcomeUnknown) throw cause
-      })
+      if (!transferred) {
+        await releaseSession(session).catch(cause => {
+          if (!outcomeUnknown) throw cause
+        })
+      }
     }
   }
 

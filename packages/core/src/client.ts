@@ -11,6 +11,7 @@ import { immutable } from './lifecycle/immutable';
 import { positive } from './lifecycle/limits';
 import { combined } from './lifecycle/errors';
 import { withStructuredOutput } from './structured-output/adapter';
+import { InputHooks } from './lifecycle/input-hooks';
 
 export { Session } from './session';
 export type { ClientOptions, InteractionHandlers, SubmitOptions } from './client-options';
@@ -46,6 +47,7 @@ export class Client {
   private disposing?: Promise<void>;
   private readonly owned = new Set<Session>();
   private readonly createId: () => string;
+  private readonly inputHooks: InputHooks | undefined;
   /** Hosts may construct without I/O, then initialize before opening; wrap the owned adapter and throw INVALID_PARAMS for invalid identity, handlers or limits. */
   constructor(private readonly options: ClientOptions) {
     this.options = {
@@ -59,11 +61,14 @@ export class Client {
     };
     this.createId = options.runtime?.createId ?? randomUUID;
     assertClientOptions(options);
+    if (options.hooks !== undefined) this.inputHooks = new InputHooks(options.hooks, options.runtime?.queue);
   }
   /** Return a detached identity for host/workflow cache keys; changing it cannot alter the client's binding checks. */
   get identity(): ClientOptions['identity'] {
     return { adapterId: this.options.identity.adapterId, runtimeConfigId: this.options.identity.runtimeConfigId };
   }
+  /** Version of the active hook policy, or undefined when no hooks are registered. */
+  get inputHookRevision(): string | undefined { return this.inputHooks?.revision; }
   /** Negotiate and validate adapter capabilities before opening sessions; reject protocol, adapter or wait failures. A caller timeout does not cancel initialization. */
   async initialize(wait?: RequestOptions): Promise<void> {
     if (invalidWait(wait)) throw new HarnessSdkError('INVALID_PARAMS');
@@ -101,7 +106,7 @@ export class Client {
   /** Validate binding/capabilities before native open, register ownership first, and dispose failed opens; reject original or aggregated cleanup errors without abandoning late attachment cleanup. */
   private async open(params: SessionOpenParams, wait?: RequestOptions): Promise<Session> {
     const capabilities = this.validateOpen(params, wait);
-    const session = new Session(structuredClone(params), this.options, capabilities, this.createId);
+    const session = new Session(structuredClone(params), this.options, capabilities, this.createId, this.inputHooks);
     // Own the sink before dispatch: native events and client disposal can race attachment.
     this.owned.add(session);
     try {
@@ -134,7 +139,7 @@ export class Client {
 
   /** Open and attach for the caller-wait wrapper; keep observing late work so the adapter wrapper or Session.attach releases backends after timeout/disposal. Native and attachment failures propagate. */
   private async attachSession(params: SessionOpenParams, session: Session): Promise<void> {
-    const backend = await this.options.adapter.openSession(structuredClone(params), session);
+    const backend = await this.options.adapter.openSession(structuredClone(params), session, this.inputHooks?.native);
     await session.attach(backend);
   }
   /** Idempotently close admission, settle all session disposals, then dispose the adapter; reject aggregated release failures only after all owned cleanup attempts finish. */

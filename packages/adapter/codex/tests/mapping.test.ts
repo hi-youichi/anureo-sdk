@@ -152,6 +152,36 @@ test('usage keeps only finite nonnegative counters and retains the requested sco
   }
 })
 
+/** Register subagent lifecycle projections: subAgentActivity kinds, documented singular legacy wire words and per-agent terminal messages. */
+test('subAgentActivity projects lifecycle kinds into the subagent vocabulary with sanitized evidence', () => {
+  expect(mapItems({ id: 'a', type: 'subAgentActivity', kind: 'started', agentThreadId: 'child-1', agentPath: '/root/scout', model: 'gpt-test', reasoningEffort: 'low' }, true)[0])
+    .toMatchObject({ type: 'subagent', subagentId: 'child-1', state: 'running', name: 'scout', extensions: { native: { kind: 'started', agentPath: '/root/scout', model: 'gpt-test', reasoningEffort: 'low' } } })
+  expect(mapItems({ id: 'b', type: 'subAgentActivity', kind: 'interacted', agentThreadId: 'c', agentPath: '/root' }, false)[0])
+    .toMatchObject({ type: 'subagent', state: 'running', name: 'root' })
+  expect(mapItems({ id: 'i', type: 'subAgentActivity', kind: 'interrupted', agentThreadId: 'c2' }, true)[0])
+    .toMatchObject({ state: 'interrupted' })
+  expect(mapItems({ id: 'd', type: 'subAgentActivity', kind: 'completed', agentThreadId: 'c3' }, true)[0])
+    .toMatchObject({ state: 'completed' })
+  expect(() => mapItems({ id: 'e', type: 'subAgentActivity', kind: 'completed' }, true)).toThrow('Native subagent activity lacks agent identity')
+})
+
+test('documented singular collab wire words expand with dedupe and global status fallback', () => {
+  const solo = mapItems({ id: 'legacy', type: 'collabToolCall', tool: 'spawnAgent', status: 'inProgress', senderThreadId: 'parent', receiverThreadId: 'solo', newThreadId: 'solo', prompt: 'do it', agentStatus: 'errored' }, true)[0]
+  expect(solo).toEqual({ id: 'legacy:solo', parentItemId: 'legacy', type: 'subagent', subagentId: 'solo', state: 'failed', status: 'running', task: 'do it', extensions: { native: { tool: 'spawnAgent', senderThreadId: 'parent' } } })
+  const pair = mapItems({ id: 'pair', type: 'collabToolCall', status: 'completed', senderThreadId: 'p', receiverThreadId: 'one', newThreadId: 'two', agentStatus: 'running' }, true)
+  expect(pair.map(item => item.subagentId)).toEqual(['one', 'two'])
+  expect(pair.every(item => item.state === 'running')).toBe(true)
+})
+
+test('per-agent terminal messages land in sanitized extensions by outcome', () => {
+  const [failed] = mapItems({ id: 'x', type: 'collabAgentToolCall', status: 'completed', receiverThreadIds: ['c1'], agentsStates: { c1: { status: 'errored', message: 'child exploded' } } }, true)
+  expect(failed).toMatchObject({ type: 'subagent', subagentId: 'c1', state: 'failed', extensions: { native: { errorMessage: 'child exploded' } } })
+  const [done] = mapItems({ id: 'y', type: 'collabAgentToolCall', status: 'completed', receiverThreadIds: ['c2'], agentsStates: { c2: { status: 'completed', message: 'final answer' } } }, true)
+  expect(done).toMatchObject({ state: 'completed', extensions: { native: { resultMessage: 'final answer' } } })
+  const [live] = mapItems({ id: 'z', type: 'collabAgentToolCall', status: 'failed', receiverThreadIds: ['c3'] })
+  expect(live).toMatchObject({ state: 'failed', status: 'failed' })
+})
+
 /** Connection evidence survives invalid status, but provider text and unrecognized object categories cannot determine a public error. */
 test('turn error evidence uses native entry order and validates HTTP status without disclosure', () => {
   expect(mapTurnError({ codexErrorInfo: {

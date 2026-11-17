@@ -60,17 +60,19 @@ async function memoizedAgent<S extends z.ZodObject>(
   const key = journal.nextKey(prompt, canonicalOptions(options, output?.schema))
   return state.track(async () => {
     state.assertDispatch()
+    const inputHookRevision = options.client.inputHookRevision
+    const conflict = journal.resumeConflict(key, inputHookRevision)
+    if (conflict) {
+      state.stop(conflict)
+      throw conflict
+    }
     const hit = journal.resultFor(key)
     if (hit !== undefined) {
       return output ? output.parse(canonicalJson(hit)) : hit as string
     }
-    const prior = journal.beginExecution(key)
-    if (prior?.outcomeUnknown) {
-      throw new HarnessSdkError('WORKFLOW_RECONCILIATION_REQUIRED',
-        'A previous run left this agent call with an unknown outcome; reconcile it before resuming', false, true)
-    }
+    journal.beginExecution(key)
     const agentId = randomUUID()
-    await journal.append({ type: 'started', key, agentId })
+    await journal.append({ type: 'started', key, agentId, ...(inputHookRevision === undefined ? {} : { inputHookRevision }) })
     state.assertDispatch()
     try {
       const value = await executeAgent(prompt, options)

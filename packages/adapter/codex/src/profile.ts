@@ -20,11 +20,17 @@ export type CodexProfile = {
   history: 'thread/items/list' | 'turns'
   /** Live session settings: thread/settings/update, or per-turn overrides applied to the next turn. */
   settings: 'thread/settings/update' | 'per-turn'
+  /** Spawned-subagent thread/started discovery notices and canAcceptDirectInput handling are surfaced. */
+  subagentDiscovery: boolean
+  /** thread/list parentThreadId/ancestorThreadId relation filters are callable (experimental native API). */
+  subagentTree: boolean
 }
 /** Ascending native compatibility profiles shared by capability selection and session fallback; callers must not mutate these templates. */
 export const CODEX_PROFILES: CodexProfile[] = [
-  { since: '0.148.0', fork: ['through'], turns: 'thread/read', revert: 'thread/rollback', history: 'turns', settings: 'per-turn' },
-  { since: '0.164.0', fork: ['before', 'through'], turns: 'thread/turns/list', revert: 'thread/revert', history: 'thread/items/list', settings: 'thread/settings/update' },
+  // thread/started is a general owned-thread notification, while relation filters arrived later;
+  // unverified tree support on 0.148 stays undeclared until a pinned probe proves it.
+  { since: '0.148.0', fork: ['through'], turns: 'thread/read', revert: 'thread/rollback', history: 'turns', settings: 'per-turn', subagentDiscovery: true, subagentTree: false },
+  { since: '0.164.0', fork: ['before', 'through'], turns: 'thread/turns/list', revert: 'thread/revert', history: 'thread/items/list', settings: 'thread/settings/update', subagentDiscovery: true, subagentTree: true },
 ]
 /** Exact versions checked against the pinned native schema; other versions stay unverified even when a compatibility profile matches. */
 const VERIFIED_VERSIONS: readonly string[] = ['0.148.0', '0.164.0']
@@ -74,7 +80,8 @@ export function codexCapabilities(version: string): Capabilities {
     session: { resume: true, fork: profile.fork, revert: ['conversation'], history: true },
     input: { delivery: ['native'], steer: { target: 'turn', atomicMatch: true }, interrupt: { targets: ['turn'], reportsPendingInputs: false } },
     turn: { outputSchema: true, inputModalities: ['text', 'image', 'file'], overrides: ['model','effort','summary','approvalPolicy','sandboxPolicy','serviceTier'] },
-    goal: { actions: ['set','clear'] as ['set','clear'] }, compact: true, review: true, subagents: { events: 'nested' as const },
+    goal: { actions: ['set','clear'] as ['set','clear'] }, compact: true, review: true,
+    subagents: { events: 'nested' as const, threadDiscovery: profile.subagentDiscovery, tree: profile.subagentTree },
     interactions: ['approval','userInput','elicitation','dynamicTool'],
     config: { options: [
       { id: 'permissionMode', title: 'Permissions', scope: 'session', schema: { type: 'string', enum: [...PERMISSION_MODES] } },

@@ -27,7 +27,8 @@ export const manifestSchema = z.strictObject({
 })
 export const journalKeySchema = z.string().regex(/^v1:[a-f0-9]{64}$/)
 export const journalEventSchema = z.discriminatedUnion('type', [
-  z.strictObject({ type: z.literal('started'), key: journalKeySchema, agentId: uuidSchema }),
+  z.strictObject({ type: z.literal('started'), key: journalKeySchema, agentId: uuidSchema,
+    inputHookRevision: z.string().refine(value => value.trim().length > 0).optional() }),
   z.strictObject({ type: z.literal('result'), key: journalKeySchema, agentId: uuidSchema, result: jsonSchema }),
   z.strictObject({ type: z.literal('failed'), key: journalKeySchema, agentId: uuidSchema,
     code: z.string().min(1), outcomeUnknown: z.boolean() }),

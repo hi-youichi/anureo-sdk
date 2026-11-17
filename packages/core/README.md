@@ -52,6 +52,7 @@ Import the application API and its types from `@anureo/sdk`.
 | `createClient(options, wait?)` | Initialize an adapter and return a `Client` ready to open sessions. |
 | `new Client(options)`, `client.initialize(wait?)` | Construct a client without I/O, then negotiate adapter capabilities explicitly. |
 | `client.identity` | Read the adapter and runtime configuration IDs used to validate session bindings. |
+| `client.inputHookRevision` | Read the version of the active hook policy. Unconfigured clients return `undefined`. |
 | `client.sessions.create(options, wait?)` | Open a new session with a fresh binding. |
 | `client.sessions.resume(reference, wait?)` | Reopen the session identified by a saved `session.reference`, when supported. |
 | `client.sessions.fork(reference, { boundary }, wait?)` | Open a new session from a specified boundary in an existing session, when supported. |
@@ -59,9 +60,77 @@ Import the application API and its types from `@anureo/sdk`.
 | `client.dispose()` | Release the client's sessions and adapter. Call it in `finally`. |
 
 [`ClientOptions`](src/client-options.ts) configures the adapter, client identity,
-runtime hooks, interaction handlers, and retention limits.
+input hooks, runtime hooks, interaction handlers, and retention limits.
 [`RuntimeOptions`](src/ports.ts) configures timeouts, resource budgets, and host
 hooks such as ID generation and history redaction.
+
+### Input hooks
+
+Register application callbacks through `ClientOptions.hooks` to transform and
+validate input before sending it to the backend. The same callbacks apply to
+`session.submit()`, `turn.steer()`, and direct `input/submit` and `turn/steer`
+requests on every session opened through that client.
+
+```ts
+const client = await createClient({
+  adapter,
+  identity,
+  hooks: {
+    inputRevision: 'trim-input-v1',
+    transformInput: [
+      ({ input }) => input.map(block =>
+        block.type === 'text' ? { ...block, text: block.text.trim() } : block,
+      ),
+    ],
+    beforeInput: [
+      ({ input }) => input.some(block => block.type !== 'text' || block.text.length > 0)
+        ? undefined
+        : { action: 'deny' },
+    ],
+  },
+})
+```
+
+`InputTransformHook` returns replacement blocks or `undefined` to keep the
+current blocks. After all transformations, every `BeforeInputHook` receives a
+detached snapshot of the final input. Return `undefined` to continue or
+`{ action: 'deny' }` to reject with `HOOK_DENIED`. The root entry point also
+exports `ClientHooks`, `BeforeInputEvent`, and `BeforeInputDecision`.
+
+Hook handlers run in registration order. Within a session, inputs reach the
+backend wrapper in the order they enter the hook queue. Each input shares a
+single budget across queueing and callbacks, set with `hooks.timeoutMs` and
+defaulting to 5 seconds. Respect the callback's `AbortSignal` on cancellation
+or timeout. Callbacks can read raw application input, so handle it accordingly.
+The client shares a 32-callback limit and a pending-input byte budget across
+its sessions. Exhausting either budget rejects with `BACKPRESSURE_EXCEEDED`.
+
+Hook exceptions and invalid return values produce `HOOK_FAILED`. An expired
+hook produces `HOOK_TIMEOUT`. Both reject before backend handoff with
+`outcomeUnknown: false`. Aborting a caller's wait leaves the admitted request
+running. Closing the session or sending a supported
+`session.interrupt({ cancelQueued: true })` cancels inputs still in the local
+hook queue. The interrupt receipt includes local cancellation IDs after native
+acknowledgement. Increase `inputRevision` when policy behavior changes and
+consult the [workflow resume contract](../workflow/README.md#durable-workflow)
+for persisted agent calls.
+
+### Native control hooks
+
+On adapters that implement native hooks, `hooks.beforeTool` takes exact native
+tool names and a callback. Returning `{ action: 'deny' }` rejects the call.
+Returning `undefined` leaves the decision to the normal native permission
+flow. Invalid decisions, callback failures, and host-side timeout deny a
+matching call while the native callback channel remains responsive.
+
+`hooks.beforeStop` receives the current turn ID and the last assistant message,
+when provided. Return `{ action: 'continue', prompt }` to request one more
+native continuation of the same text turn, or `undefined` to let it stop.
+The continuation prompt accepts up to 4 KiB of UTF-8 text. Native controls use
+the same `hooks.timeoutMs` callback budget and `inputRevision` as input hooks.
+Both receive an `AbortSignal`. Check the adapter guide for covered tools,
+eligible turns, and transport guarantees. Opening a session fails with
+`CAPABILITY_UNSUPPORTED` if the adapter cannot provide the configured hooks.
 
 ### Session
 
@@ -130,6 +199,7 @@ Adapters import their contracts from `@anureo/sdk` and use the types in
 | Contract | Who implements and calls it |
 | --- | --- |
 | `HarnessAdapter` | The adapter implements `initialize()`, `openSession()`, and `dispose()`. The client calls them to negotiate capabilities, open native sessions, and release client-wide resources. |
+| `NativeHookCallbacks` | An adapter with native hook coverage implements `validateNativeHooks()` and consumes the local callbacks supplied to `openSession()`. It invokes them at the native decision point. |
 | `BackendSession` | The adapter returns this from `openSession()`. Core reads its binding, capabilities, and optional state, and calls `execute()` and `dispose()` for native requests and cleanup. `SessionMethod` identifies requests routed through an open session. |
 | `SessionEventSink` | Core supplies this to the adapter at open. The adapter calls `emit()` or `tryEmit()` to publish events, `bindSubmission()` to associate input with an execution, and `fail()` to report observation failure. `EventScope` supplies turn or item context for an event. |
 | `NativeInteractionResponder` | The adapter supplies this callback to `sink.requestInteraction()`. Core calls it to deliver a response or request cancellation. The adapter calls `sink.resolveInteraction()` when the native peer has already settled a request. |
@@ -166,7 +236,7 @@ resolves to launch the stdio bridge subprocess.
 | [`src/client.ts`](src/client.ts), [`src/session.ts`](src/session.ts), [`src/turn.ts`](src/turn.ts) | Implement the application API for opening sessions, dispatching requests, and observing and controlling executions. |
 | [`src/client-options.ts`](src/client-options.ts), [`src/types.ts`](src/types.ts), [`src/ports.ts`](src/ports.ts) | Define public configuration, input, result, and observation types, plus adapter contracts. |
 | [`src/errors.ts`](src/errors.ts), [`src/request.ts`](src/request.ts) | Provide SDK errors, failure normalization, and caller-scoped waits. |
-| [`src/lifecycle/`](src/lifecycle/) | Supports the application API with event subscriptions, result accumulation, and interaction settlement. |
+| [`src/lifecycle/`](src/lifecycle/) | Supports the application API with event subscriptions, result accumulation, input hook scheduling, and interaction settlement. |
 | [`src/adapter/`](src/adapter/), [`src/requests/`](src/requests/) | Provide native-to-SDK ID mapping and request validation against session bindings and capabilities. |
 | [`src/privacy/`](src/privacy/) | Redacts marked secrets from observed data and bounds retained file change content. |
 | [`src/structured-output/`](src/structured-output/) | Wraps adapters for schema validation and manages the direct-tool and MCP fallback paths. |

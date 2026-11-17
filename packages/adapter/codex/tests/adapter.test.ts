@@ -90,6 +90,22 @@ function collectSessionEvents(session: Awaited<ReturnType<Client['openSession']>
 
 const start = { input: [{ type: 'text' as const, text: 'hello' }] }
 
+test('maps v2 hook summaries and preserves session-level hooks without a turn', async () => {
+  const s = await setup({ scenario: 'native-hooks' })
+  const turn = await s.session.submit(start)
+  await turn.result()
+  await s.waitFor(() => s.events.some(event => event.type === 'notice' && event.payload.code === 'NATIVE_HOOK_COMPLETED'))
+  expect(s.events.filter(event => event.type === 'item/started' && event.payload.item.type === 'hook')).toMatchObject([
+    { turnId: turn.id, payload: { item: { id: 'turn-hook', name: 'PreToolUse', status: 'running' } } },
+  ])
+  expect((await turn.result()).items).toContainEqual(expect.objectContaining({
+    id: 'turn-hook', name: 'PreToolUse', status: 'declined', durationMs: 5, output: [{ kind: 'feedback', text: 'denied' }],
+  }))
+  const sessionHook = s.events.find(event => event.type === 'notice' && event.payload.code === 'NATIVE_HOOK_COMPLETED')
+  expect(sessionHook).toMatchObject({ payload: { raw: { id: 'session-hook', name: 'SessionStart', status: 'completed' } } })
+  expect(sessionHook?.turnId).toBeUndefined()
+})
+
 /** Pure projection assertions keep generated attachments distinguishable from viewed inputs, including empty generated data; matcher failures expose lost provenance. */
 test('retains image provenance and distinguishes generated output from viewed inputs', () => {
   expect(mapItems({ id: 'g', type: 'imageGeneration', result: 'base64-data', savedPath: '/tmp/g.png', revisedPrompt: 'A tree' }, true)[0]).toMatchObject({
@@ -389,8 +405,10 @@ describe('versioned controls and history', () => {
     expect(newer.session?.fork).toEqual(['before', 'through'])
     expect(newer.input?.steer?.atomicMatch).toBe(true)
     expect(newer.review).toBe(true)
+    expect(newer.subagents).toEqual({ events: 'nested', threadDiscovery: true, tree: true })
+    expect(codexCapabilities('0.148.0').subagents).toEqual({ events: 'nested', threadDiscovery: true, tree: false })
     const old = codexCapabilities('0.100.0')
-    expect(old.session?.fork).toEqual([]); expect(old.input?.steer).toBeUndefined(); expect(old.review).toBeUndefined(); expect(old.config?.options).toEqual([])
+    expect(old.session?.fork).toEqual([]); expect(old.input?.steer).toBeUndefined(); expect(old.review).toBeUndefined(); expect(old.subagents).toBeUndefined(); expect(old.config?.options).toEqual([])
   })
 })
 
@@ -751,5 +769,92 @@ describe('version probe', () => {
     resources.push(adapter)
     await expect(adapter.initialize({ protocolVersions: [1],protocolContract:'native-lifecycle', clientInfo: { name: 'test', version: '1' }, clientCapabilities: { interactions: [] } })).rejects.toMatchObject({ code: 'HARNESS_UNAVAILABLE', message: 'Codex version probe timed out' })
     expect(disposals).toBe(1)
+  })
+})
+
+/** Register subagent protocol regressions: discovery notices, parent-owned degradation, native denial classification and thread-tree discovery. */
+describe('Codex subagent protocol support', () => {
+  /** The parent's own started notification and foreign-thread evidence must stay silent; the late activity completion keeps its spawning-turn attribution. */
+  test('spawned children publish discovery notices and keep late completion attribution', async () => {
+    const s = await setup({ scenario: 'subagent-discovery' })
+    await s.session.submit(start)
+    await s.waitFor(() => s.events.some(event => event.type === 'item/completed' && event.payload.item && 'subagentId' in event.payload.item && event.payload.item.subagentId === 'child-1'))
+    const notices = s.events.filter(event => event.type === 'notice' && event.payload.code === 'SUBAGENT_THREAD_STARTED')
+    expect(notices).toMatchObject([
+      { payload: { severity: 'info', code: 'SUBAGENT_THREAD_STARTED', message: 'Subagent thread started (Scout)', extensions: { nativeThreadId: 'child-1', parentThreadId: 'native-thread', agentNickname: 'Scout', agentRole: 'researcher', forkedFromId: 'native-thread' } } },
+      { payload: { severity: 'info', code: 'SUBAGENT_THREAD_STARTED', extensions: { nativeThreadId: 'child-2', parentThreadId: 'native-thread', agentNickname: 'Mapper' } } },
+    ])
+    expect(s.events.some(event => event.type === 'item/started' && event.payload.item && 'id' in event.payload.item && event.payload.item.id === 'foreign')).toBe(false)
+    const started = s.events.find(event => event.type === 'item/started' && event.payload.item && 'subagentId' in event.payload.item)
+    expect(started).toMatchObject({ turnId: 'native-turn-1', payload: { item: { type: 'subagent', subagentId: 'child-1', state: 'running', name: 'scout', extensions: { native: { kind: 'started', agentPath: '/root/scout', model: 'gpt-test', reasoningEffort: 'low' } } } } })
+    const completed = s.events.find(event => event.type === 'item/completed' && event.payload.item && 'subagentId' in event.payload.item)
+    expect(completed).toMatchObject({ turnId: 'native-turn-1', payload: { item: { type: 'subagent', subagentId: 'child-1', state: 'completed' } } })
+  })
+  /** Parent-owned Multi-Agent V2 children advertise spawn metadata and lose direct input before any native call; the SDK-level check must reject, not the wire. */
+  test('parent-owned subagent threads surface metadata and degrade direct input', async () => {
+    const s = await setup({ scenario: 'subagent-owned' })
+    expect(s.session.snapshot.metadata).toEqual({ extensions: { parentThreadId: 'root-thread', agentNickname: 'Scout', agentRole: 'researcher' } })
+    expect(s.session.snapshot.capabilities.input).toEqual({ delivery: [], interrupt: { targets: ['turn'], reportsPendingInputs: false } })
+    expect(s.session.snapshot.capabilityRevision).toBeGreaterThan(1)
+    await expect(s.session.submit(start)).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' })
+    expect((await s.calls()).some(call => call.method === 'turn/start')).toBe(false)
+  })
+  /** Resume of a spawn child must reveal its parent linkage without inventing a title. */
+  test('resumed subagent threads expose spawn metadata without a title', async () => {
+    const s = await setup({ scenario: 'subagent-owned' })
+    const resumed = await s.runtime.openSession({ requestId: 'resume-child', mode: 'resume', binding: { sessionId: 'child', adapterId: 'codex', runtimeConfigId: 'codex-test', nativeRef: { provider: 'codex', value: 'native-thread' } }, cwd: s.dir })
+    resources.push({ async dispose() { await resumed.close() } })
+    expect(resumed.snapshot.metadata).toEqual({ extensions: { parentThreadId: 'root-thread', agentNickname: 'Scout', agentRole: 'researcher' } })
+  })
+  /** The fixed native denial must reach hosts as its own definite error. Skipped on bun/Windows hosts: the runtime can leave a piped child's trailing read completion unserviced until the requesting timeout fires (bytes sit in the kernel pipe buffer), so harness-only request-response pairs stall there; the real Codex binary is unaffected (verified via a direct latency probe). */
+  test.skipIf(process.platform === 'win32' && typeof Bun !== 'undefined')('native direct-input denial maps to a distinct definite SDK error', async () => {
+    const s = await setup({ scenario: 'subagent-denial' })
+    await expect(rejectionOf(s.session.submit(start))).resolves.toMatchObject({ code: 'SUBAGENT_DIRECT_INPUT_REJECTED', retryable: false })
+  })
+  /** Relation filters are mutually exclusive locally, pages project optional metadata, and cursors survive. Skipped on bun/Windows hosts: probe request-response pairs can hit the runtime's parked pipe-read delivery (see the denial test note), making this coverage flaky there; non-Windows hosts keep it. */
+  test.skipIf(process.platform === 'win32' && typeof Bun !== 'undefined')('thread discovery pages native threads with relation filters', async () => {
+    const s = await setup({ scenario: 'threads-page' })
+    const page = await s.adapter.listThreads()
+    expect(page.data).toEqual([
+      { id: 'native-thread', status: 'idle', title: 'Main', preview: 'working' },
+      { id: 'child-1', status: 'notLoaded', parentThreadId: 'native-thread', agentNickname: 'Scout', agentRole: 'researcher' },
+      { id: 'child-2', status: 'notLoaded', parentThreadId: 'native-thread' },
+    ])
+    expect(page.nextCursor).toBeUndefined()
+    const children = await s.adapter.listThreads({ parentThreadId: 'native-thread' })
+    expect(children.data.map(thread => thread.id)).toEqual(['child-1'])
+    const descendants = await s.adapter.listThreads({ ancestorThreadId: 'native-thread' })
+    expect(descendants.data.map(thread => thread.id)).toEqual(['child-1', 'grand-child'])
+    expect(descendants.nextCursor).toBe('page-two')
+    await expect(s.adapter.listThreads({ parentThreadId: 'a', ancestorThreadId: 'b' })).rejects.toMatchObject({ code: 'SUBAGENT_FILTER_CONFLICT' })
+  })
+  /** Locally observed spawn metadata enriches sparse pages; native values always win. */
+  test('thread discovery enriches locally observed spawn metadata without overwriting native values', async () => {
+    const s = await setup({ scenario: 'subagent-discovery' })
+    await s.session.submit(start)
+    await s.waitFor(() => s.events.some(event => event.type === 'item/completed' && event.payload.item && 'subagentId' in event.payload.item))
+    const page = await s.adapter.listThreads()
+    expect(page.data).toEqual([
+      { id: 'child-1', status: 'notLoaded', parentThreadId: 'native-thread', agentNickname: 'Scout', agentRole: 'researcher' },
+      { id: 'child-2', status: 'notLoaded', parentThreadId: 'native-thread', agentNickname: 'Mapper', agentRole: 'native-role' },
+    ])
+  })
+  /** Method-not-found tree discovery downgrades every registered session exactly once through the published capability revision. */
+  test('missing native thread discovery downgrades registered sessions once', async () => {
+    const s = await setup({ scenario: 'no-threads' })
+    await expect(s.adapter.listThreads()).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' })
+    expect(s.session.snapshot.capabilities.subagents).toEqual({ events: 'nested', threadDiscovery: true, tree: false })
+    expect(s.session.snapshot.capabilityRevision).toBe(2)
+  })
+  /** Pages with unidentifiable entries must fail closed as protocol errors, not silently drop rows. */
+  test('malformed thread pages reject with a protocol error', async () => {
+    const s = await setup({ scenario: 'threads-badentry' })
+    await expect(s.adapter.listThreads()).rejects.toMatchObject({ code: 'PROTOCOL_ERROR' })
+  })
+  /** Undeclared tree capability must refuse discovery before any process launch. */
+  test('profiles without declared tree support reject thread discovery before launch', async () => {
+    const s = await setup({ scenario: 'threads-page', version: '0.148.0' })
+    await expect(s.adapter.listThreads()).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' })
+    expect((await s.calls()).some(call => call.method === 'thread/list')).toBe(false)
   })
 })

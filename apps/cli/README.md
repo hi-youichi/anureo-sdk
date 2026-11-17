@@ -45,6 +45,8 @@ anureo [options] [prompt]          # prompt omitted or "-" reads stdin
   --schema <file>                  JSON Schema file constraining the final message
   --output <stream|result>         stream (default): AHP event JSONL
                                    result: one final JSON object
+  --review-profile                 Propose improvements after a fixed bee completes
+  --review-feedback <text>         Enable profile review and provide feedback
   --verbose                        CLI diagnostics on stderr (default: silent)
   -h, -V                           Help / version
 ```
@@ -65,6 +67,38 @@ There are no config files, no daemon, no interactive mode, and no passthrough es
 | `swarm:<name>` | [Swarm adapter](../../packages/adapter/swarm/README.md) with one Client for the named backend | Choose `codex`, `claude`, `hermes`, `pi`, or `acp`. `swarm` is shorthand for `swarm:codex`. `--command` and `--args` follow the selected backend's rules. |
 
 The `ahp` protocol adapter (WebSocket, host-to-host) is intentionally not exposed: it is an embedding transport for SDK hosts, not a local harness.
+
+### Fixed Swarm bees
+
+Store reusable bee profiles as UTF-8 JSON files in `~/.anureo/bees/` or `<project>/.anureo/bees/`. Swarm starts at the CLI working directory (`--cd`, if supplied) and uses the nearest ancestor marked by a `.git` directory or file. In a plain directory it uses the working directory itself.
+
+Save this example as `.anureo/bees/tester.json`:
+
+```json
+{
+  "name": "Test engineer",
+  "description": "Reviews regression tests and edge cases",
+  "instructions": "List missing assertions and suggest reproducible test cases."
+}
+```
+
+The filename provides the profile ID. A project file replaces the entire user profile with the same ID. Set `model` to a model on the selected backend, or leave it out for the backend default. Swarm can select profiles automatically or accept an explicit assignment at the start of the prompt:
+
+```bash
+anureo --harness swarm:codex --sandbox read-only "@tester Review the current diff for missing regression tests."
+```
+
+`--verbose` prints the effective profile paths to stderr.
+
+### Profile review
+
+```bash
+anureo --harness swarm:codex --sandbox read-only --review-feedback "Include the rollback assertions." "@tester Review the migrations."
+```
+
+Use `--review-profile` for a review based on the completed assignment alone. Swarm forks the member's completed turn and appends a review request. The CLI writes the foreground answer to stdout and finishes pending reviews before exit. It reports the review outcome and the backend's `cacheRead` count, when available, on stderr.
+
+Validated candidates are saved under the project root at `.anureo/evolution/<profile-id>/proposals/<id>.json`. Each includes the source profile, baseline instructions hash, patch, proposed instructions, evidence and a check for a future task. Edit the profile file with a candidate you decide to adopt.
 
 ### Controlling tool permissions
 
@@ -142,6 +176,8 @@ The events you see per harness, as a verification contract. The mapping lives in
 - [`bin/anureo.ts`](bin/anureo.ts) — executable entry; delegates to `runCli`.
 - [`src/cli.ts`](src/cli.ts) — argument parsing/validation and help text; owns no client lifecycle.
 - [`src/run.ts`](src/run.ts) — client assembly (adapter selection, identity, sandbox mapping) and turn execution.
+- [`src/profiles.ts`](src/profiles.ts) — user and project profile discovery and precedence.
+- [`src/profile-review.ts`](src/profile-review.ts) — atomic writes for project profile proposals.
 - [`src/project.ts`](src/project.ts) — event → JSONL projection for stream mode and the single-object writer for result mode.
 
 The CLI follows the workspace apps' conventions: injected `CliDependencies` (stdout/stderr/factories) for tests, `parseArgs` from `node:util`, exit codes 0/2.

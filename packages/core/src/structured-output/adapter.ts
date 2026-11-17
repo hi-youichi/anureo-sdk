@@ -57,10 +57,14 @@ export function withStructuredOutput(adapter: HarnessAdapter, limits: OutputLimi
     /** Negotiate once through the adapter and remember native output support for subsequent session preparation; native failures propagate. */
     async initialize(params) { const result = await adapter.initialize(params); nativeOutput = result.capabilities.turn?.outputSchema === true; return result },
     /** Own a wrapper before opening so failures release partially acquired output resources before rejection. */
-    async openSession(params, sink) {
+    async openSession(params, sink, hooks) {
+      if (hooks) {
+        if (!adapter.validateNativeHooks) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Adapter lacks native hook coverage')
+        adapter.validateNativeHooks(params, hooks)
+      }
       const session = new OutputSession({ params, sink, manager, limits, forget: () => sessions.delete(session) })
       sessions.add(session)
-      try { return await session.open(adapter, nativeOutput) }
+      try { return await session.open(adapter, nativeOutput, hooks) }
       catch (cause) { try { await session.dispose() } catch { throw new HarnessSdkError('RESOURCE_RELEASE_FAILED', 'Structured output setup cleanup failed', false, sdkError(cause).outcomeUnknown) }; throw cause }
     },
     /** Attempt all session cleanup before concurrently releasing the shared manager/adapter; reject safe aggregated failures. */
@@ -123,7 +127,7 @@ class OutputSession implements BackendSession {
     return { ...state, capabilities: this.projectCapabilities(state.capabilities), capabilityRevision: state.capabilityRevision + (this.lease || this.backend?.structuredOutputTool ? 1 : 0) }
   }
   /** Prepare an optional session bridge before native open, warning on preparation failure; adopt/dispose late backends safely. Reject reserved names, native open and cleanup failure. */
-  async open(adapter: HarnessAdapter, nativeOutput: boolean): Promise<this> {
+  async open(adapter: HarnessAdapter, nativeOutput: boolean, hooks?: Parameters<HarnessAdapter['openSession']>[2]): Promise<this> {
     // The optional port is an execution-location attestation, not a provider-name heuristic.
     const transport = nativeOutput ? undefined : adapter.outputBridgeTransport?.(this.params)
     let open = this.params
@@ -151,7 +155,7 @@ class OutputSession implements BackendSession {
       resolveInteraction: result => this.sink.resolveInteraction(result),
       fail: cause => this.sink.fail(cause),
     }
-    const backend = await adapter.openSession(structuredClone(open), bridgeSink)
+    const backend = await adapter.openSession(structuredClone(open), bridgeSink, hooks)
     this.backend = backend
     if (this.disposed) { await backend.dispose(); throw new HarnessSdkError('SESSION_CLOSED') }
     backend.state?.activeTurnIds.forEach(id => this.active.add(id))

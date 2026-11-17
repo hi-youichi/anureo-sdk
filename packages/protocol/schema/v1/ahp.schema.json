@@ -225,6 +225,12 @@
                 "nested",
                 "none"
               ]
+            },
+            "threadDiscovery": {
+              "type": "boolean"
+            },
+            "tree": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -2716,6 +2722,9 @@
             },
             "raw": {
               "$ref": "#/$defs/JsonValue"
+            },
+            "extensions": {
+              "$ref": "#/$defs/JsonObject"
             }
           },
           "required": [
@@ -4095,6 +4104,9 @@
               "type": "null"
             }
           ]
+        },
+        "extensions": {
+          "$ref": "#/$defs/JsonObject"
         }
       },
       "additionalProperties": true
