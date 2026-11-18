@@ -1,5 +1,6 @@
 // Workflow execution for one swarm session: runs, step admission, façade clients and tool dispatch.
 import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { HarnessSdkError, sdkError, type Client, type SessionEventSink, type TurnResult } from '@anureo/sdk'
@@ -182,6 +183,20 @@ export class WorkflowRunner {
 
   private async execute(record: RunRecord, registration: SwarmWorkflowRegistration, argsInput: unknown, resumeFrom?: string): Promise<void> {
     try {
+      // A resumed run inherits the source run's input from its manifest; the directive
+      // carries no args. Hosts that never configured a journal directory share the
+      // OS-temp default written at dispatch time.
+      if (resumeFrom !== undefined) {
+        const storageRoot = this.options.journalDirectory ?? join(tmpdir(), 'anureo-swarm-workflows')
+        try {
+          const manifest = JSON.parse(await readFile(join(storageRoot, resumeFrom, 'run.json'), 'utf8')) as { identity?: { input?: unknown } }
+          argsInput = manifest.identity?.input ?? null
+        } catch {
+          record.status = 'failed'
+          record.error = { code: 'SWARM_WORKFLOW_RESUME_NOT_FOUND', message: `cannot read the source run manifest for ${resumeFrom}` }
+          return
+        }
+      }
       if (registration.argsSchema !== undefined) {
         const parsed = registration.argsSchema.safeParse(argsInput ?? null)
         if (!parsed.success) {

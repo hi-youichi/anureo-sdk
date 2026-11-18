@@ -61,7 +61,10 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
   if (parsed.kind === 'version') { out(`${VERSION}\n`); return 0 }
 
   let prompt = dependencies.prompt ?? parsed.prompt
-  if (parsed.workflow !== undefined || parsed.resumeWorkflow !== undefined) {
+  if (parsed.resumeWorkflow !== undefined) {
+    // Resume takes the source run ID verbatim; workflow args live in the source journal.
+    prompt = `/workflow resume ${parsed.resumeWorkflow!} ${prompt ?? ''}`.trimEnd()
+  } else if (parsed.workflow !== undefined) {
     let argsText = '{}'
     if (prompt?.trim()) {
       try {
@@ -73,9 +76,7 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
         return 2
       }
     }
-    prompt = parsed.workflow !== undefined
-      ? `/workflow run ${parsed.workflow} ${argsText}`
-      : `/workflow resume ${parsed.resumeWorkflow!} ${argsText}`
+    prompt = `/workflow run ${parsed.workflow} ${argsText}`
   }
   if (!prompt || prompt === '-') prompt = await readStdin()
   if (!prompt?.trim()) { err('anureo: a prompt argument or piped stdin is required\n'); return 2 }
