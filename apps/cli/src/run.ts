@@ -105,10 +105,10 @@ export async function runTurn(options: RunOptions, io: RunIo): Promise<number> {
     let sessionInstructions: string | undefined
     if (harness.name === 'swarm') {
       const { createSwarmAdapter } = await import('@anureo/adapter-swarm')
-      const { findProjectRoot, loadBeeProfiles, profileStorageInstructions } = await import('./profiles')
+      const { findProjectRoot, loadBeeProfiles, profileStorageInstructions, moduleRoutingInstructions } = await import('./profiles')
       const { applyModelGuidance } = await import('./model-guidance')
       const project = await findProjectRoot(options.cwd)
-      sessionInstructions = profileStorageInstructions(project, options.homeDirectory)
+      sessionInstructions = [profileStorageInstructions(project, options.homeDirectory), moduleRoutingInstructions()].join('\n\n')
       const profiles = await loadBeeProfiles(options.cwd, options.homeDirectory)
       if (options.verbose) {
         for (const { profile, source, sourceFile } of profiles) io.err(`anureo: bee @${source.scope}/${profile.id} from ${sourceFile}\n`)

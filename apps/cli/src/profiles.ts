@@ -63,3 +63,13 @@ export async function loadBeeProfiles(cwd: string, homeDirectory = homedir()): P
     }
   }))
 }
+
+/** Cross-module collaboration policy for this repository's fixed module bees. */
+export function moduleRoutingInstructions(): string {
+  return [
+    'Module bees are fixed project profiles, one per module: protocol-bee (packages/protocol), core-bee (packages/core), workflow-bee (packages/workflow), conformance-bee (packages/conformance), adapter-codex-bee (packages/adapter/codex), adapter-acp-bee (packages/adapter/acp), adapter-family-bee (packages/adapter/claude, packages/adapter/ahp, packages/adapter/hermes, packages/adapter/pi), swarm-bee (packages/adapter/swarm).',
+    'Prefer the owning module bee for investigation, diagnosis, and patch proposals inside its territory; work directly only for trivial lookups or pure coordination. Delegate first, then apply the returned patch proposals yourself.',
+    'Change propagation is layered: schema changes go protocol-bee first for an impact list, then core-bee for semantics, then the affected adapter bees for mapping, with conformance-bee owning the acceptance suite. Port changes from core-bee require conformance fake updates and per-adapter status in its report.',
+    'Members are read-only: bees analyze, run their own verify commands, and return exact patch proposals with evidence. You apply the edits and re-run the root checks (bun run typecheck, bun test) as acceptance; bee reports are evidence, never acceptance.',
+  ].join('\n\n')
+}

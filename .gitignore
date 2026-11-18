@@ -1,4 +1,6 @@
-.anureo/
+.anureo/*
+!.anureo/bees/
+.anureo/bees/scopecheck-*.json
 node_modules/
 artifacts/
 dist/
