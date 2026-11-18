@@ -6,7 +6,10 @@ and versions follow [SemVer](https://semver.org/spec/v2.0.0.html). During the
 0.x line, minor versions may include breaking changes; such entries are
 marked **BREAKING**.
 
-## Unreleased
+## [0.3.7] - 2026-11-18
+
+Merge the `fix/history-frame-budget` line into `main` and release the combined
+SDK.
 
 - Bound history reads by frame size so large sessions replay on every transport:
   the Codex stdio JSONL default `maxFrameBytes` rises from 8MiB to 64MiB, native
@@ -21,6 +24,36 @@ marked **BREAKING**.
   Previously a session whose 200-item native page exceeded 8MiB failed every
   open with `FRAME_TOO_LARGE`, killing the adapter connection and leaving the
   session permanently unrecoverable.
+- Add client-scoped input hooks (`ClientOptions.hooks`): ordered input
+  transformations, `beforeInput` gating with revised payloads, `beforeTool`
+  policy, and `beforeStop` continuation decisions shared by every session on a
+  client. Adapters receive optional native hook callbacks through
+  `HarnessAdapter.openSession` (validated via `validateNativeHooks`), and
+  interrupts and closes cancel pending hook work with definite outcome codes.
+- Accept explicit `timeoutMs: null` on requests, submissions and closes to wait
+  without a deadline; admission still rejects non-finite, non-positive and
+  above-2_147_483_647 values.
+- Claude adapter: subagent stream ownership (child items attribute to their
+  spawning tool item, parent-loop text owns the final answer, subagent
+  descendants stay out of host-visible turn text), late native completion
+  evidence for tracked items, background-task notifications that open follow-up
+  turns carrying `extensions.native.origin`, `toolExecution.success` evidence on
+  matched tool results, and host-echoed fork boundaries resolved through the
+  transcript prompt map.
+- Codex adapter: Multi-Agent V2 subagent discovery (thread/started projection,
+  thread metadata enrichment, direct-input capability degradation), singular
+  collab wire-word mapping with per-agent outcome evidence, and classification
+  of parent-owned subagent input denials as `SUBAGENT_DIRECT_INPUT_REJECTED`.
+- Workflow: journaled calls record drop reason codes, tolerate SDK clients
+  without `inputHookRevision` in the journal key, and reserve keys through a
+  tracked preflight thunk so schema failures mark runs incomplete; unknown
+  saved outcomes require `WORKFLOW_RECONCILIATION_REQUIRED` before re-dispatch.
+- Hermes adapter rejects session instructions before any native mutation with a
+  `session.instructions` capability detail.
+- Add the `@anureo/cli` package (`anureo` bin): single-turn agent runs printing
+  the unified AHP event stream for Codex, Claude, Hermes, Pi, ACP and Swarm.
+- Harden swarm orchestration internals: per-bee module routing instructions are
+  injected into swarm sessions and bee profiles are tracked in the repository.
 
 ## [0.3.2] - 2026-11-15
 
@@ -199,6 +232,8 @@ packages this codebase was extracted from): package names, the `x-anureo/`
 extension prefix, the `Ahp*` / `createAhpAdapter` naming, and the schema
 `$id` changed; old-brand extension names are not compatible.
 
+[0.3.7]: https://www.npmjs.com/package/@anureo/sdk/v/0.3.7
+[0.3.2]: https://www.npmjs.com/package/@anureo/sdk/v/0.3.2
 [0.3.1]: https://www.npmjs.com/package/@anureo/sdk/v/0.3.1
 [0.3.0]: https://www.npmjs.com/package/@anureo/sdk/v/0.3.0
 [0.2.0]: https://github.com/hi-youichi/anureo-sdk/releases/tag/v0.2.0

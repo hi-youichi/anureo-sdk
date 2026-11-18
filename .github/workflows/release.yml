@@ -50,12 +50,13 @@ jobs:
           npm install --no-audit --no-fund "$artifacts"/*.tgz
           npx --no-install anureo-review --help
           npx --no-install anureo-refactor --help
+          npx --no-install anureo --help
       - name: Publish packages in dependency order
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version=$(node -p "require('./package.json').version")
-          for name in protocol sdk conformance adapter-acp adapter-ahp adapter-claude adapter-codex adapter-hermes adapter-pi workflow code-review refactor; do
+          for name in protocol sdk conformance adapter-acp adapter-ahp adapter-claude adapter-codex adapter-hermes adapter-pi workflow code-review refactor cli; do
             published=$(npm view "@anureo/$name@$version" version 2>/dev/null || true)
             if [ "$published" = "$version" ]; then
               echo "Skipping @anureo/$name@$version (already published)"

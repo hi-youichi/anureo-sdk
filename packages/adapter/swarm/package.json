@@ -1,7 +1,7 @@
 {
   "name": "@anureo/adapter-swarm",
   "description": "A conversational main agent that creates and manages independent bee sessions",
-  "version": "0.2.0",
+  "version": "0.3.7",
   "private": true,
   "type": "module",
   "exports": {
