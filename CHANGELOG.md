@@ -8,6 +8,20 @@ marked **BREAKING**.
 
 ## Unreleased
 
+- Bound history reads by frame size so large sessions replay on every transport:
+  the Codex stdio JSONL default `maxFrameBytes` rises from 8MiB to 64MiB, native
+  history pages (`thread/items/list`, `thread/turns/list`) request a bounded
+  `nativePageLimit` (default 50) instead of 200, oversized history item content
+  is capped at snapshot build time (64KiB per field with an in-band marker and
+  `extensions.historyTruncated`), and public history pages shrink to a
+  serialized byte budget (`maxPageBytes`, default 4MiB) while always keeping at
+  least one item so cursors progress. The Claude adapter applies the same
+  capping and byte budgeting through new shared `@anureo/sdk` helpers
+  (`historyItemBytes`, `pageEndWithinBudget`, `capItem`, `capHistoryEntry`).
+  Previously a session whose 200-item native page exceeded 8MiB failed every
+  open with `FRAME_TOO_LARGE`, killing the adapter connection and leaving the
+  session permanently unrecoverable.
+
 ## [0.3.2] - 2026-11-15
 
 - **BREAKING** Workflow checkpoints now use format version 3. Runs created

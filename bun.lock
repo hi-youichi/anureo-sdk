@@ -10,6 +10,7 @@
         "@anureo/adapter-codex": "workspace:*",
         "@anureo/adapter-hermes": "workspace:*",
         "@anureo/adapter-pi": "workspace:*",
+        "@anureo/adapter-swarm": "workspace:*",
         "@anureo/code-review": "workspace:*",
         "@anureo/conformance": "workspace:*",
         "@anureo/protocol": "workspace:*",
@@ -20,6 +21,23 @@
         "@types/node": "22.15.3",
         "typescript": "5.8.3",
         "zod": "4.6.7",
+      },
+    },
+    "apps/cli": {
+      "name": "@anureo/cli",
+      "version": "0.2.0",
+      "bin": {
+        "anureo": "./bin/anureo.ts",
+      },
+      "dependencies": {
+        "@anureo/adapter-acp": "workspace:*",
+        "@anureo/adapter-claude": "workspace:*",
+        "@anureo/adapter-codex": "workspace:*",
+        "@anureo/adapter-hermes": "workspace:*",
+        "@anureo/adapter-pi": "workspace:*",
+        "@anureo/adapter-swarm": "workspace:*",
+        "@anureo/protocol": "workspace:*",
+        "@anureo/sdk": "workspace:*",
       },
     },
     "apps/code-review": {
@@ -92,7 +110,7 @@
     },
     "packages/adapter/claude": {
       "name": "@anureo/adapter-claude",
-      "version": "0.3.2",
+      "version": "0.3.6",
       "dependencies": {
         "@anthropic-ai/claude-agent-sdk": "0.3.265",
         "@anureo/protocol": "workspace:*",
@@ -105,7 +123,7 @@
     },
     "packages/adapter/codex": {
       "name": "@anureo/adapter-codex",
-      "version": "0.3.2",
+      "version": "0.3.4",
       "dependencies": {
         "@anureo/protocol": "workspace:*",
         "@anureo/sdk": "workspace:*",
@@ -141,6 +159,19 @@
         "@earendil-works/pi-coding-agent": ">=1.5.2 <2",
       },
     },
+    "packages/adapter/swarm": {
+      "name": "@anureo/adapter-swarm",
+      "version": "0.2.0",
+      "dependencies": {
+        "@anureo/protocol": "workspace:*",
+        "@anureo/sdk": "workspace:*",
+        "@anureo/workflow": "workspace:*",
+        "@modelcontextprotocol/sdk": "^1.32.2",
+      },
+      "devDependencies": {
+        "@anureo/adapter-codex": "workspace:*",
+      },
+    },
     "packages/conformance": {
       "name": "@anureo/conformance",
       "version": "0.3.2",
@@ -151,7 +182,7 @@
     },
     "packages/core": {
       "name": "@anureo/sdk",
-      "version": "0.3.2",
+      "version": "0.3.3",
       "dependencies": {
         "@anureo/protocol": "workspace:*",
         "@modelcontextprotocol/sdk": "1.32.2",
@@ -173,7 +204,7 @@
     },
     "packages/workflow": {
       "name": "@anureo/workflow",
-      "version": "0.3.2",
+      "version": "0.3.4",
       "dependencies": {
         "@anureo/protocol": "workspace:*",
         "@anureo/sdk": "workspace:*",
@@ -223,6 +254,10 @@
     "@anureo/adapter-hermes": ["@anureo/adapter-hermes@workspace:packages/adapter/hermes"],
 
     "@anureo/adapter-pi": ["@anureo/adapter-pi@workspace:packages/adapter/pi"],
+
+    "@anureo/adapter-swarm": ["@anureo/adapter-swarm@workspace:packages/adapter/swarm"],
+
+    "@anureo/cli": ["@anureo/cli@workspace:apps/cli"],
 
     "@anureo/code-review": ["@anureo/code-review@workspace:apps/code-review"],
 

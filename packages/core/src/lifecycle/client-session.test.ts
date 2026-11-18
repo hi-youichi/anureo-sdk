@@ -18,17 +18,17 @@ const capabilities: Capabilities = {
 /** fixture supplies this callback to its backend execute port, recording dispatch before the test controls events, receipt or rejection. */
 type Run = (method: SessionMethod, params: AhpRequestMap[SessionMethod], sink: SessionEventSink) => Promise<unknown>;
 /** Build a public client/session around Run and return native dispatch, event and release probes. Client invokes the fixture adapter ports; setup failures reject. Tests own gates/readers and must await client.dispose in finally; the fixture starts no processes. */
-async function fixture(run: Run, options: Partial<ClientOptions> = {}, wait?: { timeoutMs: number }) {
+async function fixture(run: Run, options: Partial<ClientOptions> = {}, wait?: { timeoutMs: number }, supported: Capabilities = capabilities) {
   // Native open assigns the sink before session creation resolves or any test can dispatch.
   let sink!: SessionEventSink, disposals = 0;
   const calls: Array<{ method: SessionMethod; params: AhpRequestMap[SessionMethod] }> = [];
   const adapter: HarnessAdapter = {
     /** withStructuredOutput forwards Client.initialize here; assert negotiation and return capabilities without acquiring native resources. */
-    async initialize(p) { expect(p.protocolContract).toBe(AHP_PROTOCOL_CONTRACT); return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: 'fixture', version: '1', adapter: 'fixture' }, capabilities }; },
+    async initialize(p) { expect(p.protocolContract).toBe(AHP_PROTOCOL_CONTRACT); return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: 'fixture', version: '1', adapter: 'fixture' }, capabilities: supported }; },
     /** OutputSession.open invokes this port; capture its forwarding sink and return an owned in-memory backend. */
     async openSession(p, events) {
       sink = events;
-      return { binding: p.binding, capabilities,
+      return { binding: p.binding, capabilities: supported,
         /** OutputSession.execute invokes this backend port; record the attempt and propagate Run's receipt or rejection without retries. */
         async execute<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> { calls.push({ method, params }); return await run(method, params, sink) as AhpResultMap[M]; },
         /** OutputSession.dispose releases this backend; count attempts so tests can detect repeated cleanup. */
@@ -69,6 +69,269 @@ async function startWithReceipt(sink: SessionEventSink, { submissionId, turnId }
 }
 
 /** Gate the native receipt after binding and require submit to return a Turn first; the public observer must reach completion without an acknowledgement dependency. Finally release both gate and client. */
+function hookRequest(sessionId: string, requestId: string, input: string): AhpRequestMap['input/submit'] {
+  return { sessionId, requestId, submissionId: `input-${requestId}`, delivery: 'native', input: [{ type: 'text', text: input }] };
+}
+
+test('input hooks apply to submit, steer and raw requests and validate the final detached input', async () => {
+  const seen: string[] = [];
+  const validators: NonNullable<NonNullable<ClientOptions['hooks']>['beforeInput']>[number][] = [
+    event => {
+      seen.push(`${event.method}:${(event.input[0] as { text: string }).text}`);
+      Object.assign(event.input[0]!, { text: 'callback mutation' });
+    },
+    event => { expect(event.input[0]).toMatchObject({ text: 'final' }); },
+  ];
+  const f = await fixture(async (method, p, sink) => {
+    const submission = asSubmitParams(p);
+    if (method === 'turn/steer') return { submissionId: submission.submissionId, accepted: true, turnId: 'active' };
+    if (submission.requestId !== 'raw') {
+      await started(sink, 'active');
+      await sink.bindSubmission(submission.submissionId, 'active');
+    }
+    return { submissionId: submission.submissionId, disposition: 'dispatched' };
+  }, { hooks: {
+    inputRevision: 'r1',
+    transformInput: [
+      () => [{ type: 'text', text: 'intermediate' }],
+      event => { expect(event.input[0]).toMatchObject({ text: 'intermediate' }); return [{ type: 'text', text: 'final' }]; },
+    ],
+    beforeInput: validators,
+  } });
+  try {
+    validators.push(() => ({ action: 'deny' }));
+    expect(f.client.inputHookRevision).toBe('r1');
+    const turn = await f.session.submit({ input: 'submit', delivery: 'afterTurn' });
+    await turn.steer({ input: 'steer' });
+    await f.session.request('input/submit', hookRequest(f.session.id, 'raw', 'raw'));
+    expect(seen).toEqual(['input/submit:final', 'turn/steer:final', 'input/submit:final']);
+    expect(f.calls.map(call => asSubmitParams(call.params).input)).toEqual(Array.from({ length: 3 }, () => [{ type: 'text', text: 'final' }]));
+    expect(f.calls[0]!.params).toMatchObject({ delivery: 'afterTurn' });
+    expect(f.calls[1]!.params).toMatchObject({ expectedTurnId: 'active' });
+  } finally { await f.client.dispose(); }
+});
+
+test('input policy rejection is deduplicated and sends only safe failure metadata', async () => {
+  const entered = deferred<void>(), release = deferred<void>();
+  let ran = 0;
+  const f = await fixture(async () => { throw new Error('unexpected native dispatch'); }, { hooks: {
+    inputRevision: 'r1',
+    beforeInput: [async () => {
+      ran++;
+      entered.resolve();
+      await release.promise;
+      throw new HarnessSdkError('PRIVATE_ERROR', 'private callback error', false, true);
+    }],
+  } });
+  const events: AhpEvent[] = [];
+  const reading = (async () => { try { for await (const event of f.session.events()) events.push(event); } catch {} })();
+  try {
+    const params = hookRequest(f.session.id, 'once', 'private input');
+    const first = f.session.request('input/submit', params);
+    const duplicate = f.session.request('input/submit', params);
+    await entered.promise;
+    await expect(f.session.request('input/submit', { ...params, input: [{ type: 'text', text: 'different' }] }))
+      .rejects.toMatchObject({ code: 'REQUEST_ID_CONFLICT' });
+    const safe = { code: 'HOOK_FAILED', message: 'HOOK_FAILED', outcomeUnknown: false };
+    const outcomes = Promise.allSettled([first, duplicate]);
+    release.resolve();
+    expect(await outcomes).toMatchObject([
+      { status: 'rejected', reason: safe }, { status: 'rejected', reason: safe },
+    ]);
+    await f.sink.emit({ type: 'notice', payload: { severity: 'info', code: 'BARRIER', message: 'barrier' } });
+    expect(events.filter(event => event.type === 'submission/status')).toMatchObject([
+      { payload: { submissionId: params.submissionId, status: 'rejected', error: safe } },
+    ]);
+    expect(ran).toBe(1);
+    expect(f.calls).toHaveLength(0);
+  } finally { release.resolve(); await f.client.dispose(); await reading; }
+});
+
+test('deny, invalid replacement and oversized inputs stop before backend submission', async () => {
+  const f = await fixture(async () => { throw new Error('unexpected native dispatch'); }, {
+    runtime: { queue: { maxFrameBytes: 1_024 } },
+    hooks: {
+      inputRevision: 'r1',
+      transformInput: [event => {
+        const block = event.input[0];
+        if (block?.type !== 'text') return;
+        switch (block.text) {
+          case 'invalid': return [];
+          case 'large': return [{ type: 'text', text: 'x'.repeat(2_048) }];
+          case 'image': return [{ type: 'image', mimeType: 'image/png', data: 'AA==' }];
+        }
+      }],
+      beforeInput: [() => ({ action: 'deny' })],
+    },
+  }, undefined, { ...capabilities, turn: { ...capabilities.turn, outputSchema: true } });
+  try {
+    for (const [input, code] of [
+      ['deny', 'HOOK_DENIED'], ['invalid', 'HOOK_FAILED'],
+      ['large', 'FRAME_TOO_LARGE'], ['image', 'CAPABILITY_UNSUPPORTED'],
+    ] as const) {
+      const outputSchema = input === 'deny' ? { type: 'invalid-schema-type' } : undefined;
+      await expect(f.session.submit({ input, outputSchema })).rejects.toMatchObject({ code, outcomeUnknown: false });
+    }
+    expect(f.calls).toHaveLength(0);
+  } finally { await f.client.dispose(); }
+});
+
+test('cancelQueued cancels the current hook batch once and returns both local and native IDs', async () => {
+  const entered = deferred<void>(), release = deferred<void>(), aborted = deferred<void>();
+  const f = await fixture(async (method, params) => {
+    if (method === 'session/interrupt') return { accepted: true, cancelled: ['native'] };
+    return { submissionId: asSubmitParams(params).submissionId, disposition: 'dispatched' };
+  }, { hooks: {
+    inputRevision: 'r1',
+    beforeInput: [async (event, { signal }) => {
+      if (event.requestId !== 'first') return;
+      signal.addEventListener('abort', () => aborted.resolve(), { once: true });
+      entered.resolve();
+      await release.promise;
+    }],
+  } }, undefined, { ...capabilities, input: { ...capabilities.input!, interrupt: { ...capabilities.input!.interrupt!, cancelQueued: true } } });
+  try {
+    const first = f.session.request('input/submit', hookRequest(f.session.id, 'first', 'x'));
+    const second = f.session.request('input/submit', hookRequest(f.session.id, 'second', 'x'));
+    await entered.promise;
+    const params = { sessionId: f.session.id, requestId: 'interrupt', cancelQueued: true };
+    const interrupted = f.session.request('session/interrupt', params);
+    const third = f.session.request('input/submit', hookRequest(f.session.id, 'third', 'x'));
+    const replay = f.session.request('session/interrupt', params);
+    await aborted.promise;
+    const cancelled = { code: 'REQUEST_ABORTED', outcomeUnknown: false };
+    await expect(first).rejects.toMatchObject(cancelled);
+    await expect(second).rejects.toMatchObject(cancelled);
+    const receipt: AhpResultMap['session/interrupt'] = { accepted: true, cancelled: ['input-first', 'input-second', 'native'] };
+    await expect(interrupted).resolves.toEqual(receipt);
+    await expect(replay).resolves.toEqual(receipt);
+    await expect(third).resolves.toMatchObject({ submissionId: 'input-third' });
+    release.resolve();
+    expect(f.calls.map(call => call.method)).toEqual(['session/interrupt', 'input/submit']);
+  } finally { release.resolve(); await f.client.dispose(); }
+});
+
+test('an unsupported queue interrupt leaves hooks pending and a native refusal preserves local cancellation', async () => {
+  for (const supportsCancellation of [false, true]) {
+    const entered = deferred<void>(), release = deferred<void>();
+    const f = await fixture(async (method, params) => {
+      if (method === 'session/interrupt') throw new HarnessSdkError('NATIVE_REFUSED');
+      return { submissionId: asSubmitParams(params).submissionId, disposition: 'dispatched' };
+    }, { hooks: { inputRevision: 'r1', beforeInput: [async () => { entered.resolve(); await release.promise; }] } }, undefined, {
+      ...capabilities,
+      input: { ...capabilities.input!, interrupt: { ...capabilities.input!.interrupt!, cancelQueued: supportsCancellation } },
+    });
+    try {
+      const waiting = f.session.request('input/submit', hookRequest(f.session.id, 'held', 'x'));
+      const outcome = Promise.allSettled([waiting]);
+      await entered.promise;
+      await expect(f.session.interrupt({ cancelQueued: true })).rejects.toMatchObject({
+        code: supportsCancellation ? 'NATIVE_REFUSED' : 'CAPABILITY_UNSUPPORTED',
+      });
+      release.resolve();
+      if (supportsCancellation) {
+        expect(await outcome).toMatchObject([{ status: 'rejected', reason: { code: 'REQUEST_ABORTED', outcomeUnknown: false } }]);
+      } else {
+        expect(await outcome).toMatchObject([{ status: 'fulfilled', value: { submissionId: 'input-held' } }]);
+      }
+      expect(f.calls.map(call => call.method)).toEqual([supportsCancellation ? 'session/interrupt' : 'input/submit']);
+    } finally { release.resolve(); await f.client.dispose(); }
+  }
+});
+
+test('closing and observation failure reject inputs still in hooks with a definite outcome', async () => {
+  for (const mode of ['close', 'dispose', 'fail'] as const) {
+    const entered = deferred<void>(), release = deferred<void>();
+    const f = await fixture(async () => closeResult, { hooks: {
+      inputRevision: 'r1',
+      beforeInput: [async () => { entered.resolve(); await release.promise; }],
+    } });
+    try {
+      const waiting = f.session.submit({ input: 'held' });
+      await entered.promise;
+      const closing = mode === 'fail' ? f.sink.fail(new HarnessSdkError('PROTOCOL_ERROR')) : f.session[mode]();
+      const code = { close: 'SESSION_CLOSING', dispose: 'SESSION_CLOSED', fail: 'PROTOCOL_ERROR' }[mode];
+      await expect(waiting).rejects.toMatchObject({ code, outcomeUnknown: false });
+      release.resolve();
+      await closing;
+      expect(f.calls.map(call => call.method)).toEqual(mode === 'close' ? ['session/close'] : []);
+    } finally { release.resolve(); await f.client.dispose(); }
+  }
+});
+
+test('a hook deadline frees the queue while an uncooperative callback is still running', async () => {
+  const entered = deferred<void>(), release = deferred<void>();
+  let signal: AbortSignal | undefined;
+  const f = await fixture(async (_method, params) => ({ submissionId: asSubmitParams(params).submissionId, disposition: 'dispatched' }), { hooks: {
+    inputRevision: 'r1',
+    timeoutMs: 40,
+    beforeInput: [async (event, context) => {
+      if (event.requestId !== 'held') return;
+      signal = context.signal;
+      entered.resolve();
+      await release.promise;
+    }],
+  } });
+  try {
+    const waiting = f.session.request('input/submit', hookRequest(f.session.id, 'held', 'x'));
+    await entered.promise;
+    await expect(waiting).rejects.toMatchObject({ code: 'HOOK_TIMEOUT', outcomeUnknown: false });
+    expect(signal?.aborted).toBe(true);
+    await f.session.request('input/submit', hookRequest(f.session.id, 'next', 'x'));
+    release.resolve();
+    expect(f.calls.map(call => call.params.requestId)).toEqual(['next']);
+  } finally { release.resolve(); await f.client.dispose(); }
+});
+
+test('hook handoff keeps caller wait cancellation and backend observation closure independent', async () => {
+  const entered = deferred<void>(), allow = deferred<void>(), sent = deferred<void>(), receipt = deferred<void>();
+  const f = await fixture(async (_method, params) => {
+    sent.resolve();
+    await receipt.promise;
+    return { submissionId: asSubmitParams(params).submissionId, disposition: 'dispatched' };
+  }, { hooks: { inputRevision: 'r1', beforeInput: [async () => { entered.resolve(); await allow.promise; }] } });
+  try {
+    const params = hookRequest(f.session.id, 'wait', 'x');
+    const signal = new AbortController();
+    const first = f.session.request('input/submit', params, { signal: signal.signal });
+    const follower = f.session.request('input/submit', params);
+    await entered.promise;
+    const aborted = Promise.allSettled([first]);
+    signal.abort();
+    expect(await aborted).toMatchObject([{ status: 'rejected', reason: { code: 'REQUEST_ABORTED', outcomeUnknown: true } }]);
+    allow.resolve();
+    await sent.promise;
+    const closed = Promise.allSettled([follower]);
+    await f.session.dispose();
+    expect(await closed).toMatchObject([{ status: 'rejected', reason: { code: 'OBSERVATION_CLOSED', outcomeUnknown: true } }]);
+    expect(f.calls).toHaveLength(1);
+  } finally { allow.resolve(); receipt.resolve(); await f.client.dispose(); }
+});
+
+test('pending input bytes are bounded across sessions and released by cancellation', async () => {
+  const entered = deferred<void>(), release = deferred<void>();
+  const f = await fixture(async (_method, params) => ({ submissionId: asSubmitParams(params).submissionId, disposition: 'dispatched' }), {
+    runtime: { queue: { maxBytes: 2_048 } },
+    hooks: { inputRevision: 'r1', beforeInput: [async event => {
+      if (event.requestId === 'hold') { entered.resolve(); await release.promise; }
+    }] },
+  });
+  try {
+    const other = await f.client.sessions.create({ cwd: process.cwd() });
+    const first = f.session.request('input/submit', hookRequest(f.session.id, 'hold', 'x'.repeat(1_400)));
+    await entered.promise;
+    await expect(other.request('input/submit', hookRequest(other.id, 'oversubscribed', 'x'.repeat(1_400))))
+      .rejects.toMatchObject({ code: 'BACKPRESSURE_EXCEEDED', outcomeUnknown: false });
+    // This session can still process an independent small request.
+    await other.request('input/submit', hookRequest(other.id, 'small', 'x'));
+    const cancelled = Promise.allSettled([first]);
+    await f.session.dispose();
+    expect(await cancelled).toMatchObject([{ status: 'rejected', reason: { code: 'SESSION_CLOSED', outcomeUnknown: false } }]);
+    await other.request('input/submit', hookRequest(other.id, 'large', 'x'.repeat(1_400)));
+    expect(f.calls.map(call => call.params.requestId)).toEqual(['small', 'large']);
+  } finally { release.resolve(); await f.client.dispose(); }
+});
+
 test('submit returns a Turn from binding before a delayed receipt; no public Submission stage', async () => {
   const ack = deferred<void>();
   const f = await fixture(async (_m, p, sink) => {

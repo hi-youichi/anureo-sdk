@@ -1,10 +1,9 @@
-import { randomUUID } from 'node:crypto'
-import { HarnessSdkError, sdkError } from '@anureo/sdk'
+import { HarnessSdkError } from '@anureo/sdk'
 import type { z } from 'zod'
 import { executeAgent, prepareAgentCall, type AgentOptions, type PreparedAgentCall } from './agent-execution'
-import type { AgentOutputSchema } from './output-schema'
-import { currentRun, isFatal, type RunContext } from './workflow-state'
-import { canonicalJson, jsonCopy, type JsonValue } from './persistence/json'
+import { currentRun } from './workflow-state'
+import { journaledCall } from './journal-call'
+import { canonicalJson, type JsonValue } from './persistence/json'
 
 /**
  * Run a prompt in a fresh session or replay an eligible workflow result. Return the SDK's final
@@ -38,37 +37,14 @@ export function agent<S extends z.ZodObject>(prompt: string, options: AgentOptio
 export function agent<S extends z.ZodObject>(prompt: string, options: AgentOptions<S>): Promise<string | z.output<S> | null>
 export async function agent(prompt: string, options: AgentOptions): Promise<string | Record<string, unknown> | null> {
   const context = currentRun()
-  if (context) return memoizedAgent(context, prompt, options)
+  if (context) return memoizedAgent(prompt, options)
   const outcome = await executeAgent(prompt, prepareAgentCall(options))
   return outcome.status === 'dropped' ? null : outcome.value
 }
 
-/**
- * Track preflight, replay and execution so workflow observes failures and can drain unawaited calls.
- * Prepare the call and reserve its key synchronously in invocation order.
- */
-async function memoizedAgent(
-  context: RunContext,
-  prompt: string,
-  options: AgentOptions,
-): Promise<string | Record<string, unknown> | null> {
-  const { journal, state } = context
-  return state.track(() => {
-    const call = prepareAgentCall(options)
-    const key = journal.nextKey(prompt, canonicalOptions(call))
-    const decision = journal.resolveCall(key)
-    if (decision.action === 'replay') return replayAgentResult(decision.result, call.output)
-    if (decision.action === 'reconcile') {
-      throw new HarnessSdkError('WORKFLOW_RECONCILIATION_REQUIRED',
-        'A previous run left this agent call with an unknown outcome; reconcile it before resuming', false, true)
-    }
-    return executeJournaledAgent({ context, key, prompt, call })
-  })
-}
-
-/** Project the options memoizedAgent hashes with the prompt. Preserve the persisted key format
- * by using null for absent model, instructions, permission mode and schema, and omitting absent
- * fallback. Use the client identity so equivalent backend configurations can share a key. */
+/** Project the options the journaled call hashes with the prompt. Preserve the persisted key
+ * format by using null for absent model, instructions, permission mode and schema, and omitting
+ * absent fallback. Use the client identity so equivalent backend configurations share a key. */
 function canonicalOptions(call: PreparedAgentCall): JsonValue {
   return {
     model: call.model ?? null,
@@ -81,56 +57,24 @@ function canonicalOptions(call: PreparedAgentCall): JsonValue {
   }
 }
 
-/** Return saved text or await current schema validation for memoizedAgent's typed hit.
- * A rejected validation propagates to the agent caller without rerunning the prompt. */
-async function replayAgentResult(
-  hit: JsonValue,
-  output: AgentOutputSchema | undefined,
-): Promise<string | Record<string, unknown>> {
-  return output ? output.parse(canonicalJson(hit)) : hit as string
-}
-
-/**
- * Execute memoizedAgent's cache miss after saving its started marker and rechecking dispatch.
- * Await fresh execution and session release before publishing the terminal event. Drops mark
- * the run incomplete. Fatal failures stop later dispatch, and WORKFLOW_STORAGE_FAILED rejects
- * without attempting a second terminal write. The dispatch check is outside the execution catch
- * so a call stopped during publication retains its started marker.
- */
-async function executeJournaledAgent({ context, key, prompt, call }: {
-  context: RunContext
-  key: string
-  prompt: string
-  call: PreparedAgentCall
-}): Promise<string | Record<string, unknown> | null> {
-  const { journal, state } = context
-  const agentId = randomUUID()
-  await journal.append({ type: 'started', key, agentId })
-  state.assertDispatch()
-  try {
-    const outcome = await executeAgent(prompt, call)
-    if (outcome.status === 'dropped') {
-      await journal.append({ type: 'failed', key, agentId, code: outcome.error.code, outcomeUnknown: false })
-      state.noteIncomplete()
-      return null
-    }
-    const stored = jsonCopy(outcome.value) as JsonValue
-    await journal.append({ type: 'result', key, agentId, result: stored })
-    return jsonCopy(stored) as string | Record<string, unknown>
-  } catch (cause) {
-    const error = sdkError(cause, 'AGENT_FAILED')
-    if (isFatal(error)) state.stop(error)
-    // The storage layer may have published a terminal record already.
-    if (error.code !== 'WORKFLOW_STORAGE_FAILED') {
-      try {
-        await journal.append({ type: 'failed', key, agentId,
-          code: error.code, outcomeUnknown: error.outcomeUnknown === true })
-      } catch {
-        state.noteStorageFailure()
-        throw new HarnessSdkError(error.code, error.message, error.retryable, error.outcomeUnknown,
-          { ...error.details, journalErrorCode: 'WORKFLOW_STORAGE_FAILED' })
-      }
-    }
-    throw error
+/** Reserve the journal key synchronously through journaledCall, then replay the saved result or
+ * execute fresh through agent-execution. The prepared call is built inside the tracked region so
+ * preflight failures mark the run incomplete. Schema validation awaits async refinements for
+ * fresh and replayed results. Drops mark the run incomplete; fatal failures stop later dispatch. */
+async function memoizedAgent(prompt: string, options: AgentOptions): Promise<string | Record<string, unknown> | null> {
+  let prepared!: PreparedAgentCall
+  /** The drop reason is only known after execution; the journal reads it lazily at append time. */
+  const dropCode = { value: undefined as string | undefined }
+  const build = () => {
+    prepared = prepareAgentCall(options)
+    return { prompt, canonical: canonicalOptions(prepared), get droppedCode() { return dropCode.value } }
   }
+  const run = () => executeAgent(prompt, prepared).then(outcome => {
+    if (outcome.status === 'dropped') dropCode.value = outcome.error.code
+    return outcome.status === 'dropped' ? null : outcome.value as JsonValue
+  })
+  if (options.schema !== undefined) {
+    return journaledCall(build, run, stored => prepared.output!.parse(canonicalJson(stored))) as Promise<string | Record<string, unknown> | null>
+  }
+  return journaledCall(build, run) as Promise<string | Record<string, unknown> | null>
 }

@@ -1,7 +1,7 @@
 import { createFixture } from './test-helpers'
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -41,7 +41,7 @@ function failingExecute(error: HarnessError): NonNullable<FakeAdapterOptions['ex
 }
 
 test('root runtime exports contain the four independently usable primitives', async () => {
-  expect(Object.keys(await import('./index')).sort()).toEqual(['agent', 'parallel', 'pipeline', 'workflow'])
+  expect(Object.keys(await import('./index')).sort()).toEqual(['agent', 'isDroppedOutcome', 'journaledCall', 'parallel', 'pipeline', 'prepareOutputSchema', 'workflow'])
 })
 
 test('run identity is durable before body, inputs are isolated, and results are persisted', async () => {
@@ -190,7 +190,17 @@ test('unknown previous outcomes require reconciliation instead of silent re-exec
   await expect(workflow({ ...options, resumeFrom: runId }, () =>
     agent('unknown', { client, cwd: options.directory })))
     .rejects.toMatchObject({ code: 'WORKFLOW_RECONCILIATION_REQUIRED' })
+  const revisedAdapter = createScriptedAdapter()
+  const revised = {
+    client: await createClient({ adapter: revisedAdapter, identity: client.identity, hooks: { inputRevision: 'new', beforeInput: [() => undefined] } }),
+    adapter: revisedAdapter,
+  }
+  clients.push(revised.client)
+  await expect(workflow({ ...options, resumeFrom: runId }, () =>
+    agent('unknown', { client: revised.client, cwd: options.directory })))
+    .rejects.toMatchObject({ code: 'WORKFLOW_RECONCILIATION_REQUIRED' })
   expect(adapter.opened).toHaveLength(1)
+  expect(revised.adapter.opened).toHaveLength(0)
 })
 
 test('a failed journal replacement preserves exact-key uncertainty in the manifest', async () => {
@@ -243,8 +253,10 @@ test('storage failure is sticky and blocks subsequent agent dispatch', async () 
   let id = ''
   await expect(workflow(options, async run => {
     id = run.runId
-    // Moving the run directory breaks every subsequent journal publication.
-    await rename(join(options.directory, id), join(options.directory, `${id}-moved`))
+    // Block atomic replacement of the journal while leaving the open writer lock alone.
+    const journal = join(options.directory, id, 'journal.json')
+    await rm(journal)
+    await mkdir(journal)
     try { await agent('first', { client, cwd: options.directory }) } catch {}
     try { await agent('second', { client, cwd: options.directory }) } catch {}
     return 'caught'

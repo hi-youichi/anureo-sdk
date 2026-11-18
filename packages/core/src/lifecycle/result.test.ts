@@ -12,6 +12,26 @@ const bytes = (item: Item) => Buffer.byteLength(JSON.stringify(item));
 /** Direct finish calls use this native interruption payload without an error or terminal usage override. */
 const terminal = { turnId: 'turn', status: 'interrupted' as const };
 
+test('final text excludes subagent descendants while retaining their items and main tool-nested answers', () => {
+  const accumulator = new ResultAccumulator(10000, 20);
+  const items: Item[] = [
+    { id: 'member-answer', type: 'agentMessage', parentItemId: 'member-tool', phase: 'final', text: 'Member evidence' },
+    { id: 'member-tool', type: 'toolCall', parentItemId: 'assignment', kind: 'command', title: 'Check' },
+    { id: 'assignment', type: 'subagent', subagentId: 'bee', state: 'completed' },
+    { id: 'main-tool', type: 'toolCall', kind: 'other', title: 'Main' },
+    { id: 'main-answer', type: 'agentMessage', parentItemId: 'main-tool', phase: 'final', text: 'Final answer' },
+  ];
+  for (const item of items) accumulator.accept(event({ type: 'item/completed', payload: { item } }));
+  expect(accumulator.finish(terminal).text).toBe('Final answer');
+  expect(accumulator.finish(terminal).items).toEqual(items);
+});
+
+test('cyclic parent references cannot hang final text assembly', () => {
+  const accumulator = new ResultAccumulator(10000, 20);
+  for (const [id, parentItemId] of [['a', 'b'], ['b', 'a']]) accumulator.accept(event({ type: 'item/completed', payload: { item: { id, parentItemId, type: 'agentMessage', phase: 'final', text: id } } }));
+  expect(accumulator.finish(terminal).text).toBe('a\nb');
+});
+
 /** Mutate native error details after finish; the interrupted snapshot must retain detached metadata and status. */
 test('interrupted results preserve immutable native reason metadata without becoming failed', () => {
   const accumulator = new ResultAccumulator(1024, 10);

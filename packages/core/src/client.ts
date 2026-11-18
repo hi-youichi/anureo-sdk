@@ -12,6 +12,7 @@ import { immutable } from './lifecycle/immutable';
 import { DEFAULT_MAX_RESULT_BYTES, positive } from './lifecycle/limits';
 import { combined } from './lifecycle/errors';
 import { withStructuredOutput } from './structured-output/adapter';
+import { InputHooks } from './lifecycle/input-hooks';
 
 export { Session } from './session';
 export type { ClientOptions, InteractionHandlers, SubmitOptions } from './client-options';
@@ -38,11 +39,14 @@ export class Client {
     };
     this.createId = options.runtime?.createId ?? randomUUID;
     assertClientOptions(options);
+    if (options.hooks !== undefined) this.inputHooks = new InputHooks(options.hooks, options.runtime?.queue);
   }
   /** Read a fresh copy of the adapter and runtime configuration IDs used to check session bindings. */
   get identity(): ClientOptions['identity'] {
     return { adapterId: this.options.identity.adapterId, runtimeConfigId: this.options.identity.runtimeConfigId };
   }
+  /** Version of the active hook policy, or undefined when no hooks are registered. */
+  get inputHookRevision(): string | undefined { return this.inputHooks?.revision; }
   /**
    * Negotiate adapter capabilities before opening sessions. Concurrent callers share an in-flight
    * negotiation with independent waits. Each wait defaults to 30 seconds unless configured by
@@ -94,6 +98,7 @@ export class Client {
   private disposing?: Promise<void>;
   private readonly owned = new Set<Session>();
   private readonly createId: () => string;
+  private readonly inputHooks: InputHooks | undefined;
 
   /** Open sessions using generated request IDs and the same attachment wait and ownership as openSession. */
   readonly sessions = {
@@ -145,7 +150,7 @@ export class Client {
    */
   private async open(input: unknown, wait?: RequestOptions): Promise<Session> {
     const { params, capabilities } = this.validateOpen(input, wait);
-    const session = new Session(structuredClone(params), this.options, capabilities, this.createId, released => { this.owned.delete(released); });
+    const session = new Session(structuredClone(params), this.options, capabilities, this.createId, released => { this.owned.delete(released); }, this.inputHooks);
     // Own the sink before dispatch: native events and client disposal can race attachment.
     this.owned.add(session);
     try {
@@ -180,7 +185,7 @@ export class Client {
    * Native/attachment failures reject the operation and remain observed by waitForRequest.
    */
   private async attachSession(params: SessionOpenParams, session: Session): Promise<void> {
-    const backend = await this.options.adapter.openSession(structuredClone(params), session);
+    const backend = await this.options.adapter.openSession(structuredClone(params), session, this.inputHooks?.native);
     await session.attach(backend);
   }
 }

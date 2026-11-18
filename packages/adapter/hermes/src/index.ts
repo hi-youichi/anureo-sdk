@@ -120,9 +120,9 @@ export class HermesAdapter implements HarnessAdapter {
 
   /** Reject unsupported features and foreign resume bindings before openSession acquires resources. */
   private assertSupportedOpen(params: SessionOpenParams): void {
-    if (params.mode === 'fork' || params.instructions !== undefined || params.permissionMode !== undefined
-      || (params.mcpServers !== undefined && (!this.editorMcp || params.mode !== 'new'))
+    if (params.mode === 'fork' || params.permissionMode !== undefined || params.mcpServers !== undefined && (!this.editorMcp || params.mode !== 'new')
       || Object.keys(params.config ?? {}).length) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
+    if (params.instructions !== undefined) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Hermes does not support session instructions', false, false, { capability: 'session.instructions' })
     if (params.mode === 'resume' && params.binding.nativeRef?.provider !== 'hermes') throw new HarnessSdkError('SESSION_BINDING_MISMATCH')
   }
 }

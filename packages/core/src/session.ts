@@ -17,6 +17,7 @@ import type { EventSubscriptionOptions, RequestOptions, TurnResult } from './typ
 import { deferred } from './lifecycle/deferred';
 import { immutable } from './lifecycle/immutable';
 import { inputBlocks } from './lifecycle/input';
+import { InputHookQueue, type HookInput, type InputHooks } from './lifecycle/input-hooks';
 import { DEFAULT_MAX_RESULT_BYTES, positive } from './lifecycle/limits';
 import { combined, observationClosed } from './lifecycle/errors';
 
@@ -31,7 +32,8 @@ export class Session implements SessionEventSink {
    * attachment safely. Clone initial state, allocate stream identity and install privacy/interaction
    * hooks without acquiring a backend. ID generation or cloning can throw; Client owns later disposal.
    */
-  constructor(private readonly params: SessionOpenParams, private readonly options: ClientOptions, capabilities: Capabilities, private readonly createId: () => string, private readonly releaseOwnership?: (session: Session) => void) {
+  constructor(private readonly params: SessionOpenParams, private readonly options: ClientOptions, capabilities: Capabilities, private readonly createId: () => string, private readonly releaseOwnership?: (session: Session) => void, inputHooks?: InputHooks) {
+    if (inputHooks?.hasInputHooks) this.inputQueue = new InputHookQueue(inputHooks);
     this.streamId = createId();
     this.state = { binding: immutable(params.binding), capabilities: immutable(capabilities), capabilityRevision: 1, config: structuredClone(params.config ?? {}), status: 'opening', activeTurnIds: [], ...(params.model ? { model: params.model } : {}) };
     this.secrets = new SecretRedactor(value => options.runtime?.onMarkedSecret?.(this.binding, value));
@@ -270,7 +272,7 @@ export class Session implements SessionEventSink {
   dispose(): Promise<void> {
     if (this.disposal) return this.disposal;
     this.disposal = this.cancelInteractions('runtime_disposed').then(() => this.disposeBackend());
-    this.endObservation(observationClosed());
+    this.endObservation(observationClosed(), 'SESSION_CLOSED');
     return this.disposal;
   }
   private backend?: BackendSession;
@@ -293,6 +295,7 @@ export class Session implements SessionEventSink {
   private readonly executions = new Map<string, Execution>();
   private readonly submissions = new Map<string, SubmissionRecord>();
   private readonly requests = new Map<string, RequestRecord>();
+  private readonly inputQueue?: InputHookQueue;
   private readonly interactions: InteractionRegistry;
   private readonly handlers = new Map<string, AbortController>();
   private handlerCount = 0;
@@ -482,7 +485,8 @@ export class Session implements SessionEventSink {
   /**
    * admitEvent calls with the context for a validated execution event. Enforce native turn/item order,
    * mutating execution-local markers only for admitted transitions. Return false to suppress duplicate
-   * turn starts/completions or item completions; throw for invalid transitions. retainEvent owns terminal
+   * turn starts/completions or item completions; admit late completions of started items on terminal
+   * executions (Codex subagent activities); throw for invalid transitions. retainEvent owns terminal
    * settlement after privacy projection, so this phase does not finish the execution.
    */
   private admitExecutionEvent(execution: Execution, rawPayload: AhpEventPayload): boolean {
@@ -503,10 +507,16 @@ export class Session implements SessionEventSink {
    * introduce an item without a start; suppress repeated completions without changing its markers.
    */
   private admitItemEvent(execution: Execution, payload: AhpEventPayload): boolean {
-    if (!execution.started || execution.terminal) throw new HarnessSdkError('PROTOCOL_ERROR', 'Item outside execution');
     const itemId = payloadItemId(payload);
     if (!itemId) return true;
     const previousState = execution.items.get(itemId);
+    if (payload.type === 'item/completed' && execution.terminal) {
+      // Late native completion evidence for a tracked item keeps its original attribution;
+      // unknown items outside a live execution still reject below (Codex subagent activities).
+      if (previousState === 'started') { execution.items.set(itemId, 'completed'); return true; }
+      if (previousState === 'completed') return false;
+    }
+    if (!execution.started || execution.terminal) throw new HarnessSdkError('PROTOCOL_ERROR', 'Item outside execution');
     if (
       (payload.type === 'item/started' && previousState !== undefined) ||
       (payload.type === 'item/delta' && previousState !== 'started')
@@ -652,7 +662,8 @@ export class Session implements SessionEventSink {
       assertRequest(method, params);
       if (params.sessionId !== this.id) throw new HarnessSdkError('SESSION_BINDING_MISMATCH');
     } catch (cause) { return Promise.reject(cause); }
-    if (Buffer.byteLength(JSON.stringify(params)) > (this.options.runtime?.queue?.maxFrameBytes ?? 8 * 1024 * 1024)) return Promise.reject(new HarnessSdkError('FRAME_TOO_LARGE'));
+    const bytes = Buffer.byteLength(JSON.stringify(params));
+    if (bytes > (this.options.runtime?.queue?.maxFrameBytes ?? 8 * 1024 * 1024)) return Promise.reject(new HarnessSdkError('FRAME_TOO_LARGE'));
     params = structuredClone(params);
     const key = JSON.stringify([method, params.requestId]);
     const fingerprint = JSON.stringify(params);
@@ -704,7 +715,13 @@ export class Session implements SessionEventSink {
   private cacheRequestOutcome<M extends SessionMethod>({ method, params, key, fingerprint }: {
     method: M; params: AhpRequestMap[M]; key: string; fingerprint: string;
   }): Promise<AhpResultMap[M]> {
-    const requestOutcome = Promise.race([Promise.resolve().then(() => this.executeRequest(method, params)), this.ended.promise]);
+    const inputQueue = this.inputQueue;
+    const gated = inputQueue && (method === 'input/submit' || method === 'turn/steer') ? deferred<AhpResultMap[M]>() : undefined;
+    let cancelledInputs: string[] | undefined;
+    const requestOutcome = gated?.promise ?? Promise.race([
+      Promise.resolve().then(() => this.executeRequest(method, params, cancelledInputs)),
+      this.ended.promise,
+    ]);
     const entry = { fingerprint, result: requestOutcome, settled: false };
     this.requests.set(key, entry);
     // The cached/returned outcome races the backend result against observation closure.
@@ -722,6 +739,27 @@ export class Session implements SessionEventSink {
       },
     );
     void outcomeBookkeeping.catch(cause => { void this.fail(cause); });
+    const bytes = Buffer.byteLength(JSON.stringify(params));
+    if (gated && inputQueue) {
+      const input = { method, params } as HookInput;
+      inputQueue.enqueue(input, bytes, {
+        validate: candidate => {
+          this.assertCallable(candidate.method);
+          guardRequest(candidate.method, candidate.params, this.id, this.capabilities);
+        },
+        dispatch: candidate => {
+          void Promise.race([this.executeRequest(candidate.method, candidate.params), this.ended.promise])
+            .then(result => gated.resolve(result as AhpResultMap[M]), gated.reject);
+        },
+        reject: cause => {
+          const record = this.submissions.get(input.params.submissionId);
+          if (record) this.rejectSubmission({ record, cause, dispatch: 'pending' });
+          gated.reject(cause);
+        },
+      });
+    } else if (inputQueue && method === 'session/interrupt' && (params as AhpRequestMap['session/interrupt']).cancelQueued) {
+      cancelledInputs = inputQueue.cancel(new HarnessSdkError('REQUEST_ABORTED'));
+    }
     return requestOutcome;
   }
   /**
@@ -731,8 +769,13 @@ export class Session implements SessionEventSink {
    * observation closure wins its race; execution and state effects can still finish after that race.
    * The caller owns outcome bookkeeping and never retries native work automatically.
    */
-  private async executeRequest<M extends SessionMethod>(method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
-    const nativeResult = await this.invokeRequest(method, params);
+  private async executeRequest<M extends SessionMethod>(method: M, params: AhpRequestMap[M], cancelledInputs?: string[]): Promise<AhpResultMap[M]> {
+    const invoked = await this.invokeRequest(method, params);
+    let nativeResult = invoked;
+    if (method === 'session/interrupt' && cancelledInputs?.length) {
+      const receipt = invoked as AhpResultMap['session/interrupt'];
+      nativeResult = { ...receipt, cancelled: [...new Set([...cancelledInputs, ...(receipt.cancelled ?? [])])] };
+    }
     this.validateNativeResult(method, params, nativeResult);
     let result = this.projectRequestResult(method, nativeResult);
     if (method === 'history/read' && this.options.runtime?.redactHistory) {
@@ -880,9 +923,11 @@ export class Session implements SessionEventSink {
    * Completed execution snapshots/streams remain intact. Callers own interaction cancellation, backend
    * release and any native close; rejecting observation does not assert execution stopped.
    */
-  private endObservation(cause: unknown): void {
+  private endObservation(cause: HarnessSdkError, pendingInputCode = cause.code): void {
     this.observationFailure ??= cause;
-    this.closed = true; this.updateStatus(); this.ended.reject(cause);
+    this.closed = true; this.updateStatus();
+    this.inputQueue?.cancel(new HarnessSdkError(pendingInputCode));
+    this.ended.reject(cause);
     for (const value of this.submissions.values()) value.executionBinding.reject(cause);
     for (const execution of this.executions.values()) if (!execution.terminal) { execution.completion.reject(cause); execution.events.end(cause); }
     for (const controller of this.handlers.values()) controller.abort(); this.handlers.clear();
@@ -929,6 +974,7 @@ export class Session implements SessionEventSink {
     );
     void this.closing.catch(() => {});
     this.updateStatus();
+    this.inputQueue?.cancel(new HarnessSdkError('SESSION_CLOSING'));
     return this.closing;
   }
   /**

@@ -16,6 +16,8 @@ export type ClaudeQueryFactory = (params: Parameters<typeof query>[0]) => Claude
 export interface ClaudeAdapterOptions {
   /** Native executable path; takes precedence over the executable alias. */
   command?: string;
+  /** Working directory for catalog-only query launches when no session open supplies one. */
+  cwd?: string;
   /** Alias for command when command is omitted; omission of both uses the native SDK executable. */
   executable?: string;
   /** Extra child arguments appended after the native SDK arguments. */

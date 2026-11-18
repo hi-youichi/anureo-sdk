@@ -111,17 +111,17 @@ test('catalog projects ordered model pages without normalizing optional metadata
   const f = scriptedCatalog(call => {
     const params = call.params as NativeRecord
     return { result: params.cursor === 'next' ? {
-      data: [{ model: 'second', hidden: true, supportedReasoningEfforts: [], serviceTiers: [] }], nextCursor: '',
+      data: [{ model: 'second', description: ' ', inputModalities: ['text', null, '', 5], hidden: true, supportedReasoningEfforts: [], serviceTiers: [] }], nextCursor: '',
     } : {
-      data: [{ id: 'first', displayName: '', isDefault: true, hidden: false,
+      data: [{ id: 'first', displayName: '', description: 'Native picker description', inputModalities: ['text', 'image'], isDefault: true, hidden: false,
         supportedReasoningEfforts: [{ reasoningEffort: 'high', description: 'Deep' }, { reasoningEffort: '' }, null],
         defaultReasoningEffort: 'high', serviceTiers: [{ id: '' }, { id: 'priority' }, null] }], nextCursor: 'next',
     } }
   })
   try {
     expect(await f.session.listModels()).toEqual([
-      { id: 'first', name: '', isDefault: true, efforts: [{ id: 'high', description: 'Deep' }], defaultEffort: 'high', serviceTiers: ['', 'priority'] },
-      { id: 'second', name: 'second', hidden: true, efforts: [], serviceTiers: [] },
+      { id: 'first', name: '', description: 'Native picker description', inputModalities: ['text', 'image'], isDefault: true, efforts: [{ id: 'high', description: 'Deep' }], defaultEffort: 'high', serviceTiers: ['', 'priority'] },
+      { id: 'second', name: 'second', inputModalities: ['text'], hidden: true, efforts: [], serviceTiers: [] },
     ])
     expect(f.calls.filter(call => call.method === 'model/list').map(call => call.params)).toEqual([
       { limit: 100, includeHidden: true }, { limit: 100, includeHidden: true, cursor: 'next' },

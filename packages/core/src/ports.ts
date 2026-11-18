@@ -1,5 +1,17 @@
 import type { AhpEventPayload, AhpMethod, AhpRequestMap, AhpResultMap, Capabilities, HarnessError, InitializeParams, InitializeResult, InteractionRequested, InteractionResponse, JsonSchema, SessionBinding, SessionOpenParams } from '@anureo/protocol';
 import type { QueueLimits } from './queue';
+import type { BeforeStopEvent, BeforeToolEvent } from './client-options';
+
+/** Optional local control callbacks. Invoke only while the native runtime is awaiting a decision. */
+export interface NativeHookCallbacks {
+  /** Host callback budget in milliseconds. Native response delivery requires its own margin. */
+  readonly timeoutMs: number;
+  readonly beforeTool?: {
+    readonly toolNames: readonly string[];
+    invoke(event: BeforeToolEvent, signal: AbortSignal): Promise<'continue' | 'deny'>;
+  };
+  readonly beforeStop?: (event: BeforeStopEvent, signal: AbortSignal) => Promise<string | undefined>;
+}
 /**
  * Deliver an interaction answer or cancellation to the native peer. Adapters supply this callback to
  * the sink's requestInteraction. InteractionRegistry.deliverResponse invokes it with an answer;
@@ -135,12 +147,15 @@ export interface BackendSession {
  * negotiation or a native open is still in flight, since a host can stop waiting first.
  */
 export interface HarnessAdapter {
+  /** Validate requested native hook coverage synchronously, before acquiring session resources. */
+  validateNativeHooks?(params: SessionOpenParams, hooks: NativeHookCallbacks): void;
   /**
    * Select a bridge transport reachable by the native session, or return undefined to disable MCP
    * fallback. OutputSession.open calls this synchronously when initialization lacks native
    * outputSchema support. Opt in when native open can consume session-scoped MCP configuration.
    * A throw rejects session setup.
    */
+  outputBridgeTransport?(params: SessionOpenParams): 'http' | 'stdio' | undefined;
   outputBridgeTransport?(params: SessionOpenParams): 'http' | 'stdio' | undefined;
   /** Client.initialize awaits negotiation through its wrapper, validates the result and stores capabilities; reject incompatible contracts/native setup failure. */
   initialize(params: InitializeParams): Promise<InitializeResult>;
@@ -149,7 +164,7 @@ export interface HarnessAdapter {
    * backend; callbacks may run before it resolves. Reject setup failure after releasing partially
    * acquired native resources; the wrapper/Session release backends that arrive after caller teardown.
    */
-  openSession(params: SessionOpenParams, sink: SessionEventSink): Promise<BackendSession>;
+  openSession(params: SessionOpenParams, sink: SessionEventSink, hooks?: NativeHookCallbacks): Promise<BackendSession>;
   /** The output wrapper invokes this after session cleanup attempts; release client-wide native resources or reject release failure. */
   dispose(): Promise<void>;
 }

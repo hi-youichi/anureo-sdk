@@ -44,15 +44,16 @@ export class OutputSession implements BackendSession {
    * setup. Other bridge preparation failures warn and continue. If disposal wins the open race,
    * await native release and reject with its failure or SESSION_CLOSED.
    * nativeOutput is the initialization negotiation result, used only to decide bridge preparation;
-   * per-session capabilities decide submission mode. Native-open and release failures reject to the
+   * per-session capabilities decide submission mode. hooks are native lifecycle callbacks to pass
+   * through to the adapter open. Native-open and release failures reject to the
    * adapter wrapper, which owns setup cleanup.
    */
-  async open({ adapter, nativeOutput }: { adapter: HarnessAdapter; nativeOutput: boolean }): Promise<this> {
+  async open({ adapter, nativeOutput, hooks }: { adapter: HarnessAdapter; nativeOutput: boolean; hooks?: Parameters<HarnessAdapter['openSession']>[2] }): Promise<this> {
     // The optional port is an execution-location attestation, not a provider-name heuristic.
     const transport = nativeOutput ? undefined : adapter.outputBridgeTransport?.(this.params)
     // Avoid a promise turn before native dispatch when no bridge needs preparation.
     const params = transport ? await this.prepareBridge(transport) : this.params
-    const backend = await adapter.openSession(structuredClone(params), this.nativeSink())
+    const backend = await adapter.openSession(structuredClone(params), this.nativeSink(), hooks)
     this.backend = backend
     if (this.disposed) { await backend.dispose(); throw new HarnessSdkError('SESSION_CLOSED') }
     backend.state?.activeTurnIds.forEach(id => this.active.add(id))

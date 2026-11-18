@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -139,6 +139,59 @@ function observe(promise: Promise<Turn>) {
   void promise.catch(() => {});
   return promise;
 }
+
+test.each(['deny', 'timeout'] as const)('the pinned Claude SDK exchanges native tool and Stop decisions (%s)', async mode => {
+  const dir = await mkdtemp(join(tmpdir(), 'anureo-claude-hooks-'));
+  const probeLog = join(dir, 'native-hooks.jsonl');
+  const calls: string[] = [];
+  const client = await createClient({
+    adapter: createClaudeAdapter({
+      command: fileURLToPath(new URL('../tests/fixtures/fake-claude.mjs', import.meta.url)),
+      executableRuntime: 'node', stateDir: join(dir, 'state'), env: { FAKE_HOOK_PROBE: '1', FAKE_HOOK_LOG: probeLog },
+    }),
+    identity: { adapterId: 'claude', runtimeConfigId: 'native-hook-fixture' },
+    hooks: {
+      inputRevision: 'hooks-v1',
+      timeoutMs: mode === 'timeout' ? 40 : 5_000,
+      beforeTool: { toolNames: ['Read'], handle: (event, { signal }) => {
+        calls.push(event.toolCallId);
+        if (mode === 'timeout') {
+          return new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
+        }
+        return { action: 'deny' };
+      } },
+      beforeStop: event => {
+        calls.push(event.lastAssistantMessage ?? '');
+        return { action: 'continue', prompt: 'check once' };
+      },
+    },
+  });
+  try {
+    const session = await client.sessions.create({ cwd: dir });
+    const result = await (await session.submit({ input: 'exercise hooks' })).result();
+    expect(result).toMatchObject({ status: 'completed' });
+    expect(calls).toEqual(['fixture-read', 'initial answer']);
+  } catch (cause) {
+    throw new Error(`Hook probe failed: ${await readFile(probeLog, 'utf8').catch(() => 'no control frames')}`, { cause });
+  } finally {
+    await client.dispose();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Claude rejects unsupported pre-tool coverage before opening the query', async () => {
+  let queries = 0;
+  const client = await createClient({
+    adapter: createClaudeAdapter({ queryFactory: () => { queries++; throw new Error('unexpected native query'); } }),
+    identity: { adapterId: 'claude', runtimeConfigId: 'unsupported-hook' },
+    hooks: { inputRevision: '1', beforeTool: { toolNames: ['NotAClaudeTool'], handle: () => undefined } },
+  });
+  try {
+    const [outcome] = await Promise.allSettled([client.sessions.create({ cwd: process.cwd() })]);
+    expect(outcome).toMatchObject({ status: 'rejected', reason: { code: 'CAPABILITY_UNSUPPORTED' } });
+    expect(queries).toBe(0);
+  } finally { await client.dispose(); }
+});
 
 test('mid-run UUID changes and a multi-input result bind independent observations to one real execution', async () => {
   const f = await fixture();

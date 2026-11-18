@@ -39,10 +39,11 @@ export interface RequestOptions {
   /** Stops this caller waiting; does not interrupt accepted native execution. */
   signal?: AbortSignal;
   /**
-   * Positive finite observation deadline in milliseconds; omission uses the operation default.
-   * Client/Session admission also rejects values above 2_147_483_647; standalone waits use host timers.
+   * Positive finite observation deadline in milliseconds; null waits without a deadline, omission
+   * uses the operation default. Client/Session admission also rejects values above 2_147_483_647;
+   * standalone waits use host timers.
    */
-  timeoutMs?: number;
+  timeoutMs?: number | null;
 }
 
 /**

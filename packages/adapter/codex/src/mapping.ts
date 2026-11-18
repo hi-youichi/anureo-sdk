@@ -2,7 +2,7 @@
 import { isAbsolute } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { codexFileChanges } from './file-changes'
-import type { InputBlock, Item } from '@anureo/protocol'
+import type { InputBlock, Item, JsonObject } from '@anureo/protocol'
 import { HarnessSdkError } from '@anureo/sdk'
 import { record, safe, string, type NativeRecord } from './native-values'
 
@@ -39,6 +39,33 @@ export function itemStatus(value: unknown, completed: boolean): 'running' | 'com
  * rejects a history read or reaches JSONL stream failure handling for live notifications.
  * Callers own ordering across snapshots.
  */
+
+/** Project subAgentActivity lifecycle kinds for mapItems without effects; unknown words keep the child observable as running. */
+function subAgentActivityState(value: unknown): 'running' | 'completed' | 'interrupted' {
+  switch (value) {
+    case 'completed': return 'completed'
+    case 'interrupted': return 'interrupted'
+    default: return 'running'
+  }
+}
+
+/** Collect sanitized raw evidence for subagent projections without mutation or I/O; absent fields stay absent, and redaction failures propagate from safe(). */
+function nativeSubagentEvidence(raw: NativeRecord, state: NativeRecord, nativeState: string | undefined): JsonObject | undefined {
+  const evidence: Record<string, unknown> = {}
+  for (const key of ['tool', 'model', 'reasoningEffort', 'senderThreadId']) {
+    const value = string(raw[key])
+    if (value !== undefined) evidence[key] = value
+  }
+  const kind = string(raw.kind)
+  const agentPath = string(raw.agentPath)
+  if (kind !== undefined) evidence.kind = kind
+  if (agentPath !== undefined) evidence.agentPath = agentPath
+  const message = string(state.message)
+  if (message !== undefined && nativeState === 'errored') evidence.errorMessage = message
+  if (message !== undefined && nativeState === 'completed') evidence.resultMessage = message
+  return Object.keys(evidence).length ? safe(evidence) as JsonObject : undefined
+}
+
 export function mapItems(value: unknown, completed: boolean, history = false, timing: { startedAtMs?: unknown } = {}): Item[] {
   const raw = record(value)
   const id = string(raw.id)
@@ -69,6 +96,20 @@ export function mapItems(value: unknown, completed: boolean, history = false, ti
       steps: [{ id: `${id}:text`, text: string(raw.text) ?? '', status: completed ? 'completed' : 'inProgress' }],
     }]
     case 'collabAgentToolCall': case 'collabToolCall': return subagentItems(raw, { common, status })
+    case 'subAgentActivity': {
+      const agentThreadId = string(raw.agentThreadId)
+      if (!agentThreadId) throw new HarnessSdkError('PROTOCOL_ERROR', 'Native subagent activity lacks agent identity')
+      const agentPath = string(raw.agentPath)
+      const evidence = nativeSubagentEvidence(raw, {}, undefined)
+      return [{
+        ...common,
+        type: 'subagent',
+        subagentId: agentThreadId,
+        state: subAgentActivityState(raw.kind),
+        ...(agentPath ? { name: agentPath.slice(agentPath.lastIndexOf('/') + 1) || agentPath } : {}),
+        ...(evidence ? { extensions: { native: evidence } } : {}),
+      }]
+    }
     case 'enteredReviewMode': case 'exitedReviewMode': return [{
       ...common,
       type: 'review',
@@ -160,15 +201,17 @@ function reasoningText(value: unknown): string {
  * are no string receivers, use state keys. Scope each item ID to the parent snapshot.
  */
 function subagentItems(raw: NativeRecord, context: { common: ItemMetadata; status: ReturnType<typeof itemStatus> }): Item[] {
-  const ids = Array.isArray(raw.receiverThreadIds)
-    ? raw.receiverThreadIds.filter((v): v is string => typeof v === 'string')
-    : []
+  const explicitIds = Array.isArray(raw.receiverThreadIds) ? raw.receiverThreadIds.filter((v): v is string => typeof v === 'string') : []
+  // Documented legacy wire words (singular receiver plus created thread) tolerate older schema shapes.
+  const legacyIds = [raw.receiverThreadId, raw.newThreadId].filter((v): v is string => typeof v === 'string').filter((v, index, all) => all.indexOf(v) === index)
   const states = record(raw.agentsStates)
-  return (ids.length ? ids : Object.keys(states)).map(
-    /** Pick receiver status, falling back to legacy state and then the normalized parent status. */
+  const legacyStatus = string(raw.agentStatus)
+  return (explicitIds.length ? explicitIds : legacyIds.length ? legacyIds : Object.keys(states)).map(
+    /** Project one receiver using per-agent status, then legacy state, then singular legacy status, then envelope evidence; no mutation or I/O. */
     subagentId => {
       const state = record(states[subagentId])
-      const nativeState = string(state.status) ?? string(state.state) ?? context.status
+      const nativeState = string(state.status) ?? string(state.state) ?? legacyStatus ?? context.status
+      const evidence = nativeSubagentEvidence(raw, state, nativeState)
       return {
         ...context.common,
         id: `${context.common.id}:${subagentId}`,
@@ -177,6 +220,7 @@ function subagentItems(raw: NativeRecord, context: { common: ItemMetadata; statu
         subagentId,
         state: subagentState(nativeState),
         ...(typeof raw.prompt === 'string' ? { task: raw.prompt } : {}),
+        ...(evidence ? { extensions: { native: evidence } } : {}),
       }
     },
   )

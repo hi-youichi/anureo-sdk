@@ -12,8 +12,8 @@ import {
   type SessionStore, type SessionKey, type SessionMessage, type PermissionMode, type PermissionResult,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
-  BoundedEventQueue, HarnessSdkError, sdkError,
-  type BackendSession, type HarnessAdapter, type NativeInteractionResponder, type SessionEventSink, type SessionMethod,
+  BoundedEventQueue, HarnessSdkError, sdkError, capHistoryEntry, pageEndWithinBudget, DEFAULT_HISTORY_PAGE_BYTES,
+  type BackendSession, type HarnessAdapter, type NativeInteractionResponder, type NativeHookCallbacks, type SessionEventSink, type SessionMethod,
 } from "@anureo/sdk";
 import {
   AHP_PROTOCOL_CONTRACT, assertRequest, negotiateVersion, publicValue, validateJsonSchema,
@@ -24,6 +24,7 @@ import {
 import { FileSessionStore } from "./store";
 import { compileOutputSchema, type OutputSchema } from './output-schema';
 import { claudeTurnError } from './turn-error';
+import { claudeNativeHooks, validateNativeHooks } from './hooks';
 
 /** Connect a client to Claude queries and retain ownership of opened backend sessions.
  * createClient initializes and disposes this adapter through its output wrapper; direct consumers
@@ -51,14 +52,16 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
     if (!this.env.CLAUDE_CONFIG_DIR && !this.options.defaultHome && !this.options.queryFactory) throw new HarnessSdkError("HARNESS_CONFIG_INVALID", "Claude requires an explicit isolated CLAUDE_CONFIG_DIR");
     return { protocolVersion: 1, protocolContract: AHP_PROTOCOL_CONTRACT, runtime: { name: "claude", version: packageManifest.dependencies["@anthropic-ai/claude-agent-sdk"], adapter: "claude-native/0.1.0" }, capabilities: this.capabilities };
   }
+  validateNativeHooks(_params: SessionOpenParams, hooks: NativeHookCallbacks): void { validateNativeHooks(hooks); }
   /** Open and retain a backend for OutputSession.open to attach. Await resume/fork setup, query
    * construction and any resumed-title refresh. Native handshake and execution events arrive
    * independently through the sink. Setup errors reject the open. The client disposes the backend
    * it attaches, and adapter disposal also releases retained sessions. */
-  async openSession(params: SessionOpenParams, sink: SessionEventSink): Promise<BackendSession> {
+  async openSession(params: SessionOpenParams, sink: SessionEventSink, hooks?: NativeHookCallbacks): Promise<BackendSession> {
     if (this.disposed) throw new HarnessSdkError("RUNTIME_DISPOSED");
     if (params.binding.adapterId !== "claude" && params.binding.adapterId !== "claude-native") throw new HarnessSdkError("SESSION_BINDING_MISMATCH");
-    const session = new ClaudeBackendSession(this, params, sink, this.defaultStore);
+    if (hooks) this.validateNativeHooks(params, hooks);
+    const session = new ClaudeBackendSession(this, params, sink, this.defaultStore, hooks);
     this.sessions.add(session);
     try {
       await session.open();
@@ -85,7 +88,7 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
   queryOptions(cwd: string): Options {
     return {
       cwd, env: this.env, settingSources: [], persistSession: true,
-      includePartialMessages: true, includeHookEvents: true,
+      includePartialMessages: true, includeHookEvents: true, forwardSubagentText: true,
       ...(this.options.command ?? this.options.executable ? { pathToClaudeCodeExecutable: this.options.command ?? this.options.executable } : {}),
       ...(this.options.executableRuntime ? { executable: this.options.executableRuntime } : {}),
       ...(this.options.args?.length ? {
@@ -131,9 +134,11 @@ export class ClaudeNativeAdapter implements HarnessAdapter {
  * requests and OutputSession.dispose awaits its cleanup on behalf of the client.
  * Native receipt, execution association and terminal completion remain separate observations. */
 export class ClaudeBackendSession implements BackendSession {
+  private hookLifetime = new AbortController();
+  private readonly subagentTasks = new Map<string, SubagentTask>();
   /** Prepare binding/configuration for ClaudeNativeAdapter.openSession without starting a query.
    * Reject unsupported config keys or invalid values before native open. */
-  constructor(private readonly adapter: ClaudeNativeAdapter, private readonly params: SessionOpenParams, private readonly sink: SessionEventSink, private readonly fileStore?: FileSessionStore) {
+  constructor(private readonly adapter: ClaudeNativeAdapter, private readonly params: SessionOpenParams, private readonly sink: SessionEventSink, private readonly fileStore?: FileSessionStore, private readonly nativeHooks?: NativeHookCallbacks) {
     this.binding = { ...params.binding, nativeRef: params.binding.nativeRef ?? { provider: "claude", value: randomUUID() } };
     this.capabilities = adapter.capabilities; this.config = structuredClone(params.config ?? {}); this.model = params.model ?? str(this.config.model);
     this.effectiveConfig = { ...this.config };
@@ -174,6 +179,8 @@ export class ClaudeBackendSession implements BackendSession {
     switch (method) {
       case 'input/submit': return await this.submitInput(params as AhpRequestMap['input/submit'], query) as AhpResultMap[M];
       case 'session/interrupt': {
+        this.hookLifetime.abort();
+        this.hookLifetime = new AbortController();
         const receipt = await query.interrupt();
         const stillQueued = receipt?.still_queued?.flatMap(id => {
           const pending = this.nativeInputs.get(id);
@@ -199,6 +206,7 @@ export class ClaudeBackendSession implements BackendSession {
     return this.release ??= (async () => {
       this.closed = true;
       this.generation++;
+      this.hookLifetime.abort();
       this.nativeInputs.clear();
       this.input?.end();
       if (this.query) await this.releaseQuery(this.query);
@@ -403,6 +411,20 @@ export class ClaudeBackendSession implements BackendSession {
       ...(typeof fastMode === 'boolean' ? { settings: { fastMode } } : {}),
       ...(this.outputSchema ? { outputFormat: { type: 'json_schema' as const, schema: this.outputSchema.schema } } : {}),
       mcpServers,
+      ...(this.nativeHooks ? { hooks: claudeNativeHooks(this.nativeHooks, {
+        sessionId: this.params.binding.sessionId,
+        current: () => generation === this.generation ? this.active : undefined,
+        stopTurn: async () => {
+          if (generation !== this.generation) return;
+          if (this.active) return this.active;
+          // A native Stop callback is execution evidence, even if the SDK has
+          // not delivered the buffered assistant messages to the query iterator.
+          const userUuid = this.nativeInputs.keys().next().value;
+          if (userUuid) return await this.beginExecution(userUuid);
+        },
+        mayContinue: () => generation === this.generation && !this.outputSchema,
+        signal: () => generation === this.generation ? this.hookLifetime.signal : AbortSignal.abort(),
+      }) } : {}),
       canUseTool: async (toolName, input, details) => this.permissionRequest(toolName, input, details),
       onElicitation: async (request, details) => this.elicitationRequest(request, details),
     };
@@ -446,7 +468,12 @@ export class ClaudeBackendSession implements BackendSession {
     const hasNonterminalEvidence = this.nativeInputs.size > 0 && message.type !== 'result';
     // A message UUID is input identity. New UUID echoes inside an active native
     // loop bind additional inputs to that loop; they never create another turn.
-    if (mainReply && (this.active || matchesPendingInput || hasNonterminalEvidence)) {
+    // Claude also runs turns in response to background-task notifications. These
+    // can start without a submitted input and must still surface on the session.
+    const backgroundReply = message.type === 'result' && record(message.origin).kind === 'task-notification';
+    const executionEvidence = message.type === 'assistant' ||
+      (message.type === 'stream_event' && record(message.event).type !== 'ping') || backgroundReply;
+    if (mainReply && (this.active || matchesPendingInput || hasNonterminalEvidence || executionEvidence)) {
       if (message.type === 'result' && value.num_turns === 0 && !this.active) {
         for (const id of uuids) {
           if (!this.nativeInputs.has(id)) continue;
@@ -454,6 +481,7 @@ export class ClaudeBackendSession implements BackendSession {
         }
         return;
       }
+      if (!this.active && executionEvidence) await this.beginExecution(uuids[0]);
       await this.associateInputs(uuids);
     }
     const active = this.active;
@@ -465,6 +493,17 @@ export class ClaudeBackendSession implements BackendSession {
       }
       await this.sink.emit({ type: "session/state", payload: this.snapshot() }); return;
     }
+    if (message.type === "system" && ["task_started", "task_progress", "task_updated", "task_notification"].includes(String(value.subtype))) {
+      await this.mapSubagentTask(value, active); return;
+    }
+    const parentToolUseId = str(value.parent_tool_use_id);
+    if (parentToolUseId) {
+      for (const task of this.subagentTasks.values()) {
+        if (task.item.parentItemId === parentToolUseId && task.turnId !== active?.id) {
+          await this.notice(value, task.turnId); return;
+        }
+      }
+    }
     if (!active) { await this.notice(value); return; }
     if (message.type === "assistant") {
       if (!message.parent_tool_use_id) active.apiError = message.error;
@@ -472,18 +511,17 @@ export class ClaudeBackendSession implements BackendSession {
       const offset = active.blockCounts.get(messageId) ?? 0;
       active.blockCounts.set(messageId, offset + content.length);
       for (const [index, block] of content.entries()) {
-        await this.completeBlock({ block: record(block), messageId, blockIndex: offset + index, context: message.parent_tool_use_id !== null ? "subagent" : "main", active });
+        await this.completeBlock({ block: record(block), messageId, blockIndex: offset + index, context: message.parent_tool_use_id !== null ? "subagent" : "main", parentToolUseId: str(message.parent_tool_use_id) ?? undefined, active });
       }
       return;
     }
-    if (message.type === "stream_event") { await this.streamEvent(record(message.event), active); return; }
+    if (message.type === "stream_event") { await this.streamEvent(record(message.event), str(message.parent_tool_use_id) ?? undefined, active); return; }
     if (message.type === "user") {
       return this.publishToolResults(value, active);
     }
     if (message.type === "result") return this.completeTurn(message, active);
     if (message.type === "system" && typeof value.subtype === "string") {
       const subtype = value.subtype;
-      if (subtype.startsWith("task_")) return this.publishTask(value, active);
       if (subtype.startsWith("hook_")) return this.publishHook(subtype, value, active);
       if (subtype === "compact_boundary") { await this.sink.emit({ type: "item/completed", payload: { item: { id: str(value.uuid) ?? randomUUID(), type: "compaction", status: "completed", summary: str(value.summary), trigger: str(record(value.compact_metadata).trigger) } } }, { turnId: active.id }); return; }
     }
@@ -506,28 +544,55 @@ export class ClaudeBackendSession implements BackendSession {
       await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
     }
   }
-  /** Map native task updates to an item's start, patch or terminal event. mapMessage awaits
-   * publication, falling back to a notice when the native task identity is missing. */
-  private async publishTask(value: Record<string, unknown>, active: ActiveTurn): Promise<void> {
-    const id = str(value.task_id);
-    if (!id) return this.notice(value);
-    const previous = active.output.get(`task:${id}`);
+  /** Map native task updates to an item's start, patch or terminal event across turn
+   * boundaries: background tasks outlive their spawning turn, so task identity is tracked
+   * session-wide and events route to the originating turn. mapMessage awaits publication,
+   * falling back to a notice when the native task identity is missing. */
+  private async mapSubagentTask(value: Record<string, unknown>, active?: ActiveTurn): Promise<void> {
+    const taskId = str(value.task_id);
+    if (!taskId) return this.notice(value);
+    const previous = this.subagentTasks.get(taskId);
+    const parentItemId = str(value.tool_use_id) ?? previous?.item.parentItemId;
+    const tool = parentItemId ? active?.output.get(parentItemId) : undefined;
+    const isAgent = value.task_type === "local_agent" || (value.task_type === undefined &&
+      (previous || str(value.subagent_type) || (tool?.type === "toolCall" && (tool.nativeType === "Agent" || tool.nativeType === "Task"))));
+    const turnId = previous?.turnId ?? active?.id;
+    if (!isAgent || !turnId) return this.notice(value);
+    const baseId = `task:${taskId}`;
+    if (!previous && active?.output.has(baseId) && value.subtype !== "task_started") return;
+    const itemId = previous?.item.id ?? (active?.output.has(baseId) ? `${baseId}:${randomUUID()}` : baseId);
     const patch = record(value.patch);
-    const status = str(value.status) ?? str(patch.status) ?? "running";
-    const final = ["completed", "failed", "stopped", "killed"].includes(status);
+    const status = str(value.status) ?? str(patch.status);
+    // The terminal patch often precedes the notification, which adds the
+    // authoritative summary and usage. Keep that patch for the final item.
+    const terminalPatch = value.subtype === "task_updated" && (status === "completed" || status === "failed" || status === "killed");
+    const final = value.subtype === "task_notification" && (status === "completed" || status === "failed" || status === "stopped" || status === "killed");
+    const state = final
+      ? status === "completed" ? "completed" : status === "failed" ? "failed" : "interrupted"
+      : status === "pending" ? "pending" : status === "running" || value.subtype === "task_progress" ? "running" : previous?.item.state ?? "running";
+    const native = { ...record(previous?.item.extensions?.native), ...patch } as Record<string, unknown>;
+    for (const key of ["task_type", "subagent_type", "is_backgrounded", "spawn_depth", "prompt", "usage", "summary", "output_file", "last_tool_name", "skip_transcript", "ambient"]) {
+      if (value[key] !== undefined) native[key] = value[key];
+    }
+    const durationMs = record(value.usage).duration_ms;
     const item: Item = {
-      id: `task:${id}`,
-      type: "subagent",
-      subagentId: id,
-      state: status === "completed" || status === "failed" ? status : final ? "interrupted" : "running",
-      status: status === "completed" ? "completed" : final ? "failed" : "running",
-      task: str(value.description) ?? str(patch.description) ?? str(value.summary),
-      ...(str(value.tool_use_id) ? { parentItemId: str(value.tool_use_id) } : {}),
+      ...previous?.item, id: itemId, type: "subagent", subagentId: taskId, state,
+      status: state === "pending" ? "running" : state,
+      task: str(value.description) ?? str(patch.description) ?? previous?.item.task ?? str(value.summary),
+      ...(parentItemId ? { parentItemId } : {}),
+      ...(typeof durationMs === "number" ? { durationMs } : {}),
+      extensions: { native: safe(native) },
     };
-    active.output.set(item.id, item);
-    if (final) await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
-    else if (!previous) await this.sink.emit({ type: "item/started", payload: { item } }, { turnId: active.id });
-    else await this.sink.emit({ type: "item/delta", payload: { itemId: item.id, kind: "patch", value: safe(item) } }, { turnId: active.id });
+    if (active?.id === turnId) active.output.set(item.id, item);
+    if (final) {
+      this.subagentTasks.delete(taskId);
+      await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId });
+    } else {
+      this.subagentTasks.set(taskId, { turnId, item });
+      if (active?.id !== turnId) return;
+      if (!previous) await this.sink.emit({ type: "item/started", payload: { item } }, { turnId });
+      else if (!terminalPatch) await this.sink.emit({ type: "item/delta", payload: { itemId: item.id, kind: "patch", value: safe(item) } }, { turnId });
+    }
   }
   /** Give hook progress a start event when the hook was previously unseen. mapMessage awaits
    * publication before consuming another message, including when a missing hook ID emits a notice. */
@@ -581,14 +646,23 @@ export class ClaudeBackendSession implements BackendSession {
   private async completeTurn(message: Extract<SDKMessage, { type: "result" }>, active: ActiveTurn): Promise<void> {
     const value = record(message);
     const { interrupted, error, resultText, structuredText } = this.terminalOutput(message, active, value);
-    const textItems = [...active.output.values()].filter((item) => item.type === "agentMessage" && item.status !== "completed");
+    const backgroundReply = record(message.origin).kind === "task-notification";
+    const origin = backgroundReply ? { origin: { kind: "task-notification" } } : undefined;
+    const textItems = [...active.output.values()].filter((item) => item.type === "agentMessage" && !item.parentItemId && item.status !== "completed");
+    // Subagent child texts complete at turn end with commentary attribution; they never
+    // compete with the parent loop for the final answer.
+    const childTextItems = [...active.output.values()].filter((item) => item.type === "agentMessage" && item.parentItemId && item.status !== "completed");
+    for (const item of childTextItems) {
+      const completed: Item = { ...item, status: "completed", ...(origin ? { extensions: { ...record(item.extensions), native: { ...record(record(item.extensions).native), ...origin } } } : {}) };
+      active.output.set(item.id, completed); await this.sink.emit({ type: "item/completed", payload: { item: completed } }, { turnId: active.id });
+    }
     for (let index = 0; index < textItems.length; index++) {
       const item = textItems[index]!; if (item.type !== "agentMessage") continue;
-      const completed: Item = { ...item, text: index === textItems.length - 1 && resultText !== undefined ? resultText : item.text, phase: !this.outputSchema && index === textItems.length - 1 ? "final" : "commentary", status: "completed" };
+      const completed: Item = { ...item, text: index === textItems.length - 1 && resultText !== undefined ? resultText : item.text, phase: !this.outputSchema && index === textItems.length - 1 ? "final" : "commentary", status: "completed", ...(origin ? { extensions: { ...record(item.extensions), native: { ...record(record(item.extensions).native), ...origin } } } : {}) };
       active.output.set(item.id, completed); await this.sink.emit({ type: "item/completed", payload: { item: completed } }, { turnId: active.id });
     }
     if (!textItems.length && resultText) {
-      const item: Item = { id: `${active.userUuid}:final`, type: "agentMessage", phase: "final", text: resultText, status: "completed" };
+      const item: Item = { id: `${active.userUuid}:final`, type: "agentMessage", phase: "final", text: resultText, status: "completed", ...(origin ? { extensions: { native: origin } } : {}) };
       await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
     }
     if (structuredText !== undefined) {
@@ -636,7 +710,7 @@ export class ClaudeBackendSession implements BackendSession {
   }
   /** Update the active turn from streamed content, publishing starts/deltas before final blocks.
    * mapMessage calls only with an active turn; sink rejection propagates to the query pump. */
-  private async streamEvent(event: Record<string, unknown>, active: ActiveTurn): Promise<void> {
+  private async streamEvent(event: Record<string, unknown>, parentToolUseId: string | undefined, active: ActiveTurn): Promise<void> {
     const type = event.type;
     if (type === "message_start") { active.streamMessageId = str(record(event.message).id); return; }
     const index = typeof event.index === "number" ? event.index : 0;
@@ -646,6 +720,7 @@ export class ClaudeBackendSession implements BackendSession {
       const blockId = str(block.id) ?? id;
       const status = active.stoppedTools.get(blockId) ?? "running";
       const item = this.blockItem(block, blockId, status);
+      if (parentToolUseId) { item.parentItemId = parentToolUseId; item.extensions = { ...(item.extensions ?? {}), nativeParentTool: "subagent" }; }
       active.output.set(item.id, item); await this.sink.emit({ type: "item/started", payload: { item } }, { turnId: active.id });
     } else if (type === "content_block_delta") {
       const delta = record(event.delta); const previous = active.output.get(id);
@@ -668,24 +743,25 @@ export class ClaudeBackendSession implements BackendSession {
   }
   /** Merge a complete assistant block into active output and publish its start/patch/completion.
    * Text and tool calls stay pending until native result/tool evidence; sink failures reach pump. */
-  private async completeBlock({ block, messageId, blockIndex, context, active }: {
-    block: Record<string, unknown>; messageId: string; blockIndex: number; context: "main" | "subagent"; active: ActiveTurn;
+  private async completeBlock({ block, messageId, blockIndex, context, parentToolUseId, active }: {
+    block: Record<string, unknown>; messageId: string; blockIndex: number; context: "main" | "subagent"; parentToolUseId?: string; active: ActiveTurn;
   }): Promise<void> {
     const id = str(block.id) ?? `${messageId}:${blockIndex}`;
     const previous = active.output.get(id);
     const running = block.type === "text" || block.type === "tool_use";
     const status = active.stoppedTools.get(id) ?? (running ? "running" : "completed");
-    const item = this.blockItem(block, id, status);
-    if (context === "subagent") item.extensions = { ...(item.extensions ?? {}), nativeParentTool: "subagent" };
+    const item = this.blockItem(block, id, parentToolUseId && block.type === "text" ? "completed" : status);
+    if (parentToolUseId) { item.parentItemId = parentToolUseId; item.extensions = { ...(item.extensions ?? {}), nativeParentTool: "subagent" }; }
     active.output.set(id, item);
     if (!previous) await this.sink.emit({ type: "item/started", payload: { item: { ...item, status: "running" } } }, { turnId: active.id });
     else if (block.type === "tool_use") await this.sink.emit({ type: "item/delta", payload: { itemId: item.id, kind: "patch", value: safe(item) } }, { turnId: active.id });
     if (item.type !== "agentMessage" && block.type !== "tool_use") await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
+    else if (item.type === "agentMessage" && parentToolUseId && item.status === "completed") await this.sink.emit({ type: "item/completed", payload: { item } }, { turnId: active.id });
   }
   /** Publish otherwise unmapped native messages through the sink with privacy-safe raw content. */
-  private async notice(value: Record<string, unknown>): Promise<void> {
+  private async notice(value: Record<string, unknown>, turnId = this.active?.id): Promise<void> {
     const subtype = str(value.subtype) ?? str(value.type) ?? "unknown";
-    await this.sink.emit({ type: "notice", payload: { severity: /error|denied|retry|rate_limit/.test(subtype) ? "warning" : "info", code: `CLAUDE_${subtype.toUpperCase().replace(/[^A-Z0-9_]/g, "_")}`, message: str(value.content) ?? str(value.message) ?? subtype, raw: safe(value) } }, this.active ? { turnId: this.active.id } : {});
+    await this.sink.emit({ type: "notice", payload: { severity: /error|denied|retry|rate_limit/.test(subtype) ? "warning" : "info", code: `CLAUDE_${subtype.toUpperCase().replace(/[^A-Z0-9_]/g, "_")}`, message: str(value.content) ?? str(value.message) ?? subtype, raw: safe(value) } }, turnId ? { turnId } : {});
   }
   /** Native canUseTool callback supplied by sessionQueryOptions. Await SDK approval/user answers or
    * native cancellation, translating unavailable interactions to denial and removing the abort listener.
@@ -865,8 +941,9 @@ export class ClaudeBackendSession implements BackendSession {
     const messages = await this.messages(nativeId);
     const turns = this.fileStore ? await this.fileStore.loadTurnMap(nativeId) : this.adapter.turnMaps.get(nativeId) ?? this.turns;
     const { nativeTurnId } = boundary;
-    if (nativeTurnId && !messages.some(message => message.uuid === nativeTurnId && isPrompt(message))) throw new HarnessSdkError("TURN_NOT_FOUND");
-    const targetTurn = nativeTurnId ? turns[nativeTurnId] : boundary.turnId;
+    // Hosts may echo the turn/started identity as nativeTurnId; resolve a turn-map key or a
+    // turn id itself through the transcript prompt map and validate at the index lookup.
+    const targetTurn = nativeTurnId ? (turns[nativeTurnId] ?? nativeTurnId) : boundary.turnId;
     const index = messages.findIndex(message => isPrompt(message) && (message.uuid === nativeTurnId || (targetTurn !== undefined && turns[message.uuid] === targetTurn)));
     if (index < 0) throw new HarnessSdkError("TURN_NOT_FOUND");
     const promptUuid = messages[index]!.uuid;
@@ -1020,14 +1097,14 @@ export class ClaudeBackendSession implements BackendSession {
       const turns = { ...this.turns };
       const items = this.projectHistory(await this.messages(source.value), turns);
       const withStructuredOutput = await this.structuredHistory(items, source.value);
-      snapshotToken = randomUUID(); this.historySnapshots.set(snapshotToken, { items: withStructuredOutput, source });
+      snapshotToken = randomUUID(); this.historySnapshots.set(snapshotToken, { items: withStructuredOutput.map(entry => capHistoryEntry(entry)), source });
       if (this.historySnapshots.size > 8) this.historySnapshots.delete(this.historySnapshots.keys().next().value!);
     }
     const snapshot = this.historySnapshots.get(snapshotToken); if (!snapshot) throw new HarnessSdkError("CURSOR_EXPIRED");
     const { items, source } = snapshot;
     const offset = request.cursor === undefined ? 0 : Number(request.cursor);
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > items.length) throw new HarnessSdkError("CURSOR_INVALID");
-    const limit = Math.min(request.limit ?? 200, 1000); const page = items.slice(offset, offset + limit);
+    const limit = Math.min(request.limit ?? 200, 1000); const end = pageEndWithinBudget(items, offset, Math.min(offset + limit, items.length), DEFAULT_HISTORY_PAGE_BYTES); const page = items.slice(offset, end);
     return { items: structuredClone(page), ...(offset + page.length < items.length ? { nextCursor: String(offset + page.length) } : {}), snapshotToken, source: structuredClone(source) };
   }
   /** Reconstruct readHistory's live-compatible item IDs and tool results from ordered native entries.
@@ -1162,3 +1239,4 @@ type NativeElicitation = NonNullable<Options["onElicitation"]>;
 
 /** Execution output and input associations that completeTurn reads before clearing the active slot. */
 interface ActiveTurn { id: string; userUuid: string; consumed: Set<string>; output: Map<string, Item>; stoppedTools: Map<string, "declined" | "interrupted">; streamMessageId?: string; blockCounts: Map<string, number>; apiError?: Extract<SDKMessage, { type: 'assistant' }>['error'] }
+interface SubagentTask { turnId: string; item: Extract<Item, { type: "subagent" }> }

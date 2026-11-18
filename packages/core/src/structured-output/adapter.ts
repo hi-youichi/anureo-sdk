@@ -27,11 +27,15 @@ export function withStructuredOutput(adapter: HarnessAdapter, limits: OutputLimi
      * before native open so adapter disposal can see it during setup. If setup fails, await
      * session cleanup before rejecting with the setup cause or a safe release failure.
      */
-    async openSession(params, sink) {
+    async openSession(params, sink, hooks) {
+      if (hooks) {
+        if (!adapter.validateNativeHooks) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Adapter lacks native hook coverage')
+        adapter.validateNativeHooks(params, hooks)
+      }
       const session = new OutputSession({ params, sink, manager, limits, forget: () => sessions.delete(session) })
       sessions.add(session)
       try {
-        return await session.open({ adapter, nativeOutput })
+        return await session.open({ adapter, nativeOutput, hooks })
       } catch (cause) {
         try { await session.dispose() }
         catch {

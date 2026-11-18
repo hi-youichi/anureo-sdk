@@ -17,6 +17,8 @@ export class AgentJournal {
   constructor(
     private readonly path: string,
     source: readonly JournalEvent[],
+    /** Memory-only journals keep their event/index state but never touch the filesystem. */
+    private readonly persist = true,
   ) {
     this.events.push(...jsonCopy(source))
     this.sourceIndex = indexJournal(this.events)
@@ -35,10 +37,10 @@ export class AgentJournal {
     return key
   }
 
-  /** Decide how memoizedAgent should handle the reserved key. A replay carries an isolated
+  /** Decide how a journaled call should handle the reserved key. A replay carries an isolated
    * result for the caller to validate. A miss closes result reuse unless the source left this
    * key at started. Even after reuse closes, an exact-key failure with an unknown outcome
-   * requires reconciliation before memoizedAgent can dispatch. */
+   * requires reconciliation before the call can dispatch. */
   resolveCall(key: string): JournalDecision {
     if (this.reuseOpen) {
       const result = this.sourceIndex.results.get(key)
@@ -63,18 +65,20 @@ export class AgentJournal {
       this.replayPrefix = undefined
     }
     this.events.push(jsonCopy(event))
-    // Concurrent callers must not race atomic renames: an earlier snapshot
-    // landing last would silently drop later events from the published file.
-    const publish = this.publishQueue.catch(() => {}).then(async () => {
-      try {
-        const count = this.events.length
-        await atomicPublish(this.path, this.events, () => { this.publishedCount = count })
-      } catch (cause) {
-        throw storageError(cause)
-      }
-    })
-    this.publishQueue = publish
-    await publish
+    if (this.persist) {
+      // Concurrent callers must not race atomic renames: an earlier snapshot
+      // landing last would silently drop later events from the published file.
+      const publish = this.publishQueue.catch(() => {}).then(async () => {
+        try {
+          const count = this.events.length
+          await atomicPublish(this.path, this.events, () => { this.publishedCount = count })
+        } catch (cause) {
+          throw storageError(cause)
+        }
+      })
+      this.publishQueue = publish
+      await publish
+    }
   }
 
   /** After agent work drains, bind the manifest to the last installed snapshot and carry
@@ -97,7 +101,7 @@ export class AgentJournal {
   private publishQueue: Promise<void> = Promise.resolve()
 }
 
-/** Result handling stays with memoizedAgent, which owns validation, dispatch and rejection. */
+/** Result handling stays with the journaled caller, which owns validation, dispatch and rejection. */
 type JournalDecision = { action: 'replay'; result: JsonValue } | { action: 'execute' | 'reconcile' }
 
 /** Replay lookup built from validated events. A key left at started can be respawned. */

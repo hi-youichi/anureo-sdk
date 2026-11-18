@@ -143,6 +143,12 @@ receives a deeply frozen input copy. The root exports `WorkflowOptions`,
 `WorkflowContext`, and `WorkflowResult` for typing the options, callback context,
 and published result.
 
+Every `agent()` call made inside the body is journaled automatically: identical
+calls on a `resumeFrom` run return their saved results without opening new
+sessions, and any changed call invalidates the calls after it. A saved call whose
+previous outcome is unknown rejects resume with `WORKFLOW_RECONCILIATION_REQUIRED`
+until the previous execution's outcome is confirmed.
+
 To resume, set `resumeFrom` to an inactive source run with the same name and
 revision. The body runs again from the beginning in a new run. After schema
 validation, journaled calls reserve keys in invocation order using their prompt,
@@ -181,6 +187,18 @@ for cache keys, failure recovery, and file guarantees.
   [Checkpoint records](src/persistence/records.ts) define the shared file layout and schemas.
   [Checkpoint file I/O](src/persistence/checkpoint-files.ts) owns atomic publication and
   checked reads. [Canonical JSON](src/persistence/json.ts) supplies copying and hashing rules.
+
+## Adapter-facing helpers
+
+Root exports also include three functions for adapter authors composing their
+own journaled step primitives (for example `beer()` in
+[`@anureo/adapter-swarm`](../adapter/swarm/README.md#workflow-execution)).
+`journaledCall({ prompt, canonical, inputHookRevision?, droppedCode?,
+failureCode? }, execute, revive?)` runs one memoized step with exactly the
+`agent()` journal semantics: it executes unbundled outside a `workflow()` body.
+`prepareOutputSchema(schema)` turns a zod object into the canonical JSON schema
+plus `parse` used by structured-output steps, and `isDroppedOutcome(error,
+status)` detects drop-class turn failures that map to a journaled null result.
 
 ## Examples
 

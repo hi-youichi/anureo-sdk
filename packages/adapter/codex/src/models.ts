@@ -8,6 +8,10 @@ export type CodexModel = {
   id: string
   /** First string among the native displayName, name and resolved id fields, including an empty label. */
   name: string
+  /** Native picker description, when nonempty. */
+  description?: string
+  /** Input modalities reported by the native model catalog. */
+  inputModalities?: string[]
   /** Present only when the native response marks this model as the default. */
   isDefault?: boolean
   /** Present only when the native response hides this model from the usual picker. */
@@ -64,11 +68,15 @@ function decodeModel(entry: unknown): CodexModel {
     return effort ? [{ id: effort, ...(description ? { description } : {}) }] : []
   }) : undefined
   const defaultEffort = string(model.defaultReasoningEffort)
+  const description = string(model.description)
+  const inputModalities = Array.isArray(model.inputModalities) ? model.inputModalities.flatMap(item => typeof item === 'string' && item.trim() ? [item] : []) : undefined
   const serviceTiers = Array.isArray(model.serviceTiers) ? model.serviceTiers.flatMap(item => string(record(item).id) ?? []) : undefined
 
   return {
     id,
     name: string(model.displayName) ?? string(model.name) ?? id,
+    ...(description?.trim() ? { description } : {}),
+    ...(inputModalities ? { inputModalities } : {}),
     ...(model.isDefault === true ? { isDefault: true } : {}),
     ...(model.hidden === true ? { hidden: true } : {}),
     ...(efforts ? { efforts } : {}),

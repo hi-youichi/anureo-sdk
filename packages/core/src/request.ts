@@ -4,20 +4,22 @@ import type { RequestOptions } from './types';
 
 /**
  * Package-internal validation of explicit Client and Session wait durations in milliseconds.
- * Return true for non-finite, non-positive or above 2_147_483_647. Omission and positive fractions
- * within the limit pass. Client.initialize and Client.validateOpen throw INVALID_PARAMS on
- * failure. Session.request, Session.submitExecution and Session.closeRequest return a rejection.
+ * Return true for non-finite, non-positive or above 2_147_483_647. Explicit null passes and waits
+ * without a deadline. Omission and positive fractions within the limit pass. Client.initialize and
+ * Client.validateOpen throw INVALID_PARAMS on failure. Session.request, Session.submitExecution and
+ * Session.closeRequest return a rejection.
  */
 export function invalidWait(wait?: RequestOptions): boolean {
-  return wait?.timeoutMs !== undefined
+  return wait?.timeoutMs != null
     && (!Number.isFinite(wait.timeoutMs) || wait.timeoutMs <= 0 || wait.timeoutMs > 0x7fffffff);
 }
 
 /**
  * Await one operation with a caller-scoped deadline and optional abort signal.
  * A pre-aborted signal rejects with REQUEST_ABORTED before timeout validation or invocation.
- * A nullish timeout uses defaultTimeoutMs, which defaults to 30,000 ms. A non-finite or non-positive
- * effective timeout rejects with INVALID_PARAMS. Rounding and timer range follow the host timer.
+ * An omitted timeout uses defaultTimeoutMs, which defaults to 30,000 ms; an explicit null waits
+ * without a deadline. A non-finite or non-positive effective timeout rejects with INVALID_PARAMS.
+ * Rounding and timer range follow the host timer.
  * The operation is invoked synchronously once. Its value or original failure, including a
  * synchronous throw, settles the wait if it wins the race. Abort or expiry after invocation
  * rejects with REQUEST_ABORTED or REQUEST_TIMEOUT and outcomeUnknown=true. Settlement clears
@@ -33,8 +35,8 @@ export function invalidWait(wait?: RequestOptions): boolean {
  */
 export function waitForRequest<T>(operation: () => Promise<T>, options: RequestOptions = {}, defaultTimeoutMs = 30_000): Promise<T> {
   if (options.signal?.aborted) return Promise.reject(new HarnessSdkError("REQUEST_ABORTED", "Request aborted before dispatch"));
-  const timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return Promise.reject(new HarnessSdkError("INVALID_PARAMS", "timeoutMs must be positive"));
+  const timeoutMs = options.timeoutMs === undefined ? defaultTimeoutMs : options.timeoutMs;
+  if (timeoutMs !== null && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) return Promise.reject(new HarnessSdkError("INVALID_PARAMS", "timeoutMs must be positive or null"));
   return observeRequest({ operation, options, timeoutMs });
 }
 
@@ -45,7 +47,7 @@ export function waitForRequest<T>(operation: () => Promise<T>, options: RequestO
 function observeRequest<T>({ operation, options, timeoutMs }: {
   operation: () => Promise<T>;
   options: RequestOptions;
-  timeoutMs: number;
+  timeoutMs: number | null;
 }): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let settled = false;
@@ -73,7 +75,7 @@ function observeRequest<T>({ operation, options, timeoutMs }: {
     /** Forward invocation failures and promise rejections through the same cleanup. */
     const rejectOperation = (cause: unknown) => finish(() => reject(cause));
 
-    const timer = setTimeout(() => abandon("REQUEST_TIMEOUT"), timeoutMs);
+    const timer = timeoutMs === null ? undefined : setTimeout(() => abandon("REQUEST_TIMEOUT"), timeoutMs);
     // Install before invoking operation: it may synchronously trigger the caller's abort signal.
     signal?.addEventListener("abort", abort, { once: true });
     // Keep the rejection handler attached after abandonment so late failures stay observed.

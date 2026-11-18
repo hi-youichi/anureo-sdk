@@ -1,7 +1,7 @@
 /** Owns a native thread's binding, execution evidence, and projection into SDK state and events. */
 import { randomUUID } from 'node:crypto'
 import type { ApprovalOption, Capabilities, AhpRequestMap, AhpResultMap, GoalState, HistoryItem, HistoryPage, InteractionRequested, InteractionResponse, Item, JsonObject, SessionBinding, SessionOpenParams, SessionState, Usage } from '@anureo/protocol'
-import { HarnessSdkError, sdkError, type BackendSession, type SessionEventSink, type SessionMethod } from '@anureo/sdk'
+import { HarnessSdkError, sdkError, capItem, pageEndWithinBudget, DEFAULT_HISTORY_PAGE_BYTES, type BackendSession, type SessionEventSink, type SessionMethod } from '@anureo/sdk'
 import { CodexJsonlClient, CodexRpcError, type NativeRequest } from './jsonl'
 import { json, safe, record, string, type NativeRecord } from './native-values'
 import { mapItems } from './mapping'
@@ -13,6 +13,8 @@ import { PERMISSION_MODES, permissionSettings, serviceTierFor } from './settings
 import type { CodexProfile } from './profile'
 import type { CodexAdapterOptions } from './options'
 
+/** One spawn child observed through thread/started; nickname/role enrich adapter thread discovery. */
+type DiscoveredSubagent = { parentThreadId: string; agentNickname?: string; agentRole?: string; forkedFromId?: string }
 /**
  * Per-thread BackendSession created by CodexNativeAdapter.openSession. Attach its transport
  * before opening. Feed notifications in wire order while server requests settle concurrently.
@@ -43,6 +45,18 @@ export class CodexBackendSession implements BackendSession {
   importTurnMap(source: CodexBackendSession): void {
     this.canonicalTurnIdByNativeId = new Map(source.canonicalTurnIdByNativeId)
     this.nativeTurnIdByCanonicalId = new Map(source.nativeTurnIdByCanonicalId)
+  }
+  // Locally observed spawn children (thread/started) enrich adapter thread discovery.
+  private readonly discoveredChildThreads = new Map<string, DiscoveredSubagent>()
+  /** Let the adapter enrich thread/list summaries with locally observed spawn metadata; unknown threads return undefined without effects. */
+  subagentMetadata(threadId: string): DiscoveredSubagent | undefined { return this.discoveredChildThreads.get(threadId) }
+  /** Let the adapter revoke thread/list support observed as method-not-found; already-disabled capabilities publish nothing and revision advances only on change. Sink rejection propagates to the adapter caller. */
+  async disableSubagentTree(): Promise<void> {
+    if (!this.capabilities.subagents?.tree) return
+    this.capabilities.subagents.tree = false
+    this.state.capabilityRevision = ++this.capabilityRevision
+    this.state.capabilities = this.capabilities
+    await this.sink.emit({ type: 'session/state', payload: structuredClone(this.state) })
   }
   /** Open the native thread after the handshake and await any restored metadata publication. CodexNativeAdapter.openSession registers the backend on success and disposes the client if policy, identity, native, or sink errors reject. */
   async open(): Promise<void> {
@@ -126,7 +140,9 @@ export class CodexBackendSession implements BackendSession {
    */
   async notification(method: string, params: NativeRecord): Promise<void> {
     if (typeof params.threadId === 'string' && this.threadId && params.threadId !== this.threadId) return
-    if (method === 'thread/started') return
+    // thread/started bypasses the thread-scope filter below: spawned subagent threads carry the
+    // child's own identity, and this notice is the only pushed discovery channel for them.
+    if (method === 'thread/started') return await this.threadStarted(params)
     if (method === 'thread/name/updated') {
       const title = typeof params.threadName === 'string' ? params.threadName : null
       if (this.state.metadata?.title !== title) {
@@ -163,7 +179,7 @@ export class CodexBackendSession implements BackendSession {
       return
     }
     if ((method === 'hook/started' || method === 'hook/completed') && turnId) {
-      await this.projectHook({ params, turnId, phase: method === 'hook/started' ? 'started' : 'completed' })
+      await this.projectHook(params, turnId, method === 'hook/started')
       return
     }
     if (method === 'thread/compacted') {
@@ -283,20 +299,8 @@ export class CodexBackendSession implements BackendSession {
     await this.sink.emit({ type: 'usage/updated', payload: usage }, { turnId })
   }
 
-  /** Publish notification's scoped hook snapshot when a hook ID exists. Output sanitization and sink failures reject. */
-  private async projectHook({ params, turnId, phase }: { params: NativeRecord; turnId: string; phase: ItemPhase }): Promise<void> {
-    const hook = record(params.hook ?? params)
-    const id = string(hook.id) ?? string(params.hookId)
-    if (!id) return
-    const item: Item = {
-      id,
-      type: 'hook',
-      name: string(hook.name) ?? 'hook',
-      status: phase === 'started' ? 'running' : 'completed',
-      output: safe(hook.output),
-    }
-    await this.sink.emit({ type: phase === 'started' ? 'item/started' : 'item/completed', payload: { item } }, { turnId, itemId: id })
-  }
+
+
   /** Translate a copy of the configuration for open and record the selected permission mode in SDK state. An explicit config permission mode takes precedence. Invalid policy can throw before dispatch. */
   private threadOptions(): NativeRecord {
     const config: NativeRecord = { ...(this.params.config ?? {}) }
@@ -354,8 +358,27 @@ export class CodexBackendSession implements BackendSession {
     if (!this.threadId) throw new HarnessSdkError('PROTOCOL_ERROR', 'Native thread identity missing')
     this.binding = { ...this.binding, nativeRef: { provider: 'codex', value: this.threadId } }
     this.state.binding = this.binding
-    if (typeof thread.name === 'string' || thread.name === null) this.state.metadata = { title: thread.name }
-    if (this.state.metadata) await this.sink.emit({ type: 'session/metadata', payload: this.state.metadata })
+    const title = typeof thread.name === 'string' || thread.name === null ? thread.name : undefined
+    const extensions: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries({
+      parentThreadId: string(thread.parentThreadId),
+      agentNickname: string(thread.agentNickname),
+      agentRole: string(thread.agentRole),
+      forkedFromId: string(thread.forkedFromId),
+      nativeSource: string(thread.threadSource),
+    })) if (value !== undefined) extensions[key] = value
+    if (title !== undefined || Object.keys(extensions).length) {
+      this.state.metadata = { ...(title !== undefined ? { title } : {}), ...(Object.keys(extensions).length ? { extensions: safe(extensions) as JsonObject } : {}) }
+      await this.sink.emit({ type: 'session/metadata', payload: this.state.metadata })
+    }
+    // Parent-owned Multi-Agent V2 subagent threads reject every direct input natively; degrade the
+    // advertised input capability so hosts observe the restriction instead of a per-request denial.
+    if (thread.canAcceptDirectInput === false) {
+      this.capabilities.input = { delivery: [], interrupt: { targets: ['turn'], reportsPendingInputs: false } }
+      this.state.capabilityRevision = ++this.capabilityRevision
+      this.state.capabilities = this.capabilities
+      await this.sink.emit({ type: 'session/state', payload: structuredClone(this.state) })
+    }
   }
   /** Resolve a native identity for steer, interrupt, or revert. A supplied boundary ID takes precedence over observed evidence. Throw the operation's missing-identity code before dispatch. */
   private nativeTurn({ canonical, provided, missing = 'BOUNDARY_NATIVE_ID_REQUIRED' }: { canonical: string; provided?: string; missing?: string }): string {
@@ -445,7 +468,8 @@ export class CodexBackendSession implements BackendSession {
    */
   private async startInput(start: AhpRequestMap['input/submit']): Promise<NativeRecord> {
     if (start.delivery !== 'native') throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
-    if (await readAccountStatus(this.client) === 'required') throw new HarnessSdkError('AUTH_REQUIRED')
+    const accountStatus = await readAccountStatus(this.client)
+    if (accountStatus === 'required') throw new HarnessSdkError('AUTH_REQUIRED')
     const permissions = permissionSettings(this.state.config.permissionMode)
     const sessionOverrides = Object.fromEntries(
       Object.entries(this.state.config).filter(([key]) => this.capabilities.turn?.overrides?.includes(key)),
@@ -553,7 +577,7 @@ export class CodexBackendSession implements BackendSession {
     const seen = new Set<string>()
     let cursor: string | undefined
     do {
-      const page = record(await this.client.request('thread/turns/list', { threadId: this.threadId, sortDirection: 'asc', limit: 200, ...(cursor ? { cursor } : {}) }))
+      const page = record(await this.client.request('thread/turns/list', { threadId: this.threadId, sortDirection: 'asc', limit: this.options.nativePageLimit ?? 50, ...(cursor ? { cursor } : {}) }))
       if (!Array.isArray(page.data)) throw new HarnessSdkError('PROTOCOL_ERROR')
       turns.push(...page.data.map(record))
       if (turns.length > (this.options.maxHistoryItems ?? 10000)) throw new HarnessSdkError('HISTORY_LIMIT_EXCEEDED')
@@ -585,7 +609,8 @@ export class CodexBackendSession implements BackendSession {
     const { items } = snapshot
     if (offset > items.length) throw new HarnessSdkError('CURSOR_INVALID')
     const limit = params.limit ?? 200
-    const end = Math.min(offset + limit, items.length)
+    // Byte-budget the page so no transport hop (8MiB AHP frames, 16MiB WS receive limits) can reject it; capping at snapshot build bounds each item first.
+    const end = pageEndWithinBudget(items, offset, Math.min(offset + limit, items.length), this.options.maxPageBytes ?? DEFAULT_HISTORY_PAGE_BYTES)
     return {
       items: structuredClone(items.slice(offset, end)),
       snapshotToken: snapshot.token,
@@ -621,7 +646,7 @@ export class CodexBackendSession implements BackendSession {
     const seen = new Set<string>()
     let cursor: string | undefined
     do {
-      const page = record(await this.optional('thread/items/list', { threadId: this.threadId, sortDirection: 'asc', limit: 200, ...(cursor ? { cursor } : {}) }, () => { this.capabilities.session!.history = false }))
+      const page = record(await this.optional('thread/items/list', { threadId: this.threadId, sortDirection: 'asc', limit: this.options.nativePageLimit ?? 50, ...(cursor ? { cursor } : {}) }, () => { this.capabilities.session!.history = false }))
       if (!Array.isArray(page.data)) throw new HarnessSdkError('PROTOCOL_ERROR')
       for (const entry of page.data) {
         const native = record(entry)
@@ -664,7 +689,7 @@ export class CodexBackendSession implements BackendSession {
       turnId: this.canonicalTurnIdByNativeId.get(nativeTurnId) ?? nativeTurnId,
       nativeTurnId,
       nativeItemId: string(record(nativeItem).id),
-      item,
+      item: capItem(item),
     }))
   }
   /** Publish notification's plan start or patch before storing the latest plan for completeTurn. If publication fails, reject and keep the previous plan. */
@@ -690,6 +715,52 @@ export class CodexBackendSession implements BackendSession {
       await this.sink.emit({ type: 'item/delta', payload: { itemId: id, kind: 'patch', value: json(item) } }, { turnId, itemId: id })
     }
     this.nativePlans.set(turnId, plan)
+  }
+  /** Project v2 run summaries and older hook notifications without inventing an execution for session hooks. */
+  private async projectHook(params: NativeRecord, turnId: string | undefined, started: boolean): Promise<void> {
+    const hook = record(params.run ?? params.hook ?? params)
+    const id = string(hook.id) ?? string(params.hookId)
+    if (!id) return
+    const name = string(hook.eventName) ?? string(hook.name) ?? 'hook'
+    const status = started ? 'running' : hook.status === 'blocked' ? 'declined' : hook.status === 'stopped'
+      ? 'interrupted' : hook.status === 'failed' ? 'failed' : 'completed'
+    const output = hook.entries ?? hook.output
+    const key = `${turnId}\0${id}`
+    if (!turnId || (!this.state.activeTurnIds.includes(turnId) && (started || !this.items.has(key)))) {
+      await this.sink.emit({ type: 'notice', payload: {
+        severity: status === 'failed' ? 'warning' : 'info',
+        code: started ? 'NATIVE_HOOK_STARTED' : 'NATIVE_HOOK_COMPLETED',
+        message: 'Native hook lifecycle update',
+        raw: safe({ id, name, status, output }),
+      } }, { turnId })
+      return
+    }
+    const item: Item = {
+      id, name, type: 'hook', status,
+      ...(output !== undefined ? { output: safe(output) } : {}),
+      ...(typeof hook.durationMs === 'number' && Number.isFinite(hook.durationMs) && hook.durationMs >= 0
+        ? { durationMs: hook.durationMs } : {}),
+    }
+    this.items.add(key)
+    await this.sink.emit({ type: started ? 'item/started' : 'item/completed', payload: { item } }, { turnId, itemId: id })
+  }
+  /**
+   * For spawned subagent discovery, register the child thread and publish a structured notice.
+   * Own-thread and non-subagent notifications stay silent; malformed identity rejects as
+   * PROTOCOL_ERROR; no turn state is touched, and evidence is sanitized before publication.
+   */
+  private async threadStarted(params: NativeRecord): Promise<void> {
+    const thread = record(params.thread ?? params)
+    const id = string(thread.id)
+    if (!id) throw new HarnessSdkError('PROTOCOL_ERROR', 'Native thread notification lacks identity')
+    if (id === this.threadId) return
+    const parentThreadId = string(thread.parentThreadId)
+    if (!parentThreadId) return
+    const metadata: DiscoveredSubagent = { parentThreadId, agentNickname: string(thread.agentNickname), agentRole: string(thread.agentRole), forkedFromId: string(thread.forkedFromId) }
+    this.discoveredChildThreads.set(id, metadata)
+    const evidence: Record<string, unknown> = { nativeThreadId: id, parentThreadId }
+    for (const key of ['agentNickname', 'agentRole', 'forkedFromId'] as const) if (metadata[key] !== undefined) evidence[key] = metadata[key]
+    await this.sink.emit({ type: 'notice', payload: { severity: 'info', code: 'SUBAGENT_THREAD_STARTED', message: `Subagent thread started${metadata.agentNickname ? ` (${metadata.agentNickname})` : ''}`, extensions: safe(evidence) as JsonObject } })
   }
   /**
    * observeItem awaits these snapshots after any submission correlation. Publish in map order.

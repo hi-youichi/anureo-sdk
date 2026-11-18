@@ -6,4 +6,7 @@ export { parallel } from './parallel'
 export { pipeline } from './pipeline'
 
 export { workflow } from './workflow'
-export type { WorkflowContext, WorkflowOptions, WorkflowResult } from './workflow-types'
+export { journaledCall, type JournaledCall } from './journal-call'
+export { prepareOutputSchema } from './output-schema'
+export { isDroppedOutcome } from './agent-execution'
+export type { WorkflowOptions, WorkflowContext, WorkflowResult } from './workflow-types'

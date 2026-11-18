@@ -313,3 +313,4 @@ async function releaseLock(path: string, handle: FileHandle): Promise<void> {
     await syncDirectory(dirname(path))
   } finally { await handle.close() }
 }
+

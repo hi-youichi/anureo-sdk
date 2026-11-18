@@ -7,7 +7,6 @@ const threadId = 'native-thread'
 let currentTurnId = 'native-turn-1'
 let counter = 0
 let allowedHistory = ['native-turn-1','native-turn-2']
-/** For fixture emitters, serialize a supplied frame to stdout in call order and return its backpressure boolean without waiting for drain. Serialization errors throw; stream failures remain process errors. */
 const send = value => process.stdout.write(JSON.stringify(value) + '\n')
 /** Queue a notification with the fixture's thread ID as the default. Scenario params can override it to test thread filtering. */
 const notify = (method, params) => send({ method, params: { threadId, ...params } })
@@ -79,6 +78,10 @@ function sendRpcError(msg, code, message) {
 
 /** For turn/start and review/start, reject a busy held turn or allocate the next turn, notify before acknowledging, then emit its scenario. Mutates process-owned turn identity/counter; write failures propagate. */
 function startTurn(msg) {
+  if (mode === 'subagent-denial' && msg.method === 'turn/start') {
+    send({ id: msg.id, error: { code: -32600, message: 'direct app-server input is not allowed for multi-agent v2 sub-agents' } })
+    return
+  }
   if (mode === 'hold' && msg.method === 'turn/start' && counter > 0) {
     sendRpcError(msg, -32602, 'Native busy')
     return
@@ -93,6 +96,39 @@ function startTurn(msg) {
 /** Emit the scenario after startTurn acknowledges the RPC. Some modes leave the turn pending or schedule exit or an oversized frame. Interactive scenarios wait for handleMessage to receive the response. */
 function emitTurnScenario(msg) {
   switch (mode) {
+    case 'native-hooks': {
+      const setup = { turnId: null, run: { id: 'session-hook', eventName: 'SessionStart', status: 'completed', entries: [] } }
+      notify('hook/completed', setup)
+      const run = { id: 'turn-hook', eventName: 'PreToolUse', status: 'running', entries: [] }
+      notify('hook/started', { turnId: currentTurnId, run })
+      notify('hook/completed', { turnId: currentTurnId, run: { ...run, status: 'blocked', durationMs: 5, entries: [{ kind: 'feedback', text: 'denied' }] } })
+      emitFinalAnswerAndCompleteCurrentTurn()
+      return
+    }
+
+    case 'native-hooks': {
+      const setup = { turnId: null, run: { id: 'session-hook', eventName: 'SessionStart', status: 'completed', entries: [] } }
+      notify('hook/completed', setup)
+      const run = { id: 'turn-hook', eventName: 'PreToolUse', status: 'running', entries: [] }
+      notify('hook/started', { turnId: currentTurnId, run })
+      notify('hook/completed', { turnId: currentTurnId, run: { ...run, status: 'blocked', durationMs: 5, entries: [{ kind: 'feedback', text: 'denied' }] } })
+      emitFinalAnswerAndCompleteCurrentTurn()
+      return
+    }
+    case 'subagent-discovery': {
+      // Real wire shape carries only the thread object; a defensive variant repeats the child id at
+      // the top level, and the parent's own started notification must stay silent.
+      send({ method: 'thread/started', params: { thread: { id: 'child-1', parentThreadId: threadId, agentNickname: 'Scout', agentRole: 'researcher', forkedFromId: threadId } } })
+      send({ method: 'thread/started', params: { threadId: 'child-2', thread: { id: 'child-2', parentThreadId: threadId, agentNickname: 'Mapper' } } })
+      send({ method: 'thread/started', params: { thread: { id: threadId } } })
+      // Foreign-thread item evidence must keep dropping through the thread-scope filter.
+      send({ method: 'item/started', params: { threadId: 'child-9', turnId: 'foreign-turn', item: { id: 'foreign', type: 'agentMessage', text: 'foreign' } } })
+      notify('item/started', { turnId: currentTurnId, item: { id: 'act-1', type: 'subAgentActivity', kind: 'started', agentThreadId: 'child-1', agentPath: '/root/scout', model: 'gpt-test', reasoningEffort: 'low' } })
+      // The completed activity lands after its spawning turn completed and must keep that attribution.
+      notify('turn/completed', { turn: { id: currentTurnId, status: 'completed', items: [] } })
+      notify('item/completed', { turnId: currentTurnId, item: { id: 'act-1', type: 'subAgentActivity', kind: 'completed', agentThreadId: 'child-1', agentPath: '/root/scout' } })
+      return
+    }
     case 'titles':
       send({ method: 'thread/name/updated', params: { threadId: 'unrelated', threadName: 'Wrong title' } })
       notify('thread/name/updated', { threadName: 'Native title' })
@@ -136,6 +172,20 @@ function emitTurnScenario(msg) {
       notify('error', { turnId: currentTurnId, message: 'Native subsystem failed' })
       emitFinalAnswerAndCompleteCurrentTurn()
       return
+    case 'subagent-discovery': {
+      // Real wire shape carries only the thread object; a defensive variant repeats the child id at
+      // the top level, and the parent's own started notification must stay silent.
+      send({ method: 'thread/started', params: { thread: { id: 'child-1', parentThreadId: threadId, agentNickname: 'Scout', agentRole: 'researcher', forkedFromId: threadId } } })
+      send({ method: 'thread/started', params: { threadId: 'child-2', thread: { id: 'child-2', parentThreadId: threadId, agentNickname: 'Mapper' } } })
+      send({ method: 'thread/started', params: { thread: { id: threadId } } })
+      // Foreign-thread item evidence must keep dropping through the thread-scope filter.
+      send({ method: 'item/started', params: { threadId: 'child-9', turnId: 'foreign-turn', item: { id: 'foreign', type: 'agentMessage', text: 'foreign' } } })
+      notify('item/started', { turnId: currentTurnId, item: { id: 'act-1', type: 'subAgentActivity', kind: 'started', agentThreadId: 'child-1', agentPath: '/root/scout', model: 'gpt-test', reasoningEffort: 'low' } })
+      // The completed activity lands after its spawning turn completed and must keep that attribution.
+      notify('turn/completed', { turn: { id: currentTurnId, status: 'completed', items: [] } })
+      notify('item/completed', { turnId: currentTurnId, item: { id: 'act-1', type: 'subAgentActivity', kind: 'completed', agentThreadId: 'child-1', agentPath: '/root/scout' } })
+      return
+    }
     case 'hold': case 'timeout-revert': case 'missing-optional':
       return
   }
@@ -192,6 +242,16 @@ function sendHistoryItems(msg) {
     sendRpcError(msg, -32601, 'No optional native history method')
     return
   }
+  /** Oversized replay: two ~160KiB command outputs plus a small message, served in one native page so adapters must cap items and budget public pages themselves. */
+  if (mode === 'oversized-history') {
+    if (msg.params.cursor) { sendResult(msg, { data: [], nextCursor: null }); return }
+    sendResult(msg, { data: [
+      { turnId: 'native-turn-1', item: { id: 'big-one', type: 'commandExecution', status: 'completed', command: 'one', aggregatedOutput: 'x'.repeat(160 * 1024) } },
+      { turnId: 'native-turn-1', item: { id: 'big-two', type: 'commandExecution', status: 'completed', command: 'two', aggregatedOutput: 'y'.repeat(160 * 1024) } },
+      { turnId: 'native-turn-1', item: { id: 'small', type: 'agentMessage', text: 'done' } },
+    ], nextCursor: null })
+    return
+  }
   if (!allowedHistory.length) {
     sendResult(msg, { data: [], nextCursor: null })
     return
@@ -221,7 +281,7 @@ function sendModels(msg) {
     return
   }
   sendResult(msg, { data: [
-    { id: 'test-model', displayName: 'Test model' },
+    { id: 'test-model', displayName: 'Test model', description: 'Native task description', inputModalities: ['text', 'image'] },
     { id: 'gpt-6.1-sol', displayName: 'GPT-6.1-Sol', isDefault: true, hidden: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'ultra', description: 'Deepest' }], serviceTiers: [{ id: 'standard' }, { id: 'priority' }] },
     ...(msg.params?.includeHidden ? [{ id: 'gpt-reserve', displayName: 'GPT-Reserve', hidden: true }] : []),
   ], nextCursor: null })
@@ -234,7 +294,11 @@ function openThread(msg) {
     return
   }
   if (msg.method === 'thread/fork') allowedHistory = msg.params.beforeTurnId ? [] : [msg.params.lastTurnId]
-  sendResult(msg, { thread: { id: threadId, ...(mode === 'titles' ? { name: 'Restored title' } : {}) } })
+  sendResult(msg, { thread: {
+    id: threadId,
+    ...(mode === 'titles' ? { name: 'Restored title' } : {}),
+    ...(mode === 'subagent-owned' ? { parentThreadId: 'root-thread', agentNickname: 'Scout', agentRole: 'researcher', canAcceptDirectInput: false } : {}),
+  } })
 }
 
 /** For revert and rollback, clear visible history before acknowledging so later thread reads see the change. A write failure leaves the history cleared. */
@@ -336,6 +400,38 @@ function handleMessage(msg) {
       break
     case 'thread/items/list':
       sendHistoryItems(msg)
+      break
+    case 'thread/list':
+      if (mode === 'no-threads') {
+        send({ id: msg.id, error: { code: -32601, message: 'No optional native thread method' } })
+        break
+      }
+      if (mode === 'threads-badentry') {
+        sendResult(msg, { data: [{ id: 'ok', status: { type: 'idle' } }, { nope: true }], nextCursor: null })
+        break
+      }
+      if (mode === 'threads-relations') {
+        if (msg.params?.parentThreadId) sendResult(msg, { data: [{ id: 'child-1', parentThreadId: msg.params.parentThreadId, status: { type: 'notLoaded' } }], nextCursor: null })
+        else if (msg.params?.ancestorThreadId) sendResult(msg, { data: [
+          { id: 'child-1', parentThreadId: msg.params.ancestorThreadId, status: { type: 'notLoaded' } },
+          { id: 'grand-child', parentThreadId: 'child-1', status: { type: 'notLoaded' } },
+        ], nextCursor: 'page-two' })
+        else sendResult(msg, { data: [{ id: 'native-thread', status: { type: 'idle' }, name: 'Main', preview: 'working' }], nextCursor: null })
+        break
+      }
+      if (mode === 'subagent-discovery') {
+        // The page lacks locally observed nickname/role evidence so the adapter must enrich it.
+        sendResult(msg, { data: [
+          { id: 'child-1', parentThreadId: threadId, status: { type: 'notLoaded' } },
+          { id: 'child-2', parentThreadId: threadId, status: { type: 'notLoaded' }, agentRole: 'native-role' },
+        ], nextCursor: null })
+        break
+      }
+      sendResult(msg, { data: [
+        { id: 'native-thread', status: { type: 'idle' }, name: 'Main', preview: 'working' },
+        { id: 'child-1', parentThreadId: 'native-thread', agentNickname: 'Scout', agentRole: 'researcher', status: { type: 'notLoaded' } },
+        { id: 'child-2', parentThreadId: 'native-thread', status: { type: 'notLoaded' } },
+      ], nextCursor: null })
       break
     case 'thread/goal/set':
       sendResult(msg, { goal: { objective: msg.params.objective ?? 'goal', status: 'active' } })

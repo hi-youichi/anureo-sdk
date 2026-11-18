@@ -1,7 +1,7 @@
 // Root entry point for the application API, adapter contracts and host utilities.
 export { createClient, Client } from './client';
 export { Session } from './session';
-export type { ClientOptions, InteractionHandlers, SubmitOptions } from './client-options';
+export type { BeforeInputDecision, BeforeInputEvent, BeforeInputHook, BeforeStopEvent, BeforeStopHook, BeforeToolEvent, BeforeToolHook, BeforeToolPolicy, ClientHooks, ClientOptions, InputTransformHook, InteractionHandlers, SubmitOptions } from './client-options';
 export { Turn } from './turn';
 export type { EventSubscriptionOptions, Input, RequestOptions, TurnResult } from './types';
 export type * from './ports';
@@ -9,6 +9,7 @@ export * from './errors';
 export { waitForRequest } from './request';
 /** Adapter/observer buffering primitives, also available from the package's queue entry point. */
 export * from './queue';
+export * from './history-pages';
 /** Session-local native ID mapping implementation. */
 export * from './adapter/identity';
 /** Interaction settlement and replay implementation used by Session. */

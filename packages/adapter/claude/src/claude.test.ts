@@ -232,10 +232,19 @@ async function collect(session: Session, answer?: (request: InteractionRequested
 
 /** Subscribe and submit, then yield for dispatch without waiting for binding. A native callback
  * may need the collector to answer an interaction before the query can emit UUID evidence. */
-async function submitAndYield(session: Session) {
+const turnIdsByAlias = new WeakMap<Session, Map<string, string>>();
+function requireBoundTurnId(session: Session, alias: string): string {
+  const turnId = turnIdsByAlias.get(session)?.get(alias);
+  if (!turnId) throw new Error(`Execution ${alias} is not bound`);
+  return turnId;
+}
+async function submitAndYield(session: Session, alias?: string) {
   readerFor(session);
   let turnId: string | undefined;
-  void session.submit({ input: "conformance" }).then(turn => { turnId = turn.id; }, () => {});
+  void session.submit({ input: "conformance" }).then(turn => {
+    turnId = turn.id;
+    if (alias) { const sessionTurnIds = turnIdsByAlias.get(session) ?? new Map(); sessionTurnIds.set(alias, turn.id); turnIdsByAlias.set(session, sessionTurnIds); }
+  }, () => {});
   await new Promise(resolve => setImmediate(resolve));
   return {
     /** Require binding at the point of assertion, with no extra wait that could hide late binding. */
@@ -271,8 +280,15 @@ test("Claude streams partial text and authoritative final output with native UUI
 
 test("native tool results, task/hook lifecycle, compaction and unknown blocks remain structured", async () => {
   const { runtime, session } = await setup({}, async (_, stream) => {
-    await stream.emit({ type: "assistant", uuid: "a", parent_tool_use_id: null, message: { id: "tool-message", content: [{ type: "tool_use", id: "tool", name: "Bash", input: { command: "echo fixture", apiKey: "PRIVATE" } }] } });
-    await stream.emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tool", content: "done" }] } });
+    await stream.emit({ type: "assistant", uuid: "a", parent_tool_use_id: null, message: { id: "tool-message", content: [
+      { type: "tool_use", id: "shell", name: "Bash", input: { command: "echo fixture", apiKey: "PRIVATE" } },
+      { type: "tool_use", id: "tool", name: "Agent", input: { prompt: "Read a file" } },
+    ] } });
+    await stream.emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "shell", content: "done" }] } });
+    await stream.emit({ type: "system", subtype: "task_started", task_id: "shell-task", description: "Shell", tool_use_id: "shell" });
+    await stream.emit({ type: "system", subtype: "task_notification", task_id: "shell-task", status: "completed", tool_use_id: "shell" });
+    await stream.emit({ type: "assistant", parent_tool_use_id: "tool", message: { id: "child-message", content: [{ type: "tool_use", id: "child-read", name: "Read", input: { file_path: "package.json" } }] } });
+    await stream.emit({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "child-read", content: "child result" }] } });
     await stream.emit({ type: "system", subtype: "task_started", task_id: "child", description: "Work", tool_use_id: "tool" });
     await stream.emit({ type: "system", subtype: "task_progress", task_id: "child", description: "Working" });
     await stream.emit({ type: "system", subtype: "task_notification", task_id: "child", status: "completed", summary: "Finished" });
@@ -283,9 +299,61 @@ test("native tool results, task/hook lifecycle, compaction and unknown blocks re
     await stream.emit({ type: "assistant", uuid: "unknown", parent_tool_use_id: null, message: { id: "future", content: [{ type: "futureContent", safeField: "preserved" }] } });
     await stream.result();
   });
-  const { events } = await submitAndCollect(session); const completed = events.filter((event) => event.type === "item/completed").map((event) => event.payload.item);
-  expect(completed).toEqual(expect.arrayContaining([expect.objectContaining({ type: "toolCall", kind: "command", output: "done" }), expect.objectContaining({ type: "subagent", subagentId: "child", state: "completed" }), expect.objectContaining({ type: "hook", name: "PreToolUse", status: "completed" }), expect.objectContaining({ type: "compaction", trigger: "auto" }), expect.objectContaining({ type: "toolCall", kind: "other", nativeType: "futureContent" })]));
+  await submitAndYield(session, "t"); const events = await collect(session); const completed = events.filter((event) => event.type === "item/completed").map((event) => event.payload.item);
+  expect(completed).toEqual(expect.arrayContaining([expect.objectContaining({ type: "toolCall", kind: "command", output: "done" }), expect.objectContaining({ type: "subagent", subagentId: "child", state: "completed", parentItemId: "tool" }), expect.objectContaining({ type: "hook", name: "PreToolUse", status: "completed" }), expect.objectContaining({ type: "compaction", trigger: "auto" }), expect.objectContaining({ type: "toolCall", kind: "other", nativeType: "futureContent" })]));
+  expect(completed).toEqual(expect.arrayContaining([expect.objectContaining({ id: "child-read", parentItemId: "tool", output: "child result" })]));
+  expect(events.flatMap(event => event.type === "item/started" && event.payload.item.type === "subagent" ? [event.payload.item.id] : [])).toEqual(["task:child"]);
   expect(JSON.stringify(events)).not.toContain("PRIVATE"); await runtime.dispose();
+});
+
+test("background subagents settle on the spawning turn and Claude's replies stream on subsequent turns", async () => {
+  const { runtime, session, queries } = await setup({}, async (_, stream) => {
+    await stream.text("Launching readers");
+    for (const id of ["alpha", "beta"]) {
+      await stream.emit({ type: "system", subtype: "task_started", task_type: "local_agent", task_id: id, tool_use_id: `agent-${id}`, description: `Read ${id}`, is_backgrounded: true });
+    }
+    await stream.result("Both readers are running");
+  });
+  const reader = readerFor(session);
+  try {
+    const launch = await session.submit({ input: "Read two files in the background" });
+    expect((await launch.result()).text).toBe("Both readers are running");
+    const stream = queries[0]!;
+    await stream.emit({ type: "system", subtype: "task_updated", task_id: "alpha", patch: { status: "completed" } });
+    await stream.emit({ type: "system", subtype: "task_notification", task_id: "alpha", status: "completed", summary: "Value A" });
+    await stream.emit({ type: "assistant", parent_tool_use_id: null, message: { id: "follow-up", content: [{ type: "text", text: "Alpha finished" }] } });
+    await stream.emit({ type: "system", subtype: "task_updated", task_id: "beta", patch: { status: "completed" } });
+    await stream.emit({ type: "system", subtype: "task_notification", task_id: "beta", status: "completed", summary: "Value B" });
+    await stream.emit({ type: "result", subtype: "success", origin: { kind: "task-notification" }, is_error: false, result: "Alpha finished" });
+    await stream.emit({ type: "result", subtype: "success", origin: { kind: "task-notification" }, is_error: false, result: "Alpha and beta finished" });
+
+    const events: AhpEvent[] = [];
+    let turns = 0;
+    for (let i = 0; i < 100 && turns < 3; i++) {
+      const entry = await reader.next();
+      if (entry.done) break;
+      events.push(entry.value);
+      if (entry.value.type === "turn/completed") turns++;
+    }
+    const completedTurns = events.filter(event => event.type === "turn/completed").map(event => event.payload.turnId);
+    expect(completedTurns).toHaveLength(3);
+    expect(new Set(completedTurns).size).toBe(3);
+    expect(completedTurns[0]).toBe(launch.id);
+    expect(events.filter(event => event.type === "item/completed" && event.payload.item.type === "subagent")).toMatchObject(
+      [["alpha", "A"], ["beta", "B"]].map(([id, value]) => ({
+        turnId: launch.id,
+        payload: { item: { subagentId: id, parentItemId: `agent-${id}`, state: "completed", task: `Read ${id}`, extensions: { native: { summary: `Value ${value}` } } } },
+      })),
+    );
+    expect(events.filter(event => event.type === "item/completed" && event.payload.item.type === "agentMessage" && event.payload.item.phase === "final")).toMatchObject(
+      ["Both readers are running", "Alpha finished", "Alpha and beta finished"].map((text, i) => ({
+        turnId: completedTurns[i], payload: { item: { text, ...(i > 0 ? { extensions: { native: { origin: { kind: "task-notification" } } } } : {}) } },
+      })),
+    );
+  } finally {
+    await reader.return?.();
+    await runtime.dispose();
+  }
 });
 
 test("steer never appends Claude input; interrupt preserves the current turn identity", async () => {
@@ -568,6 +636,20 @@ test.each([true, false])("fork and revert resolve merged inputs as a single exec
   } finally { await runtime.dispose(); }
 });
 
+test("fork resolves a host-echoed execution id boundary to its transcript prompt", async () => {
+  const history = historyApi();
+  const { runtime, session } = await setup({ sessionStore: new InMemorySessionStore(), getSessionMessages: history.getSessionMessages, forkSession: history.forkSession }, async (input, stream) => { history.append(input); await stream.text("conformance"); await stream.result(); });
+  await submitAndYield(session, "t1"); const events = await collect(session);
+  const started = events.find((event) => event.type === "turn/started")!;
+  const executionId = started.payload.turnId;
+  // Hosts round-trip the turn/started identity back as boundary.nativeTurnId, but the
+  // transcript prompt keeps its own uuid; the fork must resolve the execution id to it.
+  const through = await runtime.openSession({ ...OPEN, requestId: "echoed", mode: "fork", binding: { ...session.binding, sessionId: "echoed" }, fork: { sourceSessionId: "s", nativeRef: session.binding.nativeRef, boundary: { turnId: executionId, nativeTurnId: executionId, relation: "through" } } });
+  const items = await through.request("history/read", { requestId: "echoed-history", sessionId: "echoed" });
+  expect(items.items.some((entry) => entry.turnId === requireBoundTurnId(session, "t1"))).toBe(true);
+  await through.close(); await runtime.dispose();
+});
+
 test("history items reuse live streamed ids and the session settles to ready after the turn", async () => {
   const history = historyApi();
   const { runtime, session } = await setup({ sessionStore: new InMemorySessionStore(), getSessionMessages: history.getSessionMessages, forkSession: history.forkSession }, async (input, stream) => {
@@ -780,3 +862,38 @@ test("official Claude rename and info helpers deliver titles through the observe
     expect(title).toBe('Official renamed title');
   } finally { await reader.return?.(); await f.runtime.dispose(); }
 });
+
+
+test("interleaved child streams keep ownership and never replace the parent final answer", async () => {
+  const { runtime, session, queries } = await setup({}, async (_, stream) => {
+    for (const [parent, id] of [[null, "parent"], ["agent-a", "child-a"], ["agent-b", "child-b"]]) {
+      await stream.emit({ type: "stream_event", parent_tool_use_id: parent, event: { type: "message_start", message: { id } } });
+      await stream.emit({ type: "stream_event", parent_tool_use_id: parent, event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } });
+    }
+    for (const [parent, id, text] of [["agent-a", "child-a", "A"], [null, "parent", "P"], ["agent-b", "child-b", "B"]]) {
+      await stream.emit({ type: "stream_event", parent_tool_use_id: parent, event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } } });
+      await stream.emit({ type: "assistant", parent_tool_use_id: parent, message: { id, content: [{ type: "text", text }] } });
+    }
+    await stream.result("parent final");
+  });
+  await submitAndYield(session, "t"); const events = await collect(session);
+  const completed = events.filter(e => e.type === "item/completed").map(e => e.payload.item);
+  expect(completed).toEqual(expect.arrayContaining([
+    expect.objectContaining({ id: "child-a:0", parentItemId: "agent-a", text: "A", phase: "commentary" }),
+    expect.objectContaining({ id: "child-b:0", parentItemId: "agent-b", text: "B", phase: "commentary" }),
+    expect.objectContaining({ id: "parent:0", text: "parent final", phase: "final" }),
+  ]));
+  expect(queries[0]!.options.forwardSubagentText).toBe(true);
+  await runtime.dispose();
+});
+
+test('native lifecycle also correlates through the pinned official SDK and an actual child executable', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'claude native actual '));
+  const client = await createClient({ adapter: createClaudeAdapter({ command: fileURLToPath(new URL('../tests/fixtures/fake-claude.mjs', import.meta.url)), executableRuntime: 'node', stateDir: join(directory, 'state') }), identity: { adapterId: 'claude', runtimeConfigId: 'native' } });
+  try {
+    const session = await client.sessions.create({ cwd: directory });
+    const turn = await session.submit({ input: 'probe' }, { timeoutMs: 3000 });
+    expect((await turn.result({ timeoutMs: 3000 })).text).toBe('external executable probe passed');
+    await session.close();
+  } finally { await client.dispose(); await rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); }
+}, 15_000);

@@ -62,6 +62,20 @@ It may join the same execution or reach a later one. Session input delivery is
 distinct from atomic exact-turn steering. See the
 [Claude example](../../../docs/native-harness-lifecycle.md#42-claude追加会话指导与精确-steer-分开).
 
+### Background subagents
+
+`turn.result()` settles when Claude completes the execution that accepted the
+input. To observe background work, subscribe to `session.events()` before
+submitting and keep the session open. A background subagent's terminal
+`item/completed` event keeps the spawning turn ID and the parent tool-call ID
+when Claude supplied one. Its native summary is available under
+`item.extensions.native.summary`.
+
+Claude can generate a reply after processing a background-task notification.
+The session stream exposes that reply as a separate turn. When Claude reports
+its origin, the final `agentMessage` carries
+`extensions.native.origin.kind === 'task-notification'`.
+
 ## Structured output
 
 Pass a self-contained draft-07 JSON Schema with `type: 'object'` at its root:
@@ -125,7 +139,7 @@ Resume, fork, and history need the official `SessionStore` contract. `FileSessio
 
 ### Model catalog
 
-`createClaudeCatalogSession(options)` opens a prompt-less connection to list supported models (including effort levels per model) without creating a product session; `adapter.listModels(cwd)` is the one-shot variant.
+`createClaudeCatalogSession(options)` opens a prompt-less connection to list supported models (including effort levels per model) without creating a product session. Set `options.cwd` to match the execution working directory; omission uses `process.cwd()`. `adapter.listModels(cwd)` is the one-shot variant.
 
 ## Code structure
 
@@ -142,7 +156,30 @@ Resume, fork, and history need the official `SessionStore` contract. `FileSessio
 
 Session-scoped config options exposed through AHP: `model`, `permissionMode` (`default` / `acceptEdits` / `bypassPermissions` / `plan` / `dontAsk` / `auto`), `effort` (`low`–`max`, per-model support reported by the catalog), `fastMode`, and `maxThinkingTokens`. Text and image inputs are supported.
 
+### Native control hooks
+
+Configure these through [the client's hooks](../../core/README.md#native-control-hooks).
+`beforeTool` can select Claude's `Read`, `Write`, `Edit`, `Glob`, and `Grep`
+built-ins. Coverage is limited to these exact native tool calls. Claude's
+permission handling still applies when the host callback lets the call proceed.
+`beforeStop` runs on primary text turns and can ask Claude to continue the
+same turn once. Structured-output turns follow their existing schema validation
+path. Interruption and query teardown cancel in-flight callbacks.
+
+The pinned Claude Agent SDK delivers decisions through its native callback
+channel. Use Claude's native permission settings for enforcement that must
+survive a disconnected or unresponsive callback channel.
+
 For script-based Claude executables, `executableRuntime: 'node' | 'bun' | 'deno'` names the interpreter; native binaries need none. Tests can inject `queryFactory` and the store/history functions — that is how `@anureo/conformance` drives this adapter without credentials.
+
+## Code structure
+
+| Source | Responsibility |
+| --- | --- |
+| [`src/index.ts`](src/index.ts) | Exports the adapter, constructs Claude SDK queries, and projects session events and interactions. |
+| [`src/hooks.ts`](src/hooks.ts) | Validates Claude hook coverage and translates local hook callbacks into native SDK decisions. |
+| [`src/output-schema.ts`](src/output-schema.ts), [`src/file-changes.ts`](src/file-changes.ts) | Validate structured results and project native tool and file-change data. |
+| [`src/catalog.ts`](src/catalog.ts), [`src/store.ts`](src/store.ts) | Implement model discovery and session persistence. |
 
 ## Development
 

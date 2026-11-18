@@ -55,7 +55,27 @@ export class ResultAccumulator {
   finish(payload: Extract<AhpEvent, { type: 'turn/completed' }>['payload']): TurnResult {
     const items = [...this.items.values()].map(materializeItem);
     const usage = payload.usage?.scope === 'turn' ? payload.usage : this.usage;
-    const common = { text: finalMessageText(items), items, ...(usage ? { usage } : {}) };
+    /**
+     * Correct append accounting when a chunk joins a trailing high surrogate to a leading low surrogate.
+     * Walk each item's parent chain to detect subagent descendants (cycle-safe, memoized): their final
+     * messages are member evidence and stay out of the host-visible turn text.
+     */
+    const memberItems = new Map<string, boolean>();
+    const isMemberItem = (item: Item): boolean => {
+      const path = new Set<string>();
+      let current: Item | undefined = item;
+      let member = false;
+      while (current && !path.has(current.id)) {
+        if (current.type === 'subagent') { member = true; break; }
+        const cached = memberItems.get(current.id);
+        if (cached !== undefined) { member = cached; break; }
+        path.add(current.id);
+        current = current.parentItemId ? this.items.get(current.parentItemId)?.snapshot : undefined;
+      }
+      for (const id of path) memberItems.set(id, member);
+      return member;
+    };
+    const common = { text: finalMessageText(items, isMemberItem), items, ...(usage ? { usage } : {}) };
     if (payload.status === 'failed') {
       const error = payload.error ?? {
         code: 'TURN_FAILED',
@@ -209,9 +229,9 @@ function materializeItem({ snapshot, bufferedText }: RetainedItem): Item {
  * ResultAccumulator.finish derives host-visible text from materialized items. Keep final messages in
  * retained order, including empty messages and their separators; interim messages remain in items.
  */
-function finalMessageText(items: readonly Item[]): string {
+function finalMessageText(items: readonly Item[], isExcluded?: (item: Item) => boolean): string {
   return items
-    .filter((item): item is Extract<Item, { type: 'agentMessage' }> => item.type === 'agentMessage' && item.phase === 'final')
+    .filter((item): item is Extract<Item, { type: 'agentMessage' }> => item.type === 'agentMessage' && item.phase === 'final' && !(isExcluded?.(item) ?? false))
     .map(item => item.text)
     .join('\n');
 }

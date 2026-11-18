@@ -23,4 +23,8 @@ export interface CodexAdapterOptions extends JsonlOptions {
   timeoutMs?: number;
   /** Separate limits for pending RPCs, unfinished RPC writes and submissions awaiting native execution evidence. Each defaults to 128 and rejects new work at capacity. */
   maxPending?: number;
+  /** Native page size for paged history requests (`thread/items/list`, `thread/turns/list`); defaults to 50 so one native response frame stays well under the transport limit even when items are large. */
+  nativePageLimit?: number;
+  /** Serialized byte budget for one public history page; defaults to 4MiB, and every page still carries at least one item so cursors progress. */
+  maxPageBytes?: number;
 }

@@ -39,6 +39,11 @@ export function completeClaudeTool(previous: Extract<Item, { type: 'toolCall' }>
     ...previous,
     status,
     output: block.content as JsonValue,
+    // A matched native tool_result supplies success evidence even without an exit code.
+    extensions: {
+      ...previous.extensions,
+      toolExecution: { ...record(previous.extensions?.toolExecution), success: status === 'completed' } as JsonValue,
+    },
     ...(fileChanges !== undefined ? { fileChanges } : {}),
   }
 }

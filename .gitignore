@@ -1,4 +1,6 @@
-.anureo/
+.anureo/*
+!.anureo/bees/
+.anureo/bees/scopecheck-*.json
 node_modules/
 artifacts/
 dist/
@@ -16,3 +18,5 @@ draft
 !/.claude/skills/
 /.claude/skills/*
 !/.claude/skills/openspec-authoring-setup.md
+log/
+work/

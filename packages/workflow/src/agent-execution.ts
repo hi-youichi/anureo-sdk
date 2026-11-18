@@ -210,8 +210,16 @@ function isStartupBlocked(error: Pick<HarnessSdkError, 'code' | 'outcomeUnknown'
 }
 
 /** Recognize a thrown SDK startup denial during session creation or turn observation. */
-function isStartupBlockException(cause: unknown): cause is HarnessSdkError {
+export function isStartupBlockException(cause: unknown): cause is HarnessSdkError {
   return cause instanceof HarnessSdkError && isStartupBlocked(cause)
+}
+
+/** Report whether a retained terminal matches the confirmed-drop rules shared with
+ * adapter-owned journaled primitives (beer). Mirrors classifyTerminalFailure's drop branch. */
+export function isDroppedOutcome(error: HarnessError, status: 'failed' | 'interrupted'): boolean {
+  if (error.outcomeUnknown) return false
+  if (status === 'interrupted') return error.details?.workflowDisposition === 'skipped'
+  return isStartupBlocked(error) || terminalApiErrors.has(error.code)
 }
 
 // Only apply to native failed terminal results, never open/submit/observation failures.

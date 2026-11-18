@@ -2,8 +2,8 @@
 import { HarnessSdkError } from '@anureo/sdk'
 import type { HarnessProcess } from '@anureo/sdk/process'
 
-import { record, type NativeRecord } from './native-values'
-/** Value helpers re-exported through the JSONL entry point for native payload inspection. */
+import { record, string, type NativeRecord } from './native-values'
+/** Keep value helpers available through the public JSONL entry point while their interpretation remains owned by native-values. */
 export { record, string, type NativeRecord } from './native-values'
 
 /** Server interaction received by a low-level client's request handler. Answer through the supplied callbacks. */
@@ -45,26 +45,24 @@ export interface JsonlHandlers {
 export interface JsonlOptions {
   /** Per-request response deadline in milliseconds from admission, including queued write time. Defaults to 30,000. Timeout reports an unknown outcome without cancelling native work. */
   timeoutMs?: number;
-  /**
-   * Maximum UTF-8 bytes per frame. Defaults to 8 MiB. Outgoing frames include the newline.
-   * Incoming lines exclude LF or CRLF. A buffered trailing CR is excluded until the next
-   * byte determines whether it is part of CRLF.
-   */
+  /** Maximum UTF-8 bytes per frame, default 64MiB; native paged history responses legitimately exceed the previous 8MiB default, and a local stdio pipe has no external frame ceiling. Outgoing includes the newline, incoming excludes the CRLF/LF delimiter. */
   maxFrameBytes?: number;
   /** Maximum unresolved client requests and, separately, maximum unfinished RPC writes. Defaults to 128. */
   maxPending?: number;
   /** Maximum concurrent server handlers until their full completion, default 32. */
   maxServerRequests?: number
 }
-/**
- * Identify a definite native rejection without exposing its message or payload. For code -32601,
- * CodexBackendSession.optional publishes revised capabilities before rejecting the SDK request,
- * and readAccountStatus returns unknown.
- */
+/** Fixed native denial text for parent-owned Multi-Agent V2 subagent threads; classified without retaining native message bytes. */
+const SUBAGENT_DIRECT_INPUT_DENIAL = 'direct app-server input is not allowed for multi-agent v2 sub-agents'
+/** Definite native rejection returned to RPC callers; retain only the numeric code plus a sanitized denial flag so native error messages cannot disclose payloads. */
 export class CodexRpcError extends HarnessSdkError {
-  /** Map -32601 to METHOD_NOT_FOUND and other codes to NATIVE_RPC_ERROR. Expose rpcCode for callers that handle specific native rejections. */
-  constructor(readonly rpcCode: number) {
-    super(rpcCode === -32601 ? 'METHOD_NOT_FOUND' : 'NATIVE_RPC_ERROR', 'Native Codex request failed', false, false, { rpcCode })
+  /** For response decoding, map a numeric native code and a -32600 denial prefix to a safe SDK error without I/O; method-not-found and the multi-agent direct-input denial stay distinguishable from other definite failures. */
+  constructor(readonly rpcCode: number, readonly subagentDirectInputDenied = false) {
+    super(
+      rpcCode === -32601 ? 'METHOD_NOT_FOUND' : rpcCode === -32600 && subagentDirectInputDenied ? 'SUBAGENT_DIRECT_INPUT_REJECTED' : 'NATIVE_RPC_ERROR',
+      rpcCode === -32600 && subagentDirectInputDenied ? 'Native Codex rejected direct input for a parent-owned subagent thread' : 'Native Codex request failed',
+      false, false, { rpcCode },
+    )
   }
 }
 /**
@@ -82,7 +80,7 @@ export class CodexJsonlClient {
 
   /** Start draining the supplied process with the owner's handlers. Call dispose on this client to release the process. */
   constructor(readonly process: HarnessProcess, private readonly handlers: JsonlHandlers, private readonly options: JsonlOptions = {}) {
-    this.maxFrameBytes = options.maxFrameBytes ?? 8 * 1024 * 1024
+    this.maxFrameBytes = options.maxFrameBytes ?? 64 * 1024 * 1024
     // Start before the handshake and drain to stdout EOF so buffered replies can settle.
     this.finished = this.read().catch(cause => this.fail(cause instanceof HarnessSdkError ? cause : new HarnessSdkError('PROTOCOL_ERROR', 'Invalid Codex stream', false, true)))
     void this.drainDiagnostics()
@@ -253,9 +251,10 @@ export class CodexJsonlClient {
     const waiting = this.takePendingRequest(id)
     if (!waiting) return // A late or duplicate response has no waiter to settle.
     if (Object.hasOwn(message, 'error')) {
-      const code = record(message.error).code
+      const error = record(message.error)
+      const code = error.code
       if (typeof code === 'number' && Number.isInteger(code)) {
-        waiting.reject(new CodexRpcError(code))
+        waiting.reject(new CodexRpcError(code, code === -32600 && string(error.message)?.startsWith(SUBAGENT_DIRECT_INPUT_DENIAL) === true))
         return
       }
     } else if (Object.hasOwn(message, 'result')) {

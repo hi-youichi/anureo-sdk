@@ -12,11 +12,12 @@ export function createFixture(clients: Client[]) {
   /**
    * Forward optional hook and capability overrides to the scripted adapter. Return the initialized
    * client and adapter for dispatch assertions. Give each fixture a distinct runtime identity so
-   * journal replay can distinguish clients.
+   * journal replay can distinguish clients, unless the caller pins the identity for revised-policy
+   * probes that must hash to the same journal key.
    */
-  return async function fixture(options?: FakeAdapterOptions) {
+  return async function fixture(options?: FakeAdapterOptions, identity?: { adapterId: string; runtimeConfigId: string }) {
     const adapter = createScriptedAdapter(options)
-    const client = await createClient({ adapter, identity: { adapterId: 'scripted', runtimeConfigId: randomUUID() } })
+    const client = await createClient({ adapter, identity: identity ?? { adapterId: 'scripted', runtimeConfigId: randomUUID() } })
     clients.push(client)
     return { client, adapter }
   }

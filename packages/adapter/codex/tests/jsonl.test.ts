@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import { PassThrough } from 'node:stream'
 import { CodexJsonlClient, CodexRpcError } from '../src/jsonl'
 import type { JsonlHandlers, JsonlOptions } from '../src/jsonl'
+import { rejectionOf } from './test-helpers'
 import type { HarnessProcess } from '@anureo/sdk/process'
 
 /** Build an in-memory client with optional handler overrides and captured effects. Tests drive stdout and must dispose the client; waitForWrite observes the first captured write, which can precede handler completion. */
@@ -415,4 +416,24 @@ describe('native JSONL transport', () => {
       } finally { await f.client.dispose() }
     })
   }
+
+  /** Classification must distinguish the multi-agent direct-input denial from other -32600 rejections without retaining native message bytes. */
+  test('native direct-input denial keeps a distinct safe error while other -32600 stays generic', async () => {
+    const f = fixture()
+    try {
+      const denial = f.client.request('turn/start')
+      await f.waitForWrite()
+      const id = JSON.parse(f.writes[0]!).id
+      f.stdout.write(JSON.stringify({ id, error: { code: -32600, message: 'direct app-server input is not allowed for multi-agent v2 sub-agents' } }) + '\n')
+      const cause = await rejectionOf(denial)
+      expect(cause).toMatchObject({ code: 'SUBAGENT_DIRECT_INPUT_REJECTED', retryable: false, details: { rpcCode: -32600 } })
+      expect(JSON.stringify(cause)).not.toContain('direct app-server input is not allowed')
+      const generic = f.client.request('thread/resume')
+      // A turn of the event loop lets the queued second write land before reading its frame id.
+      await new Promise<void>(resolve => setImmediate(resolve))
+      const secondId = JSON.parse(f.writes[1]!).id
+      f.stdout.write(JSON.stringify({ id: secondId, error: { code: -32600, message: 'another process owns a descendant' } }) + '\n')
+      await expect(generic).rejects.toMatchObject({ code: 'NATIVE_RPC_ERROR', details: { rpcCode: -32600 } })
+    } finally { await f.client.dispose() }
+  })
 })

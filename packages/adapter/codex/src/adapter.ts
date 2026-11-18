@@ -2,13 +2,14 @@
 import { AHP_PROTOCOL_CONTRACT, assertRequest, negotiateVersion, type Capabilities, type InitializeParams, type InitializeResult, type SessionBinding, type SessionOpenParams } from '@anureo/protocol'
 import { HarnessSdkError, type BackendSession, type HarnessAdapter, type SessionEventSink } from '@anureo/sdk'
 import { spawnHarnessProcess, type HarnessProcess } from '@anureo/sdk/process'
-import { CodexJsonlClient } from './jsonl'
+import { CodexJsonlClient, CodexRpcError } from './jsonl'
 import { record, type NativeRecord } from './native-values'
 import type { CodexAdapterOptions } from './options'
 import { CODEX_PROFILES, codexCapabilities, resolveCodexProfile } from './profile'
 import { probeVersion } from './version'
 import { readAccountStatus } from './account'
 import { readCodexModels, type CodexModel } from './models'
+import { readCodexThreads, type CodexThreadListParams, type CodexThreadPage } from './threads'
 import { CodexBackendSession } from './session'
 
 /**
@@ -54,6 +55,37 @@ export class CodexNativeAdapter implements HarnessAdapter {
     return this.runProbe({ kind: 'models', cwd, query: readCodexModels })
   }
 
+  /** For host discovery after initialization, page stored threads with optional spawn-edge relation filters on a fresh read-only client. Reject conflicting relation filters, uninitialized adapters and launch/query errors; method-not-found downgrades every registered session's tree capability before rejecting unsupported, and the created client is always disposed without creating a thread. */
+  async listThreads(params: CodexThreadListParams = {}): Promise<CodexThreadPage> {
+    if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
+    if (!this.clientInfo) throw new HarnessSdkError('NOT_INITIALIZED')
+    if (params.parentThreadId && params.ancestorThreadId) throw new HarnessSdkError('SUBAGENT_FILTER_CONFLICT', 'Codex thread/list accepts only one of parentThreadId and ancestorThreadId')
+    if (!codexCapabilities(this.version).subagents?.tree) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
+    const probe = PROBES.threads
+    const process = await this.launchProcess(this.options.cwd)
+    const client = new CodexJsonlClient(process, {
+      notification: async () => {},
+      request: async (_request, _reply, reject) => { await reject(-32601, probe.interactionError) },
+      failure: async () => {},
+      diagnostic: this.options.diagnostic,
+    }, this.options)
+    try {
+      await this.initializeClient(client, this.clientInfo)
+      return await readCodexThreads(client, params, threadId => {
+        for (const session of this.sessions) {
+          const metadata = session.subagentMetadata(threadId)
+          if (metadata) return metadata
+        }
+        return undefined
+      })
+    } catch (cause) {
+      if (cause instanceof CodexRpcError && cause.rpcCode === -32601) {
+        for (const session of this.sessions) await session.disableSubagentTree()
+        throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
+      }
+      throw cause
+    } finally { await client.dispose() }
+  }
   /**
    * Check whether the configured environment is ready, requires authentication, or lacks native
    * account status support. Uses a fresh connection without refreshing credentials or requiring
@@ -260,6 +292,7 @@ type ExecutionInspection = { stopped: false } | { stopped: true; status: 'comple
 
 const PROBES = {
   models: { name: 'anureo-harness-models', interactionError: 'No interactive surface during model discovery' },
+  threads: { name: 'anureo-harness-threads', interactionError: 'No interactive surface during thread discovery' },
   auth: { name: 'anureo-harness-auth', interactionError: 'Account status is non-interactive' },
   reconcile: { name: 'anureo-harness-reconcile', interactionError: 'Reconciliation is non-interactive' },
 }
@@ -283,3 +316,4 @@ function inspectThread(thread: NativeRecord, { threadId, nativeTurnId }: { threa
   if (!target || !isTerminalStatus(target.status)) return { stopped: false }
   return { stopped: true, status: target.status, turnId: nativeTurnId }
 }
+
