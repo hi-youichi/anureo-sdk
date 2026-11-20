@@ -59,12 +59,12 @@ export async function defaultChecks(cwd: string): Promise<CheckCommand[]> {
  * runAgentWork awaits this before merging and records rejection as a failed step.
  * Commands may modify files or start other processes.
  * Resolves void after all checks; the first failed command is recorded before rejection and stops
- * later commands. Each process has a five-minute timeout and an eight-MiB
+ * later commands. Each process has a fifteen-minute timeout and an eight-MiB
  * limit on each output stream. Reports concatenate stdout then stderr, followed by the error
  * message on failure, and retain only the final 4,000 characters. An empty command list resolves
  * without changing results; existing entries are retained. */
 export async function runChecks(cwd: string, commands: readonly CheckCommand[], results: CheckResult[]): Promise<void> {
-  const limits = { cwd, env: checkoutEnvironment(), maxBuffer: 8 << 20, timeout: 300_000, killSignal: 'SIGKILL' as const, windowsHide: true }
+  const limits = { cwd, env: checkoutEnvironment(), maxBuffer: 8 << 20, timeout: 900_000, killSignal: 'SIGKILL' as const, windowsHide: true }
   for (const command of commands) {
     const display = typeof command === 'string' ? command : [command.executable, ...(command.args ?? [])]
       .map(arg => /^[\w./:-]+$/.test(arg) ? arg : JSON.stringify(arg)).join(' ')

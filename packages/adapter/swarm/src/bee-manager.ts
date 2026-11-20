@@ -325,6 +325,22 @@ export class BeeManager {
     return sending
   }
 
+  /**
+   * Open params for a member session. Members inherit the parent session's permissions: the top-level
+   * `permissionMode` and `config.permissionMode` (which the Codex, Claude and Pi adapters read in
+   * preference to the top-level field). Without the latter, a parent opened with
+   * `config: { permissionMode: 'read-only' }` would leave members on the backend's default mode.
+   */
+  private memberOpen(bee: Bee, model: string | undefined, instructions: string, effort: string | undefined) {
+    const inherited = this.params.config?.permissionMode
+    const config = { ...(inherited !== undefined ? { permissionMode: inherited } : {}), ...effortConfig(effort, bee.backend) }
+    return {
+      cwd: this.params.cwd, permissionMode: this.params.permissionMode, model, instructions,
+      config: Object.keys(config).length ? config : undefined,
+      ...(bee.memberServer ? { mcpServers: [bee.memberServer.config] } : {}),
+    }
+  }
+
   private async run(bee: Bee, task: Task, assignment: SwarmAssignment) {
     task.phase = 'preparing'
     let profile = bee.profile
@@ -337,7 +353,7 @@ export class BeeManager {
       reusable?.length ? 'Reusable experience:\n' + reusable.join('\n\n') : undefined, bee.memberServer ? MEMBER_TOOLS_INSTRUCTIONS : undefined].filter(Boolean).join('\n\n')
     let instructions = assemble(profile?.instructions)
     let requestedEffort = bee.selection.requestedEffort
-    let open = { cwd: this.params.cwd, permissionMode: this.params.permissionMode, model: bee.requestedModel, instructions, config: effortConfig(requestedEffort, bee.backend), ...(bee.memberServer ? { mcpServers: [bee.memberServer.config] } : {}) }
+    let open = this.memberOpen(bee, bee.requestedModel, instructions, requestedEffort)
     let boundary: Boundary | undefined
     let submitted = false
     let dispatched = false
@@ -353,7 +369,7 @@ export class BeeManager {
         task.pin = snapshot({ revisionId: resolved.revision.id, generation: resolved.head.generation, headId: resolved.head.id })
         instructions = assemble(profile.instructions, experiences)
         requestedEffort = selectEffort(profile.effort, profile.model, bee.backend)
-        open = { cwd: this.params.cwd, permissionMode: this.params.permissionMode, model: profile.model, instructions, config: effortConfig(requestedEffort, bee.backend), ...(bee.memberServer ? { mcpServers: [bee.memberServer.config] } : {}) }
+        open = this.memberOpen(bee, profile.model, instructions, requestedEffort)
       }
       for (const message of bee.pending ?? []) {
         if (message.state === 'queued' && message.revisionId !== task.pin?.revisionId) { message.state = 'rejected'; message.reasonCode = 'SWARM_MESSAGE_PROFILE_CHANGED' }

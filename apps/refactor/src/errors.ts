@@ -1,15 +1,6 @@
 // Normalizes caught errors for reports and diagnostics.
 import type { Failure } from './results'
 
-declare module './results' {
-  interface Failure {
-    /** Whether the source error permits a retry. May be absent in older reports. */
-    retryable?: boolean
-    /** Field paths and rule codes from structured-output validation. */
-    issues?: Array<{ path: string | Array<string | number>; code: string }>
-  }
-}
-
 /** Convert a caught value for display, including values with throwing accessors or conversions. */
 export function message(cause: unknown): string {
   try {

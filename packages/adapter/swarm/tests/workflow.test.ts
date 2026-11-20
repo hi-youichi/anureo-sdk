@@ -163,6 +163,24 @@ test('workflow bees inherit the swarm session permission mode', async () => {
   await client.dispose()
 })
 
+test('workflow bees inherit config.permissionMode from the swarm session', async () => {
+  const backend = await fixture(echoTask([]))
+  const client = await swarmClient(backend.client, {
+    registrations: [{
+      id: 'inherit-config', description: 'One step', revision: '1',
+      run: async (_args: Record<string, never>, ctx) => ({ a: await beer('step a', { client: ctx.client, cwd: ctx.cwd }) }),
+    }],
+  })
+  const session = await client.sessions.create({ cwd, config: { permissionMode: 'read-only', custom: 'parent-only' } })
+  const result = await (await session.submit({ input: '/workflow run inherit-config' })).result({ timeoutMs: null })
+  expect(result.status).toBe('completed')
+  const [main, step] = backend.opened
+  expect(main.config).toEqual({ permissionMode: 'read-only', custom: 'parent-only' })
+  // Only the permission is inherited; other parent config stays with the main session.
+  expect(step.config).toEqual({ permissionMode: 'read-only' })
+  await client.dispose()
+})
+
 test('façade sessions reject permission-mode overrides so steps inherit the swarm mode', async () => {
   const backend = await fixture(echoTask([]))
   const client = await swarmClient(backend.client, {

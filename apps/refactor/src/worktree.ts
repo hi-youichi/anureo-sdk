@@ -1,6 +1,6 @@
 // Materializes Git-visible source and transfers edits between independent worktrees.
 import { constants } from 'node:fs'
-import { copyFile, cp, link, lstat, mkdir, mkdtemp, readdir, readlink, realpath, rename, rm, rmdir, symlink, writeFile } from 'node:fs/promises'
+import { copyFile, cp, link, lstat, mkdir, mkdtemp, readdir, readlink, realpath, rename, rm, rmdir, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { inspectGitPath, isSnapshotPath } from './git-path'
@@ -141,28 +141,40 @@ export async function prepareCheckDependencies(baseline: WorktreeBaseline, workt
   }
 }
 
+/** Copy an installed dependency tree into the checkout. Real entries copy recursively and every
+ * link is recreated with a rebased target and a type matching its destination. */
 async function copyDependencies(from: string, to: string, sourceRoot: string, targetRoot: string): Promise<void> {
-  await cp(from, to, { recursive: true, verbatimSymlinks: true, mode: constants.COPYFILE_FICLONE })
-  await rebaseDependencyLinks(to, sourceRoot, targetRoot)
+  await mkdir(to, { recursive: true })
+  for (const entry of await readdir(from, { withFileTypes: true })) {
+    const source = join(from, entry.name)
+    const destination = join(to, entry.name)
+    if (entry.isSymbolicLink()) await copyDependencyLink(source, destination, sourceRoot, targetRoot)
+    else if (entry.isDirectory()) await copyDependencies(source, destination, sourceRoot, targetRoot)
+    else await copyFile(source, destination, constants.COPYFILE_FICLONE)
+  }
 }
 
-async function rebaseDependencyLinks(directory: string, source: string, target: string): Promise<void> {
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    const path = join(directory, entry.name)
-    if (entry.isDirectory()) await rebaseDependencyLinks(path, source, target)
-    else if (entry.isSymbolicLink()) {
-      const link = await readlink(path)
-      if (!isAbsolute(link)) continue
-      const absolute = await realpath(path).catch((cause: NodeJS.ErrnoException) => {
-        if (cause.code !== 'ENOENT' && cause.code !== 'ELOOP') throw cause
-        return link
-      })
-      const rebased = rebaseDependencyLink(absolute, source, target)
-      if (rebased === absolute) continue
-      await rm(path)
-      await symlink(rebased, path)
-    }
+/** Rebase one dependency link into the target checkout and recreate it with an absolute target
+ * and an explicit type: 'dir' stays readable as a directory and traversable by module resolution
+ * even when the target is copied later in the same walk, and Git worktree removal deletes it
+ * without following. The runtime's typeless creation stores a 'file' link when the target is
+ * absent, which never becomes traversable after the target arrives. Verbatim copying breaks
+ * Windows directory links whose stored target ascends through '..' segments, which is how bun's
+ * isolated .bun layout links shared packages: the copy loses its directory type and resolution
+ * fails. A broken source link keeps its stored target so resolution stays observable. */
+async function copyDependencyLink(source: string, destination: string, sourceRoot: string, targetRoot: string): Promise<void> {
+  const stored = await readlink(source)
+  const resolved = await realpath(source).catch((cause: NodeJS.ErrnoException) => {
+    if (cause.code !== 'ENOENT' && cause.code !== 'ELOOP') throw cause
+    return undefined
+  })
+  if (resolved === undefined) {
+    await symlink(stored, destination)
+    return
   }
+  const rebased = rebaseDependencyLink(resolved, sourceRoot, targetRoot)
+  if ((await stat(resolved)).isDirectory()) await symlink(rebased, destination, 'dir')
+  else await symlink(rebased, destination, 'file')
 }
 
 function rebaseDependencyLink(link: string, source: string, target: string): string {

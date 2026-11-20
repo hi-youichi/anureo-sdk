@@ -472,6 +472,29 @@ test('main and member sessions inherit the swarm session permission mode', async
   } finally { await client.dispose(); await backend.client.dispose(); await alternate.client.dispose() }
 })
 
+test('members inherit config.permissionMode from the swarm session alongside effort config', async () => {
+  const backend = await fixture(async (input, _structured, _prior, params) => {
+    if (!params.mcpServers?.some(server => server.name === 'anureo-swarm')) return `worker: ${JSON.parse(input).task}`
+    const mcp = await management(params)
+    try {
+      const { beeId } = await mcp.call('bee_create', { role: 'worker', name: 'Worker' })
+      const task = await mcp.call('bee_delegate', assignment(beeId))
+      expect((await mcp.call('bee_wait', { taskId: task.taskId })).state).toBe('completed')
+      return 'done'
+    } finally { await mcp.client.close() }
+  })
+  const client = await swarm(backend)
+  try {
+    const session = await client.sessions.create({ cwd, permissionMode: 'read-only', config: { permissionMode: 'read-only', custom: 'parent-only' } })
+    expect((await (await session.submit({ input: 'Investigate' })).result()).status).toBe('completed')
+    const [main, member] = backend.opened
+    expect(main.config).toEqual({ permissionMode: 'read-only', custom: 'parent-only' })
+    expect(member.permissionMode).toBe('read-only')
+    // Only permissions are inherited; other parent config stays with the main session.
+    expect(member.config).toEqual({ permissionMode: 'read-only' })
+  } finally { await client.dispose(); await backend.client.dispose() }
+})
+
 test('validates tools, enforces limits, cancels a member and expires the endpoint', async () => {
   let endpoint: SessionOpenParams | undefined
   const backend = await fixture(async (_input, _structured, _prior, params) => {

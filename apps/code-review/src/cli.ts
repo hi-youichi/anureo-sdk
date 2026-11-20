@@ -7,7 +7,7 @@ import { formatFailure } from './errors'
 import { formatReport } from './report'
 import { DEFAULT_WORKFLOW_DIRECTORY, resolveReviewDirectory } from './paths'
 import { reviewCode } from './review'
-import { DEFAULT_REVIEW_CONCURRENCY, validatePositiveInteger, validateModuleIds, hasDuplicateIds } from './options'
+import { DEFAULT_REVIEW_CONCURRENCY, MAX_REVIEW_ID_BYTES, validatePositiveInteger, validateModuleIds, hasDuplicateIds } from './options'
 import type { ReviewProgress } from './progress'
 
 /** Run the CLI with arguments following the executable name. The bin entry point awaits the result
@@ -109,8 +109,8 @@ function parseCommand(args: string[]) {
   const maxModules = values['max-modules'] === undefined ? undefined : Number(values['max-modules'])
   if (maxModules !== undefined) validatePositiveInteger(maxModules, '--max-modules')
   validateModuleIds(values.module, '--module requires unique nonempty module ids')
-  if (values.module?.some(id => Buffer.byteLength(id) > 256)) {
-    throw new Error('--module IDs must be at most 256 bytes each')
+  if (values.module?.some(id => Buffer.byteLength(id) > MAX_REVIEW_ID_BYTES)) {
+    throw new Error(`--module IDs must be at most ${MAX_REVIEW_ID_BYTES} bytes each`)
   }
   const angles = resolveSelectedAngles(values.angle)
   return {

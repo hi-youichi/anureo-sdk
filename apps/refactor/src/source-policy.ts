@@ -32,9 +32,14 @@ const sourceOnlyExclusions = new Set(['.repograph', 'node_modules', 'dist', 'bui
 /** Repository metadata and conventional standalone prose. Explicit includes can select these files. */
 const supportingFile = /^(?:\.(?:gitignore|gitattributes|gitmodules|editorconfig)|package(?:-lock)?\.json|(?:bun|yarn|Cargo|uv|poetry)\.lockb?|pnpm-lock\.ya?ml|(?:README|LICENSE|LICENCE|COPYING|NOTICE|CHANGELOG|CONTRIBUTING|AGENTS)(?:\.(?:md|txt|rst|adoc))?)$/i
 
-/** Match hard exclusions against any path component, regardless of case or glob settings. */
+/** Match hard exclusions against the leading path component, regardless of case or glob settings.
+ * Conventional output, dependency and prose directories are excluded at the repository root; the
+ * same names stay eligible as nested implementation module names (for example a Rust `build`
+ * module directory inside a crate). */
 function isExcluded(file: string): boolean {
-  return !isSnapshotPath(file) || file.split('/').some(part => sourceOnlyExclusions.has(part.toLowerCase()))
+  if (!isSnapshotPath(file)) return false
+  const [root = ''] = file.split('/')
+  return sourceOnlyExclusions.has(root.toLowerCase())
 }
 
 /** Default to UTF-8 unless a UTF-16 byte-order mark is present. Decode strictly so invalid

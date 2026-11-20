@@ -6,6 +6,16 @@ and versions follow [SemVer](https://semver.org/spec/v2.0.0.html). During the
 0.x line, minor versions may include breaking changes; such entries are
 marked **BREAKING**.
 
+## [Unreleased]
+
+- Swarm members (temporary, fixed-profile and workflow bees) now inherit the
+  swarm session's `config.permissionMode` in addition to the top-level
+  `permissionMode`. The Codex, Claude and Pi adapters read the config value in
+  preference to the top-level field, so a session opened with
+  `config: { permissionMode: 'read-only' }` previously left members on the
+  backend's default mode (`agent-full-access` for Pi). Other parent `config`
+  keys are still not forwarded to members.
+
 ## [0.3.7] - 2026-11-18
 
 Merge the `fix/history-frame-budget` line into `main` and release the combined

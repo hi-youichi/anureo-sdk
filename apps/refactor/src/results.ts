@@ -15,6 +15,10 @@ export interface Failure {
   outcomeUnknown: boolean
   /** A resource-release error was reported, independently of execution outcome. */
   cleanupFailed: boolean
+  /** Whether the source error permits a retry. May be absent in older reports. */
+  retryable?: boolean
+  /** Field paths and rule codes from structured-output validation. */
+  issues?: Array<{ path: string | Array<string | number>; code: string }>
 }
 /** Outcome of a design or module step, including host observations from integration and validation.
  * The inherited summary, changes and deferred fields are the agent's account of the work. */
