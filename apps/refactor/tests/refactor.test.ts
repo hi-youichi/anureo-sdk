@@ -376,8 +376,9 @@ test('the plan checkpoint is published before either module starts', async () =>
       expect(saved.plan).toBeNull()
       return plan
     }
+    // Modules run concurrently and each completion republishes the whole report, so a later-starting
+    // module may already see its sibling's results; only the plan checkpoint is guaranteed on start.
     expect(saved.plan).toEqual(plan)
-    expect(saved.modules).toEqual([])
     return unchanged
   })
   const report = await refactorCode({ ...context, checks: [],
