@@ -2,7 +2,16 @@
   "name": "@anureo/adapter-swarm",
   "description": "A conversational main agent that creates and manages independent bee sessions",
   "version": "0.3.8",
-  "private": true,
+  "license": "Apache-2.0",
+  "keywords": ["anureo", "ahp", "harness", "agent", "swarm"],
+  "homepage": "https://github.com/hi-youichi/anureo-sdk#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
+    "directory": "packages/adapter/swarm"
+  },
+  "bugs": { "url": "https://github.com/hi-youichi/anureo-sdk/issues" },
+  "publishConfig": { "access": "public" },
   "type": "module",
   "exports": {
     ".": "./src/index.ts",

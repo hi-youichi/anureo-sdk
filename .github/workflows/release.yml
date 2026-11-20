@@ -56,7 +56,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version=$(node -p "require('./package.json').version")
-          for name in protocol sdk conformance adapter-acp adapter-ahp adapter-claude adapter-codex adapter-hermes adapter-pi workflow code-review refactor cli; do
+          for name in protocol sdk conformance adapter-acp adapter-ahp adapter-claude adapter-codex adapter-hermes adapter-pi adapter-swarm workflow code-review refactor cli; do
             published=$(npm view "@anureo/$name@$version" version 2>/dev/null || true)
             if [ "$published" = "$version" ]; then
               echo "Skipping @anureo/$name@$version (already published)"

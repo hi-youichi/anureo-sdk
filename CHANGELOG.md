@@ -18,6 +18,9 @@ marked **BREAKING**.
 - `anureo` CLI workflow resume now reads the input from the source run's stored
   manifest (`run.json`) instead of passing the CLI prompt as args; a missing or
   unreadable manifest fails the run with `SWARM_WORKFLOW_RESUME_NOT_FOUND`.
+- Publish `@anureo/adapter-swarm` to npm. It was marked private and left out of
+  the release workflow, so `@anureo/cli` (which depends on it) could not be
+  installed from the registry in 0.3.7.
 - Bump `@anthropic-ai/claude-agent-sdk` to 0.3.328 in the Claude adapter.
 - Codex adapter: spawned-subagent `thread/started` notifications that repeat the
   child's id in a top-level `threadId` were dropped by the thread-scope filter
