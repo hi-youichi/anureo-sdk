@@ -410,7 +410,8 @@ function handleMessage(msg) {
         sendResult(msg, { data: [{ id: 'ok', status: { type: 'idle' } }, { nope: true }], nextCursor: null })
         break
       }
-      if (mode === 'threads-relations') {
+      // threads-page answers relation-filtered queries from the tree fixture and keeps the default page for unfiltered ones.
+      if (mode === 'threads-relations' || (mode === 'threads-page' && (msg.params?.parentThreadId || msg.params?.ancestorThreadId))) {
         if (msg.params?.parentThreadId) sendResult(msg, { data: [{ id: 'child-1', parentThreadId: msg.params.parentThreadId, status: { type: 'notLoaded' } }], nextCursor: null })
         else if (msg.params?.ancestorThreadId) sendResult(msg, { data: [
           { id: 'child-1', parentThreadId: msg.params.ancestorThreadId, status: { type: 'notLoaded' } },

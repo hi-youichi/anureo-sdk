@@ -19,6 +19,17 @@ marked **BREAKING**.
   manifest (`run.json`) instead of passing the CLI prompt as args; a missing or
   unreadable manifest fails the run with `SWARM_WORKFLOW_RESUME_NOT_FOUND`.
 - Bump `@anthropic-ai/claude-agent-sdk` to 0.3.328 in the Claude adapter.
+- Codex adapter: spawned-subagent `thread/started` notifications that repeat the
+  child's id in a top-level `threadId` were dropped by the thread-scope filter
+  before reaching discovery, so no `SUBAGENT_THREAD_STARTED` notice was published
+  and `listThreads()` lacked their nickname. Session-level hooks (no turn id)
+  now publish `NATIVE_HOOK_STARTED`/`NATIVE_HOOK_COMPLETED` notices instead of
+  a generic `NATIVE_NOTIFICATION`.
+- Test-suite fixes that previously blocked the release workflow: align the Codex
+  fake app server's `threads-page` scenario with relation-filtered queries,
+  update the ACP model-open cleanup assertion to the documented `cleanupErrors`
+  contract, and observe the pending workflow-pool acquire in its unit test so
+  it no longer leaks an unhandled rejection.
 
 ## [0.3.7] - 2026-11-18
 

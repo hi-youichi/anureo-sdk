@@ -26,7 +26,7 @@ test('model validation and configuration failures release partially opened nativ
     const client = await createClient({ adapter: createAcpAdapter({ connect: async () => channel }), identity: { adapterId: 'acp', runtimeConfigId: 'model-open' } })
     try {
       await expect(client.sessions.create({ cwd: process.cwd(), model })).rejects.toMatchObject(model === 'cleanup-failure'
-        ? { code: 'RESOURCE_RELEASE_FAILED', outcomeUnknown: true, details: { errors: expect.arrayContaining([{ code: 'INVALID_PARAMS', outcomeUnknown: false }]) } }
+        ? { code: 'INVALID_PARAMS', outcomeUnknown: false, details: { cleanupErrors: [{ code: 'RESOURCE_RELEASE_FAILED' }] } }
         : { code: 'INVALID_PARAMS' })
       expect(calls.filter(method => method === 'session/new')).toHaveLength(1)
       expect(calls.filter(method => method === 'session/close')).toHaveLength(1)

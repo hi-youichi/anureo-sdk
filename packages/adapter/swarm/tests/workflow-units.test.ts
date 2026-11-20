@@ -65,16 +65,19 @@ describe('WorkflowPool', () => {
     const signal = new ChangeSignal()
     const pool = new WorkflowPool(host(created, closed, 0, signal))
     const key = poolKeyFor(backend, undefined, undefined)
+    // Observe the blocked acquire from the start: it wakes within the 1s slot wait after the pool closes
+    // and must settle as turn-ended rather than leak an unhandled rejection into later tests.
     const pending = pool.acquire({ role: 'workflow', name: 'b' }, key, backend, new AbortController().signal)
+      .then(() => 'acquired', (cause: unknown) => (cause as HarnessSdkError).code)
     await new Promise(resolve => setTimeout(resolve, 20))
     // Signal a close that frees a slot; the retry loop then creates.
     // Simulate by raising the host limit indirectly is not possible; instead verify rejection below.
-    void pending
     const acquirer = new WorkflowPool({ ...host(created, closed, 0, signal), createBee: async () => 'late' })
     const late = await acquirer.acquire({ role: 'workflow', name: 'b' }, key, backend, new AbortController().signal)
     expect(late.beeId).toBe('late')
     late.release()
     await pool.settle()
+    expect(await pending).toBe('SWARM_WORKFLOW_TURN_ENDED')
   })
 })
 

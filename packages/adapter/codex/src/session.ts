@@ -139,10 +139,10 @@ export class CodexBackendSession implements BackendSession {
    * identity is known. Projection or publication failures reject and fail the reader.
    */
   async notification(method: string, params: NativeRecord): Promise<void> {
-    if (typeof params.threadId === 'string' && this.threadId && params.threadId !== this.threadId) return
     // thread/started bypasses the thread-scope filter below: spawned subagent threads carry the
     // child's own identity, and this notice is the only pushed discovery channel for them.
     if (method === 'thread/started') return await this.threadStarted(params)
+    if (typeof params.threadId === 'string' && this.threadId && params.threadId !== this.threadId) return
     if (method === 'thread/name/updated') {
       const title = typeof params.threadName === 'string' ? params.threadName : null
       if (this.state.metadata?.title !== title) {
@@ -178,7 +178,7 @@ export class CodexBackendSession implements BackendSession {
       await this.projectPlan(params, turnId)
       return
     }
-    if ((method === 'hook/started' || method === 'hook/completed') && turnId) {
+    if (method === 'hook/started' || method === 'hook/completed') {
       await this.projectHook(params, turnId, method === 'hook/started')
       return
     }
