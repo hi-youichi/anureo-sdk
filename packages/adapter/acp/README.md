@@ -32,6 +32,7 @@ const client = await createClient({
 ACP's core protocol covers sessions, turns, messages, and permission requests. AHP-only features are opt-in through an extension object in the agent's `initialize` response (`_meta.ahp`, version 1):
 
 - **Optional methods** — `fork`, `revert`, `steer`, `history`, `goalSet`, `goalClear`, `compact`, `review`, each declaring its private `_…` method name, plus fork boundaries and revert scopes where applicable
+- **Provider-neutral goal control** — independent of `_meta.ahp`. An `initialize` response carrying `_meta.goal` (top level, or `agentCapabilities._meta.goal`) with `version: 1`, a private `controlMethod` and `actions` advertises `goal.actions` for the `set` and `clear` actions AHP can express (pause/resume/edit are ignored). `goal/set` sends `{ sessionId, action: 'set', objective, tokenBudget? }` and `goal/clear` sends `{ sessionId, action: 'clear' }` to that method, which answers `{ goal }`; `goal/set` requires a string `objective`. The peer's `session_info_update._meta.goal` snapshots (also republished on `session/load`; `null` clears) update the session goal and publish `session/state`. Snapshots map to AHP as `status: 'cleared'` when the neutral status is `complete` and `'active'` otherwise, with the snapshot kept in `goal`. A goal method served through `_meta.ahp.methods.goalSet`/`goalClear` takes precedence for that action.
 - **Client requests** — `userInput` (`_ahp/user_input`) and `dynamicTool` (`_ahp/dynamic_tool`) interactions
 - **Features** — nested subagent events and custom instructions
 

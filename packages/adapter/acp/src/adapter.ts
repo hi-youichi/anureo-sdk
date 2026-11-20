@@ -1,5 +1,6 @@
 // Negotiates ACP and coordinates native requests, notifications and session lifecycles.
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import * as acp from '@agentclientprotocol/sdk';
 import {
   HarnessSdkError, sdkError, waitForRequest,
@@ -9,7 +10,7 @@ import {
   AHP_PROTOCOL_CONTRACT, assertRequest, negotiateVersion, assertResult, assertDefinition,
   type Capabilities, type SessionBinding, type SessionOpenParams, type SessionState, type InitializeParams,
   type InitializeResult, type AhpRequestMap, type AhpResultMap, type JsonObject, type InteractionRequested,
-  type InteractionResponse, type AhpEventPayload,
+  type InteractionResponse, type AhpEventPayload, type GoalState,
 } from '@anureo/protocol';
 import { AcpUpdateMapper, record, safe, input, mcp, configuration, resolveConfigValue } from './mapping';
 import { acpFileChanges } from './file-changes';
@@ -283,10 +284,17 @@ export class AcpAdapter implements HarnessAdapter {
   }
 
   /** Withdraw a peer-rejected method from dispatch and every advertised session snapshot. */
-  async withdrawExtension(key: ExtensionKey): Promise<void> {
-    if (!this.extension.methods[key]) return;
-    delete this.extension.methods[key];
-    removeExtensionCapability(this.capabilities, key);
+  async withdrawExtension(key: ExtensionKey, source: 'ahp' | 'neutral' = 'ahp'): Promise<void> {
+    const action = goalAction(key);
+    if (source === 'neutral') {
+      if (!action || !this.extension.goal?.actions.includes(action)) return;
+      this.extension.goal.actions = this.extension.goal.actions.filter(candidate => candidate !== action);
+    } else {
+      if (!this.extension.methods[key]) return;
+      delete this.extension.methods[key];
+    }
+    // A goal action stays advertised while the other source (AHP method or neutral control) still serves it.
+    if (!action || !goalAvailable(this.extension, action)) removeExtensionCapability(this.capabilities, key);
     const sessions = new Set(this.sessions.values());
     if (this.openingSession) sessions.add(this.openingSession);
     await Promise.allSettled([...sessions].filter(session => session.acceptsPeerTraffic)
@@ -520,7 +528,7 @@ export class AcpAdapter implements HarnessAdapter {
       input: { delivery: ['native'], interrupt: { targets: ['session'], reportsPendingInputs: false } },
       turn: { inputModalities: ['text', ...(native.promptCapabilities?.image ? ['image' as const] : []), ...(native.promptCapabilities?.embeddedContext ? ['file' as const] : [])] },
       interactions: ['approval', 'elicitation', ...(this.extension.userInput ? ['userInput' as const] : []), ...(this.extension.dynamicTool ? ['dynamicTool' as const] : [])],
-      goal: { actions: [...(this.extension.methods.goalSet ? ['set' as const] : []), ...(this.extension.methods.goalClear ? ['clear' as const] : [])] },
+      goal: { actions: (['set', 'clear'] as const).filter(action => goalAvailable(this.extension, action)) },
       compact: !!this.extension.methods.compact, review: !this.extension.nativeLifecycle && !!this.extension.methods.review, subagents: { events: this.extension.subagents ? 'nested' : 'none' },
       mcp: { stdio: true, http: native.mcpCapabilities?.http === true, elicitation: ['form', 'url'] }, config: { options: [] },
       extensions: this.extension.version && (this.extension.nativeLifecycle || Object.keys(this.extension.methods).length || this.extension.subagents || this.extension.userInput || this.extension.dynamicTool)
@@ -561,6 +569,7 @@ export class AcpBackendSession implements BackendSession {
       config: this.config,
       capabilities: this.capabilities,
       capabilityRevision: this.capabilityRevision,
+      ...(this.goalState ? { goal: structuredClone(this.goalState) } : {}),
       status: this.activeTurn ? 'running' : 'ready',
       activeTurnIds: [...this.nativeStartedTurnIds, ...(this.standardTurnStarted && this.activeTurn ? [this.activeTurn] : [])],
     };
@@ -622,6 +631,9 @@ export class AcpBackendSession implements BackendSession {
     if (this.hydrating) {
       this.captureLoadedUpdate(data);
       return;
+    }
+    if (data.sessionUpdate === 'session_info_update' && Object.hasOwn(record(data._meta), 'goal')) {
+      await this.publishGoal(neutralGoalState(record(data._meta).goal));
     }
     if (this.adapter.extension.nativeLifecycle) {
       const native = record(record(data._meta).ahp);
@@ -696,8 +708,8 @@ export class AcpBackendSession implements BackendSession {
       }
       case 'session/revert': return this.extension('revert', method, params);
       case 'history/read': return this.extension('history', method, params);
-      case 'goal/set': return this.extension('goalSet', method, params);
-      case 'goal/clear': return this.extension('goalClear', method, params);
+      case 'goal/set': return this.goal('set', method, params);
+      case 'goal/clear': return this.goal('clear', method, params);
       case 'compact/start': return this.extension('compact', method, params);
       case 'review/start': return this.submitReview(params as AhpRequestMap['review/start']) as Promise<AhpResultMap[M]>;
       case 'interaction/respond': case 'interaction/cancel': throw new HarnessSdkError('INTERACTION_EXPIRED');
@@ -762,6 +774,8 @@ export class AcpBackendSession implements BackendSession {
   private configurationData: Record<string, unknown> = {};
   private capabilityRevision = 1;
   private sessionTitle?: string | null;
+  /** Latest goal published by the peer's neutral `_meta.goal` snapshots or confirmed by a goal request. */
+  private goalState?: GoalState;
   private closed = false;
   private snapshotBytes = 0;
   /** Save pre-attachment updates for the host snapshot callback. Capture title as attachment metadata
@@ -769,6 +783,9 @@ export class AcpBackendSession implements BackendSession {
   private captureLoadedUpdate(data: Record<string, unknown>): void {
     if (data.sessionUpdate === 'session_info_update') {
       if (typeof data.title === 'string' || data.title === null) this.sessionTitle = data.title;
+      // session/load republishes the authoritative goal; it overwrites any cached value.
+      const meta = record(data._meta);
+      if (Object.hasOwn(meta, 'goal')) this.goalState = neutralGoalState(meta.goal);
       return;
     }
     this.snapshotBytes += JSON.stringify(data).length * 3;
@@ -868,6 +885,41 @@ export class AcpBackendSession implements BackendSession {
       throw error;
     } finally { this.releaseStandardTurn(turnId); }
   }
+  /** Route goal/set and goal/clear to the AHP extension method when the peer advertised one, otherwise to the
+   * provider-neutral control method. Neutral snapshots also arrive as session_info_update `_meta.goal`. */
+  private async goal<M extends SessionMethod>(action: 'set' | 'clear', method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
+    const key: ExtensionKey = action === 'set' ? 'goalSet' : 'goalClear';
+    if (this.adapter.extension.methods[key]) return this.extension(key, method, params);
+    const neutral = this.adapter.extension.goal;
+    if (!neutral?.actions.includes(action)) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
+    const request: Record<string, unknown> = { sessionId: this.nativeId, action };
+    if (action === 'set') {
+      const requested = record((params as AhpRequestMap['goal/set']).goal);
+      const objective = typeof requested.objective === 'string' ? requested.objective.trim() : '';
+      if (!objective) throw new HarnessSdkError('INVALID_PARAMS', 'Goal objective is required');
+      request.objective = objective;
+      if (requested.tokenBudget !== undefined) request.tokenBudget = requested.tokenBudget;
+    }
+    try {
+      const response = record(await this.adapter.call(neutral.method, request));
+      if (!Object.hasOwn(response, 'goal') || (response.goal !== null && typeof response.goal !== 'object')) {
+        throw new HarnessSdkError('PROTOCOL_ERROR', 'Invalid ACP goal result', false, true);
+      }
+      const result = neutralGoalState(response.goal);
+      assertResult(method, result);
+      await this.publishGoal(result);
+      return result as AhpResultMap[M];
+    } catch (error) {
+      if (error instanceof HarnessSdkError && error.details?.nativeCode === -32601) await this.adapter.withdrawExtension(key, 'neutral');
+      throw error;
+    }
+  }
+  /** Record the peer's goal and publish it when it changed, so hosts holding session state converge. */
+  private async publishGoal(next: GoalState): Promise<void> {
+    if (isDeepStrictEqual(this.goalState, next)) return;
+    this.goalState = next;
+    if (this.nativeAcquired) await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
+  }
   /** Dispatch a negotiated extension, enrich history tool file changes, and validate the native result.
    * Method-not-found withdraws the affected live capability and publishes state before rejecting. */
   private async extension<M extends SessionMethod>(key: ExtensionKey, method: M, params: AhpRequestMap[M]): Promise<AhpResultMap[M]> {
@@ -890,6 +942,22 @@ export class AcpBackendSession implements BackendSession {
     this.capabilityRevision++;
     if (this.nativeAcquired) await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
   }
+}
+
+/** Map a goal ExtensionKey to the AHP goal action it serves. */
+function goalAction(key: ExtensionKey): 'set' | 'clear' | undefined {
+  return key === 'goalSet' ? 'set' : key === 'goalClear' ? 'clear' : undefined;
+}
+/** Whether the peer currently serves a goal action through an AHP method or the neutral control method. */
+function goalAvailable(extension: Extensions, action: 'set' | 'clear'): boolean {
+  return !!extension.methods[action === 'set' ? 'goalSet' : 'goalClear'] || !!extension.goal?.actions.includes(action);
+}
+/** Project a neutral goal snapshot (`null` clears it) onto AHP. A completed goal is no longer pending; every
+ * other status, including paused and limited, still owns the session until the user or peer resolves it. */
+function neutralGoalState(value: unknown): GoalState {
+  const goal = record(value);
+  if (!Object.keys(goal).length) return { goal: null, status: 'cleared' };
+  return { goal: safe(goal) as JsonObject, status: goal.status === 'complete' ? 'cleared' : 'active' };
 }
 
 /** Update the operation's capability on the connection baseline or a session projection. */

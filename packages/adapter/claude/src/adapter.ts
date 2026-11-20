@@ -19,7 +19,7 @@ import {
   AHP_PROTOCOL_CONTRACT, assertRequest, negotiateVersion, publicValue, validateJsonSchema,
   type Capabilities, type AhpRequestMap, type AhpResultMap, type HarnessError, type HistoryItem, type HistoryPage,
   type InitializeParams, type InitializeResult, type InputBlock, type InteractionRequested,
-  type Item, type JsonObject, type JsonValue, type SessionBinding, type SessionOpenParams, type SessionState, type Boundary,
+  type GoalState, type Item, type JsonObject, type JsonValue, type SessionBinding, type SessionOpenParams, type SessionState, type Boundary,
 } from "@anureo/protocol";
 import { FileSessionStore } from "./store";
 import { compileOutputSchema, type OutputSchema } from './output-schema';
@@ -195,6 +195,8 @@ export class ClaudeBackendSession implements BackendSession {
         result = await this.setConfig(query, (params as AhpRequestMap["session/config/set"]).patch);
         break;
       case "session/revert": result = await this.revert(params as AhpRequestMap['session/revert']); break;
+      case 'goal/set': result = await this.setGoal(params as AhpRequestMap['goal/set']); break;
+      case 'goal/clear': result = await this.clearGoal(); break;
       default: throw new HarnessSdkError("CAPABILITY_UNSUPPORTED");
     }
     return result as AhpResultMap[M];
@@ -283,6 +285,9 @@ export class ClaudeBackendSession implements BackendSession {
   private config: JsonObject;
   private readonly effectiveConfig: JsonObject;
   private capabilityRevision = 1;
+  /** Goal as this adapter last confirmed it. The native CLI emits no goal event to SDK consumers, so
+   * completeTurn infers that a goal ended with the loop that ran it, and a resumed session starts without one. */
+  private goalState?: GoalState;
   private model?: string;
   private turns: Record<string, string> = {};
   private historySnapshots = new Map<string, { items: HistoryItem[]; source: NonNullable<HistoryPage["source"]> }>();
@@ -370,7 +375,7 @@ export class ClaudeBackendSession implements BackendSession {
   }
   /** Clone binding and config for state publications during initialization, configuration,
    * completion and conversation restore. Report running while an execution occupies the active slot. */
-  private snapshot(): SessionState { return { ...(this.sessionTitle !== undefined ? { metadata: { title: this.sessionTitle } } : {}), binding: structuredClone(this.binding), status: this.active ? "running" : "ready", config: structuredClone(this.config), capabilities: this.capabilities, capabilityRevision: this.capabilityRevision, ...(this.model ? { model: this.model } : {}), ...(this.fastMode ? { fastMode: this.fastMode } : {}), activeTurnIds: this.active ? [this.active.id] : [] }; }
+  private snapshot(): SessionState { return { ...(this.sessionTitle !== undefined ? { metadata: { title: this.sessionTitle } } : {}), binding: structuredClone(this.binding), status: this.active ? "running" : "ready", config: structuredClone(this.config), capabilities: this.capabilities, capabilityRevision: this.capabilityRevision, ...(this.goalState ? { goal: structuredClone(this.goalState) } : {}), ...(this.model ? { model: this.model } : {}), ...(this.fastMode ? { fastMode: this.fastMode } : {}), activeTurnIds: this.active ? [this.active.id] : [] }; }
   /** Construct a generation-specific query for open, restoreConversation or replaceOutputFormat,
    * then start background pumping and await resumed-title refresh. Fresh mode opens the current native
    * ID as a new session; resume mode reopens its transcript. Factory/setup
@@ -673,6 +678,9 @@ export class ClaudeBackendSession implements BackendSession {
     const usage = { provider: "claude", scope: "turn" as const, source: "native" as const, ...(typeof nativeUsage.input_tokens === "number" ? { input: nativeUsage.input_tokens } : {}), ...(typeof nativeUsage.output_tokens === "number" ? { output: nativeUsage.output_tokens } : {}), ...(typeof nativeUsage.cache_read_input_tokens === "number" ? { cacheRead: nativeUsage.cache_read_input_tokens } : {}), ...(typeof nativeUsage.cache_creation_input_tokens === "number" ? { cacheWrite: nativeUsage.cache_creation_input_tokens } : {}) };
     await this.sink.emit({ type: "usage/updated", payload: usage }, { turnId: active.id });
     const failed = error !== undefined;
+    // The native Stop hook blocks the loop's final stop until the goal is met, impossible or cleared, so a
+    // finished (or failed) execution ends the goal. An interrupt leaves it set for the user to resume or clear.
+    if (this.goalState?.status === 'active' && !interrupted) this.goalState = { goal: this.goalState.goal, status: 'cleared' };
     for (const pending of active.output.values()) {
       if (pending.type !== "toolCall" || pending.kind !== "fileChange" || pending.status === "completed" || pending.status === "failed") continue;
       const item: Item = { ...pending, status: active.stoppedTools.get(pending.id) ?? (interrupted ? "interrupted" : failed ? "failed" : undefined) };
@@ -1046,6 +1054,37 @@ export class ClaudeBackendSession implements BackendSession {
       } catch (cause) { this.nativeInputs.delete(userUuid); throw cause; }
     } finally { if (changing) this.switchingOutput = false; }
   }
+  /** Start a native `/goal` loop. The CLI judges the condition with a session Stop hook and keeps the model
+   * working until it holds, so the command runs as an ordinary execution that ends in completeTurn. Reject
+   * invalid objectives and busy sessions before anything reaches the CLI; a set while work is running would
+   * race the loop's own Stop-hook evaluation. */
+  private async setGoal({ goal }: AhpRequestMap['goal/set']): Promise<GoalState> {
+    const objective = typeof goal.objective === 'string' ? goal.objective.trim() : '';
+    if (!objective || [...objective].length > MAX_GOAL_OBJECTIVE_CHARACTERS || GOAL_CLEAR_WORDS.has(objective.toLowerCase())) {
+      throw new HarnessSdkError('INVALID_PARAMS', 'Invalid Claude goal objective');
+    }
+    if (this.active || this.nativeInputs.size) throw new HarnessSdkError('SESSION_BUSY', 'A Claude goal can be set only while the session is idle');
+    this.sendGoalCommand(`/goal ${objective}`);
+    return this.publishGoal({ goal: { objective }, status: 'active' });
+  }
+  /** Clear the native goal. Allowed while a goal loop runs: the CLI applies `/goal clear` at its next input boundary. */
+  private async clearGoal(): Promise<GoalState> {
+    this.sendGoalCommand('/goal clear');
+    return this.publishGoal({ goal: null, status: 'cleared' });
+  }
+  /** Enqueue a slash command without a submission: it has no receipt, and its execution surfaces as an
+   * unbound native turn exactly like a background reply. */
+  private sendGoalCommand(text: string): void {
+    if (this.closed || !this.input) throw new HarnessSdkError('SESSION_CLOSED');
+    if (this.reverting) throw new HarnessSdkError('SESSION_BUSY', 'Claude goal cannot change during revert');
+    this.input.push({ type: 'user', uuid: randomUUID(), session_id: this.nativeId, message: { role: 'user', content: text }, parent_tool_use_id: null, priority: 'next' });
+  }
+  /** Record the confirmed goal and publish it with the settled session state before returning the result. */
+  private async publishGoal(goal: GoalState): Promise<GoalState> {
+    this.goalState = goal;
+    await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
+    return structuredClone(goal);
+  }
   /** Drain and replace the query for submitInput before enqueueing its input. Reject startup or
    * cleanup failure as a definite dispatch failure and latch it for later query operations while open. */
   private async replaceOutputFormat(query: ClaudeQuery, outputSchema: OutputSchema | undefined): Promise<void> {
@@ -1194,6 +1233,9 @@ const PERMISSION_MODES: PermissionMode[] = ["default", "acceptEdits", "bypassPer
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 type Effort = typeof EFFORT_LEVELS[number];
 const isEffort = (value: unknown): value is Effort => typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value);
+/** Longest `/goal` condition the native command accepts, and the words it reads as "clear the goal". */
+const MAX_GOAL_OBJECTIVE_CHARACTERS = 4000;
+const GOAL_CLEAR_WORDS: ReadonlySet<string> = new Set(["clear", "stop", "off", "reset", "none", "cancel"]);
 /** Validate native permission configuration before query setup or an explicit mode change. */
 function permission(value: unknown): PermissionMode { if (typeof value !== "string" || !PERMISSION_MODES.includes(value as PermissionMode)) throw new HarnessSdkError("INVALID_PARAMS", "Unsupported permission mode"); return value as PermissionMode; }
 /** Share capability projection between adapter negotiation and newly constructed backend sessions. */
@@ -1203,6 +1245,8 @@ function capabilities({ store, checkpoints }: { store: boolean; checkpoints: boo
     input: { delivery: ['native', 'afterTurn'], interrupt: { targets: ['session'], reportsPendingInputs: true } },
     turn: { outputSchema: true, overrides: [], inputModalities: ["text", "image"] },
     interactions: ["approval", "userInput", "elicitation"], subagents: { events: "nested" },
+    // Goals run through the native /goal command, so the loop and its Stop-hook evaluation stay with Claude.
+    goal: { actions: ["set", "clear"] },
     mcp: { stdio: true, http: true, elicitation: ["form", "url"] },
     config: { options: [{ id: "model", scope: "session", schema: { type: "string", minLength: 1 } }, { id: "permissionMode", title: "Permissions", scope: "session", schema: { type: "string", enum: PERMISSION_MODES, default: "default" } }, { id: "effort", title: "Effort", scope: "session", schema: { type: "string", enum: [...EFFORT_LEVELS], default: "high" } }, { id: "fastMode", title: "Fast mode", scope: "session", schema: { type: "boolean", default: false } }, { id: "maxThinkingTokens", scope: "session", schema: { type: ["integer", "null"], minimum: 0 } }] },
   };

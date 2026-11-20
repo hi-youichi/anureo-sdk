@@ -38,6 +38,16 @@ What the adapter can offer depends on the options it was constructed with:
 | A session store is present (`stateDir`, or injected `sessionStore`) | `session.resume`, fork (`before`/`through`), `revert: conversation`, `history` |
 | `enableFileCheckpointing: true` | `revert: files` (and `both` together with a store), backed by the SDK's checkpoint/rewind support |
 
+Goals use the CLI's native `/goal` command, so the adapter always advertises `goal: set, clear`.
+`goal/set` sends `/goal <objective>` (at most 4000 characters; not one of the CLI's clear words such
+as `clear` or `off`) and returns `{ goal: { objective }, status: 'active' }`. The CLI then keeps the
+model working until its own Stop-hook check says the condition holds; this surfaces as an ordinary
+execution without a submission receipt. `goal/set` rejects with `SESSION_BUSY` while an execution or
+pending input exists. `goal/clear` sends `/goal clear` and is also accepted while a goal loop runs.
+The CLI reports no goal events to SDK consumers, so the adapter tracks the goal itself: a finished
+or failed execution marks it `cleared`, an interrupted one leaves it `active`, and a resumed
+session starts without a goal.
+
 Revert requires no active execution or pending input. Those cases, and input,
 configuration changes or another revert attempted during a revert, reject with
 `SESSION_BUSY`. Finish or interrupt the current execution and await its terminal

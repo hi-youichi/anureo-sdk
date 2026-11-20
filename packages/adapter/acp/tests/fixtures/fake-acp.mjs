@@ -10,6 +10,10 @@ const badVersion = process.argv.includes('--bad-version');
 const noResume = process.argv.includes('--load-only');
 const missingHistory = process.argv.includes('--missing-history');
 const invalidExtension = process.argv.includes('--bad-extension');
+// Provider-neutral goal control (`_meta.goal` + `_session/goal`); `--neutral-goal-missing` advertises it without serving it.
+const neutralGoal = process.argv.includes('--neutral-goal') || process.argv.includes('--neutral-goal-missing');
+const neutralGoalServed = process.argv.includes('--neutral-goal');
+const neutralGoalCapability = { version: 1, controlMethod: '_session/goal', actions: ['set', 'pause', 'resume', 'clear'] };
 const authRequired = process.argv.includes('--auth-required');
 const scenarioIndex = process.argv.indexOf('--scenario');
 const scenario = scenarioIndex >= 0 ? process.argv[scenarioIndex + 1] || undefined : undefined;
@@ -68,6 +72,16 @@ async function handle(frame) {
   if (frame.method === 'session/cancel') { const promptId = waitingPromptIdsBySession.get(p.sessionId); if (promptId !== undefined) { send({ id: promptId, result: { stopReason: 'cancelled' } }); waitingPromptIdsBySession.delete(p.sessionId); } return; }
   if (frame.method === 'session/prompt') return handlePrompt({ frame, p, respond });
   if (extensions && frame.method.startsWith('_ahp/')) { handleExtension({ frame, p, respond }); return; }
+  if (neutralGoalServed && frame.method === '_session/goal') {
+    const snapshot = p.action === 'clear' ? null : {
+      objective: p.objective ?? 'existing', status: p.action === 'pause' ? 'paused' : 'active',
+      createdAt: 1_700_000_000_000, updatedAt: 1_700_000_000_001, controlMethod: '_session/goal', ...(p.tokenBudget ? { tokenBudget: p.tokenBudget } : {}),
+    };
+    // Like the real peer, publish the snapshot as session_info_update before the request settles.
+    update(p.sessionId, { sessionUpdate: 'session_info_update', _meta: { goal: snapshot } });
+    respond({ goal: snapshot });
+    return;
+  }
   if ('id' in frame) send({ id: frame.id, error: { code: -32601, message: 'Method not found' } });
 }
 
@@ -157,7 +171,7 @@ function respondInitialization(p, respond) {
         ...(scenario === 'no-close' ? {} : { close: {} }),
       },
     },
-    ...(extensions ? { _meta: extensionMetadata } : {}),
+    ...(extensions || neutralGoal ? { _meta: { ...(extensions ? extensionMetadata : {}), ...(neutralGoal ? { goal: neutralGoalCapability } : {}) } } : {}),
   });
   return;
 }

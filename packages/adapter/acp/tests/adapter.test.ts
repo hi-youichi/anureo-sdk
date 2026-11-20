@@ -316,6 +316,52 @@ test('a malformed mutation result leaves the native outcome unknown', async () =
   } finally { await f.close(); }
 });
 
+test('neutral _meta.goal control advertises goal and drives set/clear without the AHP extension', async () => {
+  const f = await fixture(['--neutral-goal']); try {
+    // pause/resume are not expressible in AHP, so only set and clear are advertised.
+    expect(f.initialized.capabilities.goal).toEqual({ actions: ['set', 'clear'] });
+    expect(f.initialized.capabilities.extensions).toEqual([]);
+
+    const set = await f.session.request('goal/set', { requestId: 'goal', sessionId: 's', goal: { objective: '  ship it  ', tokenBudget: 5000 } });
+    expect(set).toMatchObject({ status: 'active', goal: { objective: 'ship it', status: 'active', tokenBudget: 5000 } });
+    // The snapshot published before the response and the response converge on one state event.
+    await f.until(() => f.events.some((event) => event.type === 'session/state' && event.payload.goal?.status === 'active'));
+    expect(f.events.filter((event) => event.type === 'session/state' && event.payload.goal?.status === 'active')).toHaveLength(1);
+    expect(f.session.snapshot.goal).toMatchObject({ status: 'active' });
+
+    expect(await f.session.request('goal/clear', { requestId: 'clear', sessionId: 's' })).toEqual({ goal: null, status: 'cleared' });
+    await f.until(() => f.events.some((event) => event.type === 'session/state' && event.payload.goal?.status === 'cleared'));
+  } finally { await f.close(); }
+});
+
+test('neutral goal set requires an objective and sends nothing to the peer otherwise', async () => {
+  const f = await fixture(['--neutral-goal']); try {
+    for (const goal of [{}, { objective: '   ' }, { objective: 7 }, { text: 'finish' }]) {
+      expect(await rejectionOf(f.session.request('goal/set', { requestId: `bad-${JSON.stringify(goal)}`, sessionId: 's', goal }))).toMatchObject({ code: 'INVALID_PARAMS' });
+    }
+    expect(f.events.some((event) => event.type === 'session/state' && event.payload.goal !== undefined)).toBe(false);
+  } finally { await f.close(); }
+});
+
+test('a neutral goal method the peer does not serve is withdrawn from capabilities', async () => {
+  const f = await fixture(['--neutral-goal-missing']); try {
+    expect(f.initialized.capabilities.goal).toEqual({ actions: ['set', 'clear'] });
+    expect(await rejectionOf(f.session.request('goal/set', { requestId: 'goal', sessionId: 's', goal: { objective: 'finish' } }))).toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
+    await f.until(() => f.events.some((event) => event.type === 'session/state' && event.payload.capabilities.goal?.actions?.includes('set') === false));
+    expect(await rejectionOf(f.session.request('goal/set', { requestId: 'again', sessionId: 's', goal: { objective: 'finish' } }))).toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
+    // Clear was not exercised, so it stays advertised until the peer rejects it.
+    expect(f.session.snapshot.capabilities.goal?.actions).toEqual(['clear']);
+  } finally { await f.close(); }
+});
+
+test('an AHP goal method takes precedence over the neutral control method', async () => {
+  const f = await fixture(['--extensions', '--neutral-goal']); try {
+    expect(f.initialized.capabilities.goal).toEqual({ actions: ['set', 'clear'] });
+    // The AHP fixture method echoes the request goal; the neutral one would normalise objective and status.
+    expect(await f.session.request('goal/set', { requestId: 'goal', sessionId: 's', goal: { text: 'finish' } })).toEqual({ goal: { text: 'finish' }, status: 'active' });
+  } finally { await f.close(); }
+});
+
 test('a permission option ID cannot substitute for the policy kind', async () => {
   const f = await fixture([], { autoRespondPermission: 'allow-once' });
   try {

@@ -897,3 +897,96 @@ test('native lifecycle also correlates through the pinned official SDK and an ac
     await session.close();
   } finally { await client.dispose(); await rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); }
 }, 15_000);
+
+/** Run a scripted native goal loop: `/goal <condition>` acknowledges, works and finishes like the CLI does. */
+function goalFactory(hold?: Promise<void>) {
+  return factory(async (input, stream) => {
+    const text = typeof input.message.content === 'string' ? input.message.content : '';
+    if (text === '/goal clear') { await stream.text('No goal set'); await stream.result('No goal set'); return; }
+    if (text.startsWith('/goal ')) {
+      await stream.text(`Goal set: ${text.slice(6)}`);
+      if (hold) await hold;
+      await stream.text('done', 'work');
+      await stream.result('done');
+      return;
+    }
+    await stream.text('ok'); await stream.result('ok');
+  });
+}
+const goalInputs = (fake: ReturnType<typeof factory>) => fake.queries.flatMap(query => query.calls)
+  .flatMap(call => call.method === 'input' ? [(call.value as SDKUserMessage).message.content] : []);
+
+test('goal set runs the native /goal command and the goal ends with its execution', async () => {
+  const fake = goalFactory();
+  const client = await createClient({ adapter: createClaudeAdapter({ queryFactory: fake.queryFactory }), identity: { adapterId: 'claude', runtimeConfigId: 'goal' } });
+  try {
+    const session = await client.sessions.create({ cwd: process.cwd() });
+    expect(session.capabilities.goal).toEqual({ actions: ['set', 'clear'] });
+    const events: AhpEvent[] = [];
+    const pump = (async () => { for await (const event of session.events()) events.push(event); })().catch(() => {});
+    const until = async (predicate: () => boolean) => { for (let i = 0; i < 500 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 2)); expect(predicate()).toBe(true); };
+
+    expect(await session.request('goal/set', { requestId: 'set', sessionId: session.id, goal: { objective: '  all tests pass  ' } })).toEqual({ goal: { objective: 'all tests pass' }, status: 'active' });
+    expect(goalInputs(fake)).toEqual(['/goal all tests pass']);
+    // The loop runs as an unbound native execution; its completion ends the goal and publishes the settled state.
+    await until(() => events.some(event => event.type === 'turn/completed'));
+    await until(() => session.snapshot.goal?.status === 'cleared');
+    expect(session.snapshot.goal).toEqual({ goal: { objective: 'all tests pass' }, status: 'cleared' });
+    const states = events.flatMap(event => event.type === 'session/state' && event.payload.goal ? [event.payload.goal.status] : []);
+    expect(states[0]).toBe('active'); expect(states.at(-1)).toBe('cleared');
+    await session.close(); await pump;
+  } finally { await client.dispose(); }
+});
+
+test('goal set rejects invalid objectives and busy sessions before reaching the CLI', async () => {
+  const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+  const fake = factory(async (_input, stream) => { await stream.text('working'); await gate; await stream.result('finished'); });
+  const client = await createClient({ adapter: createClaudeAdapter({ queryFactory: fake.queryFactory }), identity: { adapterId: 'claude', runtimeConfigId: 'goal-invalid' } });
+  try {
+    const session = await client.sessions.create({ cwd: process.cwd() });
+    let n = 0;
+    for (const objective of ['', '   ', 'clear', ' OFF ', 'x'.repeat(4001), 7, undefined]) {
+      await expect(session.request('goal/set', { requestId: `bad-${n++}`, sessionId: session.id, goal: { objective } as never })).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    }
+    expect(goalInputs(fake)).toEqual([]);
+    const turn = await session.submit({ input: 'work' });
+    await expect(session.request('goal/set', { requestId: 'busy', sessionId: session.id, goal: { objective: 'finish' } })).rejects.toMatchObject({ code: 'SESSION_BUSY' });
+    expect(goalInputs(fake)).toHaveLength(1);
+    release(); await turn.result(); await session.close();
+  } finally { release(); await client.dispose(); }
+});
+
+test('goal clear sends /goal clear, also while a goal loop is running', async () => {
+  const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+  const fake = goalFactory(gate);
+  const client = await createClient({ adapter: createClaudeAdapter({ queryFactory: fake.queryFactory }), identity: { adapterId: 'claude', runtimeConfigId: 'goal-clear' } });
+  try {
+    const session = await client.sessions.create({ cwd: process.cwd() });
+    await session.request('goal/set', { requestId: 'set', sessionId: session.id, goal: { objective: 'finish' } });
+    const until = async (predicate: () => boolean) => { for (let i = 0; i < 500 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 2)); expect(predicate()).toBe(true); };
+    await until(() => session.snapshot.status === 'running');
+    expect(await session.request('goal/clear', { requestId: 'clear', sessionId: session.id })).toEqual({ goal: null, status: 'cleared' });
+    expect(session.snapshot.goal).toEqual({ goal: null, status: 'cleared' });
+    release();
+    await until(() => session.snapshot.status === 'ready');
+    // The finished loop must not resurrect or re-clear anything.
+    expect(session.snapshot.goal).toEqual({ goal: null, status: 'cleared' });
+    await session.close();
+  } finally { release(); await client.dispose(); }
+});
+
+test('an interrupted goal execution leaves the goal set for the user to clear', async () => {
+  const { promise: gate } = Promise.withResolvers<void>();
+  const fake = goalFactory(gate);
+  const client = await createClient({ adapter: createClaudeAdapter({ queryFactory: fake.queryFactory }), identity: { adapterId: 'claude', runtimeConfigId: 'goal-interrupt' } });
+  try {
+    const session = await client.sessions.create({ cwd: process.cwd() });
+    await session.request('goal/set', { requestId: 'set', sessionId: session.id, goal: { objective: 'finish' } });
+    const until = async (predicate: () => boolean) => { for (let i = 0; i < 500 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 2)); expect(predicate()).toBe(true); };
+    await until(() => session.snapshot.status === 'running');
+    await session.interrupt();
+    await until(() => session.snapshot.status === 'ready');
+    expect(session.snapshot.goal).toEqual({ goal: { objective: 'finish' }, status: 'active' });
+    await session.close();
+  } finally { await client.dispose(); }
+});

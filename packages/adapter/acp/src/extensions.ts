@@ -23,6 +23,14 @@ export interface Extensions {
   dynamicTool: boolean;
   /** Whether v2 turn-correlation notifications and prompt receipts govern execution. */
   nativeLifecycle?: boolean;
+  /** Provider-neutral goal control advertised as initialize `_meta.goal`; independent of the AHP extension. */
+  goal?: NeutralGoalExtension;
+}
+/** Provider-neutral goal control method and the subset of its actions that AHP can express. */
+export interface NeutralGoalExtension {
+  /** Private ACP request that carries `{ sessionId, action, ... }`. */
+  method: string;
+  actions: Array<'set' | 'clear'>;
 }
 /** Read AHP v1 metadata or v2 metadata with explicit turn correlation. AcpAdapter.configureCapabilities
  * stores the parsed methods and flags and uses them to advertise supported operations.
@@ -31,6 +39,8 @@ export function extensions(response: unknown): Extensions {
   const extension = record(record(record(response)._meta).ahp);
   const methods: Extensions['methods'] = {};
   const result: Extensions = { methods, fork: [], revert: [], subagents: false, instructions: false, userInput: false, dynamicTool: false };
+  const goal = neutralGoal(response);
+  if (goal) result.goal = goal;
   if (extension.version !== 1 && !(extension.version === 2 && extension.turnCorrelation === true)) return result;
   result.version = extension.version;
   result.nativeLifecycle = result.version === 2;
@@ -47,6 +57,19 @@ export function extensions(response: unknown): Extensions {
   result.userInput = requests.userInput === '_ahp/user_input';
   result.dynamicTool = requests.dynamicTool === '_ahp/dynamic_tool';
   return result;
+}
+
+/** Read `_meta.goal` from the initialize response top level, falling back to `agentCapabilities._meta.goal`
+ * (the neutral extension publishes both with the same shape). Require version 1 and a private control
+ * method; keep only the actions AHP can express. A block with neither action yields no capability. */
+function neutralGoal(response: unknown): NeutralGoalExtension | undefined {
+  const root = record(response);
+  const advertised = record(record(root._meta).goal);
+  const block = Object.keys(advertised).length ? advertised : record(record(record(root.agentCapabilities)._meta).goal);
+  const method = block.controlMethod;
+  if (block.version !== 1 || typeof method !== 'string' || !/^_[a-zA-Z0-9/_.-]+$/.test(method) || !Array.isArray(block.actions)) return undefined;
+  const actions = (['set', 'clear'] as const).filter(action => (block.actions as unknown[]).includes(action));
+  return actions.length ? { method, actions } : undefined;
 }
 
 const extensionKeys: readonly ExtensionKey[] = ['fork', 'revert', 'steer', 'history', 'goalSet', 'goalClear', 'compact', 'review'];
