@@ -6,7 +6,7 @@ and versions follow [SemVer](https://semver.org/spec/v2.0.0.html). During the
 0.x line, minor versions may include breaking changes; such entries are
 marked **BREAKING**.
 
-## [Unreleased]
+## [0.3.8] - 2026-11-20
 
 - Swarm members (temporary, fixed-profile and workflow bees) now inherit the
   swarm session's `config.permissionMode` in addition to the top-level
@@ -15,6 +15,10 @@ marked **BREAKING**.
   `config: { permissionMode: 'read-only' }` previously left members on the
   backend's default mode (`agent-full-access` for Pi). Other parent `config`
   keys are still not forwarded to members.
+- `anureo` CLI workflow resume now reads the input from the source run's stored
+  manifest (`run.json`) instead of passing the CLI prompt as args; a missing or
+  unreadable manifest fails the run with `SWARM_WORKFLOW_RESUME_NOT_FOUND`.
+- Bump `@anthropic-ai/claude-agent-sdk` to 0.3.328 in the Claude adapter.
 
 ## [0.3.7] - 2026-11-18
 
