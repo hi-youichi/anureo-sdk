@@ -6,6 +6,21 @@ and versions follow [SemVer](https://semver.org/spec/v2.0.0.html). During the
 0.x line, minor versions may include breaking changes; such entries are
 marked **BREAKING**.
 
+## [0.3.10] - 2026-11-20
+
+- The Claude adapter now supports `goal/set` and `goal/clear` through the CLI's
+  native `/goal` command and advertises `goal: set, clear`. The CLI reports no
+  goal events to SDK consumers, so the adapter tracks the goal itself: a finished
+  or failed execution marks it `cleared`, an interrupted one leaves it `active`,
+  and a resumed session starts without one. `goal/set` rejects with
+  `SESSION_BUSY` while work is running or input is pending.
+- The ACP adapter recognizes the provider-neutral goal extension (`_meta.goal`
+  with `controlMethod`, for example anureo 0.7.7 and later) and maps its `set`
+  and `clear` actions to `goal/set` and `goal/clear`. `session_info_update`
+  `_meta.goal` snapshots now update the session goal and publish
+  `session/state`. A goal method advertised through `_meta.ahp` still takes
+  precedence.
+
 ## [0.3.9] - 2026-11-20
 
 - Codex live events and history retain tool execution evidence, including exit
