@@ -6,6 +6,13 @@ and versions follow [SemVer](https://semver.org/spec/v2.0.0.html). During the
 0.x line, minor versions may include breaking changes; such entries are
 marked **BREAKING**.
 
+## [0.3.9] - 2026-11-20
+
+- Codex live events and history retain tool execution evidence, including exit
+  codes, signals, explicit success values, and errors alongside partial MCP
+  results. MCP tool items also expose allowlisted display labels, connector
+  details, and widget resource identifiers.
+
 ## [0.3.8] - 2026-11-20
 
 - Swarm members (temporary, fixed-profile and workflow bees) now inherit the
@@ -260,6 +267,8 @@ packages this codebase was extracted from): package names, the `x-anureo/`
 extension prefix, the `Ahp*` / `createAhpAdapter` naming, and the schema
 `$id` changed; old-brand extension names are not compatible.
 
+[0.3.9]: https://www.npmjs.com/package/@anureo/sdk/v/0.3.9
+[0.3.8]: https://www.npmjs.com/package/@anureo/sdk/v/0.3.8
 [0.3.7]: https://www.npmjs.com/package/@anureo/sdk/v/0.3.7
 [0.3.2]: https://www.npmjs.com/package/@anureo/sdk/v/0.3.2
 [0.3.1]: https://www.npmjs.com/package/@anureo/sdk/v/0.3.1

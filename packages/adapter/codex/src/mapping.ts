@@ -5,6 +5,7 @@ import { codexFileChanges } from './file-changes'
 import type { InputBlock, Item, JsonObject } from '@anureo/protocol'
 import { HarnessSdkError } from '@anureo/sdk'
 import { record, safe, string, type NativeRecord } from './native-values'
+import { toolExtensions } from './tool-metadata'
 
 export { json, safe } from './native-values'
 export { nativeInput } from './input'
@@ -125,6 +126,7 @@ export function mapItems(value: unknown, completed: boolean, history = false, ti
     }]
     case 'commandExecution': return [{
       ...common,
+      ...toolExtensions(raw),
       type: 'toolCall',
       kind: 'command',
       title: string(raw.command) ?? 'Command',
@@ -244,6 +246,7 @@ function subagentState(value: string): 'running' | 'completed' | 'failed' | 'int
 function fileChangeItem(raw: NativeRecord, common: ItemMetadata): Item {
   return {
     ...common,
+    ...toolExtensions(raw),
     type: 'toolCall',
     kind: 'fileChange',
     title: 'File changes',
@@ -272,6 +275,7 @@ function mcpToolItem(raw: NativeRecord, common: ItemMetadata): Item {
   const tool = string(raw.tool) ?? 'tool'
   return {
     ...common,
+    ...toolExtensions(raw),
     type: 'toolCall',
     kind: 'mcp',
     mcp: { server, tool },
@@ -289,6 +293,7 @@ function dynamicToolItem(raw: NativeRecord, common: ItemMetadata): Item {
   const tool = string(raw.tool)
   return {
     ...common,
+    ...toolExtensions(raw),
     type: 'toolCall',
     kind: 'dynamic',
     ...(tool ? { toolName: tool } : {}),

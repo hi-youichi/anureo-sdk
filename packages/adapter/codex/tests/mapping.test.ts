@@ -27,14 +27,15 @@ describe('native input mapping', () => {
 
   /** Empty explicit fields are intentional, while invalid file URLs must retain the URL parser's failure. */
   test('explicit empty names and image URLs survive while malformed file URLs throw', () => {
+    const uri = 'file:///C:/tmp/unopened'
     expect(nativeInput([
-      { type: 'file', uri: 'file:///tmp/unopened', name: '' },
+      { type: 'file', uri, name: '' },
       { type: 'image', url: '', data: 'ignored', mimeType: 'image/png' },
     ])).toEqual([
-      { type: 'mention', path: fileURLToPath('file:///tmp/unopened'), name: '' },
+      { type: 'mention', path: fileURLToPath(uri), name: '' },
       { type: 'image', url: '' },
     ])
-    expect(() => nativeInput([{ type: 'file', uri: 'file:///tmp/invalid%2Fpath' }])).toThrow()
+    expect(() => nativeInput([{ type: 'file', uri: 'file:///C:/tmp/invalid%2Fpath' }])).toThrow()
   })
 })
 
@@ -129,6 +130,67 @@ test('tool projections keep empty titles, optional names and falsy output', () =
   expect(dynamic).not.toHaveProperty('toolName')
   expect(mapItems({ id: 'm', type: 'mcpToolCall', server: '', tool: '', result: 0, error: 'ignored' }, true)[0])
     .toMatchObject({ mcp: { server: '', tool: '' }, title: '/', output: 0 })
+})
+
+test.each([false, true])('tool projections keep execution evidence in live and history items (history=%s)', history => {
+  const [command] = mapItems({
+    id: 'command', type: 'commandExecution', command: 'test', status: 'failed',
+    cwd: '/work', exitCode: 2, signal: 'SIGTERM', aggregatedOutput: 'original output',
+  }, true, history)
+  expect(command).toMatchObject({
+    status: 'failed', output: 'original output',
+    extensions: { toolExecution: { cwd: '/work', exitCode: 2, signal: 'SIGTERM' } },
+  })
+
+  const [fileChange] = mapItems({ id: 'edit', type: 'fileChange', changes: [], error: 'patch rejected' }, true, history)
+  expect(fileChange.extensions).toEqual({ toolExecution: { error: { kind: 'tool', message: 'patch rejected' } } })
+  const [dynamic] = mapItems({ id: 'dynamic', type: 'dynamicToolCall', success: false }, true, history)
+  expect(dynamic.extensions).toEqual({ toolExecution: { success: false } })
+
+  const [empty] = mapItems({ id: 'empty', type: 'commandExecution', exitCode: 0.5, success: 'true' }, true, history)
+  expect(empty).not.toHaveProperty('extensions')
+  expect(empty.status).toBe(history ? undefined : 'completed')
+})
+
+test.each([false, true])('MCP items keep the result, separate error and descriptive metadata (history=%s)', history => {
+  const result = { content: [{ type: 'text', text: 'partial result' }] }
+  const [item] = mapItems({
+    id: 'mcp', type: 'mcpToolCall', server: 'documents', tool: 'lookup', status: 'failed', result,
+    error: { message: 'permission denied', trace: 'private trace' },
+    toolDisplay: { title: 'Lookup documents', invoking: 'Finding documents', secret: 'private label' },
+    toolDefinition: {
+      title: 'Find documents',
+      _meta: { 'openai/toolInvocation/invoked': 'Found documents', unrelated: 'private metadata' },
+    },
+    appContext: { connectorId: 'connector_documents', appName: 'Documents', resourceUri: 'ui://documents/previous' },
+    mcpAppUi: { resourceUri: 'ui://documents/result', preferredModelDisplayMode: 'inline' },
+    mcpAppResourceUri: 'ui://documents/legacy',
+    pluginId: 'documents-plugin',
+    logoUrl: 'https://images.test/documents.png?token=private-query',
+    logoDarkUrl: 'https://user:private-password@images.test/documents.png',
+    source: { kind: 'connector', backend: 'documents', url: 'https://example.test/tools#private-fragment' },
+  }, true, history)
+
+  expect(item).toMatchObject({ type: 'toolCall', mcp: { server: 'documents', tool: 'lookup' }, output: result })
+  expect(item.extensions).toEqual({
+    toolExecution: { error: { kind: 'protocol', message: 'permission denied' } },
+    mcp: {
+      display: { title: 'Lookup documents', invoking: 'Finding documents', invoked: 'Found documents' },
+      toolTitle: 'Find documents', connectorId: 'connector_documents', appName: 'Documents',
+      resourceUri: 'ui://documents/result', isAppWidget: true, pluginId: 'documents-plugin',
+      logoUrl: 'https://images.test/documents.png',
+      source: { kind: 'connector', backend: 'documents', url: 'https://example.test/tools' },
+    },
+  })
+})
+
+test('MCP items accept legacy widget URIs and omit empty display data', () => {
+  const item = { id: 'mcp', type: 'mcpToolCall', server: 'documents', tool: 'lookup' }
+  expect(mapItems(item, true)[0]).not.toHaveProperty('extensions')
+  expect(mapItems({ ...item, appContext: { resourceUri: 'ui://documents/older' } }, true)[0].extensions)
+    .toEqual({ mcp: { resourceUri: 'ui://documents/older', isAppWidget: true } })
+  expect(mapItems({ ...item, mcpAppResourceUri: 'ui://documents/legacy' }, true)[0].extensions)
+    .toEqual({ mcp: { resourceUri: 'ui://documents/legacy', isAppWidget: true } })
 })
 
 /** Coercion must leave field validation to callers; sanitization clones native data and must not hide serialization failures. */
