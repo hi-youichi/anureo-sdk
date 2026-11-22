@@ -356,11 +356,28 @@ test("background subagents settle on the spawning turn and Claude's replies stre
   }
 });
 
-test("steer never appends Claude input; interrupt preserves the current turn identity", async () => {
+test("steer enqueues native input on the active turn and rejects a stale target without enqueueing", async () => {
   const { runtime, session, queries } = await setup({}, async (_,stream) => {await stream.text("working");}); const submission = await submitAndYield(session);
-  await expect(session.request("turn/steer", { requestId: "steer", sessionId: "s", submissionId:"steer-input", expectedTurnId: submission.requireTurnId(), input: [{ type: "text", text: "do not enqueue" }] })).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
+  const turnId = submission.requireTurnId();
+  await expect(session.request("turn/steer", { requestId: "stale", sessionId: "s", submissionId: "stale-input", expectedTurnId: "not-the-active-turn", input: [{ type: "text", text: "stale" }] })).rejects.toMatchObject({ code: "TURN_MISMATCH", outcomeUnknown: false });
+  expect(queries[0]!.calls.filter((call) => call.method === "input")).toHaveLength(1);
+  await expect(session.request("turn/steer", { requestId: "steer", sessionId: "s", submissionId: "steer-input", expectedTurnId: turnId, input: [{ type: "text", text: "change course" }] })).resolves.toMatchObject({ submissionId: "steer-input", turnId, accepted: true });
+  const inputs = queries[0]!.calls.filter((call) => call.method === "input").map((call) => call.value as SDKUserMessage);
+  expect(inputs).toHaveLength(2); expect(inputs[1]).toMatchObject({ priority: "next", message: { content: [{ type: "text", text: "change course" }] } });
   await session.interrupt(); const events = await collect(session);
-  expect(events.at(-1)?.payload).toMatchObject({ turnId: submission.requireTurnId(), status: "interrupted" }); expect(queries[0]!.calls.filter((call) => call.method === "input")).toHaveLength(1); await runtime.dispose();
+  expect(events.at(-1)?.payload).toMatchObject({ turnId, status: "interrupted" }); await runtime.dispose();
+});
+
+test("a native aborted terminal is an interruption, not a failed turn", async () => {
+  for (const reason of ["aborted_streaming", "aborted_tools"]) {
+    const { runtime, session } = await setup({}, async (_, stream) => {
+      await stream.text("working");
+      await stream.emit({ type: "result", subtype: "error_during_execution", is_error: true, stop_reason: null, terminal_reason: reason, user_message_uuid: stream.current?.uuid, uuid: "result", session_id: stream.current?.session_id, usage: { input_tokens: 1, output_tokens: 1 } });
+    });
+    const submission = await submitAndYield(session); const events = await collect(session);
+    const terminal = events.at(-1)?.payload as { turnId?: string; status?: string; error?: unknown };
+    expect(terminal).toMatchObject({ turnId: submission.requireTurnId(), status: "interrupted" }); expect(terminal.error).toBeUndefined(); await runtime.dispose();
+  }
 });
 
 test("canUseTool requests approval and only selected options enter the native callback", async () => {
@@ -738,7 +755,7 @@ test("Claude adapter passes shared conformance for all declared capabilities", a
     return { adapter: createClaudeAdapter({ queryFactory: native.queryFactory, sessionStore: new InMemorySessionStore(), getSessionMessages: history.getSessionMessages, forkSession: history.forkSession }), openParams: { ...OPEN, binding: { ...OPEN.binding, sessionId: "conformance-session" } }, ...(scenario === "disconnect" || scenario === "backpressure" ? { afterStart: async () => { native.queries[0]!.output.end(new HarnessSdkError(scenario==="disconnect"?"CONNECTION_CLOSED":"BACKPRESSURE_EXCEEDED")); } } : {}) };
   });
   expect(report.cases.filter((entry) => entry.status === "failed")).toEqual([]); expect(report.passed).toBe(true);
-  expect(report.cases.filter((entry) => entry.status === "not-applicable").map((entry) => entry.scenario)).toEqual(["dynamicTool", "steer"]);
+  expect(report.cases.filter((entry) => entry.status === "not-applicable").map((entry) => entry.scenario)).toEqual(["dynamicTool"]);
 }, 20_000);
 
 test("the real pinned SDK drives an external fake executable through the native adapter", async () => {

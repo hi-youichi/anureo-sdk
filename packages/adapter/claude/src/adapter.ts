@@ -189,7 +189,8 @@ export class ClaudeBackendSession implements BackendSession {
         result = { accepted: true, ...(stillQueued ? { stillQueued } : {}) };
         break;
       }
-      case 'turn/interrupt': case 'turn/steer': throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Claude controls target the session, not an atomically matched Turn');
+      case 'turn/steer': result = await this.steer(params as AhpRequestMap['turn/steer'], query); break;
+      case 'turn/interrupt': throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Claude interrupts target the session, not an atomically matched Turn');
       case "session/config/set":
         if (this.reverting) throw new HarnessSdkError('SESSION_BUSY', 'Claude configuration cannot change during revert');
         result = await this.setConfig(query, (params as AhpRequestMap["session/config/set"]).patch);
@@ -701,8 +702,11 @@ export class ClaudeBackendSession implements BackendSession {
   private terminalOutput(message: Extract<SDKMessage, { type: "result" }>, active: ActiveTurn, value: Record<string, unknown>): {
     interrupted: boolean; error: HarnessError | undefined; resultText: string | undefined; structuredText: string | undefined;
   } {
-    const interrupted = str(message.stop_reason) === "interrupted" || str(value.terminal_reason) === "interrupted";
-    let error = claudeTurnError(message, active.apiError);
+    // An interrupt surfaces natively as an aborted loop (`aborted_streaming` / `aborted_tools`) with an error subtype,
+    // so it must be recognized before the result is classified as a failure.
+    const terminalReason = str(value.terminal_reason);
+    const interrupted = str(message.stop_reason) === "interrupted" || terminalReason === "interrupted" || terminalReason === "aborted_streaming" || terminalReason === "aborted_tools";
+    let error = interrupted ? undefined : claudeTurnError(message, active.apiError);
     let structuredText: string | undefined;
     if (this.outputSchema && !error && !interrupted) {
       if (value.structured_output === undefined) {
@@ -1025,6 +1029,15 @@ export class ClaudeBackendSession implements BackendSession {
     await this.rememberTurnMap();
     await this.startQuery({ mode: point.uuid ? "resume" : "fresh" }); await this.sink.emit({ type: 'session/state', payload: this.snapshot() });
   }
+  /** Steer the active execution by enqueueing native input at the next boundary of the running loop.
+   * Claude has no native turn match, so the target is checked against the active execution before
+   * enqueueing and a stale target rejects definitively without touching the query. The input keeps
+   * the running output format, so steering never counts as a format change. */
+  private async steer(params: AhpRequestMap['turn/steer'], query: ClaudeQuery): Promise<AhpResultMap['turn/steer']> {
+    if (!this.active || this.active.id !== params.expectedTurnId) throw new HarnessSdkError('TURN_MISMATCH', 'Claude steer target is not the active Turn');
+    await this.submitInput({ requestId: params.requestId, sessionId: params.sessionId, submissionId: params.submissionId, input: params.input, delivery: 'native', outputSchema: this.outputSchema?.schema } as AhpRequestMap['input/submit'], query);
+    return { submissionId: params.submissionId, turnId: params.expectedTurnId, accepted: true };
+  }
   /** Admit execute's bounded input and enqueue native content, returning a dispatch receipt.
    * Changed schemas replace an idle query first; rejection never retries or replays the new input. */
   private async submitInput(start: AhpRequestMap['input/submit'], query: ClaudeQuery): Promise<AhpResultMap['input/submit']> {
@@ -1242,7 +1255,7 @@ function permission(value: unknown): PermissionMode { if (typeof value !== "stri
 function capabilities({ store, checkpoints }: { store: boolean; checkpoints: boolean }): Capabilities {
   return {
     session: { resume: store, fork: store ? ["before", "through"] : [], revert: [...(store ? ["conversation" as const] : []), ...(checkpoints ? ["files" as const] : []), ...(store && checkpoints ? ["both" as const] : [])], history: store },
-    input: { delivery: ['native', 'afterTurn'], interrupt: { targets: ['session'], reportsPendingInputs: true } },
+    input: { delivery: ['native', 'afterTurn'], steer: { target: 'turn', atomicMatch: true }, interrupt: { targets: ['session'], reportsPendingInputs: true } },
     turn: { outputSchema: true, overrides: [], inputModalities: ["text", "image"] },
     interactions: ["approval", "userInput", "elicitation"], subagents: { events: "nested" },
     // Goals run through the native /goal command, so the loop and its Stop-hook evaluation stay with Claude.

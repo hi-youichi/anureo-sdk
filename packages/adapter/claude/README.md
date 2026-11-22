@@ -55,7 +55,7 @@ result before reverting.
 
 The revised workspace exposes native input delivery (`native` → `next`,
 `afterTurn` → `later`) and **session-scoped** interrupt with pending-input receipts.
-Exact-turn steer and interrupt are not declared. It also supports `approval` / `userInput` / `elicitation` interactions, nested subagent events, MCP (stdio + http, with `form`/`url` elicitation), and `turn.outputSchema`.
+`turn/steer` is declared (`steer: { target: 'turn', atomicMatch: true }`): the target must be the active execution (otherwise `TURN_MISMATCH`, nothing enqueued) and the input joins the running loop at its next boundary. Exact-turn interrupt is not declared. A native abort (`aborted_streaming` / `aborted_tools`) settles as `interrupted`, never `failed`. It also supports `approval` / `userInput` / `elicitation` interactions, nested subagent events, MCP (stdio + http, with `form`/`url` elicitation), and `turn.outputSchema`.
 
 Validation covers two layers:
 
@@ -69,7 +69,7 @@ behavior with real Claude execution remains unconfirmed by these tests.
 
 Additional guidance uses another `await session.submit({ input, delivery: 'native' })`.
 It may join the same execution or reach a later one. Session input delivery is
-distinct from atomic exact-turn steering. See the
+distinct from `turn.steer`, which is rejected unless it names the active execution. See the
 [Claude example](../../../docs/native-harness-lifecycle.md#42-claude追加会话指导与精确-steer-分开).
 
 ### Background subagents

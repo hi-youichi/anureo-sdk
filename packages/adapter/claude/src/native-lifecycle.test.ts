@@ -221,7 +221,7 @@ test('mid-run UUID changes and a multi-input result bind independent observation
     expect(f.events.filter(e => e.type === 'turn/completed')).toHaveLength(1);
     expect(f.events.filter(e => e.type === 'submission/bound')).toHaveLength(2);
     expect(f.native.inputs.map(input => input.priority)).toEqual(['next', 'next']);
-    await expect(firstObservation.steer({ input: 'exact' })).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
+    await expect(firstObservation.steer({ input: 'exact' })).rejects.toMatchObject({ code: 'TURN_MISMATCH' });
     await expect(firstObservation.interrupt()).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
   } finally { await f.dispose(); }
 });
