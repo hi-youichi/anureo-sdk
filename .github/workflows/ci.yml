@@ -27,9 +27,11 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run generate:check
       - run: bun run protocol:check
+      - run: bun run --filter @anureo/host generate:check
       - run: bun run typecheck
       - run: bun run typecheck:tooling
       - run: bun run test
+      - run: bun run --filter @anureo/host test:node
       # The default suite skips the native repograph backend. Opt in on every matrix runner.
       - name: Verify native refactor graph exports
         env:

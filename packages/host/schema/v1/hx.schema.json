@@ -1,0 +1,3422 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cowork.dev/hx/v1/schema.json",
+  "$defs": {
+    "HxError": {
+      "$ref": "urn:anureo:ahp:v1#/$defs/HarnessError"
+    },
+    "OperationState": {
+      "enum": [
+        "accepted",
+        "completed",
+        "failed",
+        "unknown"
+      ]
+    },
+    "OperationResult": {
+      "type": "object",
+      "properties": {
+        "operationId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "$ref": "#/$defs/OperationState"
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "outcomeUnknown": {
+          "type": "boolean"
+        },
+        "result": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonValue"
+        },
+        "error": {
+          "$ref": "#/$defs/HxError"
+        }
+      },
+      "required": [
+        "operationId",
+        "state",
+        "outcomeUnknown"
+      ],
+      "additionalProperties": false
+    },
+    "PublicInteraction": {
+      "type": "object",
+      "properties": {
+        "interactionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "responding",
+            "resolved"
+          ]
+        },
+        "request": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/InteractionRequested"
+        },
+        "resolution": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/InteractionResult"
+        }
+      },
+      "required": [
+        "interactionId",
+        "revision",
+        "state",
+        "request"
+      ],
+      "additionalProperties": false
+    },
+    "PublicSession": {
+      "type": "object",
+      "properties": {
+        "executionMode": {
+          "enum": ["normal", "swarm"]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "adapterId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runtimeConfigId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "config": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonObject"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "latestSeq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "enum": [
+            "opening",
+            "ready",
+            "running",
+            "closing",
+            "closed",
+            "recoveryRequired"
+          ]
+        },
+        "activeTurnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "archived": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pendingInteractions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PublicInteraction"
+          }
+        },
+        "agentId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updatedAt": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "capabilities": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/Capabilities"
+        },
+        "capabilityRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bindingGeneration": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hostCapabilities": {
+          "$ref": "#/$defs/HostCapabilities"
+        },
+        "workspace": {
+          "$ref": "#/$defs/PublicWorkspace"
+        },
+        "managed": {
+          "type": "object",
+          "properties": {
+            "scopeId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "executionKey": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "scopeId",
+            "executionKey"
+          ],
+          "additionalProperties": false
+        },
+        "goal": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/GoalState"
+        },
+        "parent": {
+          "type": "object",
+          "properties": {
+            "sessionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "boundary": {
+              "$ref": "urn:anureo:ahp:v1#/$defs/Boundary"
+            },
+            "bindingGeneration": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "sessionId",
+            "boundary",
+            "bindingGeneration"
+          ],
+          "additionalProperties": false
+        },
+        "fastMode": {
+          "type": "object",
+          "description": "Native fast-mode outcome reported by the runtime (requested on may still be off).",
+          "properties": {
+            "state": {
+              "type": "string",
+              "enum": [
+                "off",
+                "cooldown",
+                "on"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "additionalProperties": false
+        },
+        "subagents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HxSubagent"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "projectId",
+        "ownerId",
+        "adapterId",
+        "runtimeConfigId",
+        "cwd",
+        "config",
+        "revision",
+        "latestSeq",
+        "status",
+        "archived"
+      ],
+      "additionalProperties": false
+    },
+    "HostLifecycleEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "enum": [
+            "host/operation",
+            "host/recovery",
+            "host/turnObservationEnded",
+            "host/turnInput",
+            "host/queue",
+            "host/binding",
+            "host/workspace",
+            "host/permissions",
+            "host/subagent"
+          ]
+        },
+        "payload": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    "HostEvent": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hostSeq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "recordedAt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "object",
+          "properties": {
+            "streamId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "streamId",
+            "seq"
+          ],
+          "additionalProperties": false
+        },
+        "event": {
+          "anyOf": [
+            {
+              "$ref": "urn:anureo:ahp:v1#/$defs/AhpEventPayload"
+            },
+            {
+              "$ref": "#/$defs/HostLifecycleEvent"
+            }
+          ]
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "itemId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bindingGeneration": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "hostSeq",
+        "recordedAt",
+        "event"
+      ],
+      "additionalProperties": false
+    },
+    "HxNotification": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "hx.event"
+        },
+        "params": {
+          "type": "object",
+          "properties": {
+            "sessionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "hostSeq": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "recordedAt": {
+              "type": "string",
+              "minLength": 1
+            },
+            "source": {
+              "type": "object",
+              "properties": {
+                "streamId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "seq": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "streamId",
+                "seq"
+              ],
+              "additionalProperties": false
+            },
+            "event": {
+              "anyOf": [
+                {
+                  "$ref": "urn:anureo:ahp:v1#/$defs/AhpEventPayload"
+                },
+                {
+                  "$ref": "#/$defs/HostLifecycleEvent"
+                }
+              ]
+            },
+            "subscriptionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "turnId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "itemId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "bindingGeneration": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "sessionId",
+            "hostSeq",
+            "recordedAt",
+            "event",
+            "subscriptionId"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "EventPage": {
+      "type": "object",
+      "properties": {
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HostEvent"
+          }
+        },
+        "nextAfterSeq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hasMore": {
+          "type": "boolean"
+        },
+        "latestSeq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "earliestSeq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "throughSeq": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "events",
+        "nextAfterSeq",
+        "hasMore",
+        "latestSeq",
+        "earliestSeq",
+        "throughSeq"
+      ],
+      "additionalProperties": false
+    },
+    "HxInitializeParams": {
+      "type": "object",
+      "properties": {
+        "protocolVersions": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "minItems": 1
+        },
+        "clientInfo": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/ClientInfo"
+        }
+      },
+      "required": [
+        "protocolVersions",
+        "clientInfo"
+      ],
+      "additionalProperties": false
+    },
+    "HxInitializeResult": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "limits": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "features",
+        "limits"
+      ],
+      "additionalProperties": false
+    },
+    "HxHarnessListParams": {
+      "type": "object",
+      "properties": {
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "projectId"
+      ],
+      "additionalProperties": false
+    },
+    "HxHarnessListResult": {
+      "type": "object",
+      "properties": {
+        "harnesses": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "runtimeConfigId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "adapterId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "available": {
+                "type": "boolean"
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "capabilities": {
+                "$ref": "urn:anureo:ahp:v1#/$defs/Capabilities"
+              },
+              "version": {
+                "type": "string",
+                "minLength": 1
+              },
+              "providerId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "authStatus": {
+                "enum": [
+                  "unknown",
+                  "required",
+                  "ready"
+                ]
+              }
+            },
+            "required": [
+              "runtimeConfigId",
+              "adapterId",
+              "available"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "harnesses"
+      ],
+      "additionalProperties": false
+    },
+    "HxHarnessModelsParams": {
+      "type": "object",
+      "properties": {
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runtimeConfigId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "projectId",
+        "runtimeConfigId"
+      ],
+      "additionalProperties": false
+    },
+    "HxHarnessModelsResult": {
+      "type": "object",
+      "properties": {
+        "models": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "isDefault": {
+                "type": "boolean",
+                "description": "The runtime's default model (resolved from a native default alias)."
+              },
+              "group": {
+                "type": "string",
+                "enum": [
+                  "primary",
+                  "more"
+                ],
+                "description": "primary: newest model per family; more: older or extra models."
+              },
+              "effortLevels": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": "Reasoning effort levels this model accepts; empty when it takes no effort setting. Absent when unknown."
+              },
+              "defaultEffort": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Effort the model uses when the session sets none."
+              },
+              "supportsFast": {
+                "type": "boolean",
+                "description": "The model accepts the fast (priority) service tier."
+              }
+            },
+            "required": [
+              "id",
+              "name"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "models",
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionCreateParams": {
+      "type": "object",
+      "properties": {
+        "executionMode": {
+          "enum": ["normal", "swarm"]
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runtimeConfigId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "config": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonObject"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "agentId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace": {
+          "$ref": "#/$defs/WorkspaceRequest"
+        }
+      },
+      "required": [
+        "projectId",
+        "runtimeConfigId",
+        "idempotencyKey"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionCreateResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxSessionGetParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionGetResult": {
+      "$ref": "#/$defs/PublicSession"
+    },
+    "HxSessionListParams": {
+      "type": "object",
+      "properties": {
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "archived": {
+          "type": "boolean"
+        },
+        "cursor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "required": [
+        "projectId"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionListResult": {
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PublicSession"
+          }
+        },
+        "nextCursor": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "sessions",
+        "nextCursor"
+      ],
+      "additionalProperties": false
+    },
+    "HostSessionListSummary": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "scopeId": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "status": { "enum": ["opening", "ready", "running", "closing", "closed", "recoveryRequired"] },
+        "runtimeConfigId": { "type": "string", "minLength": 1 },
+        "updatedAt": { "type": "integer", "minimum": 0 },
+        "archived": { "type": "boolean" }
+      },
+      "required": ["id", "scopeId", "status", "runtimeConfigId", "archived"],
+      "additionalProperties": false
+    },
+    "HostSessionListSummaryPage": {
+      "type": "object",
+      "properties": {
+        "sessions": { "type": "array", "items": { "$ref": "#/$defs/HostSessionListSummary" } },
+        "nextCursor": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] }
+      },
+      "required": ["sessions", "nextCursor"],
+      "additionalProperties": false
+    },
+    "HxSessionOpenParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionOpenResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxSessionCloseParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionCloseResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxSessionArchiveParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionArchiveResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxSessionRestoreParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionRestoreResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxSessionConfigSetParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "patch": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision",
+        "patch"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionConfigSetResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxSessionForkParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "boundary": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/Boundary"
+        },
+        "workspace": {
+          "$ref": "#/$defs/WorkspaceRequest"
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision",
+        "boundary"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionForkResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxSessionRevertParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "boundary": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/Boundary"
+        },
+        "scope": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/RevertScope"
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision",
+        "boundary",
+        "scope"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionRevertResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxSessionReconcileParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionReconcileResult": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/PublicSession"
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OperationResult"
+          }
+        }
+      },
+      "required": [
+        "session",
+        "operations"
+      ],
+      "additionalProperties": false
+    },
+    "HxHistoryReadParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cursor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "snapshotToken": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxHistoryReadResult": {
+      "$ref": "urn:anureo:ahp:v1#/$defs/HistoryPage"
+    },
+    "HxTurnStartParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "input": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:anureo:ahp:v1#/$defs/InputBlock"
+          },
+          "minItems": 1
+        },
+        "overrides": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonObject"
+        },
+        "outputSchema": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonSchema"
+        },
+        "references": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/HxContextReference"
+          }
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision",
+        "input"
+      ],
+      "additionalProperties": false
+    },
+    "HxTurnStartResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxTurnSteerParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedTurnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:anureo:ahp:v1#/$defs/InputBlock"
+          },
+          "minItems": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "references": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/HxContextReference"
+          }
+        }
+      },
+      "required": [
+        "sessionId",
+        "expectedTurnId",
+        "input",
+        "idempotencyKey"
+      ],
+      "additionalProperties": false
+    },
+    "HxTurnSteerResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxTurnInterruptParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "sessionId",
+        "turnId",
+        "idempotencyKey"
+      ],
+      "additionalProperties": false
+    },
+    "HxTurnInterruptResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxInteractionListParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "responding",
+            "resolved"
+          ]
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxInteractionListResult": {
+      "type": "object",
+      "properties": {
+        "interactions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PublicInteraction"
+          }
+        }
+      },
+      "required": [
+        "interactions"
+      ],
+      "additionalProperties": false
+    },
+    "HxInteractionPrivateGetParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "interactionId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId",
+        "interactionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxInteractionPrivateGetResult": {
+      "$ref": "urn:anureo:ahp:v1#/$defs/JsonObject"
+    },
+    "HxInteractionRespondParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "interactionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedInteractionRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "response": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/InteractionResponse"
+        }
+      },
+      "required": [
+        "sessionId",
+        "interactionId",
+        "expectedInteractionRevision",
+        "idempotencyKey",
+        "response"
+      ],
+      "additionalProperties": false
+    },
+    "HxInteractionRespondResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxInteractionCancelParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "interactionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedInteractionRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId",
+        "interactionId",
+        "expectedInteractionRevision",
+        "idempotencyKey"
+      ],
+      "additionalProperties": false
+    },
+    "HxInteractionCancelResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxGoalSetParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "goal": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision",
+        "goal"
+      ],
+      "additionalProperties": false
+    },
+    "HxGoalSetResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxGoalClearParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision"
+      ],
+      "additionalProperties": false
+    },
+    "HxGoalClearResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxCompactStartParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision"
+      ],
+      "additionalProperties": false
+    },
+    "HxCompactStartResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxReviewStartParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "target": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision",
+        "target"
+      ],
+      "additionalProperties": false
+    },
+    "HxReviewStartResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxOperationGetParams": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "operationId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "method": {
+              "type": "string",
+              "minLength": 1
+            },
+            "target": {
+              "type": "string",
+              "minLength": 1
+            },
+            "idempotencyKey": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "operationId"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "operationId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "method": {
+              "type": "string",
+              "minLength": 1
+            },
+            "target": {
+              "type": "string",
+              "minLength": 1
+            },
+            "idempotencyKey": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "method",
+            "target",
+            "idempotencyKey"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "HxOperationGetResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxEventsReadParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "afterSeq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "throughSeq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxEventsReadResult": {
+      "$ref": "#/$defs/EventPage"
+    },
+    "HxProjectionSnapshotParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxProjectionSnapshotResult": {
+      "type": "object",
+      "properties": {
+        "checkpoint": {
+          "description": "Materialized HxProjection checkpoint for one hostSeq prefix; null when nothing can be projected (no durable events, or a fork session). The authoritative TS type lives in @cowork/hx-projection; its tuple-bearing internals are intentionally opaque at the contract layer.",
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "latestSeq": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "checkpoint",
+        "seq",
+        "latestSeq"
+      ],
+      "additionalProperties": false
+    },
+    "HxEventsSubscribeParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "afterSeq": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "afterSeq"
+      ],
+      "additionalProperties": false
+    },
+    "HxEventsSubscribeResult": {
+      "type": "object",
+      "properties": {
+        "subscriptionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cutoverSeq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "earliestSeq": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "subscriptionId",
+        "cutoverSeq",
+        "earliestSeq"
+      ],
+      "additionalProperties": false
+    },
+    "HxEventsUnsubscribeParams": {
+      "type": "object",
+      "properties": {
+        "subscriptionId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "subscriptionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxEventsUnsubscribeResult": {
+      "type": "object",
+      "properties": {
+        "removed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "removed"
+      ],
+      "additionalProperties": false
+    },
+    "SubscriptionError": {
+      "type": "object",
+      "properties": {
+        "subscriptionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lastAvailableSeq": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "subscriptionId",
+        "code",
+        "lastAvailableSeq"
+      ],
+      "additionalProperties": false
+    },
+    "HxContextReference": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "workspace-file"
+            },
+            "resourceKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "expectedRevision": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "type",
+            "resourceKey"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "workspace-selection"
+            },
+            "resourceKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "selectedText": {
+              "type": "string",
+              "minLength": 1
+            },
+            "startLine": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "endLine": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "expectedRevision": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "type",
+            "resourceKey",
+            "selectedText"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "uploaded-file"
+            },
+            "blobRef": {
+              "type": "string",
+              "minLength": 1
+            },
+            "displayName": {
+              "type": "string",
+              "minLength": 1
+            },
+            "mimeType": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sizeBytes": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "blobRef",
+            "displayName"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "HxHarnessChangedParams": {
+      "type": "object",
+      "properties": {
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "projectId",
+        "revision"
+      ],
+      "additionalProperties": false
+    },
+    "HxHarnessChangedNotification": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "hx.harness.changed"
+        },
+        "params": {
+          "$ref": "#/$defs/HxHarnessChangedParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "HxServerNotification": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/HxNotification"
+        },
+        {
+          "$ref": "#/$defs/HxHarnessChangedNotification"
+        },
+        {
+          "$ref": "#/$defs/HxCatalogChangedNotification"
+        }
+      ]
+    },
+    "HostCapabilities": {
+      "type": "object",
+      "properties": {
+        "queue": {
+          "type": "boolean"
+        },
+        "worktree": {
+          "type": "boolean"
+        },
+        "harnessSwitch": {
+          "type": "boolean"
+        },
+        "managed": {
+          "type": "boolean"
+        },
+        "subagents": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "queue",
+        "worktree",
+        "harnessSwitch",
+        "managed"
+      ],
+      "additionalProperties": false
+    },
+    "WorkspaceRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "project"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "worktree"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "baseRef": {
+              "type": "string",
+              "minLength": 1
+            },
+            "worktreeId": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PublicWorkspace": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "project",
+            "worktree"
+          ]
+        },
+        "worktreeId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "branch": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "enum": [
+            "queued",
+            "dispatching",
+            "running",
+            "completed",
+            "failed",
+            "unknown",
+            "cancelled"
+          ]
+        },
+        "input": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:anureo:ahp:v1#/$defs/InputBlock"
+          }
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HxContextReference"
+          }
+        },
+        "createdAt": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updatedAt": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "error": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/HarnessError"
+        },
+        "bindingGeneration": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "turnId",
+        "state",
+        "input",
+        "createdAt",
+        "updatedAt",
+        "bindingGeneration"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueState": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HxQueueItem"
+          }
+        }
+      },
+      "required": [
+        "revision",
+        "paused",
+        "items"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueGetParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueGetResult": {
+      "$ref": "#/$defs/HxQueueState"
+    },
+    "HxQueueEnqueueParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedQueueRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "input": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:anureo:ahp:v1#/$defs/InputBlock"
+          }
+        },
+        "references": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/HxContextReference"
+          }
+        },
+        "overrides": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonObject"
+        },
+        "outputSchema": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonSchema"
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedQueueRevision",
+        "input"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueEnqueueResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxQueueUpdateParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedQueueRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "input": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:anureo:ahp:v1#/$defs/InputBlock"
+          }
+        },
+        "references": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/HxContextReference"
+          }
+        },
+        "overrides": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonObject"
+        },
+        "outputSchema": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/JsonSchema"
+        },
+        "itemId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedQueueRevision",
+        "input",
+        "itemId"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueUpdateResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxQueueRemoveParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedQueueRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "itemId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedQueueRevision",
+        "itemId"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueRemoveResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxQueueReorderParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedQueueRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "itemIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedQueueRevision",
+        "itemIds"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueReorderResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxQueueClearParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedQueueRevision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedQueueRevision"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueClearResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxQueuePauseParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedQueueRevision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedQueueRevision"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueuePauseResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxQueueResumeParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedQueueRevision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedQueueRevision"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueResumeResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxQueueRunParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedQueueRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "itemId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedQueueRevision",
+        "itemId"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueRunResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxQueueSteerParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedQueueRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "itemId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedTurnId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedQueueRevision",
+        "itemId",
+        "expectedTurnId"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueSteerResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxQueueRetryParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedQueueRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "itemId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedQueueRevision",
+        "itemId"
+      ],
+      "additionalProperties": false
+    },
+    "HxQueueRetryResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxSessionHarnessSetParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "runtimeConfigId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId",
+        "runtimeConfigId",
+        "idempotencyKey",
+        "expectedRevision"
+      ],
+      "additionalProperties": false
+    },
+    "HxSessionHarnessSetResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxWorkspaceGetParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxWorkspaceGetResult": {
+      "$ref": "#/$defs/PublicWorkspace"
+    },
+    "HxWorkspaceIntegrateParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "force": {
+          "type": "boolean"
+        },
+        "mode": {
+          "enum": [
+            "merge",
+            "patch"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision",
+        "mode"
+      ],
+      "additionalProperties": false
+    },
+    "HxWorkspaceIntegrateResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxWorkspaceDiscardParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "force": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision"
+      ],
+      "additionalProperties": false
+    },
+    "HxWorkspaceDiscardResult": {
+      "$ref": "#/$defs/OperationResult"
+    },
+    "HxUsageEntry": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "agentId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "usage": {
+          "oneOf": [
+            {
+              "$ref": "urn:anureo:ahp:v1#/$defs/Usage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "usage"
+      ],
+      "additionalProperties": false
+    },
+    "HxUsageGetParams": {
+      "type": "object",
+      "properties": {
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "agentId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "includeArchived": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "projectId"
+      ],
+      "additionalProperties": false
+    },
+    "HxUsageGetResult": {
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HxUsageEntry"
+          }
+        },
+        "totals": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "oneOf": [
+                {
+                  "type": "number",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "output": {
+              "oneOf": [
+                {
+                  "type": "number",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "total": {
+              "oneOf": [
+                {
+                  "type": "number",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "input",
+            "output",
+            "total"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "sessions",
+        "totals"
+      ],
+      "additionalProperties": false
+    },
+    "HxTranscriptReadParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxTranscriptReadResult": {
+      "type": "object",
+      "properties": {
+        "inherited": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HostEvent"
+          }
+        }
+      },
+      "required": [
+        "inherited"
+      ],
+      "additionalProperties": false
+    },
+    "CatalogCache": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "empty",
+            "fresh",
+            "stale"
+          ]
+        },
+        "lastSuccessAt": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "freshUntil": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "refreshing": {
+          "type": "boolean"
+        },
+        "lastErrorCode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nextRetryAt": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "state",
+        "lastSuccessAt",
+        "freshUntil",
+        "refreshing"
+      ],
+      "additionalProperties": false
+    },
+    "CatalogRuntime": {
+      "type": "object",
+      "properties": {
+        "runtimeConfigId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "adapterId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "capabilities": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/Capabilities"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "providerId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "authStatus": {
+          "enum": [
+            "unknown",
+            "required",
+            "ready"
+          ]
+        },
+        "readiness": {
+          "enum": [
+            "preparing",
+            "ready",
+            "unavailable"
+          ]
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "isDefault": {
+                "type": "boolean",
+                "description": "The runtime's default model (resolved from a native default alias)."
+              },
+              "group": {
+                "type": "string",
+                "enum": [
+                  "primary",
+                  "more"
+                ],
+                "description": "primary: newest model per family; more: older or extra models."
+              },
+              "effortLevels": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": "Reasoning effort levels this model accepts; empty when it takes no effort setting. Absent when unknown."
+              },
+              "defaultEffort": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Effort the model uses when the session sets none."
+              },
+              "supportsFast": {
+                "type": "boolean",
+                "description": "The model accepts the fast (priority) service tier."
+              }
+            },
+            "required": [
+              "id",
+              "name"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "cache": {
+          "$ref": "#/$defs/CatalogCache"
+        }
+      },
+      "required": [
+        "runtimeConfigId",
+        "adapterId",
+        "available",
+        "readiness",
+        "cache"
+      ],
+      "additionalProperties": false
+    },
+    "HxCatalogGetParams": {
+      "type": "object",
+      "properties": {
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runtimeConfigId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "projectId"
+      ],
+      "additionalProperties": false
+    },
+    "HxCatalogGetResult": {
+      "type": "object",
+      "properties": {
+        "epoch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "runtimes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CatalogRuntime"
+          }
+        }
+      },
+      "required": [
+        "epoch",
+        "revision",
+        "runtimes"
+      ],
+      "additionalProperties": false
+    },
+    "HxCatalogRefreshParams": {
+      "type": "object",
+      "properties": {
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runtimeConfigId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "projectId",
+        "runtimeConfigId"
+      ],
+      "additionalProperties": false
+    },
+    "HxCatalogRefreshResult": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "coalesced": {
+          "type": "boolean"
+        },
+        "refreshId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "accepted",
+        "coalesced",
+        "refreshId"
+      ],
+      "additionalProperties": false
+    },
+    "HxCatalogChangedParams": {
+      "type": "object",
+      "properties": {
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "epoch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "runtimeConfigIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "runtime",
+              "models",
+              "auth",
+              "refresh"
+            ]
+          }
+        }
+      },
+      "required": [
+        "projectId",
+        "epoch",
+        "revision",
+        "runtimeConfigIds",
+        "changes"
+      ],
+      "additionalProperties": false
+    },
+    "HxCatalogChangedNotification": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "hx.catalog.changed"
+        },
+        "params": {
+          "$ref": "#/$defs/HxCatalogChangedParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "HxSubagent": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parentSessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parentTurnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "interrupted",
+            "disconnected"
+          ]
+        },
+        "canOpen": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "number"
+        },
+        "updatedAt": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "sessionId",
+        "parentSessionId",
+        "name",
+        "status",
+        "canOpen",
+        "createdAt",
+        "updatedAt"
+      ],
+      "additionalProperties": false
+    },
+    "HxSubagentsListParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxSubagentsListResult": {
+      "type": "object",
+      "properties": {
+        "subagents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HxSubagent"
+          }
+        }
+      },
+      "required": [
+        "subagents"
+      ],
+      "additionalProperties": false
+    },
+    "HxSubagentsHistoryParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "childSessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cursor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200
+        }
+      },
+      "required": [
+        "sessionId",
+        "childSessionId"
+      ],
+      "additionalProperties": false
+    },
+    "HxSubagentsHistoryResult": {
+      "type": "object",
+      "properties": {
+        "subagent": {
+          "$ref": "#/$defs/HxSubagent"
+        },
+        "history": {
+          "$ref": "urn:anureo:ahp:v1#/$defs/HistoryPage"
+        }
+      },
+      "required": [
+        "subagent",
+        "history"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "x-methods": {
+    "hx.initialize": [
+      "HxInitializeParams",
+      "HxInitializeResult"
+    ],
+    "hx.harness.list": [
+      "HxHarnessListParams",
+      "HxHarnessListResult"
+    ],
+    "hx.harness.models": [
+      "HxHarnessModelsParams",
+      "HxHarnessModelsResult"
+    ],
+    "hx.session.create": [
+      "HxSessionCreateParams",
+      "HxSessionCreateResult"
+    ],
+    "hx.session.get": [
+      "HxSessionGetParams",
+      "HxSessionGetResult"
+    ],
+    "hx.session.list": [
+      "HxSessionListParams",
+      "HxSessionListResult"
+    ],
+    "hx.session.open": [
+      "HxSessionOpenParams",
+      "HxSessionOpenResult"
+    ],
+    "hx.session.close": [
+      "HxSessionCloseParams",
+      "HxSessionCloseResult"
+    ],
+    "hx.session.archive": [
+      "HxSessionArchiveParams",
+      "HxSessionArchiveResult"
+    ],
+    "hx.session.restore": [
+      "HxSessionRestoreParams",
+      "HxSessionRestoreResult"
+    ],
+    "hx.session.config.set": [
+      "HxSessionConfigSetParams",
+      "HxSessionConfigSetResult"
+    ],
+    "hx.session.fork": [
+      "HxSessionForkParams",
+      "HxSessionForkResult"
+    ],
+    "hx.session.revert": [
+      "HxSessionRevertParams",
+      "HxSessionRevertResult"
+    ],
+    "hx.session.reconcile": [
+      "HxSessionReconcileParams",
+      "HxSessionReconcileResult"
+    ],
+    "hx.history.read": [
+      "HxHistoryReadParams",
+      "HxHistoryReadResult"
+    ],
+    "hx.turn.start": [
+      "HxTurnStartParams",
+      "HxTurnStartResult"
+    ],
+    "hx.turn.steer": [
+      "HxTurnSteerParams",
+      "HxTurnSteerResult"
+    ],
+    "hx.turn.interrupt": [
+      "HxTurnInterruptParams",
+      "HxTurnInterruptResult"
+    ],
+    "hx.interaction.list": [
+      "HxInteractionListParams",
+      "HxInteractionListResult"
+    ],
+    "hx.interaction.private.get": [
+      "HxInteractionPrivateGetParams",
+      "HxInteractionPrivateGetResult"
+    ],
+    "hx.interaction.respond": [
+      "HxInteractionRespondParams",
+      "HxInteractionRespondResult"
+    ],
+    "hx.interaction.cancel": [
+      "HxInteractionCancelParams",
+      "HxInteractionCancelResult"
+    ],
+    "hx.goal.set": [
+      "HxGoalSetParams",
+      "HxGoalSetResult"
+    ],
+    "hx.goal.clear": [
+      "HxGoalClearParams",
+      "HxGoalClearResult"
+    ],
+    "hx.compact.start": [
+      "HxCompactStartParams",
+      "HxCompactStartResult"
+    ],
+    "hx.review.start": [
+      "HxReviewStartParams",
+      "HxReviewStartResult"
+    ],
+    "hx.operation.get": [
+      "HxOperationGetParams",
+      "HxOperationGetResult"
+    ],
+    "hx.events.read": [
+      "HxEventsReadParams",
+      "HxEventsReadResult"
+    ],
+    "hx.projection.snapshot": [
+      "HxProjectionSnapshotParams",
+      "HxProjectionSnapshotResult"
+    ],
+    "hx.events.subscribe": [
+      "HxEventsSubscribeParams",
+      "HxEventsSubscribeResult"
+    ],
+    "hx.events.unsubscribe": [
+      "HxEventsUnsubscribeParams",
+      "HxEventsUnsubscribeResult"
+    ],
+    "hx.queue.get": [
+      "HxQueueGetParams",
+      "HxQueueGetResult"
+    ],
+    "hx.queue.enqueue": [
+      "HxQueueEnqueueParams",
+      "HxQueueEnqueueResult"
+    ],
+    "hx.queue.update": [
+      "HxQueueUpdateParams",
+      "HxQueueUpdateResult"
+    ],
+    "hx.queue.remove": [
+      "HxQueueRemoveParams",
+      "HxQueueRemoveResult"
+    ],
+    "hx.queue.reorder": [
+      "HxQueueReorderParams",
+      "HxQueueReorderResult"
+    ],
+    "hx.queue.clear": [
+      "HxQueueClearParams",
+      "HxQueueClearResult"
+    ],
+    "hx.queue.pause": [
+      "HxQueuePauseParams",
+      "HxQueuePauseResult"
+    ],
+    "hx.queue.resume": [
+      "HxQueueResumeParams",
+      "HxQueueResumeResult"
+    ],
+    "hx.queue.run": [
+      "HxQueueRunParams",
+      "HxQueueRunResult"
+    ],
+    "hx.queue.steer": [
+      "HxQueueSteerParams",
+      "HxQueueSteerResult"
+    ],
+    "hx.queue.retry": [
+      "HxQueueRetryParams",
+      "HxQueueRetryResult"
+    ],
+    "hx.session.harness.set": [
+      "HxSessionHarnessSetParams",
+      "HxSessionHarnessSetResult"
+    ],
+    "hx.workspace.get": [
+      "HxWorkspaceGetParams",
+      "HxWorkspaceGetResult"
+    ],
+    "hx.workspace.integrate": [
+      "HxWorkspaceIntegrateParams",
+      "HxWorkspaceIntegrateResult"
+    ],
+    "hx.workspace.discard": [
+      "HxWorkspaceDiscardParams",
+      "HxWorkspaceDiscardResult"
+    ],
+    "hx.usage.get": [
+      "HxUsageGetParams",
+      "HxUsageGetResult"
+    ],
+    "hx.transcript.read": [
+      "HxTranscriptReadParams",
+      "HxTranscriptReadResult"
+    ],
+    "hx.catalog.get": [
+      "HxCatalogGetParams",
+      "HxCatalogGetResult"
+    ],
+    "hx.catalog.refresh": [
+      "HxCatalogRefreshParams",
+      "HxCatalogRefreshResult"
+    ],
+    "hx.subagents.list": [
+      "HxSubagentsListParams",
+      "HxSubagentsListResult"
+    ],
+    "hx.subagents.history": [
+      "HxSubagentsHistoryParams",
+      "HxSubagentsHistoryResult"
+    ]
+  }
+}

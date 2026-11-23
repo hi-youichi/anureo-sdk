@@ -6,6 +6,21 @@ and versions follow [SemVer](https://semver.org/spec/v2.0.0.html). During the
 0.x line, minor versions may include breaking changes; such entries are
 marked **BREAKING**.
 
+## [0.3.11] - 2026-11-23
+
+- Hermes supports session model changes and reasoning effort through native,
+  revision/generation-fenced mutations. Reasoning is available at creation and
+  restored from native snapshots; unsupported gateways do not advertise it.
+- Hermes accepts `outputBridge: false` to disable the optional ephemeral MCP
+  structured-output bridge for native sessions that outlive their observers.
+- Claude supports native turn steering and reports native aborts as interrupted.
+- ACP preserves commentary while streaming and marks only the final agent
+  message as final when a turn completes.
+- Publish `@anureo/host`: persistent scoped sessions, model catalog caching,
+  queues, interactions, SQLite storage, and embedded/standalone WebSocket access.
+- Fix Windows workspace resolution in the bundled Hermes Node consumer test and
+  wait for native reconciliation before asserting recovery completion.
+
 ## [0.3.10] - 2026-11-20
 
 - The Claude adapter now supports `goal/set` and `goal/clear` through the CLI's

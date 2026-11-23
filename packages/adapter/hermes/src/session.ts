@@ -6,15 +6,15 @@ import { HermesRpc, type ServerRequest } from './rpc'
 import { array, describe, event as nativeEvent, identity, integer, object, protocolError, publicReceipt, receipt, type Description, type NativeEvent, type NativeObject, type Receipt } from './native'
 import { HermesTurn, sessionUsage } from './events'
 import { HermesInteractions } from './interactions'
-import type { HermesAdapterOptions } from './options'
+import { isHermesEffort, type HermesAdapterOptions } from './options'
 
 /** Return a fresh native capability snapshot for HermesAdapter.initialize and each HermesSession. */
-export function hermesCapabilities(): Capabilities {
+export function hermesCapabilities(reasoning = false): Capabilities {
   return {
     session: { resume: true, fork: [], revert: [], history: false },
     input: { delivery: ['native'], interrupt: { targets: ['turn'], reportsPendingInputs: false } },
     turn: { outputSchema: false, overrides: [], inputModalities: ['text'] },
-    interactions: ['approval', 'userInput'], config: { options: [] },
+    interactions: ['approval', 'userInput'], config: { options: [{ id: 'model', scope: 'session', schema: { type: 'string', minLength: 1 } }, ...(reasoning ? [{ id: 'effort', scope: 'session' as const, schema: { type: 'string', minLength: 1 } }] : [])] },
   }
 }
 /**
@@ -43,14 +43,15 @@ export class HermesSession implements BackendSession {
     this.profileId = profileId
     this.released = released
     this.binding = structuredClone(params.binding)
-    this.model = params.model
+    this.effort = typeof params.config?.effort === 'string' ? params.config.effort : undefined
+    this.model = params.model ?? (typeof params.config?.model === 'string' ? params.config.model : undefined)
     this.interactions = new HermesInteractions({ sessionId: () => this.nativeId, rpc: () => this.channel(), ready: () => this.ready(), sink,
       turnId: (epoch, generation) => [...this.turns.values()].find(value => value.epoch === epoch && value.generation === generation)?.id,
       epoch: () => this.description!.epoch, options })
   }
   /** Supply OutputSession with the native attachment snapshot, including active turns restored from pending rows. */
   get state(): SessionState {
-    return { binding: this.binding, status: this.disposed ? 'closed' : 'ready', config: {}, capabilities: this.capabilities,
+    return { binding: this.binding, status: this.disposed ? 'closed' : 'ready', config: { ...(this.model ? { model: this.model } : {}), ...(this.effort ? { effort: this.effort } : {}) }, capabilities: this.capabilities,
       capabilityRevision: 0, activeTurnIds: [...this.turns.values()].filter(value => !value.terminal).map(value => value.id),
       ...(this.model ? { model: this.model } : {}), ...(this.title ? { metadata: { title: this.title } } : {}) }
   }
@@ -79,6 +80,7 @@ export class HermesSession implements BackendSession {
     if (params.sessionId !== this.binding.sessionId) throw new HarnessSdkError('SESSION_BINDING_MISMATCH')
     switch (method) {
       case 'input/submit': return await this.submit(params as AhpRequestMap['input/submit']) as AhpResultMap[M]
+      case 'session/config/set': return await this.setConfig(params as AhpRequestMap['session/config/set']) as AhpResultMap[M]
       case 'session/close': return await this.closeObservation() as AhpResultMap[M]
       case 'turn/interrupt': return await this.interrupt(params as AhpRequestMap['turn/interrupt']) as AhpResultMap[M]
       default: throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
@@ -91,6 +93,43 @@ export class HermesSession implements BackendSession {
     for (const input of this.submissions.values()) this.releaseInput(input)
     this.submissions.clear(); this.turns.clear(); this.retired.clear()
     this.released()
+  }
+
+  /** Model/reasoning edits affect only this native session's frozen policy. */
+  private async setConfig(params: AhpRequestMap['session/config/set']): Promise<SessionState> {
+    const keys = Object.keys(params.patch)
+    const model = params.patch.model, effort = params.patch.effort
+    if (!keys.length || keys.some(key => key !== 'model' && key !== 'effort')
+      || model !== undefined && (typeof model !== 'string' || !model || model.length > 4096
+        || /\s|["'\\\x00]/.test(model) || model.startsWith('-') || model === 'reset')
+      || effort !== undefined && !isHermesEffort(effort)) throw new HarnessSdkError('INVALID_PARAMS')
+    if (effort !== undefined && !this.description?.createParameters.includes('reasoning')) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
+    if ([...this.turns.values()].some(turn => !turn.terminal)) throw new HarnessSdkError('SESSION_BUSY')
+    await this.ready()
+    // Canonical sessions are edited through revision/generation-fenced mutations,
+    // not the legacy TUI config.set surface. Refresh the snapshot without sending input.
+    const snapshot = object(await this.channel().request('session.resume', { session_id: this.nativeId, omit_messages: true }))
+    await this.snapshot(snapshot)
+    if (snapshot.running === true) throw new HarnessSdkError('SESSION_BUSY')
+    const operation = model !== undefined ? 'model' : 'reasoning'
+    const payload = model !== undefined ? { model, ...(effort !== undefined ? { reasoning: effort } : {}) } : { effort }
+    const result = object(await this.channel().request('session.mutate', {
+      session_id: this.nativeId, request_id: params.requestId,
+      expected_revision: integer(snapshot.revision), expected_generation: integer(snapshot.execution_generation),
+      operation, payload,
+    }, true))
+    if (result.status === 'confirmation_required') throw new HarnessSdkError('MODEL_CONFIRMATION_REQUIRED', 'The native model selection requires confirmation')
+    if (result.session_id !== this.nativeId || result.operation !== operation) throw protocolError()
+    integer(result.revision)
+    try {
+      const info = object(await this.channel().request('session.info', { session_id: this.nativeId }))
+      if (info.profile_id !== this.profileId) throw protocolError()
+      this.model = identity(info.model)
+      if (this.description?.createParameters.includes('reasoning') && isHermesEffort(info.reasoning_effort)) this.effort = info.reasoning_effort
+    } catch { throw new HarnessSdkError('RESULT_UNKNOWN', 'Model mutation was committed but its state could not be read', false, true) }
+    const state = this.state
+    await this.sink.emit({ type: 'session/state', payload: state })
+    return state
   }
 
   private nativeId = ''
@@ -112,6 +151,7 @@ export class HermesSession implements BackendSession {
   private readonly abort = new AbortController()
   private title?: string
   private model?: string
+  private effort?: string
 
   /**
    * Ask a connected owner to detach, then release local observation. Report an unconfirmed detach
@@ -156,7 +196,11 @@ export class HermesSession implements BackendSession {
         : { type: 'http', name: server.name, url: server.url, headers: Object.entries(server.headers ?? {}).map(([name, value]) => ({ name, value })) }) }
     }
     if (this.options.toolsets !== undefined) params.toolsets = [...this.options.toolsets]
-    if (this.params.model !== undefined) params.model = this.params.model
+    if (this.model !== undefined) params.model = this.model
+    if (this.effort !== undefined) {
+      if (!this.description!.createParameters.includes('reasoning')) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
+      params.reasoning = this.effort
+    }
     if (this.description!.createParameters.includes('client')) params.client = { name: 'anureo-sdk', version: '0.2.0' }
     return params
   }
@@ -187,7 +231,7 @@ export class HermesSession implements BackendSession {
     }, this.options, this.abort.signal)
     if (this.disposed) { channel.dispose(); throw new HarnessSdkError('SESSION_CLOSED') }
     this.rpc = channel
-    try { this.description = describe(await channel.request('runtime.describe'), grant) }
+    try { this.description = describe(await channel.request('runtime.describe'), grant); Object.assign(this.capabilities, hermesCapabilities(this.description.createParameters.includes('reasoning'))) }
     catch (cause) { channel.dispose(); throw cause }
   }
   /** Reject overflow during setup or recovery because dropping held traffic would lose correlation evidence. */
@@ -285,6 +329,7 @@ export class HermesSession implements BackendSession {
     this.binding = { ...this.binding, nativeRef: { provider: 'hermes', value: this.nativeId } }
     if (typeof info.title === 'string') this.title = info.title
     if (typeof info.model === 'string') this.model = info.model
+    if (this.description?.createParameters.includes('reasoning') && isHermesEffort(info.reasoning_effort)) this.effort = info.reasoning_effort
     for (const value of array(snapshot.pending)) {
       await this.associatePending(value)
     }
@@ -306,6 +351,11 @@ export class HermesSession implements BackendSession {
     const payload = event.payload
     switch (event.type) {
       case 'session.info':
+        if (typeof payload.model === 'string' && payload.model !== this.model || this.description?.createParameters.includes('reasoning') && isHermesEffort(payload.reasoning_effort) && payload.reasoning_effort !== this.effort) {
+          if (typeof payload.model === 'string') this.model = payload.model
+          if (this.description?.createParameters.includes('reasoning') && isHermesEffort(payload.reasoning_effort)) this.effort = payload.reasoning_effort
+          await this.sink.emit({ type: 'session/state', payload: this.state })
+        }
         if (Array.isArray(payload.pending)) for (const value of payload.pending) await this.associatePending(value)
         if (typeof payload.title === 'string') {
           this.title = payload.title

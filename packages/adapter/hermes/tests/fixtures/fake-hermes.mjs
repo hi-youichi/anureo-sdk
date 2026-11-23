@@ -40,7 +40,7 @@ const info = session => publish(session, 'session.info', { pending: pending(sess
 const snapshot = (session, socket) => ({ session_id: session.id, stored_session_id: session.id, messages: [], messages_omitted: true,
   message_count: 0, running: !!session.active, authority_epoch: epoch, replay_epoch: session.replay, last_sequence: session.seq,
   subscription_id: socket.data.subscription, revision: session.generation, execution_generation: session.generation,
-  pending: pending(session), prompts: [...session.prompts.values()], open_requests: [...session.requests.values()], info: { profile_id: 'fake-profile', title: 'Native title', model: 'fake-model' } })
+  pending: pending(session), prompts: [...session.prompts.values()], open_requests: [...session.requests.values()], info: { profile_id: 'fake-profile', title: 'Native title', model: session.model ?? 'fake-model', reasoning_effort: session.effort ?? 'medium' } })
 /** Capture interrupt acknowledgement identity before finish can advance the FIFO to another generation. */
 const handle = session => ({ ref: { profile_id: 'fake-profile', session_id: session.id }, instance_id: instance, authority_epoch: epoch,
   revision: session.generation, execution_generation: session.generation, execution_state: session.active ? 'running' : 'idle' })
@@ -183,10 +183,21 @@ async function dispatchRequest(socket, method, params) {
   if (method === 'runtime.describe' && scenario === 'describe-hang') return NO_REPLY
   if (method === 'runtime.describe') return { instance_id: instance, profile_id: 'fake-profile', authority_epoch: epoch,
     capabilities: scenario === 'old-contract' ? [] : ['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1', ...(scenario === 'mcp' ? ['acp-session-mcp-v1'] : [])],
-    session_create: { sources: ['tool', ...(scenario === 'mcp' ? ['acp'] : [])], parameters: ['request_id', 'source', 'cwd', 'model', 'client', ...(scenario === 'mcp' ? ['editor'] : []), ...(scenario === 'no-toolsets' ? [] : ['toolsets'])] } }
+    session_create: { sources: ['tool', ...(scenario === 'mcp' ? ['acp'] : [])], parameters: ['request_id', 'source', 'cwd', 'model', 'client', ...(scenario === 'no-reasoning' ? [] : ['reasoning']), ...(scenario === 'mcp' ? ['editor'] : []), ...(scenario === 'no-toolsets' ? [] : ['toolsets'])] } }
   if (method === 'session.create') return createSession(socket, params)
   const session = sessions.get(params.session_id)
   if (!session) throw 'not_found'
+  if (method === 'session.mutate') {
+    if (!['model', 'reasoning'].includes(params.operation) || params.expected_revision !== session.generation || params.expected_generation !== session.generation || !params.request_id) throw 'unsafe_config'
+    if (params.operation === 'reasoning') { session.effort = params.payload.effort; return { session_id: session.id, operation: 'reasoning', revision: session.generation } }
+    if (params.payload.reasoning !== undefined) session.effort = params.payload.reasoning
+    const model = params.payload.model
+    if (model === 'refused') throw 'model_refused'
+    if (model === 'expensive') return { session_id: session.id, operation: 'model', status: 'confirmation_required' }
+    session.model = model === 'alias' ? 'resolved-model' : model
+    return { session_id: session.id, operation: 'model', revision: session.generation }
+  }
+  if (method === 'session.info') return { profile_id: 'fake-profile', model: session.model ?? 'fake-model', reasoning_effort: session.effort ?? 'medium' }
   if (method === 'session.resume') {
     session.viewers.add(socket); socket.data.session = session
     if (socket.data.replay) for (const event of session.events.filter(e => e.seq > socket.data.replay.sequence)) send(socket, { jsonrpc: '2.0', method: 'event', params: event })
@@ -218,6 +229,7 @@ function createSession(socket, params) {
   if (!session) {
     session = { id: `session-${++creates}`, seq: 0, replay: 'replay-1', generation: 0, queue: [], active: null, events: [], rows: new Map(), viewers: new Set(), prompts: new Map(), requests: new Map() }
     sessions.set(session.id, session); createIds.set(params.request_id, session)
+    session.effort = params.reasoning
     session.mcpServers = params.editor?.mcp_servers
   }
   session.viewers.add(socket); socket.data.session = session; return snapshot(session, socket)

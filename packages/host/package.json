@@ -1,0 +1,47 @@
+{
+  "name": "@anureo/host",
+  "version": "0.3.11",
+  "description": "Persistent agent sessions and WebSocket access for the Anureo SDK",
+  "license": "Apache-2.0",
+  "type": "module",
+  "files": [
+    "src",
+    "schema",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./compat": "./src/compat.ts",
+    "./ws": "./src/ws.ts",
+    "./protocol": "./src/protocol.ts",
+    "./sqlite": {
+      "bun": "./src/sqlite-bun.ts",
+      "default": "./src/sqlite-node.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --pretty false",
+    "test": "bun test tests",
+    "test:node": "bun scripts/test-node.ts",
+    "generate": "bun scripts/generate.ts",
+    "generate:check": "bun scripts/generate.ts --check"
+  },
+  "dependencies": {
+    "@anureo/adapter-swarm": "workspace:*",
+    "@anureo/protocol": "workspace:*",
+    "@anureo/sdk": "workspace:*",
+    "ajv": "8.20.0",
+    "ws": "8.21.1"
+  },
+  "devDependencies": {
+    "@anureo/conformance": "workspace:*",
+    "@types/ws": "8.18.1"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

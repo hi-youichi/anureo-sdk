@@ -132,15 +132,21 @@ export class AcpUpdateMapper {
     this.serial = 0;
   }
   /**
-   * Flush unended cached items in insertion order, promoting running status to completed.
+   * Flush unended cached items in insertion order, promoting running status to completed and
+   * marking the last non-empty agent message as the final answer (earlier ones stay commentary).
    * AcpBackendSession.submitStandardInput and nativeEvent await this before publishing
    * turn/completed. Publication failures reject and leave prior mutations and events in place.
    * With no current turn, no items are published.
    */
   async complete(): Promise<void> {
+    // ACP carries no message phase. Like the Claude adapter, live agent text is commentary and the
+    // turn's last non-empty agent message becomes the final answer only once the turn ends.
+    const finalId = [...this.items.values()].reverse()
+      .find((item) => item.type === 'agentMessage' && !this.ended.has(item.id) && item.text.trim() !== '')?.id;
     for (const item of this.items.values()) {
       if (this.ended.has(item.id)) continue;
-      await this.upsert({ ...item, status: item.status === 'running' ? 'completed' : item.status }, 'completion');
+      const settled: Item = { ...item, status: item.status === 'running' ? 'completed' : item.status };
+      await this.upsert(settled.type === 'agentMessage' ? { ...settled, phase: settled.id === finalId ? 'final' : 'commentary' } : settled, 'completion');
     }
   }
   /**
@@ -272,7 +278,7 @@ export class AcpUpdateMapper {
     if (!item) {
       item = kind === 'agent_thought_chunk' ? { id, type: 'reasoning', text: '' }
         : kind === 'user_message_chunk' ? { id, type: 'userMessage', content: [] }
-        : { id, type: 'agentMessage', text: '', phase: 'final' };
+        : { id, type: 'agentMessage', text: '', phase: 'commentary' };
       this.items.set(id, item);
       await this.sink.emit({ type: 'item/started', payload: { item } }, { turnId });
     }

@@ -4,7 +4,7 @@ import { attachGateway } from './attach'
 import { describe } from './native'
 import { HermesRpc } from './rpc'
 import { HermesSession, hermesCapabilities } from './session'
-import { validateOptions, type HermesAdapterOptions } from './options'
+import { isHermesEffort, validateOptions, type HermesAdapterOptions } from './options'
 export type { HermesAdapterOptions } from './options'
 
 /**
@@ -25,7 +25,7 @@ export class HermesAdapter implements HarnessAdapter {
   }
   /** Return 'http' to OutputSession.open for a new editor-capable session, or undefined when the bridge is unavailable. */
   outputBridgeTransport(params: SessionOpenParams): 'http' | undefined {
-    return this.editorMcp && params.mode === 'new' ? 'http' : undefined
+    return this.config.outputBridge !== false && this.editorMcp && params.mode === 'new' ? 'http' : undefined
   }
   /**
    * Negotiate the SDK protocol and describe the ticketed Hermes owner without creating a session.
@@ -74,6 +74,7 @@ export class HermesAdapter implements HarnessAdapter {
   private initialized?: Promise<InitializeResult>
   private profileId?: string
   private editorMcp = false
+  private reasoning = false
   private disposed = false
   private readonly abort = new AbortController()
   private probe?: HermesRpc
@@ -103,11 +104,12 @@ export class HermesAdapter implements HarnessAdapter {
       if (this.disposed) throw new HarnessSdkError('RUNTIME_DISPOSED')
       this.profileId = description.profileId
       this.editorMcp = description.editorMcp
+      this.reasoning = description.createParameters.includes('reasoning')
       return {
         protocolVersion: 1,
         protocolContract: AHP_PROTOCOL_CONTRACT,
         runtime: { name: 'hermes', version: grant.version, adapter: 'hermes-gateway/0.2.0' },
-        capabilities: hermesCapabilities(),
+        capabilities: hermesCapabilities(this.reasoning),
       }
     } catch (cause) {
       if (cause instanceof HarnessSdkError) throw new HarnessSdkError(cause.code, cause.message, cause.retryable, false)
@@ -121,7 +123,9 @@ export class HermesAdapter implements HarnessAdapter {
   /** Reject unsupported features and foreign resume bindings before openSession acquires resources. */
   private assertSupportedOpen(params: SessionOpenParams): void {
     if (params.mode === 'fork' || params.permissionMode !== undefined || params.mcpServers !== undefined && (!this.editorMcp || params.mode !== 'new')
-      || Object.keys(params.config ?? {}).length) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
+      || Object.keys(params.config ?? {}).some(key => key !== 'model' && key !== 'effort')
+      || params.config?.effort !== undefined && (!this.reasoning || !isHermesEffort(params.config.effort))
+      || params.config?.model !== undefined && typeof params.config.model !== 'string') throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
     if (params.instructions !== undefined) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED', 'Hermes does not support session instructions', false, false, { capability: 'session.instructions' })
     if (params.mode === 'resume' && params.binding.nativeRef?.provider !== 'hermes') throw new HarnessSdkError('SESSION_BINDING_MISMATCH')
   }

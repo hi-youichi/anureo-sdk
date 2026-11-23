@@ -8,6 +8,9 @@ export const DEFAULT_TIMEOUT_MS = 30_000
  * zero-enabled recovery settings below. Millisecond values must fit a signed 32-bit timer.
  */
 export interface HermesAdapterOptions {
+  /** Enable the optional SDK MCP output bridge on new sessions (default true).
+   * Disable when persistent native sessions must outlive the observing client's bridge. */
+  outputBridge?: boolean
   /** Hermes executable or wrapper; defaults to 'hermes'. Must be nonempty and contain no NUL. */
   command?: string
   /** Arguments preceding Hermes CLI arguments, for a wrapper executable; entries must contain no NUL. */
@@ -64,6 +67,7 @@ export interface HermesAdapterOptions {
 export function validateOptions(options: HermesAdapterOptions): string[] {
   if (options === null) return ['options must be an object']
   const issues: string[] = []
+  if (options.outputBridge !== undefined && typeof options.outputBridge !== 'boolean') issues.push('outputBridge must be a boolean')
   for (const key of ['timeoutMs', 'maxFrameBytes', 'maxBufferedBytes', 'maxEvents', 'maxPending',
     'maxInteractions', 'maxExecutions', 'maxSubmissions', 'reconnectAttempts', 'reconnectDelayMs',
     'maxOwnerRecoveriesPerMinute'] as const) {
@@ -93,4 +97,10 @@ export function validateOptions(options: HermesAdapterOptions): string[] {
     issues.push('args must be an array of strings without NUL')
   }
   return issues
+}
+
+/** Canonical Hermes reasoning requests; the native route determines its wire mapping. */
+export const HERMES_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const
+export function isHermesEffort(value: unknown): value is string {
+  return typeof value === 'string' && (HERMES_EFFORTS as readonly string[]).includes(value)
 }

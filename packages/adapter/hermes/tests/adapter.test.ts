@@ -241,6 +241,7 @@ test('a storage error after admission reconciles the ambiguous submission withou
     const session = await client.sessions.create({ cwd: tmpdir() })
     const turn = await session.submit({ input: 'run once' })
     expect(await turn.result()).toMatchObject({ status: 'completed', text: 'authoritative final' })
+    await until(async () => (await fixture.state()).methods.includes('session.resume'))
     const state = await fixture.state()
     expect(state.inputs).toHaveLength(1)
     expect(state.methods).toContain('session.resume')
@@ -343,4 +344,73 @@ test('a response still open on the owner after reconnect remains unknown and is 
     expect((await fixture.state()).responses).toHaveLength(1)
     expect((await fixture.state()).inputs).toHaveLength(1)
   }, { interactions: { userInput: async () => ({ kind: 'userInput', answers: { value: 'private-once' } }) } })
+})
+
+
+test('Hermes session model changes remain session-scoped, survive resume, and reject unsafe config', async () => {
+  await withFixture('lifecycle', async (fixture, client) => {
+    const session = await client.sessions.create({ cwd: tmpdir() })
+    expect(session.capabilities.config?.options.some(option => option.id === 'model')).toBe(true)
+    const changed = await session.request('session/config/set', { requestId: 'model', sessionId: session.id, patch: { model: 'next-model' } })
+    expect(changed.model).toBe('next-model'); expect(changed.config.model).toBe('next-model')
+    for (const model of ['x --global', '--global', 'reset', '']) {
+      await expect(session.request('session/config/set', { requestId: `bad-${model}`, sessionId: session.id, patch: { model } })).rejects.toMatchObject({ code: 'INVALID_PARAMS' })
+    }
+    await expect(session.request('session/config/set', { requestId: 'refused', sessionId: session.id, patch: { model: 'refused' } })).rejects.toBeDefined()
+    await expect(session.request('session/config/set', { requestId: 'confirm', sessionId: session.id, patch: { model: 'expensive' } })).rejects.toMatchObject({ code: 'MODEL_CONFIRMATION_REQUIRED' })
+    expect(session.snapshot.model).toBe('next-model')
+    const binding = { ...session.binding, nativeRef: session.binding.nativeRef! }
+    await session.request('session/close', { requestId: 'close', sessionId: session.id })
+    const resumed = await client.openSession({ requestId: 'resume', mode: 'resume', binding, cwd: tmpdir(), config: { model: 'next-model' } })
+    expect(resumed.snapshot.model).toBe('next-model')
+    const changedAgain = await resumed.request('session/config/set', { requestId: 'again', sessionId: resumed.id, patch: { model: 'after-resume' } })
+    expect(changedAgain.model).toBe('after-resume')
+    const canonical = await resumed.request('session/config/set', { requestId: 'alias', sessionId: resumed.id, patch: { model: 'alias' } })
+    expect(canonical.model).toBe('resolved-model')
+  })
+})
+
+
+test('Hermes reasoning is configurable at creation, in-session, with model changes and after resume', async () => {
+  await withFixture('lifecycle', async (fixture, client) => {
+    const session = await client.sessions.create({ cwd: tmpdir(), config: { effort: 'high' } })
+    expect((await fixture.state()).createParams[0].reasoning).toBe('high')
+    expect(session.snapshot.config.effort).toBe('high')
+    const changed = await session.request('session/config/set', { requestId: 'effort', sessionId: session.id, patch: { effort: 'low' } })
+    expect(changed.config.effort).toBe('low')
+    await expect(session.request('session/config/set', { requestId: 'invalid-effort', sessionId: session.id, patch: { effort: 'hgih' } })).rejects.toMatchObject({ code: 'INVALID_PARAMS' })
+    const combined = await session.request('session/config/set', { requestId: 'combined', sessionId: session.id, patch: { model: 'next-model', effort: 'xhigh' } })
+    expect(combined.model).toBe('next-model'); expect(combined.config.effort).toBe('xhigh')
+    const binding = { ...session.binding, nativeRef: session.binding.nativeRef! }
+    await session.close()
+    const resumed = await client.openSession({ requestId: 'effort-resume', mode: 'resume', binding, cwd: tmpdir(), config: { effort: 'low' } })
+    expect(resumed.snapshot.config.effort).toBe('xhigh')
+    const off = await resumed.request('session/config/set', { requestId: 'off', sessionId: resumed.id, patch: { effort: 'none' } })
+    expect(off.config.effort).toBe('none')
+  })
+})
+
+test('Hermes without native reasoning selection does not advertise an effort control', async () => {
+  await withFixture('no-reasoning', async (fixture, client) => {
+    const session = await client.sessions.create({ cwd: tmpdir() })
+    expect(session.capabilities.config?.options.some(option => option.id === 'effort')).toBe(false)
+    expect(session.snapshot.config.effort).toBeUndefined()
+    await expect(client.sessions.create({ cwd: tmpdir(), config: { effort: 'high' } })).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' })
+    expect((await fixture.state()).creates).toBe(1)
+  })
+})
+
+
+test('disabling the optional output bridge keeps persistent native sessions free of ephemeral MCP endpoints', async () => {
+  await withFixture('mcp', async (fixture, client) => {
+    const session = await client.sessions.create({ cwd: tmpdir() })
+    const created = (await fixture.state()).createParams[0]
+    expect(created.source).toBe('tool')
+    expect(created.editor).toBeUndefined()
+    expect(session.capabilities.turn?.outputSchema).toBe(false)
+    const binding = { ...session.binding, nativeRef: session.binding.nativeRef! }
+    await session.close()
+    const resumed = await client.openSession({ requestId: 'no-bridge-resume', mode: 'resume', binding, cwd: tmpdir() })
+    expect(resumed.binding.nativeRef).toEqual(binding.nativeRef)
+  }, { options: { outputBridge: false } })
 })

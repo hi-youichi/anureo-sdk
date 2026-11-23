@@ -28,6 +28,7 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run generate:check
       - run: bun run protocol:check
+      - run: bun run --filter @anureo/host generate:check
       - run: bun run typecheck
       - run: bun run typecheck:tooling
       - run: bun run test
@@ -56,7 +57,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version=$(node -p "require('./package.json').version")
-          for name in protocol sdk conformance adapter-acp adapter-ahp adapter-claude adapter-codex adapter-hermes adapter-pi adapter-swarm workflow code-review refactor cli; do
+          for name in protocol sdk conformance adapter-acp adapter-ahp adapter-claude adapter-codex adapter-hermes adapter-pi adapter-swarm host workflow code-review refactor cli; do
             published=$(npm view "@anureo/$name@$version" version 2>/dev/null || true)
             if [ "$published" = "$version" ]; then
               echo "Skipping @anureo/$name@$version (already published)"

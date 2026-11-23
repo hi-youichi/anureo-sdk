@@ -1,7 +1,8 @@
 import { expect, test } from 'bun:test'
-import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { spawnHarnessProcess } from '@anureo/sdk/process'
 import { fixture as nativeFixture, startFake } from './helpers'
 
@@ -9,8 +10,6 @@ test('a bundled consumer runs on Node from an unrelated cwd against the native W
   const native = await startFake(), directory = await mkdtemp(join(tmpdir(), 'anureo-hermes-node-'))
   try {
     const entry = join(directory, 'consumer.ts'), output = join(directory, 'consumer.mjs')
-    const root = resolve(import.meta.dir, '../../../..')
-    await symlink(join(root, 'node_modules'), join(directory, 'node_modules'), 'junction')
     await writeFile(entry, `
 import { createClient } from '@anureo/sdk'
 import { createHermesAdapter } from '@anureo/adapter-hermes'
@@ -27,7 +26,10 @@ try {
   console.log(JSON.stringify({ status: result.status, text: result.text }))
 } finally { await client.dispose() }
 `)
-    const build = await Bun.build({ entrypoints: [entry], target: 'node', format: 'esm', outdir: directory, naming: 'consumer.mjs' })
+    const build = await Bun.build({ entrypoints: [entry], target: 'node', format: 'esm', outdir: directory, naming: 'consumer.mjs', plugins: [{ name: 'workspace-entrypoints', setup(build) {
+      // Windows junctions do not reliably preserve relative workspace package links.
+      build.onResolve({ filter: /^@anureo\/(sdk|adapter-hermes)$/ }, args => ({ path: fileURLToPath(import.meta.resolve(args.path)) }))
+    } }] })
     expect(build.success).toBe(true)
     const child = await spawnHarnessProcess({ command: 'node', args: [output], cwd: directory,
       env: { ...process.env, ...native.adapter().options.env, FIXTURE_BUN: process.execPath, FIXTURE_ENTRY: nativeFixture } })
