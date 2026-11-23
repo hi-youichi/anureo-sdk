@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -35,7 +36,9 @@ jobs:
       - name: Pack and test release tarballs
         run: |
           version=$(node -p "require('./package.json').version")
-          test "$GITHUB_REF_NAME" = "v$version"
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
           source=$(mktemp -d)
           artifacts="$RUNNER_TEMP/anureo-artifacts"
           mkdir "$artifacts"

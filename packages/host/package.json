@@ -3,6 +3,11 @@
   "version": "0.3.11",
   "description": "Persistent agent sessions and WebSocket access for the Anureo SDK",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hi-youichi/anureo-sdk.git",
+    "directory": "packages/host"
+  },
   "type": "module",
   "files": [
     "src",
