@@ -68,3 +68,18 @@ jobs:
               npm publish "$RUNNER_TEMP/anureo-artifacts/anureo-$name-$version.tgz" --access public --provenance
             fi
           done
+      - name: Verify published registry packages
+        run: |
+          version=$(node -p "require('./package.json').version")
+          cd "$(mktemp -d)"
+          npm init -y >/dev/null
+          for attempt in {1..12}; do
+            if npm install --no-audit --no-fund --fetch-retries=0 "@anureo/host@$version" "@anureo/cli@$version" "@anureo/code-review@$version" "@anureo/refactor@$version" "@anureo/conformance@$version"; then
+              npx --no-install anureo --help
+              npx --no-install anureo-review --help
+              npx --no-install anureo-refactor --help
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
