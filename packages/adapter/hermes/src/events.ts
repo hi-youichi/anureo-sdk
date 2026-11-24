@@ -1,5 +1,5 @@
 import { HarnessSdkError, type SessionEventSink } from '@anureo/sdk'
-import type { AgentMessageItem, Item, Usage } from '@anureo/protocol'
+import type { AgentMessageItem, Item, JsonObject, JsonValue, Usage } from '@anureo/protocol'
 import { identity, integer, json, object, protocolError, stableId, text, type NativeEvent, type NativeObject } from './native'
 import type { HermesAdapterOptions } from './options'
 
@@ -134,22 +134,28 @@ export class HermesTurn {
   }
   /**
    * Project both tool phases under one native identity. Ignore duplicate starts, retain prior input
-   * when completion omits it, and convert native duration seconds to SDK milliseconds.
+   * when completion omits it, and convert native duration seconds to SDK milliseconds. A string
+   * `command` input projects a codex-style command row; results flatten to display text with
+   * execution evidence in extensions, keeping genuinely structured results as JSON.
    */
   private async toolEvent(type: 'tool.start' | 'tool.complete', payload: NativeObject): Promise<void> {
     const id = `${this.id}:tool:${identity(payload.tool_id)}`
     if (type === 'tool.start' && this.items.has(id)) return
     const name = identity(payload.name)
     const prior = this.items.get(id)
-    const item: Item = { ...(prior?.type === 'toolCall' ? prior : {}), id, type: 'toolCall', kind: 'other',
-      title: name, toolName: name, nativeType: name,
-      ...(payload.args !== undefined ? { input: json(payload.args) } : {}) }
+    const input = payload.args !== undefined ? json(payload.args) : prior?.type === 'toolCall' ? prior.input : undefined
+    const command = optionalText(jsonRecord(input).command)
+    const item: Item = { ...(prior?.type === 'toolCall' ? prior : {}), id, type: 'toolCall',
+      kind: command ? 'command' : 'other', title: command || name, toolName: name, nativeType: name,
+      ...(input !== undefined ? { input } : {}) }
     if (type === 'tool.start') {
       await this.put(item)
       return
     }
+    const { output, execution } = toolPresentation(payload.result !== undefined ? json(payload.result) : undefined)
     await this.complete({ ...item, status: 'completed',
-      ...(payload.result !== undefined ? { output: json(payload.result) } : typeof payload.result_text === 'string' ? { output: payload.result_text } : {}),
+      ...(output !== undefined ? { output } : typeof payload.result_text === 'string' ? { output: payload.result_text } : {}),
+      ...(Object.keys(execution).length ? { extensions: { ...item.extensions, toolExecution: execution } } : {}),
       ...(typeof payload.duration_s === 'number' && payload.duration_s >= 0 ? { durationMs: payload.duration_s * 1000 } : {}),
     })
   }
@@ -214,9 +220,14 @@ export class HermesTurn {
   private async finish(status: TerminalStatus, body: string, payload: NativeObject): Promise<void> {
     await this.start()
     const id = this.current?.item.id ?? `${this.id}:final`
-    await this.complete({ id, type: 'agentMessage', text: body, phase: 'final', status: status === 'completed' ? 'completed' : status })
     if (typeof payload.reasoning === 'string') this.reasoning = payload.reasoning
-    if (this.reasoning) await this.complete({ id: `${this.id}:reasoning`, type: 'reasoning', summary: this.reasoning, status: 'completed' })
+    // Gateways that never stream reasoning.delta surface it only in the terminal payload. Host
+    // projections order items by first appearance, so an unseen reasoning item starts before the
+    // final answer completes; one that already streamed keeps the position its deltas gave it.
+    const reasoning: Item = { id: `${this.id}:reasoning`, type: 'reasoning', summary: this.reasoning }
+    if (this.reasoning && !this.items.has(reasoning.id)) await this.put(reasoning)
+    await this.complete({ id, type: 'agentMessage', text: body, phase: 'final', status: status === 'completed' ? 'completed' : status })
+    if (this.reasoning) await this.complete({ ...reasoning, status: 'completed' })
     for (const item of this.items.values()) if (!this.completed.has(item.id)) {
       await this.gap()
       await this.complete({ ...item, extensions: { ...item.extensions, nativeResultUnavailable: true } })
@@ -235,3 +246,32 @@ export class HermesTurn {
 
 type TerminalStatus = 'completed' | 'interrupted' | 'failed'
 interface Segment { item: AgentMessageItem; incomplete: boolean }
+
+/** Non-throwing views for untrusted optional gateway fields; malformed shapes degrade to raw passthrough. */
+const jsonRecord = (value: unknown): NativeObject => value && typeof value === 'object' && !Array.isArray(value) ? value as NativeObject : {}
+const optionalText = (value: unknown): string | undefined => typeof value === 'string' ? value : undefined
+/** Parse JSON-text results defensively; unparsable text stays a plain string output. */
+function parseJsonText(value: string): JsonValue {
+  try { return JSON.parse(value) as JsonValue } catch { return value }
+}
+
+/**
+ * Flatten a native tool result for display hosts. Gateways deliver parsed objects or JSON text that
+ * failed their own parse; allowlisted text fields and error messages become the display text while
+ * genuinely structured results stay JSON. Exit code, success and error evidence land in
+ * extensions.toolExecution where hosts read tool outcomes.
+ */
+function toolPresentation(result: JsonValue | undefined): { output?: JsonValue; execution: JsonObject } {
+  if (result === undefined) return { execution: {} }
+  const raw = typeof result === 'string' && result.trimStart().startsWith('{') ? parseJsonText(result) : result
+  if (typeof raw === 'string') return { output: raw, execution: {} }
+  const fields = jsonRecord(raw)
+  const execution: JsonObject = {}
+  const exitCode = fields.exit_code ?? fields.exitCode
+  if (typeof exitCode === 'number' && Number.isInteger(exitCode)) execution.exitCode = exitCode
+  if (typeof fields.success === 'boolean') execution.success = fields.success
+  const error = optionalText(fields.error) ?? optionalText(jsonRecord(fields.error).message)
+  if (error?.trim()) execution.error = { kind: 'tool', message: error }
+  const display = ['output', 'content', 'analysis', 'text'].map(key => optionalText(fields[key])).find(value => value?.trim())
+  return { output: display ?? error ?? raw, execution }
+}

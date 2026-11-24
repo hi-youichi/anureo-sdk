@@ -1,7 +1,7 @@
 {
   "name": "@anureo/adapter-swarm",
   "description": "A conversational main agent that creates and manages independent bee sessions",
-  "version": "0.3.11",
+  "version": "0.3.12",
   "license": "Apache-2.0",
   "keywords": ["anureo", "ahp", "harness", "agent", "swarm"],
   "homepage": "https://github.com/hi-youichi/anureo-sdk#readme",

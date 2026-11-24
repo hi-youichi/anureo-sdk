@@ -6,6 +6,17 @@ and versions follow [SemVer](https://semver.org/spec/v2.0.0.html). During the
 0.x line, minor versions may include breaking changes; such entries are
 marked **BREAKING**.
 
+## [0.3.12] - 2026-11-24
+
+- Hermes tool results project codex-style command rows: shell calls carry the
+  command line as their title, results flatten their display text instead of a
+  stringified JSON envelope, and exit code, success and error evidence land in
+  `extensions.toolExecution` where hosts read tool outcomes. Genuinely
+  structured results keep their JSON shape.
+- Hermes turns that surface reasoning only in the terminal payload now start
+  the reasoning item before the final answer completes, so host projections
+  render reasoning ahead of the answer it precedes.
+
 ## [0.3.11] - 2026-11-23
 
 - Hermes supports session model changes and reasoning effort through native,

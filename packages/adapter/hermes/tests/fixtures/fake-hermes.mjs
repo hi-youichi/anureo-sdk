@@ -49,9 +49,9 @@ function finish(row, status = 'complete', answer = 'authoritative final') {
   if (row.status === 'terminal') return
   const session = row.session
   row.status = 'terminal'; row.outcome = status === 'complete' ? 'completed' : status === 'interrupted' ? 'interrupted' : 'failed'
-  row.result = { final_response: answer, completed: status === 'complete', ...(status === 'error' ? { failed: true } : {}), ...(status === 'interrupted' ? { interrupted: true } : {}) }
+  row.result = { final_response: answer, completed: status === 'complete', ...(status === 'error' ? { failed: true } : {}), ...(status === 'interrupted' ? { interrupted: true } : {}), ...(scenario.startsWith('late-reasoning') ? { reasoning: 'late reasoning' } : {}) }
   publish(session, 'message.complete', { text: answer, status, outcome: status === 'interrupted' ? 'cancelled' : row.outcome,
-    usage: { input: 100, output: 20, total: 120 }, persisted_turn: { submission_id: row.inputId, row_ids: [session.seq], complete: true } }, row)
+    usage: { input: 100, output: 20, total: 120 }, persisted_turn: { submission_id: row.inputId, row_ids: [session.seq], complete: true }, ...(scenario.startsWith('late-reasoning') ? { reasoning: 'late reasoning' } : {}) }, row)
   session.active = null; session.prompts.clear(); session.requests.clear(); info(session)
   if (session.queue.length) start(session.queue.shift())
 }
@@ -71,7 +71,19 @@ function progress(row) {
   if (scenario === 'global-events') for (const socket of s.viewers) {
     send(socket, { jsonrpc: '2.0', method: 'event', params: { type: 'sessions.changed', session_id: '', payload: {} } })
   }
+  if (scenario === 'late-reasoning') { finish(row); return }
+  if (scenario === 'tool-display') {
+    publish(s, 'tool.start', { tool_id: 't1', name: 'terminal', args: { command: 'bun test' } })
+    publish(s, 'tool.complete', { tool_id: 't1', name: 'terminal', duration_s: 1.5, result: JSON.stringify({ output: 'all green', exit_code: 0, error: null }) })
+    publish(s, 'tool.start', { tool_id: 't2', name: 'write_file', args: { path: 'report.md' } })
+    publish(s, 'tool.complete', { tool_id: 't2', name: 'write_file', result: JSON.stringify({ error: 'Refusing to overwrite report.md' }) })
+    publish(s, 'tool.start', { tool_id: 't3', name: 'search_files', args: { pattern: 'x' } })
+    publish(s, 'tool.complete', { tool_id: 't3', name: 'search_files', result: { total_count: 0 } })
+    finish(row)
+    return
+  }
   publish(s, 'message.delta', { text: 'provisional ', segment: 0, offset: 0 })
+  if (scenario === 'late-reasoning-streamed') { finish(row); return }
   if (scenario === 'delta-replay') {
     publish(s, 'message.delta', { text: 'provisional ', segment: 0, offset: 0 })
     publish(s, 'message.delta', { text: 'visional continued', segment: 0, offset: 3 })

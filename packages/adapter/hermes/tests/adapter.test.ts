@@ -93,6 +93,45 @@ test('authoritative final snapshots replace streamed text and cumulative usage r
   })
 })
 
+test.each(['late-reasoning', 'late-reasoning-streamed'])('%s surfaces terminal-only reasoning ahead of the final answer instead of after it', async scenario => {
+  await withFixture(scenario, async (_fixture, client) => {
+    const session = await client.sessions.create({ cwd: tmpdir() }), read = collect(session)
+    try {
+      const result = await (await session.submit({ input: 'think first' })).result()
+      expect(result.text).toBe('authoritative final')
+      expect(result.items.filter(value => value.type === 'agentMessage')).toHaveLength(1)
+      expect(result.items.find(value => value.type === 'reasoning')).toMatchObject({ summary: 'late reasoning', status: 'completed' })
+      // First appearance fixes host render order. An unstreamed answer starts after its reasoning;
+      // an answer that already streamed keeps its position, but the reasoning starts before it completes.
+      const order = read.events.flatMap(value => value.type === 'item/started' ? [`started:${value.payload.item.type}`] : value.type === 'item/completed' ? [`completed:${value.payload.item.type}`] : [])
+      const anchor = scenario === 'late-reasoning' ? 'started:agentMessage' : 'completed:agentMessage'
+      expect(order.indexOf('started:reasoning')).toBeGreaterThan(-1)
+      expect(order.indexOf('started:reasoning')).toBeLessThan(order.indexOf(anchor))
+      expect(order).toContain('completed:reasoning')
+    } finally { await read.stop() }
+  })
+})
+
+test('tool results project command rows, flattened output and execution evidence', async () => {
+  await withFixture('tool-display', async (_fixture, client) => {
+    const session = await client.sessions.create({ cwd: tmpdir() }), read = collect(session)
+    try {
+      const result = await (await session.submit({ input: 'run tools' })).result()
+      expect(result.text).toBe('authoritative final')
+      const tools = read.events.flatMap(value => value.type === 'item/completed' && value.payload.item.type === 'toolCall' ? [value.payload.item] : [])
+      const byName = new Map(tools.map(item => [item.toolName, item]))
+      // Shell tools mirror the codex display model: kind command with the command line as title.
+      expect(byName.get('terminal')).toMatchObject({ kind: 'command', title: 'bun test', input: { command: 'bun test' },
+        output: 'all green', status: 'completed', durationMs: 1500, extensions: { toolExecution: { exitCode: 0 } } })
+      // Failures flatten the error into the output text and surface execution evidence hosts can render.
+      expect(byName.get('write_file')).toMatchObject({ kind: 'other', title: 'write_file', output: 'Refusing to overwrite report.md',
+        extensions: { toolExecution: { error: { kind: 'tool', message: 'Refusing to overwrite report.md' } } } })
+      // Genuinely structured results keep their JSON shape instead of a stringified envelope.
+      expect(byName.get('search_files')).toMatchObject({ kind: 'other', title: 'search_files', output: { total_count: 0 } })
+    } finally { await read.stop() }
+  })
+})
+
 test.each(['delta-replay', 'delta-gap'])('%s preserves text overlap and native terminal authority', async scenario => {
   await withFixture(scenario, async (fixture, client) => {
     const session = await client.sessions.create({ cwd: tmpdir() }), read = collect(session)

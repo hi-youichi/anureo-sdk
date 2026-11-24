@@ -1,6 +1,6 @@
 {
   "name": "@anureo/cli",
-  "version": "0.3.11",
+  "version": "0.3.12",
   "description": "Single-turn agent runner printing the unified AHP event stream for Codex, Claude, Hermes, Pi, ACP, and Swarm",
   "license": "Apache-2.0",
   "repository": {
