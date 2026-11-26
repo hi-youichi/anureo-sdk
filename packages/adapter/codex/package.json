@@ -1,7 +1,7 @@
 {
   "name": "@anureo/adapter-codex",
   "description": "Anureo SDK adapter for the Codex CLI app-server protocol over stdio JSONL",
-  "version": "0.3.12",
+  "version": "0.3.13",
   "license": "Apache-2.0",
   "keywords": [
     "anureo",

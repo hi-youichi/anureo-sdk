@@ -296,6 +296,8 @@ export class CodexBackendSession implements BackendSession {
     const usage = mapUsage(tokenUsage.total, 'session')
     if (turnId) this.nativeUsage.set(turnId, lastUsage)
     if (typeof tokenUsage.modelContextWindow === 'number') usage.contextWindow = tokenUsage.modelContextWindow
+    // Codex uses the latest native sample to measure active context occupancy.
+    if (lastUsage.total !== undefined) usage.contextUsed = lastUsage.total
     await this.sink.emit({ type: 'usage/updated', payload: usage }, { turnId })
   }
 

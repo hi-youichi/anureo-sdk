@@ -209,6 +209,8 @@ describe('Codex native lifecycle', () => {
     expect(s.events.some(event => event.type === 'item/delta' && event.payload.text === 'hello 日本語')).toBe(true)
     const children = s.events.filter(event => event.type === 'item/completed' && event.payload.item.type === 'subagent')
     expect(children).toHaveLength(2)
+    const usage = s.events.find(event => event.type === 'usage/updated')
+    expect(usage?.payload).toMatchObject({ scope: 'session', total: 50, contextUsed: 12, contextWindow: 1000 })
     const terminal = s.events.find(event => event.type === 'turn/completed')!
     expect(terminal.type === 'turn/completed' && terminal.payload.usage?.total).toBe(12)
     const unknown = s.events.find(event => event.type === 'notice' && event.payload.message === 'future/newNotification')!
