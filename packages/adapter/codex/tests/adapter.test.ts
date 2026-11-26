@@ -523,6 +523,22 @@ test('file-change output arriving first stays a typed tool log and later snapsho
   expect(s.events.find(event => event.type === 'item/completed' && event.payload.item.id === 'edit')).toMatchObject({ payload: { item: { status: 'completed', output: 'Applying patch…\n', fileChanges: [{ materials: [{ format: 'unified' }] }] } } })
 })
 
+test('a completed file change survives late notifications and the same turn returns its final reply', async () => {
+  const s = await setup({ scenario: 'file-change-late-events' })
+  const turn = await s.session.submit(start)
+  const result = await turn.result()
+  expect(result.status).toBe('completed')
+  expect(result.items.find(item => item.id === 'message')).toMatchObject({ type: 'agentMessage', text: 'authoritative final' })
+  expect(result.items.find(item => item.id === 'edit')).toMatchObject({
+    status: 'completed', output: 'Applying patch…\n', fileChanges: [{ path: '/workspace/new.ts', operation: 'rename' }],
+  })
+  await s.waitFor(() => s.events.some(event => event.type === 'turn/completed' && event.turnId === turn.id))
+  expect(s.events.filter(event => event.type.startsWith('item/') && event.itemId === 'edit').map(event => event.type)).toEqual([
+    'item/started', 'item/delta', 'item/delta', 'item/completed',
+  ])
+  expect((await s.calls()).filter(call => call.method === 'turn/start')).toHaveLength(1)
+})
+
 /** Register speed selection at the adapter boundary because a public boolean must become a native service tier rather than leak into native config. */
 describe('Codex fast mode', () => {
   /** Drive fake startup, dispatch and config updates, then reject invalid input; priority selection and explicit clearing must agree across native scopes. */

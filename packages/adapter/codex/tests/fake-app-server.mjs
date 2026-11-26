@@ -157,11 +157,17 @@ function emitTurnScenario(msg) {
       notify('item/started', { turnId: currentTurnId, startedAtMs: startedAtMs + 1000, item: { id: 'message', type: 'agentMessage', text: 'Repeated start', phase: 'final_answer' } })
       return
     }
-    case 'file-change': {
+    case 'file-change':
+    case 'file-change-late-events': {
       const changes = [{ path: '/workspace/old.ts', kind: { type: 'update', move_path: '/workspace/new.ts' }, diff: '@@ -56,3 +56,3 @@\n context\n-old\n+new\n end\n' }]
       notify('item/fileChange/outputDelta', { turnId: currentTurnId, itemId: 'edit', delta: 'Applying patch…\n' })
       notify('item/started', { turnId: currentTurnId, item: { id: 'edit', type: 'fileChange', status: 'inProgress', changes } })
       notify('item/completed', { turnId: currentTurnId, item: { id: 'edit', type: 'fileChange', status: 'completed', changes } })
+      if (mode === 'file-change-late-events') {
+        notify('item/fileChange/outputDelta', { turnId: currentTurnId, itemId: 'edit', delta: 'Late output' })
+        notify('item/started', { turnId: currentTurnId, item: { id: 'edit', type: 'fileChange', status: 'inProgress', changes: [] } })
+        notify('item/completed', { turnId: currentTurnId, item: { id: 'edit', type: 'fileChange', status: 'completed', changes: [] } })
+      }
       emitFinalAnswerAndCompleteCurrentTurn()
       return
     }

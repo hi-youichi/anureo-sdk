@@ -239,7 +239,7 @@ export class CodexBackendSession implements BackendSession {
   private canonicalTurnIdByNativeId = new Map<string, string>()
   private nativeTurnIdByCanonicalId = new Map<string, string>()
   private started = new Set<string>()
-  private items = new Set<string>()
+  private readonly itemPhases = new Map<string, ItemPhase>()
   private executionOutput = new Map<string, string>()
   private itemStartedAt = new Map<string, string>()
   private history = new Map<string, HistoryItem[]>()
@@ -728,7 +728,7 @@ export class CodexBackendSession implements BackendSession {
       ? 'interrupted' : hook.status === 'failed' ? 'failed' : 'completed'
     const output = hook.entries ?? hook.output
     const key = `${turnId}\0${id}`
-    if (!turnId || (!this.state.activeTurnIds.includes(turnId) && (started || !this.items.has(key)))) {
+    if (!turnId || (!this.state.activeTurnIds.includes(turnId) && (started || !this.itemPhases.has(key)))) {
       await this.sink.emit({ type: 'notice', payload: {
         severity: status === 'failed' ? 'warning' : 'info',
         code: started ? 'NATIVE_HOOK_STARTED' : 'NATIVE_HOOK_COMPLETED',
@@ -737,13 +737,15 @@ export class CodexBackendSession implements BackendSession {
       } }, { turnId })
       return
     }
+    if (this.itemPhases.get(key) === 'completed') return
     const item: Item = {
       id, name, type: 'hook', status,
       ...(output !== undefined ? { output: safe(output) } : {}),
       ...(typeof hook.durationMs === 'number' && Number.isFinite(hook.durationMs) && hook.durationMs >= 0
         ? { durationMs: hook.durationMs } : {}),
     }
-    this.items.add(key)
+    const phase = started ? 'started' : 'completed'
+    this.itemPhases.set(key, phase)
     await this.sink.emit({ type: started ? 'item/started' : 'item/completed', payload: { item } }, { turnId, itemId: id })
   }
   /**
@@ -766,13 +768,15 @@ export class CodexBackendSession implements BackendSession {
   }
   /**
    * observeItem awaits these snapshots after any submission correlation. Publish in map order.
-   * Keep the first known start time, patch repeated starts, and fill missing tool output from the buffer.
-   * Clear buffered output on completion before publication. Projection and sink failures reject.
+   * Keep the first known start time, patch repeated starts while active, and fill missing tool
+   * output from the buffer. The first completed snapshot is final. Projection and sink failures reject.
    */
   private async projectItem({ params, turnId, phase }: { params: NativeRecord; turnId: string; phase: ItemPhase }): Promise<void> {
     const completed = phase === 'completed'
     for (const sourceItem of mapItems(params.item, completed, false, { startedAtMs: completed ? undefined : params.startedAtMs })) {
       const key = `${turnId}\0${sourceItem.id}`
+      const previousPhase = this.itemPhases.get(key)
+      if (previousPhase === 'completed') continue
       // Completed snapshots omit the start time; repeated starts must not reset it.
       const startedAt = this.itemStartedAt.get(key) ?? sourceItem.startedAt
       if (startedAt !== undefined) this.itemStartedAt.set(key, startedAt)
@@ -782,18 +786,17 @@ export class CodexBackendSession implements BackendSession {
         ? { ...timedItem, output }
         : timedItem
       if (completed) this.executionOutput.delete(key)
-      if (!completed && this.items.has(key)) {
+      if (!completed && previousPhase === 'started') {
         await this.sink.emit({ type: 'item/delta', payload: { itemId: item.id, kind: 'patch', value: json(item) } }, { turnId, itemId: item.id })
         continue
       }
-      this.items.add(key)
+      this.itemPhases.set(key, phase)
       await this.sink.emit({ type: completed ? 'item/completed' : 'item/started', payload: { item } }, { turnId, itemId: item.id })
     }
   }
   /**
-   * For recognized delta notifications, require item/turn scope, synthesize a start if needed, then
-   * emit the delta. Output fragments are bounded diagnostics, never file patch material. Reject
-   * missing scope or sink failures at the publication boundary; notification owns wire ordering.
+   * Require item/turn scope and ignore deltas for completed items. For live items, synthesize a
+   * start if needed before publishing. Output fragments are bounded diagnostics.
    */
   private async projectDelta({ params, turnId, delta: { kind, start } }: {
     params: NativeRecord
@@ -803,8 +806,10 @@ export class CodexBackendSession implements BackendSession {
     const itemId = string(params.itemId)
     if (!itemId || !turnId) throw new HarnessSdkError('PROTOCOL_ERROR')
     const key = `${turnId}\0${itemId}`
-    if (!this.items.has(key)) {
-      this.items.add(key)
+    const phase = this.itemPhases.get(key)
+    if (phase === 'completed') return
+    if (phase === undefined) {
+      this.itemPhases.set(key, 'started')
       await this.sink.emit({ type: 'item/started', payload: { item: start(itemId) } }, { turnId, itemId })
     }
     const deltaText = string(params.delta) ?? ''
