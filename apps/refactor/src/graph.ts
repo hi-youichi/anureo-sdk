@@ -44,7 +44,7 @@ export function repographProject(cwd: string): string {
 
 /** Export a validated graph for an absolute target directory. Supply an absolute CLI entry to
  * override the installed Repograph package. Both paths go unchanged to a subprocess started in
- * an OS temporary directory. The promise settles after temporary-directory cleanup, retaining the
+ * the OS temp root. The promise settles after cleaning up the export directory, retaining the
  * external index for reuse. Serialize calls that share that index, whose key derives from the
  * supplied target path. exportGraph does this under the run lock before writing the phase artifact.
  * Package resolution, subprocess, filesystem, parse and validation errors reject. A cleanup
@@ -87,8 +87,9 @@ const outputLimit = 8 << 20
 async function exportRepositoryGraph(input: { cwd: string; entry: string; temporary: string }): Promise<RepositoryGraph> {
   const { cwd, entry, temporary } = input
   const output = join(temporary, 'graph.json')
+  // The native backend can start a detached daemon that inherits the subprocess working directory.
   const child = await spawnHarnessProcess({
-    command: process.execPath, cwd: temporary,
+    command: process.execPath, cwd: dirname(temporary),
     args: [entry, 'export', cwd, '--kind', 'all', '--project', repographProject(cwd), '--out', output],
   })
   let timer: ReturnType<typeof setTimeout> | undefined

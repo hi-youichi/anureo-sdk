@@ -30,8 +30,31 @@ jobs:
       - run: bun run --filter @anureo/host generate:check
       - run: bun run typecheck
       - run: bun run typecheck:tooling
-      - run: bun run test
+      - if: runner.os != 'Windows'
+        run: bun run test
+      # Bun 1.4.2 can crash when running the next file after the process-heavy fix suite.
+      - name: Run SDK tests on Windows
+        if: runner.os == 'Windows'
+        run: bun test --timeout 15000 --path-ignore-patterns '**/code-review/tests/fix.test.ts' packages apps
+      - name: Run code-review fix tests in a fresh Bun process
+        if: runner.os == 'Windows'
+        run: bun test --timeout 15000 apps/code-review/tests/fix.test.ts
       - run: bun run --filter @anureo/host test:node
+      - name: Set up private Repograph directories on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+          foreach ($name in @('CBM_CACHE_DIR', 'CBM_RUNTIME_DIR')) {
+            $path = Join-Path $env:USERPROFILE "anureo-$name-$([guid]::NewGuid().ToString('N'))"
+            New-Item -ItemType Directory -Path $path | Out-Null
+            $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+            $acl.SetOwner($user)
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($user, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+            Set-Acl -LiteralPath $path -AclObject $acl
+            "$name=$path" >> $env:GITHUB_ENV
+          }
       # Keep first-run download logs out of the native CLI's JSON stream.
       - name: Prepare native Repograph backend
         working-directory: apps/refactor
