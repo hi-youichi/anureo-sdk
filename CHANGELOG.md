@@ -6,6 +6,13 @@ and versions follow [SemVer](https://semver.org/spec/v2.0.0.html). During the
 0.x line, minor versions may include breaking changes; such entries are
 marked **BREAKING**.
 
+## [0.3.16] - 2026-11-27
+
+- Republish the Goal lifecycle fixes after the npm registry returned 404 for
+  the 0.3.15 Host tarball.
+- Keep the refactor export directory removable on Windows when the native
+  Repograph daemon outlives the export subprocess.
+
 ## [0.3.15] - 2026-11-27
 
 - Codex projects native Goal updates and restores the current Goal on reopen.

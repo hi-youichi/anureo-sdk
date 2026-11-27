@@ -32,13 +32,18 @@ jobs:
       - run: bun run typecheck:tooling
       - if: runner.os != 'Windows'
         run: bun run test
-      # Bun 1.4.2 can crash when running the next file after the process-heavy fix suite.
+      # Bun 1.4.2 can crash when loading code-review suites in a shared test process.
       - name: Run SDK tests on Windows
         if: runner.os == 'Windows'
-        run: bun test --timeout 15000 --path-ignore-patterns '**/code-review/tests/fix.test.ts' packages apps
-      - name: Run code-review fix tests in a fresh Bun process
+        run: bun test --timeout 15000 --path-ignore-patterns '**/code-review/tests/**' packages apps
+      - name: Run code-review test files in fresh Bun processes
         if: runner.os == 'Windows'
-        run: bun test --timeout 15000 apps/code-review/tests/fix.test.ts
+        shell: pwsh
+        run: |
+          foreach ($file in Get-ChildItem -LiteralPath apps/code-review/tests -Filter '*.test.ts' -File -Recurse) {
+            bun test --timeout 15000 $file.FullName
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
       - run: bun run --filter @anureo/host test:node
       - name: Set up private Repograph directories on Windows
         if: runner.os == 'Windows'
