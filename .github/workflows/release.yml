@@ -73,9 +73,10 @@ jobs:
           version=$(node -p "require('./package.json').version")
           cd "$(mktemp -d)"
           npm init -y >/dev/null
-          for attempt in {1..12}; do
+          for attempt in {1..24}; do
             # Use fresh metadata after publishing. Packing and checking for existing releases
             # can cache an older packument, including a response that omits the new version.
+            # The public registry can also take several minutes to serve metadata and tarballs.
             cache=$(mktemp -d)
             if npm install --prefer-online --cache "$cache" --no-audit --no-fund --fetch-retries=0 "@anureo/host@$version" "@anureo/cli@$version" "@anureo/code-review@$version" "@anureo/refactor@$version" "@anureo/conformance@$version"; then
               npx --no-install anureo --help
