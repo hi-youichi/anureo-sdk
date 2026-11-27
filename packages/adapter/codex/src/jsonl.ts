@@ -57,7 +57,7 @@ const SUBAGENT_DIRECT_INPUT_DENIAL = 'direct app-server input is not allowed for
 /** Definite native rejection returned to RPC callers; retain only the numeric code plus a sanitized denial flag so native error messages cannot disclose payloads. */
 export class CodexRpcError extends HarnessSdkError {
   /** For response decoding, map a numeric native code and a -32600 denial prefix to a safe SDK error without I/O; method-not-found and the multi-agent direct-input denial stay distinguishable from other definite failures. */
-  constructor(readonly rpcCode: number, readonly subagentDirectInputDenied = false) {
+  constructor(readonly rpcCode: number, readonly subagentDirectInputDenied = false, readonly goalsDisabled = false) {
     super(
       rpcCode === -32601 ? 'METHOD_NOT_FOUND' : rpcCode === -32600 && subagentDirectInputDenied ? 'SUBAGENT_DIRECT_INPUT_REJECTED' : 'NATIVE_RPC_ERROR',
       rpcCode === -32600 && subagentDirectInputDenied ? 'Native Codex rejected direct input for a parent-owned subagent thread' : 'Native Codex request failed',
@@ -254,7 +254,8 @@ export class CodexJsonlClient {
       const error = record(message.error)
       const code = error.code
       if (typeof code === 'number' && Number.isInteger(code)) {
-        waiting.reject(new CodexRpcError(code, code === -32600 && string(error.message)?.startsWith(SUBAGENT_DIRECT_INPUT_DENIAL) === true))
+        const message = string(error.message)
+        waiting.reject(new CodexRpcError(code, code === -32600 && message?.startsWith(SUBAGENT_DIRECT_INPUT_DENIAL) === true, code === -32600 && message === 'goals feature is disabled'))
         return
       }
     } else if (Object.hasOwn(message, 'result')) {

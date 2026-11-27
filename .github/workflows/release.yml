@@ -61,7 +61,7 @@ jobs:
         run: |
           version=$(node -p "require('./package.json').version")
           for name in protocol sdk conformance adapter-acp adapter-ahp adapter-claude adapter-codex adapter-hermes adapter-pi adapter-swarm host workflow code-review refactor cli; do
-            published=$(npm view "@anureo/$name@$version" version 2>/dev/null || true)
+            published=$(npm view --prefer-online "@anureo/$name@$version" version 2>/dev/null || true)
             if [ "$published" = "$version" ]; then
               echo "Skipping @anureo/$name@$version (already published)"
             else
@@ -74,7 +74,10 @@ jobs:
           cd "$(mktemp -d)"
           npm init -y >/dev/null
           for attempt in {1..12}; do
-            if npm install --no-audit --no-fund --fetch-retries=0 "@anureo/host@$version" "@anureo/cli@$version" "@anureo/code-review@$version" "@anureo/refactor@$version" "@anureo/conformance@$version"; then
+            # Use fresh metadata after publishing. Packing and checking for existing releases
+            # can cache an older packument, including a response that omits the new version.
+            cache=$(mktemp -d)
+            if npm install --prefer-online --cache "$cache" --no-audit --no-fund --fetch-retries=0 "@anureo/host@$version" "@anureo/cli@$version" "@anureo/code-review@$version" "@anureo/refactor@$version" "@anureo/conformance@$version"; then
               npx --no-install anureo --help
               npx --no-install anureo-review --help
               npx --no-install anureo-refactor --help

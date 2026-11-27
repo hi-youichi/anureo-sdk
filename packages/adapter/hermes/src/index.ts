@@ -4,6 +4,7 @@ import { attachGateway } from './attach'
 import { describe } from './native'
 import { HermesRpc } from './rpc'
 import { HermesSession, hermesCapabilities } from './session'
+import { supportsHermesGoals } from './goals'
 import { isHermesEffort, validateOptions, type HermesAdapterOptions } from './options'
 export type { HermesAdapterOptions } from './options'
 
@@ -49,7 +50,7 @@ export class HermesAdapter implements HarnessAdapter {
     if (!this.profileId) throw new HarnessSdkError('NOT_INITIALIZED')
     assertRequest('session/open', params)
     this.assertSupportedOpen(params)
-    const session = new HermesSession({ params, sink, options: this.config, profileId: this.profileId, released: () => this.sessions.delete(session) })
+    const session = new HermesSession({ params, sink, options: this.config, profileId: this.profileId, goals: this.goals, released: () => this.sessions.delete(session) })
     this.sessions.add(session)
     try {
       await session.open()
@@ -75,6 +76,7 @@ export class HermesAdapter implements HarnessAdapter {
   private profileId?: string
   private editorMcp = false
   private reasoning = false
+  private goals = false
   private disposed = false
   private readonly abort = new AbortController()
   private probe?: HermesRpc
@@ -105,11 +107,12 @@ export class HermesAdapter implements HarnessAdapter {
       this.profileId = description.profileId
       this.editorMcp = description.editorMcp
       this.reasoning = description.createParameters.includes('reasoning')
+      this.goals = await supportsHermesGoals(channel)
       return {
         protocolVersion: 1,
         protocolContract: AHP_PROTOCOL_CONTRACT,
         runtime: { name: 'hermes', version: grant.version, adapter: 'hermes-gateway/0.2.0' },
-        capabilities: hermesCapabilities(this.reasoning),
+        capabilities: hermesCapabilities(this.reasoning, this.goals),
       }
     } catch (cause) {
       if (cause instanceof HarnessSdkError) throw new HarnessSdkError(cause.code, cause.message, cause.retryable, false)

@@ -3207,6 +3207,62 @@
         "history"
       ],
       "additionalProperties": false
+    },
+    "HxGoalPauseParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision"
+      ],
+      "additionalProperties": false
+    },
+    "HxGoalResumeParams": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sessionId",
+        "idempotencyKey",
+        "expectedRevision"
+      ],
+      "additionalProperties": false
     }
   },
   "x-methods": {
@@ -3417,6 +3473,14 @@
     "hx.subagents.history": [
       "HxSubagentsHistoryParams",
       "HxSubagentsHistoryResult"
+    ],
+    "hx.goal.pause": [
+      "HxGoalPauseParams",
+      "HxGoalClearResult"
+    ],
+    "hx.goal.resume": [
+      "HxGoalResumeParams",
+      "HxGoalClearResult"
     ]
   }
 }

@@ -5,6 +5,7 @@ const mode = process.env.FAKE_SCENARIO ?? 'normal'
 // A fixture process owns one thread; turn identity and visible history must survive sequential requests.
 const threadId = 'native-thread'
 let currentTurnId = 'native-turn-1'
+let currentGoal = null
 let counter = 0
 let allowedHistory = ['native-turn-1','native-turn-2']
 const send = value => process.stdout.write(JSON.stringify(value) + '\n')
@@ -440,10 +441,21 @@ function handleMessage(msg) {
         { id: 'child-2', parentThreadId: 'native-thread', status: { type: 'notLoaded' } },
       ], nextCursor: null })
       break
-    case 'thread/goal/set':
-      sendResult(msg, { goal: { objective: msg.params.objective ?? 'goal', status: 'active' } })
+    case 'thread/goal/get':
+      sendResult(msg, { goal: currentGoal })
       break
+    case 'thread/goal/set': {
+      currentGoal = { objective: msg.params.objective ?? currentGoal?.objective ?? 'goal', status: msg.params.status ?? 'active' }
+      const result = currentGoal
+      if (mode === 'goal-completes-before-reply') {
+        currentGoal = { ...currentGoal, status: 'complete', tokensUsed: 42 }
+        notify('thread/goal/updated', { goal: currentGoal, turnId: 'goal-turn' })
+      }
+      sendResult(msg, { goal: result })
+      break
+    }
     case 'thread/goal/clear':
+      currentGoal = null
       sendResult(msg, { cleared: true })
       break
     case 'thread/compact/start':

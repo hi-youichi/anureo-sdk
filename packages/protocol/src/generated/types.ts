@@ -7,7 +7,7 @@ export type RevertScope = "conversation" | "files" | "both";
 export type Boundary = { "turnId": string; "relation": "before" | "through"; "nativeTurnId"?: string };
 export type ExtensionDescriptor = { "name": string; "version": string };
 export type ConfigOption = { "id": string; "title"?: string; "schema": JsonSchema; "scope": "session" | "turn"; "value"?: JsonValue };
-export type Capabilities = { "session"?: { "resume"?: boolean; "fork"?: Array<"before" | "through">; "revert"?: Array<RevertScope>; "history"?: boolean }; "turn"?: { "outputSchema"?: boolean; "overrides"?: Array<string>; "inputModalities"?: Array<"text" | "image" | "file"> }; "goal"?: { "actions"?: Array<"set" | "clear"> }; "review"?: boolean; "compact"?: boolean; "subagents"?: { "events": "nested" | "none"; "threadDiscovery"?: boolean; "tree"?: boolean }; "mcp"?: { "stdio"?: boolean; "http"?: boolean; "elicitation"?: Array<"form" | "url"> }; "interactions"?: Array<InteractionKind>; "config"?: { "options": Array<ConfigOption> }; "extensions"?: Array<ExtensionDescriptor>; "input"?: { "delivery": Array<"native" | "afterTurn">; "steer"?: { "target": "turn"; "atomicMatch": true }; "interrupt"?: { "targets": Array<"turn" | "session">; "reportsPendingInputs": boolean; "cancelQueued"?: boolean } } };
+export type Capabilities = { "session"?: { "resume"?: boolean; "fork"?: Array<"before" | "through">; "revert"?: Array<RevertScope>; "history"?: boolean }; "turn"?: { "outputSchema"?: boolean; "overrides"?: Array<string>; "inputModalities"?: Array<"text" | "image" | "file"> }; "goal"?: { "actions"?: Array<"set" | "clear" | "pause" | "resume"> }; "review"?: boolean; "compact"?: boolean; "subagents"?: { "events": "nested" | "none"; "threadDiscovery"?: boolean; "tree"?: boolean }; "mcp"?: { "stdio"?: boolean; "http"?: boolean; "elicitation"?: Array<"form" | "url"> }; "interactions"?: Array<InteractionKind>; "config"?: { "options": Array<ConfigOption> }; "extensions"?: Array<ExtensionDescriptor>; "input"?: { "delivery": Array<"native" | "afterTurn">; "steer"?: { "target": "turn"; "atomicMatch": true }; "interrupt"?: { "targets": Array<"turn" | "session">; "reportsPendingInputs": boolean; "cancelQueued"?: boolean } } };
 export type ClientInfo = { "name": string; "version": string; "title"?: string };
 export type RuntimeInfo = { "name": string; "version": string; "adapter": string };
 export type InitializeParams = { "protocolVersions": Array<number>; "clientInfo": ClientInfo; "clientCapabilities"?: Capabilities; "protocolContract": "native-lifecycle" };
@@ -80,7 +80,7 @@ export type InteractionRequestedEvent = { "type": "interaction/requested"; "payl
 export type InteractionResolvedEvent = { "type": "interaction/resolved"; "payload": InteractionResult };
 export type NoticeEvent = { "type": "notice"; "payload": { "severity": "info" | "warning" | "error"; "code": string; "message": string; "raw"?: JsonValue; "extensions"?: JsonObject } };
 export type ExtensionEvent = { "type": "extension"; "payload": { "name": string; "version": string; "method"?: string; "data": JsonValue } };
-export type NonItemEventPayload = (SessionStateEvent) | (SessionMetadataEvent) | (TurnStartedEvent) | (TurnCompletedEvent) | (UsageUpdatedEvent) | (InteractionRequestedEvent) | (InteractionResolvedEvent) | (NoticeEvent) | (ExtensionEvent) | (SubmissionBoundEvent) | (SubmissionStatusEvent);
+export type NonItemEventPayload = (SessionStateEvent) | (SessionMetadataEvent) | (SessionGoalEvent) | (TurnStartedEvent) | (TurnCompletedEvent) | (UsageUpdatedEvent) | (InteractionRequestedEvent) | (InteractionResolvedEvent) | (NoticeEvent) | (ExtensionEvent) | (SubmissionBoundEvent) | (SubmissionStatusEvent);
 export type ItemEventPayload = (ItemStartedEvent) | (ItemDeltaEvent) | (ItemCompletedEvent);
 export type AhpEventPayload = (NonItemEventPayload) | (ItemEventPayload);
 export type SourceEnvelope = { "sessionId": string; "streamId": string; "seq": number; "timestamp": string; "turnId"?: string; "itemId"?: string };
@@ -106,7 +106,7 @@ export type ReviewStartRpcRequest = { "jsonrpc": "2.0"; "id": RpcId; "method": "
 export type EventsReadParams = { "sessionId": string; "streamId": string; "afterSeq": number; "throughSeq": number };
 export type EventsReadResult = { "events": Array<AhpEvent> };
 export type EventsReadRpcRequest = { "jsonrpc": "2.0"; "id": RpcId; "method": "x-anureo/events/read"; "params": EventsReadParams };
-export type AhpRpcRequest = (InitializeRpcRequest) | (SessionOpenRpcRequest) | (SessionCloseRpcRequest) | (SessionConfigRpcRequest) | (SessionRevertRpcRequest) | (HistoryReadRpcRequest) | (InputSubmitRpcRequest) | (TurnSteerRpcRequest) | (TurnInterruptRpcRequest) | (InteractionRespondRpcRequest) | (InteractionCancelRpcRequest) | (GoalSetRpcRequest) | (GoalClearRpcRequest) | (CompactStartRpcRequest) | (ReviewStartRpcRequest) | (SessionInterruptRpcRequest) | (EventsReadRpcRequest);
+export type AhpRpcRequest = (InitializeRpcRequest) | (SessionOpenRpcRequest) | (SessionCloseRpcRequest) | (SessionConfigRpcRequest) | (SessionRevertRpcRequest) | (HistoryReadRpcRequest) | (InputSubmitRpcRequest) | (TurnSteerRpcRequest) | (TurnInterruptRpcRequest) | (InteractionRespondRpcRequest) | (InteractionCancelRpcRequest) | (GoalSetRpcRequest) | (GoalClearRpcRequest) | (GoalPauseRpcRequest) | (GoalResumeRpcRequest) | (CompactStartRpcRequest) | (ReviewStartRpcRequest) | (SessionInterruptRpcRequest) | (EventsReadRpcRequest);
 export type AhpRpcSuccess = { "jsonrpc": "2.0"; "id": RpcId; "result": (GoalState) | (HistoryPage) | (InitializeResult) | (InteractionResult) | (MaintenanceResult) | (RevertResult) | (SessionCloseResult) | (SessionOpenResult) | (SessionState) | (TurnInterruptResult) | (InputSubmitResult) | (TurnSteerResult) | (SessionInterruptResult) | (EventsReadResult) };
 export type AhpRpcFailure = { "jsonrpc": "2.0"; "id": (RpcId) | (null); "error": RpcError };
 export type AhpRpcResponse = (AhpRpcSuccess) | (AhpRpcFailure);
@@ -123,6 +123,12 @@ export type AhpEventNotification =
     "method": "session/metadata";
     "params": (SourceEnvelope)
       & (SessionMetadataEvent)
+  })
+  | ({
+    "jsonrpc": "2.0";
+    "method": "session/goal";
+    "params": (SourceEnvelope)
+      & (SessionGoalEvent)
   })
   | ({
     "jsonrpc": "2.0";
@@ -212,6 +218,11 @@ export type SubmissionStatusEvent = { "type": "submission/status"; "payload": Su
 export type SessionInterruptParams = { "requestId": string; "sessionId": string; "cancelQueued"?: boolean };
 export type SessionInterruptResult = { "accepted": true; "stillQueued"?: Array<string>; "cancelled"?: Array<string> };
 export type SessionInterruptRpcRequest = { "jsonrpc": "2.0"; "id": RpcId; "method": "session/interrupt"; "params": SessionInterruptParams };
+export type SessionGoalEvent = { "type": "session/goal"; "payload": GoalState };
+export type GoalPauseParams = { "requestId": string; "sessionId": string };
+export type GoalResumeParams = { "requestId": string; "sessionId": string };
+export type GoalPauseRpcRequest = { "jsonrpc": "2.0"; "id": RpcId; "method": "goal/pause"; "params": GoalPauseParams };
+export type GoalResumeRpcRequest = { "jsonrpc": "2.0"; "id": RpcId; "method": "goal/resume"; "params": GoalResumeParams };
 export interface AhpRequestMap {
   "initialize": InitializeParams;
   "session/open": SessionOpenParams;
@@ -226,6 +237,8 @@ export interface AhpRequestMap {
   "interaction/cancel": InteractionCancelParams;
   "goal/set": GoalSetParams;
   "goal/clear": GoalClearParams;
+  "goal/pause": GoalPauseParams;
+  "goal/resume": GoalResumeParams;
   "compact/start": CompactStartParams;
   "review/start": ReviewStartParams;
   "session/interrupt": SessionInterruptParams;
@@ -244,6 +257,8 @@ export interface AhpResultMap {
   "interaction/cancel": InteractionResult;
   "goal/set": GoalState;
   "goal/clear": GoalState;
+  "goal/pause": GoalState;
+  "goal/resume": GoalState;
   "compact/start": MaintenanceResult;
   "review/start": InputSubmitResult;
   "session/interrupt": SessionInterruptResult;
@@ -263,6 +278,8 @@ export const AHP_METHODS = [
   "interaction/cancel",
   "goal/set",
   "goal/clear",
+  "goal/pause",
+  "goal/resume",
   "compact/start",
   "review/start",
   "session/interrupt"
@@ -318,6 +335,14 @@ export const AHP_METHOD_DEFINITIONS = {
   ],
   "goal/clear": [
     "GoalClearParams",
+    "GoalState"
+  ],
+  "goal/pause": [
+    "GoalPauseParams",
+    "GoalState"
+  ],
+  "goal/resume": [
+    "GoalResumeParams",
     "GoalState"
   ],
   "compact/start": [

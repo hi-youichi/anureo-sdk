@@ -32,6 +32,13 @@ jobs:
       - run: bun run typecheck:tooling
       - run: bun run test
       - run: bun run --filter @anureo/host test:node
+      # Keep first-run download logs out of the native CLI's JSON stream.
+      - name: Prepare native Repograph backend
+        working-directory: apps/refactor
+        run: >-
+          node -e "const requireFromRepograph = require('node:module').createRequire(require.resolve('@youichi/repograph'));
+          const shim = requireFromRepograph.resolve('codebase-memory-mcp/bin.js');
+          require('node:child_process').execFileSync(process.execPath, [shim, '--version'], { stdio: 'inherit' });"
       # The default suite skips the native repograph backend. Opt in on every matrix runner.
       - name: Verify native refactor graph exports
         env:

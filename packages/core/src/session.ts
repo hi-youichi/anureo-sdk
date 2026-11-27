@@ -301,13 +301,15 @@ export class Session implements SessionEventSink {
   private handlerCount = 0;
   private readonly secrets: SecretRedactor;
   private state: SessionState;
+  private goalRevision = 0;
   /**
    * attach and admitEvent call before recomputing status. Replace native state with a detached clone,
    * preserving earlier metadata patches omitted by the snapshot. Clone failure propagates to attachment
    * or ordered publication; callers still own binding validation and active-execution bookkeeping.
    */
   private adoptState(state: SessionState): void {
-    this.state = { ...structuredClone(state), ...((this.state.metadata || state.metadata) ? { metadata: { ...this.state.metadata, ...state.metadata } } : {}) };
+    const goal = state.goal ?? this.state.goal;
+    this.state = { ...structuredClone(state), ...(goal === undefined ? {} : { goal: structuredClone(goal) }), ...((this.state.metadata || state.metadata) ? { metadata: { ...this.state.metadata, ...state.metadata } } : {}) };
   }
   /**
    * Recompute the status and active IDs exposed by snapshot and state events after lifecycle changes.
@@ -435,6 +437,10 @@ export class Session implements SessionEventSink {
         return { payload: this.admitSubmissionStatus(rawPayload) };
       case 'session/metadata':
         this.state.metadata = { ...this.state.metadata, ...structuredClone(rawPayload.payload) };
+        return { payload: rawPayload };
+      case 'session/goal':
+        this.goalRevision++;
+        this.state.goal = structuredClone(rawPayload.payload);
         return { payload: rawPayload };
       case 'session/state':
         if (!matchesBinding(rawPayload.payload.binding, this.binding)) throw new HarnessSdkError('SESSION_BINDING_MISMATCH');
@@ -770,6 +776,7 @@ export class Session implements SessionEventSink {
    * The caller owns outcome bookkeeping and never retries native work automatically.
    */
   private async executeRequest<M extends SessionMethod>(method: M, params: AhpRequestMap[M], cancelledInputs?: string[]): Promise<AhpResultMap[M]> {
+    const goalRevision = this.goalRevision;
     const invoked = await this.invokeRequest(method, params);
     let nativeResult = invoked;
     if (method === 'session/interrupt' && cancelledInputs?.length) {
@@ -782,6 +789,9 @@ export class Session implements SessionEventSink {
       result = await this.options.runtime.redactHistory(this.binding, result as AhpResultMap['history/read']);
     }
     this.applyRequestResult(method, result);
+    if ((method === 'goal/set' || method === 'goal/clear' || method === 'goal/pause' || method === 'goal/resume') && this.goalRevision === goalRevision) {
+      await this.emit({ type: 'session/goal', payload: result as AhpResultMap['goal/set'] });
+    }
     assertResult(method, result);
     return immutable(result) as AhpResultMap[M];
   }
@@ -818,12 +828,11 @@ export class Session implements SessionEventSink {
    * these updates. Other methods leave request-owned state unchanged; events own execution activity.
    */
   private applyRequestResult(method: SessionMethod, result: unknown): void {
-    if (method === 'session/config/set') { this.state = structuredClone(result as SessionState); this.updateStatus(); }
+    if (method === 'session/config/set') { this.adoptState(result as SessionState); this.updateStatus(); }
     if (method === 'session/revert') {
       const nativeRef = (result as AhpResultMap['session/revert']).nativeRef;
       if (nativeRef) this.state.binding = { ...this.binding, nativeRef: structuredClone(nativeRef) };
     }
-    if (method === 'goal/set' || method === 'goal/clear') this.state.goal = structuredClone(result as AhpResultMap['goal/set']);
   }
   /**
    * executeRequest calls before privacy projection or request-owned state changes. Validate protocol

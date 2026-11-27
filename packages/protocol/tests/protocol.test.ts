@@ -34,7 +34,7 @@ const requests: AhpRequestMap = {
   'session/interrupt': { ...base },
   'interaction/respond': { ...base, interactionId: 'i', response: { kind: 'approval', optionId: 'deny' } },
   'interaction/cancel': { ...base, interactionId: 'i' },
-  'goal/set': { ...base, goal: { text: 'goal' } }, 'goal/clear': base,
+  'goal/set': { ...base, goal: { text: 'goal' } }, 'goal/clear': base, 'goal/pause': base, 'goal/resume': base,
   'compact/start': base, 'review/start': { ...base, submissionId: 'review', target: { type: 'uncommitted' } },
 }
 const results: AhpResultMap = {
@@ -45,7 +45,8 @@ const results: AhpResultMap = {
   'input/submit': { submissionId: 'input', disposition: 'dispatched' }, 'turn/steer': { submissionId: 'guide', turnId: 't', accepted: true },
   'turn/interrupt': { accepted: true }, 'session/interrupt': { accepted: true, stillQueued: [] }, 'interaction/respond': { interactionId: 'i', outcome: 'responded' },
   'interaction/cancel': { interactionId: 'i', outcome: 'cancelled' }, 'goal/set': { goal: { text: 'goal' }, status: 'active' },
-  'goal/clear': { goal: null, status: 'cleared' }, 'compact/start': { maintenanceId: 'm', status: 'completed' },
+  'goal/clear': { goal: null, status: 'cleared' }, 'goal/pause': { goal: { status: 'paused' }, status: 'cleared' },
+  'goal/resume': { goal: { status: 'active' }, status: 'active' }, 'compact/start': { maintenanceId: 'm', status: 'completed' },
   'review/start': { submissionId: 'review', turnId: 't-review', accepted: true, disposition: 'started' },
 }
 const envelope = { sessionId: 's', streamId: 'stream', seq: 1, timestamp: '2026-10-26T00:00:00.000Z', turnId: 't' }

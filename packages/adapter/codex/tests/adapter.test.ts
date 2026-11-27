@@ -410,12 +410,21 @@ describe('versioned controls and history', () => {
     const s = await setup({ scenario: 'hold' })
     await s.session.request('session/config/set', { requestId: 'cfg', sessionId: 'session', patch: { model: 'test-model' } })
     expect(await s.session.request('goal/set', { requestId: 'goal', sessionId: 'session', goal: { objective: 'finish' } })).toEqual({ goal: { objective: 'finish', status: 'active' }, status: 'active' })
+    expect(await s.session.request('goal/pause', { requestId: 'pause', sessionId: 'session' })).toEqual({ goal: { objective: 'finish', status: 'paused' }, status: 'cleared' })
+    expect(await s.session.request('goal/resume', { requestId: 'resume', sessionId: 'session' })).toEqual({ goal: { objective: 'finish', status: 'active' }, status: 'active' })
     expect(await s.session.request('goal/clear', { requestId: 'clear', sessionId: 'session' })).toEqual({ goal: null, status: 'cleared' })
     expect((await s.session.request('compact/start', { requestId: 'compact', sessionId: 'session' })).status).toBe('accepted')
     await s.waitFor(()=>s.events.some(event=>event.type==='notice'&&event.payload.code==='CONTEXT_COMPACTED'))
     expect(s.events.some(event => event.type === 'notice' && event.payload.code === 'CONTEXT_COMPACTED')).toBe(true)
     await s.waitFor(()=>s.events.some(event=>event.type==='turn/completed'));
     expect(s.events.filter(event=>event.type==='turn/started')).toMatchObject([{payload:{turnId:'compact-turn'}}])
+  })
+  test('a native Goal completion survives a stale set acknowledgement', async () => {
+    const s = await setup({ scenario: 'goal-completes-before-reply' })
+    await s.session.request('goal/set', { requestId: 'goal', sessionId: 'session', goal: { objective: 'finish' } })
+    await s.waitFor(() => s.events.some(event => event.type === 'session/goal' && event.payload.goal?.status === 'complete'))
+    expect(s.session.snapshot.goal).toEqual({ goal: { objective: 'finish', status: 'complete', tokensUsed: 42, completionTurnId: 'goal-turn' }, status: 'cleared' })
+    expect(s.events.filter(event => event.type === 'session/goal')).toHaveLength(1)
   })
   /** Pure capability assertions distinguish pre-profile conservatism from newer unverified versions, which must retain the latest known controls. */
   test('newer unverified versions keep the baseline and profiled methods; only pre-profile versions stay conservative', () => {

@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import * as fs from 'node:fs/promises'
 import { access, chmod, lstat, mkdir, readFile, readdir, realpath, symlink, unlink, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { HarnessSdkError } from '@anureo/sdk'
 import { correctnessAngle, formatReport, reviewCode, type ReviewProgress } from '../src'
 import { runCli } from '../src/cli'
@@ -417,7 +417,7 @@ test.each([false, true])('a failed installation restores originals or reports re
   const rename = fs.rename
   let recoveryPath: string | undefined
   const install = spyOn(fs, 'link').mockImplementation(async (from, to) => {
-    if (to === b && String(from).endsWith('/staged')) {
+    if (to === b && basename(String(from)) === 'staged') {
       expect(await readFile(a, 'utf8')).toBe(fixed)
       throw Object.assign(new Error('Disk full during installation'), { code: 'ENOSPC' })
     }
@@ -512,9 +512,9 @@ test('temporary checkout refs and configuration are independent of the original 
   await expect(git(cwd, 'config', '--local', '--get', 'review.scratch')).rejects.toThrow()
 })
 
-test('checkout links resolve symlink components before parent traversal', async () => {
+test('checkout links preserve the original target through a symlink and parent traversal', async () => {
   const { client, cwd } = await fixFixture({ fix: async sessionCwd => {
-    expect(await readFile(join(sessionCwd, 'link.ts'), 'utf8')).toBe('nested configuration')
+    expect(await readFile(join(sessionCwd, 'link.ts'), 'utf8')).toBe(await readFile(join(cwd, 'link.ts'), 'utf8'))
     await writeFile(join(sessionCwd, 'a.ts'), fixed)
     return fixResult
   } })

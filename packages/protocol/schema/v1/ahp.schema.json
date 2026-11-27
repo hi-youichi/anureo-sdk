@@ -202,7 +202,9 @@
               "items": {
                 "enum": [
                   "set",
-                  "clear"
+                  "clear",
+                  "pause",
+                  "resume"
                 ]
               },
               "uniqueItems": true
@@ -2776,6 +2778,9 @@
           "$ref": "#/$defs/SessionMetadataEvent"
         },
         {
+          "$ref": "#/$defs/SessionGoalEvent"
+        },
+        {
           "$ref": "#/$defs/TurnStartedEvent"
         },
         {
@@ -3410,6 +3415,12 @@
           "$ref": "#/$defs/GoalClearRpcRequest"
         },
         {
+          "$ref": "#/$defs/GoalPauseRpcRequest"
+        },
+        {
+          "$ref": "#/$defs/GoalResumeRpcRequest"
+        },
+        {
           "$ref": "#/$defs/CompactStartRpcRequest"
         },
         {
@@ -3590,6 +3601,33 @@
                 },
                 {
                   "$ref": "#/$defs/SessionMetadataEvent"
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "method": {
+              "const": "session/goal"
+            },
+            "params": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SourceEnvelope"
+                },
+                {
+                  "$ref": "#/$defs/SessionGoalEvent"
                 }
               ]
             }
@@ -4492,6 +4530,106 @@
         "params"
       ],
       "additionalProperties": false
+    },
+    "SessionGoalEvent": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "session/goal"
+        },
+        "payload": {
+          "$ref": "#/$defs/GoalState"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": true
+    },
+    "GoalPauseParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId"
+      ],
+      "additionalProperties": true
+    },
+    "GoalResumeParams": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "requestId",
+        "sessionId"
+      ],
+      "additionalProperties": true
+    },
+    "GoalPauseRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "goal/pause"
+        },
+        "params": {
+          "$ref": "#/$defs/GoalPauseParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "GoalResumeRpcRequest": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "method": {
+          "const": "goal/resume"
+        },
+        "params": {
+          "$ref": "#/$defs/GoalResumeParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false
     }
   },
   "x-methods": {
@@ -4545,6 +4683,14 @@
     ],
     "goal/clear": [
       "GoalClearParams",
+      "GoalState"
+    ],
+    "goal/pause": [
+      "GoalPauseParams",
+      "GoalState"
+    ],
+    "goal/resume": [
+      "GoalResumeParams",
       "GoalState"
     ],
     "compact/start": [

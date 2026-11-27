@@ -6,6 +6,14 @@ and versions follow [SemVer](https://semver.org/spec/v2.0.0.html). During the
 0.x line, minor versions may include breaking changes; such entries are
 marked **BREAKING**.
 
+## [0.3.15] - 2026-11-27
+
+- Codex projects native Goal updates and restores the current Goal on reopen.
+- Hermes supports setting, pausing, resuming, and clearing Goals through the
+  native gateway. Kickoff admission is reconciled after a lost acknowledgement.
+- Hosts persist Goal updates alongside the event stream and reevaluate queued
+  inputs when the Goal stops running.
+
 ## [0.3.14] - 2026-11-26
 
 - Keep Codex turns running when a completed item receives late notifications,

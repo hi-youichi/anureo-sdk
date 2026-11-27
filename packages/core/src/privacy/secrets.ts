@@ -126,7 +126,7 @@ export class SecretRedactor {
    */
   result<M extends AhpMethod>(method: M, value: AhpResultMap[M]): AhpResultMap[M] {
     if (method === "session/config/set") return this.state(value as SessionState) as AhpResultMap[M];
-    if (method === "goal/set" || method === "goal/clear") return this.goal(value as GoalState) as AhpResultMap[M];
+    if (method === "goal/set" || method === "goal/clear" || method === "goal/pause" || method === "goal/resume") return this.goal(value as GoalState) as AhpResultMap[M];
     if (method === "interaction/respond" || method === "interaction/cancel") return this.interactionResult(value as InteractionResult) as AhpResultMap[M];
     return value;
   }
@@ -225,6 +225,7 @@ export class SecretRedactor {
       };
       case "extension": return { ...event, payload: { ...event.payload, data: this.json(event.payload.data) } };
       case "session/metadata": return { ...event, payload: this.json(event.payload as JsonObject) as typeof event.payload };
+      case "session/goal": return { ...event, payload: this.goal(event.payload) };
       case "session/state": return { ...event, payload: this.state(event.payload) };
       case "interaction/requested": return { ...event, payload: this.interaction(event.payload) };
       case "interaction/resolved": return { ...event, payload: this.interactionResult(event.payload) };

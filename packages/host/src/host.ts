@@ -5,6 +5,7 @@ import type { SwarmWorkflowOptions } from "@anureo/adapter-swarm";
 import { publicSubagents, registerSubagent, inlineSubagentHistory, type SubagentTurn, type SubagentHistoryPort, type SubagentDiscoveryPort } from './subagents';
 import type { CatalogWorker,CatalogDiagnostic } from "./catalog-worker";
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { realpathSync } from "node:fs";
 import path from "node:path";
 import { SecretRedactor,type Client,type Session } from "@anureo/sdk";
@@ -94,8 +95,9 @@ interface RuntimeMcpBinding {servers:readonly McpServer[];release():void}
 interface LiveSession {client:Client;session:Session;reader:AsyncIterator<AhpEvent>;pump:Promise<void>;runtimeConfigId:string;registration:RuntimeRegistration;bindingGeneration:number;nativeTurnToCanonical:Map<string,string>;pendingCanonical:string[];streamSeqs:Map<string,number>;mcp?:RuntimeMcpBinding}
 interface Subscription {id:string;sessionId:string;connection:HostConnection;lastSeq:number;pending:number;bytes:number;tail:Promise<void>;active:boolean}
 type Values=Record<string,unknown>;
-const writes=new Set(["hx.session.create","hx.session.open","hx.session.close","hx.session.fork","hx.session.revert","hx.session.config.set","hx.session.archive","hx.session.restore","hx.turn.start","hx.turn.steer","hx.turn.interrupt","hx.interaction.respond","hx.interaction.cancel","hx.goal.set","hx.goal.clear","hx.compact.start","hx.review.start","hx.session.harness.set","hx.workspace.integrate","hx.workspace.discard",...Array.from(["enqueue","update","remove","reorder","clear","pause","resume","run","steer","retry"],action=>`hx.queue.${action}`)]);
-const metadataWrites=new Set(["hx.session.open","hx.session.close","hx.session.revert","hx.session.config.set","hx.session.archive","hx.session.restore","hx.goal.set","hx.goal.clear","hx.session.harness.set","hx.workspace.integrate","hx.workspace.discard"]);
+const goalWrites=["hx.goal.set","hx.goal.clear","hx.goal.pause","hx.goal.resume"] as const;
+const writes=new Set(["hx.session.create","hx.session.open","hx.session.close","hx.session.fork","hx.session.revert","hx.session.config.set","hx.session.archive","hx.session.restore","hx.turn.start","hx.turn.steer","hx.turn.interrupt","hx.interaction.respond","hx.interaction.cancel",...goalWrites,"hx.compact.start","hx.review.start","hx.session.harness.set","hx.workspace.integrate","hx.workspace.discard",...Array.from(["enqueue","update","remove","reorder","clear","pause","resume","run","steer","retry"],action=>`hx.queue.${action}`)]);
+const metadataWrites=new Set(["hx.session.open","hx.session.close","hx.session.revert","hx.session.config.set","hx.session.archive","hx.session.restore",...goalWrites,"hx.session.harness.set","hx.workspace.integrate","hx.workspace.discard"]);
 const revisionRequired=new Set([...metadataWrites,"hx.session.fork","hx.turn.start","hx.compact.start","hx.review.start"]);
 const str=(p:Values,key:string)=>{const v=p[key];if(typeof v!=="string"||!v)throw new HostError("INVALID_PARAMS");return v;};
 const optionalStr=(p:Values,key:string)=>typeof p[key]==="string"?p[key] as string:undefined;
@@ -318,7 +320,7 @@ export class HarnessHost {
   private projectResult(method:HxMethod,id:string,result:JsonValue):JsonValue {
     const privacy=this.redactor(id);
     if(method==="hx.session.config.set")return privacy.state(result as unknown as Parameters<SecretRedactor["state"]>[0]) as unknown as JsonValue;
-    if(method==="hx.goal.set"||method==="hx.goal.clear")return privacy.goal(result as unknown as Parameters<SecretRedactor["goal"]>[0]) as unknown as JsonValue;
+    if(method.startsWith("hx.goal."))return privacy.goal(result as unknown as Parameters<SecretRedactor["goal"]>[0]) as unknown as JsonValue;
     if(result&&typeof result==="object"&&!Array.isArray(result)&&result.config&&typeof result.config==="object")return {...result,config:privacy.json(result.config)};
     return result;
   }
@@ -404,7 +406,7 @@ export class HarnessHost {
     if(method==="hx.initialize") {
       if(!(p.protocolVersions as number[]).includes(1))throw new HostError("PROTOCOL_VERSION_UNSUPPORTED");
       this.initialized.add(connection.id);
-      return {protocolVersion:1,features:["durable-events","operations","private-interactions","catalog-snapshots-v1"],limits:{maxEventPage:1000}};
+      return {protocolVersion:1,features:["durable-events","operations","private-interactions","catalog-snapshots-v1","goal-events-v1"],limits:{maxEventPage:1000}};
     }
     if(!this.initialized.has(connection.id))throw new HostError("NOT_INITIALIZED");
     const result=writes.has(method)?await this.write(connection,method,p):await this.read(connection,method,p);
@@ -548,7 +550,8 @@ export class HarnessHost {
       if(queueControl&&this.controlBusy.has(target))throw new HostError("SESSION_BUSY");
       const livePermissionChange=method==="hx.session.config.set"&&!!p.patch&&typeof p.patch==="object"&&!Array.isArray(p.patch)&&Object.keys(p.patch as Values).length===1&&typeof (p.patch as Values).permissionMode==="string";
       const exclusive=!!current&&(metadataWrites.has(method)||["hx.session.fork","hx.turn.start","hx.compact.start","hx.review.start"].includes(method));
-      if(exclusive&&(this.controlBusy.has(target)||!livePermissionChange&&(current!.activeTurnId||current!.status==="running"||this.store.interactions(current!.id).some(i=>i.state!=="resolved"))))throw new HostError("SESSION_BUSY");
+      const mayControlLiveGoal=method==="hx.goal.pause"||method==="hx.goal.clear";
+      if(exclusive&&(this.controlBusy.has(target)||!livePermissionChange&&!mayControlLiveGoal&&(current!.activeTurnId||current!.status==="running"||this.store.interactions(current!.id).some(i=>i.state!=="resolved"))))throw new HostError("SESSION_BUSY");
       if(method==="hx.interaction.respond"||method==="hx.interaction.cancel") {
         const item=this.store.interaction(current!.id,str(p,"interactionId"));
         if(item.state!=="pending")throw new HostError(item.resolution?.reason==="HOST_RESTARTED"?"INTERACTION_EXPIRED":"INTERACTION_ALREADY_RESOLVED");
@@ -612,7 +615,7 @@ export class HarnessHost {
   private requireLive(id:string):LiveSession {const live=this.live.get(id);if(!live)throw new HostError("SESSION_CLOSED");return live;}
   private async perform(method:HxMethod,p:Values,current:SessionRecord|undefined,id:string,projectId:string,principal:Principal,turnId?:string,operationId?:string):Promise<JsonValue> {
     const ownerId=principal.userId;
-    const requestId=randomUUID(),common={requestId,sessionId:id};
+    const requestId=method.startsWith("hx.goal.")&&operationId?operationId:randomUUID(),common={requestId,sessionId:id};
     if(method==="hx.session.create") {
       await this.prepareRuntime(str(p,"runtimeConfigId"));
       const descriptor=this.runtimes.find(r=>r.id===p.runtimeConfigId);if(!descriptor||descriptor.available===false)throw new HostError("HARNESS_UNAVAILABLE");
@@ -637,7 +640,7 @@ export class HarnessHost {
       this.store.saveSession(record);try{await this.open(record,"new");}catch(cause){if(allocation?.created)await allocation.rollback().catch(()=>{});throw cause;}return this.publicSession(id) as unknown as JsonValue;
     }
     if(!current)throw new HostError("SESSION_NOT_FOUND");
-    if(["hx.review.start","hx.goal.set","hx.compact.start"].includes(method))await this.validateConfig(principal,current,current.config);
+    if(["hx.review.start","hx.goal.set","hx.goal.resume","hx.compact.start"].includes(method))await this.validateConfig(principal,current,current.config);
     if(method.startsWith("hx.queue."))return await this.performQueue(method,p,current,principal,turnId,operationId!) as unknown as JsonValue;
     switch(method) {
       case "hx.session.harness.set":return await this.switchHarness(current,p,principal) as unknown as JsonValue;
@@ -652,7 +655,7 @@ export class HarnessHost {
       }
       case "hx.session.fork": {
         const nextId=id,binding={...current.binding,sessionId:nextId};
-        const next={...current,id:nextId,binding,ownerId,latestSeq:0,revision:1,parent:{sessionId:current.id,boundary:p.boundary as Boundary,bindingGeneration:current.bindingGeneration??1},createdAt:Date.now(),updatedAt:Date.now(),status:"opening" as const};delete next.activeTurnId;delete next.nativeTitle;delete next.nativeSubagents;delete next.inlineSubagents;next.title=next.fallbackTitle;
+        const next={...current,id:nextId,binding,ownerId,latestSeq:0,revision:1,parent:{sessionId:current.id,boundary:p.boundary as Boundary,bindingGeneration:current.bindingGeneration??1},createdAt:Date.now(),updatedAt:Date.now(),status:"opening" as const};delete next.activeTurnId;delete next.goal;delete next.nativeTitle;delete next.nativeSubagents;delete next.inlineSubagents;next.title=next.fallbackTitle;
         // The adapter-side boundary carries the native turn id; next.parent keeps the canonical one for the product.
         const resolvedBoundary=this.store.boundary(current.id,p.boundary as Boundary);
         const boundary={...resolvedBoundary,turnId:resolvedBoundary.nativeTurnId??resolvedBoundary.turnId};
@@ -709,8 +712,14 @@ export class HarnessHost {
       }
       case "hx.interaction.respond":{const capture=clientInteractionCapture(live.client);const parked=capture?.pending.get(str(p,"interactionId"));if(parked){capture!.pending.delete(str(p,"interactionId"));parked.resolve(p.response as InteractionResponse);return {interactionId:str(p,"interactionId"),outcome:"responded"} as unknown as JsonValue;}return await live.session.request("interaction/respond",{...common,interactionId:str(p,"interactionId"),response:p.response as InteractionResponse}) as unknown as JsonValue;}
       case "hx.interaction.cancel":{const reason=optionalStr(p,"reason");const capture=clientInteractionCapture(live.client);const parked=capture?.pending.get(str(p,"interactionId"));if(parked){capture!.pending.delete(str(p,"interactionId"));parked.reject(new HarnessSdkError("INTERACTION_CANCELLED"));return {interactionId:str(p,"interactionId"),outcome:"cancelled"} as unknown as JsonValue;}return await live.session.request("interaction/cancel",{...common,interactionId:str(p,"interactionId"),...(reason?{reason}:{})}) as unknown as JsonValue;}
-      case "hx.goal.set":{        const goal=await live.session.request("goal/set",{...common,goal:p.goal as JsonObject});const next=this.store.session(id);next.goal=goal;this.store.saveSession(next);return goal as unknown as JsonValue;}
-      case "hx.goal.clear":{        const goal=await live.session.request("goal/clear",{...common});const next=this.store.session(id);next.goal=goal;this.store.saveSession(next);return goal as unknown as JsonValue;}
+      case "hx.goal.set":{
+        const goal=p.goal as JsonObject;
+        const input=current.adapterId==="hermes"&&current.instructions?{...goal,context:current.instructions}:goal;
+        return await live.session.request("goal/set",{...common,goal:input}) as unknown as JsonValue;
+      }
+      case "hx.goal.clear":return await live.session.request("goal/clear",common) as unknown as JsonValue;
+      case "hx.goal.pause":return await live.session.request("goal/pause",common) as unknown as JsonValue;
+      case "hx.goal.resume":return await live.session.request("goal/resume",common) as unknown as JsonValue;
       case "hx.compact.start":return await live.session.request("compact/start",{...common}) as unknown as JsonValue;
       case "hx.review.start":{live.pendingCanonical.push(turnId!);try{await live.session.review({target:p.target as JsonObject});await this.waitForTurnRow(id,turnId!);return {turnId:turnId!} as unknown as JsonValue;}catch(cause){const index=live.pendingCanonical.indexOf(turnId!);if(index>=0)live.pendingCanonical.splice(index,1);throw cause;}}
       default:throw new HostError("METHOD_NOT_FOUND");
@@ -855,7 +864,7 @@ export class HarnessHost {
       return result as unknown as JsonValue;
     }
     await this.closeLive(record.id);
-    const binding=await port.discard({...context,force:p.force===true});const next=this.store.session(record.id);next.cwd=realpathSync(binding.cwd);next.workspaceBinding=binding;next.workspace=this.workspacePublic(binding);next.binding={sessionId:next.id,adapterId:next.adapterId,runtimeConfigId:next.runtimeConfigId};next.bindingGeneration=(next.bindingGeneration??1)+1;next.status="closed";this.store.saveSession(next);await this.open(next,"new");const event=this.store.append(next.id,{type:"host/workspace",payload:{workspace:next.workspace as unknown as JsonValue,action:"discard"}});if(event)this.publish(event);return next.workspace as unknown as JsonValue;
+    const binding=await port.discard({...context,force:p.force===true});const next=this.store.session(record.id);next.cwd=realpathSync(binding.cwd);next.workspaceBinding=binding;next.workspace=this.workspacePublic(binding);next.binding={sessionId:next.id,adapterId:next.adapterId,runtimeConfigId:next.runtimeConfigId};next.bindingGeneration=(next.bindingGeneration??1)+1;delete next.goal;next.status="closed";this.store.saveSession(next);await this.open(next,"new");const event=this.store.append(next.id,{type:"host/workspace",payload:{workspace:next.workspace as unknown as JsonValue,action:"discard"}});if(event)this.publish(event);return next.workspace as unknown as JsonValue;
   }
   private recordWholeStop(id:string,generation:number,evidence:{quiescent:true;evidenceRef:string;source:WorkspaceStopEvidence['source']}):void {
     this.store.recordEvidence(id,generation,"session",evidence);
@@ -951,6 +960,15 @@ export class HarnessHost {
   private installLive(record:SessionRecord,live:LiveSession):void {
     this.store.clearEvidence(record.id,record.bindingGeneration??1,"session");
     record.binding={...live.session.binding};record.status="ready";record.capabilities=this.redactor(record.id).capabilities(live.session.capabilities);record.capabilityRevision=record.capabilityRevision??1;this.store.saveSession(record);
+    const nativeGoal=live.session.snapshot.goal;
+    const prior=record.goal?.goal;
+    const goal=nativeGoal?.goal?.status==="complete"&&prior?.status==="complete"&&prior.objective===nativeGoal.goal.objective
+      &&prior.createdAt===nativeGoal.goal.createdAt&&typeof prior.completionTurnId==="string"&&!nativeGoal.goal.completionTurnId
+      ? {...nativeGoal,goal:{...nativeGoal.goal,completionTurnId:prior.completionTurnId}} : nativeGoal;
+    if(goal&&!isDeepStrictEqual(goal,record.goal)){
+      const event=this.store.append(record.id,{type:"session/goal",payload:this.redactor(record.id).goal(goal)},undefined,{bindingGeneration:live.bindingGeneration});
+      if(event)this.publish(event);
+    }
     this.live.set(record.id,live);live.pump=this.pump(record.id,this.translate(record.id,live.reader,live),live).catch(cause=>{try{this.options.onError?.(hostError(cause).code);}catch{}});
   }
   private async open(record:SessionRecord,mode:"new"|"resume"|"fork",fork?:SessionOpenParams["fork"]):Promise<void> {
@@ -1060,7 +1078,7 @@ export class HarnessHost {
         const safe=this.redactor(id).event({type:source.type,payload:source.payload} as Parameters<SecretRedactor["event"]>[0]);
         const event=this.store.appendSource({...item.value,...safe} as AhpEvent,live.bindingGeneration);if(event)this.publish(event);
         if(item.value.type==="turn/completed"){this.completeQueuedTurn(id,item.value.payload.turnId,item.value.payload.status,item.value.payload.error);if(!item.value.payload.error?.outcomeUnknown)await this.turnHook("settled",id,item.value.payload.turnId,item.value.payload.status);}
-        if(item.value.type==="turn/completed"||item.value.type==="interaction/resolved"||item.value.type==="session/state")this.scheduleQueue(id);
+        if(item.value.type==="turn/completed"||item.value.type==="interaction/resolved"||item.value.type==="session/state"||item.value.type==="session/goal")this.scheduleQueue(id);
       }
     }catch(cause){
 

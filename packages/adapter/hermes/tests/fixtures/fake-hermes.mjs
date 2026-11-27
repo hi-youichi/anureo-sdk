@@ -97,7 +97,7 @@ function progress(row) {
   if (scenario === 'delta-conflict') {
     publish(s, 'message.delta', { text: 'conflicting prefix', segment: 0, offset: 0 }); return
   }
-  if (['reconnect', 'gap', 'ack-lost', 'unknown'].includes(scenario) && !row.disconnected) {
+  if (['reconnect', 'gap', 'ack-lost', 'goal-ack-lost', 'unknown'].includes(scenario) && !row.disconnected) {
     disconnectDuringProgress(row)
     return
   }
@@ -197,6 +197,24 @@ async function dispatchRequest(socket, method, params) {
     capabilities: scenario === 'old-contract' ? [] : ['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1', ...(scenario === 'mcp' ? ['acp-session-mcp-v1'] : [])],
     session_create: { sources: ['tool', ...(scenario === 'mcp' ? ['acp'] : [])], parameters: ['request_id', 'source', 'cwd', 'model', 'client', ...(scenario === 'no-reasoning' ? [] : ['reasoning']), ...(scenario === 'mcp' ? ['editor'] : []), ...(scenario === 'no-toolsets' ? [] : ['toolsets'])] } }
   if (method === 'session.create') return createSession(socket, params)
+  if (['goal', 'goal-ack-lost'].includes(scenario) && ['session.control.read', 'command.dispatch'].includes(method)) {
+    if (!params.session_id) throw 'invalid_params'
+    const session = sessions.get(params.session_id)
+    if (!session) throw 'not_found'
+    if (method === 'session.control.read') return { goal: session.goal ?? null }
+    if (params.name !== 'goal') throw 'invalid_params'
+    const command = params.arg
+    let value = { type: 'exec' }
+    if (command.startsWith('-- ')) {
+      session.goal = { goal: command.slice(3), status: 'active', max_turns: 5, turns_used: 0, created_at: 1795686254 }
+      value = { type: 'send', message: 'Start the objective' }
+    } else if (command === 'clear') session.goal = null
+    else if (command === 'pause') session.goal.status = 'paused'
+    else if (command === 'resume') { session.goal.status = 'active'; value = { type: 'send', message: 'Continue the objective' } }
+    else throw 'invalid_params'
+    publish(session, 'session.control.update', { control: { goal: session.goal } })
+    return value
+  }
   const session = sessions.get(params.session_id)
   if (!session) throw 'not_found'
   if (method === 'session.mutate') {
@@ -263,7 +281,7 @@ function submitPrompt(session, params) {
   const row = { id: randomUUID(), session, inputId: params.submission_id, text: params.text, sequence: inputs.length, status: 'queued' }
   session.rows.set(row.id, row)
   if (session.active) { session.queue.push(row); info(session) } else start(row)
-  if (scenario === 'ack-lost') return NO_REPLY
+  if (scenario === 'ack-lost' || scenario === 'goal-ack-lost') return NO_REPLY
   return admission(row)
 }
 
@@ -338,6 +356,10 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0,
 
 /** Apply test controls to native state; publication still crosses the real socket before SDK callers can observe it. */
 function control(session, action) {
+  if (action === 'completeGoal') {
+    session.goal = { ...session.goal, status: 'done', turns_used: 2 }
+    publish(session, 'session.control.update', { control: { goal: session.goal } })
+  }
   if (action === 'release') {
     while (session.active) finish(session.active)
   } else if (action === 'disconnect') disconnect(session)

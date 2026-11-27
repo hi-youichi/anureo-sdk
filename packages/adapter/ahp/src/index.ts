@@ -475,6 +475,7 @@ const KNOWN_NOTIFICATIONS: Record<AhpEvent["type"], true> = {
   "submission/bound": true,
   "submission/status": true,
   "session/metadata": true,
+  "session/goal": true,
   "session/state": true,
   "turn/started": true,
   "turn/completed": true,

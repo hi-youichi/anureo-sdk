@@ -710,6 +710,7 @@ export class AcpBackendSession implements BackendSession {
       case 'history/read': return this.extension('history', method, params);
       case 'goal/set': return this.goal('set', method, params);
       case 'goal/clear': return this.goal('clear', method, params);
+      case 'goal/pause': case 'goal/resume': throw new HarnessSdkError('CAPABILITY_UNSUPPORTED');
       case 'compact/start': return this.extension('compact', method, params);
       case 'review/start': return this.submitReview(params as AhpRequestMap['review/start']) as Promise<AhpResultMap[M]>;
       case 'interaction/respond': case 'interaction/cancel': throw new HarnessSdkError('INTERACTION_EXPIRED');

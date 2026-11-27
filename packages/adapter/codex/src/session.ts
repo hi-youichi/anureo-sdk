@@ -1,5 +1,6 @@
 /** Owns a native thread's binding, execution evidence, and projection into SDK state and events. */
 import { randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import type { ApprovalOption, Capabilities, AhpRequestMap, AhpResultMap, GoalState, HistoryItem, HistoryPage, InteractionRequested, InteractionResponse, Item, JsonObject, SessionBinding, SessionOpenParams, SessionState, Usage } from '@anureo/protocol'
 import { HarnessSdkError, sdkError, capItem, pageEndWithinBudget, DEFAULT_HISTORY_PAGE_BYTES, type BackendSession, type SessionEventSink, type SessionMethod } from '@anureo/sdk'
 import { CodexJsonlClient, CodexRpcError, type NativeRequest } from './jsonl'
@@ -15,6 +16,15 @@ import type { CodexAdapterOptions } from './options'
 
 /** One spawn child observed through thread/started; nickname/role enrich adapter thread discovery. */
 type DiscoveredSubagent = { parentThreadId: string; agentNickname?: string; agentRole?: string; forkedFromId?: string }
+
+function codexGoal(value: unknown, turnId?: string): GoalState {
+  if (value === null) return { goal: null, status: 'cleared' }
+  const native = record(value)
+  if (typeof native.objective !== 'string' || typeof native.status !== 'string') throw new HarnessSdkError('PROTOCOL_ERROR', 'Invalid Codex Goal state')
+  const status = native.status === 'usageLimited' || native.status === 'budgetLimited' ? 'limited' : native.status
+  const goal = { ...safe(native) as JsonObject, status, ...(status === 'complete' && turnId ? { completionTurnId: turnId } : {}) }
+  return { goal, status: status === 'active' ? 'active' : 'cleared' }
+}
 /**
  * Per-thread BackendSession created by CodexNativeAdapter.openSession. Attach its transport
  * before opening. Feed notifications in wire order while server requests settle concurrently.
@@ -24,6 +34,7 @@ export class CodexBackendSession implements BackendSession {
   binding: SessionBinding
   /** Session-local capability copy; missing optional native methods revoke support through the sink. */
   readonly capabilities: Capabilities
+  private goalRevision = 0
   /** Live state used by OutputSession at SDK attachment. Clone it to retain an independent snapshot. */
   state: SessionState
   /** Seed ready state from validated open parameters. Binding and capability clones can throw before transport attachment. */
@@ -63,6 +74,17 @@ export class CodexBackendSession implements BackendSession {
     const threadOptions = this.threadOptions()
     const result = await this.openNativeThread(threadOptions)
     await this.restoreThread(result)
+    if (this.capabilities.goal?.actions?.length) {
+      const revision = this.goalRevision
+      try {
+        const snapshot = record(await this.client.request('thread/goal/get', { threadId: this.threadId }))
+        if (Object.hasOwn(snapshot, 'goal') && this.goalRevision === revision) this.state.goal = codexGoal(snapshot.goal)
+      } catch (cause) {
+        // Some native versions implement set/clear but omit the read method.
+        if (!(cause instanceof CodexRpcError)) throw cause
+        if (cause.goalsDisabled) this.capabilities.goal = { actions: [] }
+      }
+    }
   }
   /**
    * OutputSession.execute dispatches validated requests here and consumes their receipts or results.
@@ -101,20 +123,23 @@ export class CodexBackendSession implements BackendSession {
         result = await this.readHistory(p as AhpRequestMap['history/read'])
         break
       case 'goal/set':
-      case 'goal/clear': {
+      case 'goal/clear':
+      case 'goal/pause':
+      case 'goal/resume': {
         const disableGoal = () => { this.capabilities.goal = { actions: [] } }
+        const revision = this.goalRevision
         let goal: GoalState
-        if (method === 'goal/set') {
-          const { goal: requested } = p as AhpRequestMap['goal/set']
+        if (method === 'goal/clear') {
+          await this.optional('thread/goal/clear', { threadId: this.threadId }, disableGoal)
+          goal = codexGoal(null)
+        } else {
+          const requested = method === 'goal/set' ? (p as AhpRequestMap['goal/set']).goal : { status: method === 'goal/pause' ? 'paused' : 'active' }
           const nativeGoal = Object.fromEntries(Object.entries(requested).filter(([key]) => ['objective', 'status', 'tokenBudget'].includes(key)))
           const value = record(await this.optional('thread/goal/set', { ...nativeGoal, threadId: this.threadId }, disableGoal))
-          goal = { goal: json(value.goal) as JsonObject, status: 'active' }
-        } else {
-          await this.optional('thread/goal/clear', { threadId: this.threadId }, disableGoal)
-          goal = { goal: null, status: 'cleared' }
+          goal = codexGoal(value.goal)
         }
-        this.state.goal = goal
-        result = goal
+        if (this.goalRevision === revision) this.state.goal = goal
+        result = this.state.goal ?? goal
         break
       }
       case 'compact/start': {
@@ -143,6 +168,16 @@ export class CodexBackendSession implements BackendSession {
     // child's own identity, and this notice is the only pushed discovery channel for them.
     if (method === 'thread/started') return await this.threadStarted(params)
     if (typeof params.threadId === 'string' && this.threadId && params.threadId !== this.threadId) return
+    if (method === 'thread/goal/updated' || method === 'thread/goal/cleared') {
+      if (method === 'thread/goal/updated' && !Object.hasOwn(params, 'goal')) return
+      const goal = codexGoal(method === 'thread/goal/cleared' ? null : params.goal, string(params.turnId))
+      this.goalRevision++
+      if (!isDeepStrictEqual(this.state.goal, goal)) {
+        this.state.goal = goal
+        await this.sink.emit({ type: 'session/goal', payload: goal })
+      }
+      return
+    }
     if (method === 'thread/name/updated') {
       const title = typeof params.threadName === 'string' ? params.threadName : null
       if (this.state.metadata?.title !== title) {
@@ -502,7 +537,7 @@ export class CodexBackendSession implements BackendSession {
   private async optional(method: string, params: NativeRecord, disable: () => void): Promise<unknown> {
     try { return await this.client.request(method, params) }
     catch (cause) {
-      if (cause instanceof CodexRpcError && cause.rpcCode === -32601) {
+      if (cause instanceof CodexRpcError && (cause.rpcCode === -32601 || cause.goalsDisabled && method.startsWith('thread/goal/'))) {
         disable()
         this.state.capabilityRevision = ++this.capabilityRevision
         this.state.capabilities = this.capabilities

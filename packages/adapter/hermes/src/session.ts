@@ -1,16 +1,19 @@
 import { setTimeout as delay } from 'node:timers/promises'
+import { isDeepStrictEqual } from 'node:util'
 import { HarnessSdkError, type BackendSession, type SessionEventSink, type SessionMethod } from '@anureo/sdk'
-import { assertRequest, type AhpRequestMap, type AhpResultMap, type Capabilities, type SessionBinding, type SessionOpenParams, type SessionState } from '@anureo/protocol'
+import { assertRequest, type AhpRequestMap, type AhpResultMap, type Capabilities, type GoalState, type SessionBinding, type SessionOpenParams, type SessionState } from '@anureo/protocol'
 import { attachGateway, type AttachMode } from './attach'
 import { HermesRpc, type ServerRequest } from './rpc'
 import { array, describe, event as nativeEvent, identity, integer, object, protocolError, publicReceipt, receipt, type Description, type NativeEvent, type NativeObject, type Receipt } from './native'
 import { HermesTurn, sessionUsage } from './events'
 import { HermesInteractions } from './interactions'
 import { isHermesEffort, type HermesAdapterOptions } from './options'
+import { hermesGoal } from './goals'
 
 /** Return a fresh native capability snapshot for HermesAdapter.initialize and each HermesSession. */
-export function hermesCapabilities(reasoning = false): Capabilities {
+export function hermesCapabilities(reasoning = false, goals = false): Capabilities {
   return {
+    ...(goals ? { goal: { actions: ['set', 'clear', 'pause', 'resume'] } } : {}),
     session: { resume: true, fork: [], revert: [], history: false },
     input: { delivery: ['native'], interrupt: { targets: ['turn'], reportsPendingInputs: false } },
     turn: { outputSchema: false, overrides: [], inputModalities: ['text'] },
@@ -29,11 +32,12 @@ export class HermesSession implements BackendSession {
   binding: SessionBinding
 
   /** Set up local observation state for HermesAdapter.openSession. Call open before dispatching native requests. */
-  constructor({ params, sink, options, profileId, released }: {
+  constructor({ params, sink, options, profileId, goals, released }: {
     params: SessionOpenParams
     sink: SessionEventSink
     options: HermesAdapterOptions
     profileId: string
+    goals: boolean
     /** Remove this handle from HermesAdapter's tracked sessions when local disposal finishes. */
     released: () => void
   }) {
@@ -41,6 +45,7 @@ export class HermesSession implements BackendSession {
     this.sink = sink
     this.options = options
     this.profileId = profileId
+    this.goals = goals
     this.released = released
     this.binding = structuredClone(params.binding)
     this.effort = typeof params.config?.effort === 'string' ? params.config.effort : undefined
@@ -53,7 +58,8 @@ export class HermesSession implements BackendSession {
   get state(): SessionState {
     return { binding: this.binding, status: this.disposed ? 'closed' : 'ready', config: { ...(this.model ? { model: this.model } : {}), ...(this.effort ? { effort: this.effort } : {}) }, capabilities: this.capabilities,
       capabilityRevision: 0, activeTurnIds: [...this.turns.values()].filter(value => !value.terminal).map(value => value.id),
-      ...(this.model ? { model: this.model } : {}), ...(this.title ? { metadata: { title: this.title } } : {}) }
+      ...(this.model ? { model: this.model } : {}), ...(this.title ? { metadata: { title: this.title } } : {}),
+      ...(this.goal ? { goal: this.goal } : {}) }
   }
   /**
    * HermesAdapter.openSession awaits connection, creation/resume, snapshot projection and held events.
@@ -65,6 +71,7 @@ export class HermesSession implements BackendSession {
     const snapshot = await this.openSnapshot(rpc)
     await this.snapshot(snapshot)
     this.cursor = { epoch: identity(snapshot.replay_epoch), sequence: integer(snapshot.last_sequence) }
+    await this.readGoal(rpc, false)
     await this.flush('contiguous')
     this.holding = false
   }
@@ -83,7 +90,85 @@ export class HermesSession implements BackendSession {
       case 'session/config/set': return await this.setConfig(params as AhpRequestMap['session/config/set']) as AhpResultMap[M]
       case 'session/close': return await this.closeObservation() as AhpResultMap[M]
       case 'turn/interrupt': return await this.interrupt(params as AhpRequestMap['turn/interrupt']) as AhpResultMap[M]
+      case 'goal/set':
+      case 'goal/clear':
+      case 'goal/pause':
+      case 'goal/resume':
+        return await this.controlGoal(method, params as AhpRequestMap['goal/set' | 'goal/clear' | 'goal/pause' | 'goal/resume']) as AhpResultMap[M]
       default: throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
+    }
+  }
+
+  private async readGoal(rpc: HermesRpc, publish: boolean): Promise<boolean> {
+    if (!this.goals) return false
+    const revision = this.goalRevision
+    let reply: NativeObject
+    try { reply = object(await rpc.request('session.control.read', { session_id: this.nativeId })) }
+    catch (cause) {
+      if (cause instanceof HarnessSdkError && ['METHOD_NOT_FOUND', 'CAPABILITY_UNSUPPORTED', 'AUTHORIZATION_FAILED'].includes(cause.code)) {
+        this.goals = false
+        delete this.capabilities.goal
+        if (publish) await this.sink.emit({ type: 'session/state', payload: this.state })
+      }
+      return false
+    }
+    if (revision !== this.goalRevision) return true
+    const goal = hermesGoal(reply.goal, this.goal?.goal?.completionTurnId as string | undefined)
+    if (publish) await this.publishGoal(goal)
+    else this.goal = goal
+    return true
+  }
+
+  private async publishGoal(goal: GoalState): Promise<void> {
+    this.goalRevision++
+    if (isDeepStrictEqual(goal, this.goal)) return
+    this.goal = goal
+    await this.sink.emit({ type: 'session/goal', payload: goal })
+  }
+
+  private async controlGoal(method: 'goal/set' | 'goal/clear' | 'goal/pause' | 'goal/resume',
+    params: AhpRequestMap['goal/set' | 'goal/clear' | 'goal/pause' | 'goal/resume']): Promise<GoalState> {
+    await this.ready()
+    if (!this.goals) throw new HarnessSdkError('CAPABILITY_UNSUPPORTED')
+    const requested = 'goal' in params ? params.goal : undefined
+    const objective = typeof requested?.objective === 'string' ? requested.objective.trim() : ''
+    if (method === 'goal/set' && !objective) throw new HarnessSdkError('INVALID_PARAMS')
+    const command = method === 'goal/set' ? `-- ${objective}` : method.slice('goal/'.length)
+    const revision = this.goalRevision
+    // The gateway's command path owns subsequent Goal continuations. The classic CLI
+    // session.automation path delegates them to its caller.
+    const result = object(await this.channel().request('command.dispatch', {
+      session_id: this.nativeId, name: 'goal', arg: command,
+    }, true))
+    if (method === 'goal/set' && result.type !== 'send') throw new HarnessSdkError('GOAL_OPERATION_FAILED', 'Hermes declined the Goal operation')
+    const observed = await this.readGoal(this.channel(), true)
+    if (result.type === 'send') {
+      if (typeof result.message !== 'string' || !result.message.trim()) {
+        throw new HarnessSdkError('GOAL_KICKOFF_FAILED', 'Hermes did not supply the Goal kickoff prompt')
+      }
+      const context = typeof requested?.context === 'string' ? `<cowork_context>\n${requested.context}\n</cowork_context>\n` : ''
+      await this.submitGoalKickoff(params.requestId, context + result.message)
+    }
+    if (!this.goal || !observed && this.goalRevision === revision) throw new HarnessSdkError('RESULT_UNKNOWN', 'Hermes Goal state could not be confirmed', false, true)
+    return this.goal
+  }
+
+  private async submitGoalKickoff(requestId: string, prompt: string): Promise<void> {
+    const submissionId = `goal:${requestId}`
+    const input = this.retainInput({ submissionId, input: [{ type: 'text', text: prompt }] }, true)
+    try {
+      const receipt = await this.submitReceipt(submissionId, input)
+      await this.associate(receipt, submissionId)
+      if (input.rejected) throw new HarnessSdkError('INPUT_CANCELLED')
+    } catch (cause) {
+      if (cause instanceof HarnessSdkError && !cause.outcomeUnknown) {
+        input.rejected = true
+        throw new HarnessSdkError('GOAL_KICKOFF_FAILED', 'Goal was saved but Hermes did not start it')
+      }
+      throw cause
+    } finally {
+      input.acknowledged = true
+      this.releaseSettledInput(input, input.admission ? this.turns.get(input.admission.id)?.terminal : false)
     }
   }
   /** Idempotently abort local work, drop retained evidence and release adapter tracking; native execution is left running. */
@@ -231,7 +316,7 @@ export class HermesSession implements BackendSession {
     }, this.options, this.abort.signal)
     if (this.disposed) { channel.dispose(); throw new HarnessSdkError('SESSION_CLOSED') }
     this.rpc = channel
-    try { this.description = describe(await channel.request('runtime.describe'), grant); Object.assign(this.capabilities, hermesCapabilities(this.description.createParameters.includes('reasoning'))) }
+    try { this.description = describe(await channel.request('runtime.describe'), grant); Object.assign(this.capabilities, hermesCapabilities(this.description.createParameters.includes('reasoning'), this.goals)) }
     catch (cause) { channel.dispose(); throw cause }
   }
   /** Reject overflow during setup or recovery because dropping held traffic would lose correlation evidence. */
@@ -296,7 +381,7 @@ export class HermesSession implements BackendSession {
         if (!input || input.rejected) continue
         input.rejected = true
         this.releaseSettledInput(input)
-        await this.sink.emit({ type: 'submission/status', payload: { submissionId: id, status: 'rejected',
+        if (!input.goalKickoff) await this.sink.emit({ type: 'submission/status', payload: { submissionId: id, status: 'rejected',
           error: { code: 'INPUT_CANCELLED', message: 'Hermes input cancelled before execution', retryable: false, outcomeUnknown: false } } })
       }
       return undefined
@@ -304,7 +389,7 @@ export class HermesSession implements BackendSession {
     if (this.retired.has(value.id)) return undefined
     const turn = this.turn(value.id, value.epoch, value.generation)
     await turn.start()
-    for (const [id, input] of inputs) if (input) await turn.bind(id, input.input)
+    for (const [id, input] of inputs) if (input && !input.goalKickoff) await turn.bind(id, input.input)
     if (value.status === 'terminal' && !turn.terminal && value.result) await turn.fromReceipt(value.result, value.outcome)
     if (turn.terminal) for (const [, input] of inputs) if (input) this.releaseSettledInput(input, true)
     return turn
@@ -350,6 +435,11 @@ export class HermesSession implements BackendSession {
     }
     const payload = event.payload
     switch (event.type) {
+      case 'session.control.update': {
+        const control = object(payload.control)
+        if (Object.hasOwn(control, 'goal')) await this.publishGoal(hermesGoal(control.goal, this.lastObservedTurn))
+        break
+      }
       case 'session.info':
         if (typeof payload.model === 'string' && payload.model !== this.model || this.description?.createParameters.includes('reasoning') && isHermesEffort(payload.reasoning_effort) && payload.reasoning_effort !== this.effort) {
           if (typeof payload.model === 'string') this.model = payload.model
@@ -418,6 +508,7 @@ export class HermesSession implements BackendSession {
       return
     }
     const turn = this.turn(admissionId, integer(event.authority_epoch), generation)
+    this.lastObservedTurn = turn.id
     const submissionId = payload.persisted_turn == null ? undefined : object(payload.persisted_turn).submission_id
     if (typeof submissionId === 'string') {
       const input = this.submissions.get(submissionId)
@@ -471,6 +562,8 @@ export class HermesSession implements BackendSession {
     const rpc = this.channel()
     const continuity = await this.replaySnapshot(rpc)
     await this.reconcileAdmissions(rpc)
+    await this.flush(continuity, true)
+    await this.readGoal(rpc, true)
     await this.flush(continuity, true)
     this.holding = false
   }
@@ -550,7 +643,7 @@ export class HermesSession implements BackendSession {
     }
   }
   /** Enforce identity/count/byte budgets before native dispatch, evicting only acknowledged inputs with known outcomes. */
-  private retainInput(params: AhpRequestMap['input/submit']): Submission {
+  private retainInput(params: Pick<AhpRequestMap['input/submit'], 'submissionId' | 'input'>, goalKickoff = false): Submission {
     if (this.submissions.has(params.submissionId)) throw new HarnessSdkError('SUBMISSION_ID_CONFLICT')
     if (this.submissions.size >= (this.options.maxSubmissions ?? 1024)) {
       const old = [...this.submissions].find(([, value]) => value.acknowledged && (value.rejected || value.admission && (this.turns.get(value.admission.id)?.terminal || this.retired.has(value.admission.id))))
@@ -558,7 +651,7 @@ export class HermesSession implements BackendSession {
       this.releaseInput(old[1])
       this.submissions.delete(old[0])
     }
-    const input: Submission = { input: params.input.map(value => value.type === 'text' ? value.text : '').join('\n'), acknowledged: false, rejected: false }
+    const input: Submission = { input: params.input.map(value => value.type === 'text' ? value.text : '').join('\n'), acknowledged: false, rejected: false, goalKickoff }
     const bytes = Buffer.byteLength(input.input)
     if (this.submissionBytes + bytes > (this.options.maxBufferedBytes ?? 16 * 1024 * 1024)) throw new HarnessSdkError('BACKPRESSURE_EXCEEDED')
     this.submissionBytes += bytes
@@ -589,6 +682,10 @@ export class HermesSession implements BackendSession {
   private readonly sink: SessionEventSink
   private readonly options: HermesAdapterOptions
   private readonly profileId: string
+  private goals: boolean
+  private goal?: GoalState
+  private goalRevision = 0
+  private lastObservedTurn?: string
   private readonly released: () => void
 }
 
@@ -598,6 +695,7 @@ interface Submission {
   /** The submit call has settled, so terminal evidence may release its retained text. */
   acknowledged: boolean
   rejected: boolean
+  goalKickoff?: boolean
 }
 /** Snapshot reconciliation may bridge missing sequences, but still records incomplete turn progress. */
 type ReplayContinuity = 'contiguous' | 'snapshot'

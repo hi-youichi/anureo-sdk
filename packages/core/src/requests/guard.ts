@@ -51,6 +51,8 @@ function supportsOperation<M extends SessionMethod>(method: M, params: AhpReques
       return supportsCapability(capabilities, "session.history");
     case "goal/set":
     case "goal/clear":
+    case "goal/pause":
+    case "goal/resume":
       return supportsCapability(capabilities, "goal.actions", method.split("/")[1]);
     case "compact/start":
       return Boolean(capabilities.compact);

@@ -1,6 +1,6 @@
 {
   "name": "@anureo/host",
-  "version": "0.3.14",
+  "version": "0.3.15",
   "description": "Persistent agent sessions and WebSocket access for the Anureo SDK",
   "license": "Apache-2.0",
   "repository": {

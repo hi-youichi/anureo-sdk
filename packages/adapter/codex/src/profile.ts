@@ -62,7 +62,7 @@ export function codexCapabilities(version: string): Capabilities {
     session: { resume: true, fork: profile.fork, revert: ['conversation'], history: true },
     input: { delivery: ['native'], steer: { target: 'turn', atomicMatch: true }, interrupt: { targets: ['turn'], reportsPendingInputs: false } },
     turn: { outputSchema: true, inputModalities: ['text', 'image', 'file'], overrides: ['model','effort','summary','approvalPolicy','sandboxPolicy','serviceTier'] },
-    goal: { actions: ['set','clear'] as ['set','clear'] }, compact: true, review: true,
+    goal: { actions: ['set','clear','pause','resume'] as ['set','clear','pause','resume'] }, compact: true, review: true,
     subagents: { events: 'nested' as const, threadDiscovery: profile.subagentDiscovery, tree: profile.subagentTree },
     interactions: ['approval','userInput','elicitation','dynamicTool'],
     config: { options: [

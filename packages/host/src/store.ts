@@ -192,8 +192,11 @@ export class SqliteHostStore {
       committed={sessionId:id,hostSeq,recordedAt,bindingGeneration:scope.bindingGeneration??session.bindingGeneration??1,...scope,...(source?{source}:{}),event:safe};
       session.updatedAt=Date.now();
       if(safe.type==="session/state") {
-        const state=safe.payload as SessionState;session.status=state.status;session.config=state.config;session.binding=state.binding;session.model=state.model;session.capabilities=state.capabilities;session.capabilityRevision=state.capabilityRevision;session.goal=state.goal;session.fastMode=state.fastMode;
+        const state=safe.payload as SessionState;session.status=state.status;session.config=state.config;session.binding=state.binding;session.model=state.model;session.capabilities=state.capabilities;session.capabilityRevision=state.capabilityRevision;session.fastMode=state.fastMode;
+        if(state.goal!==undefined)session.goal=state.goal;
         this.applyMetadata(session,state.metadata);
+      } else if(safe.type==="session/goal") {
+        session.goal=safe.payload;
       } else if(safe.type==="session/metadata") {
         this.applyMetadata(session,safe.payload);
       } else if(safe.type==="turn/started") {

@@ -57,6 +57,33 @@ test('initialization describes a ticketed owner without creating a session and k
   }, { options: { diagnostic: value => diagnostics.push(value), env: { FAKE_HERMES_STDERR: 'test-sensitive-stderr' } } })
 })
 
+test.each(['goal', 'goal-ack-lost'])('Hermes Goal starts exactly one native kickoff and restores completion (%s)', async scenario => {
+  await withFixture(scenario, async (fixture, client) => {
+    const session = await client.sessions.create({ cwd: tmpdir() })
+    expect(session.capabilities.goal?.actions).toEqual(['set', 'clear', 'pause', 'resume'])
+    const observed = collect(session)
+    try {
+      const set = { requestId: 'goal-request', sessionId: session.id, goal: { objective: 'pause the cron' } }
+      expect(await session.request('goal/set', set)).toMatchObject({ status: 'active', goal: { objective: 'pause the cron', turnBudget: 5 } })
+      await session.request('goal/set', set)
+      expect((await fixture.state()).inputs.map(input => input.text)).toEqual(['Start the objective'])
+      await until(async () => observed.events.some(event => event.type === 'turn/completed'))
+      expect(await session.request('goal/pause', { requestId: 'pause-goal', sessionId: session.id })).toMatchObject({ goal: { status: 'paused' } })
+      expect(await session.request('goal/resume', { requestId: 'resume-goal', sessionId: session.id })).toMatchObject({ goal: { status: 'active' } })
+      expect((await fixture.state()).inputs.map(input => input.text)).toEqual(['Start the objective', 'Continue the objective'])
+      await until(async () => observed.events.filter(event => event.type === 'turn/completed').length === 2)
+      await fixture.control('completeGoal')
+      await until(async () => session.snapshot.goal?.goal?.status === 'complete')
+      expect(session.snapshot.goal?.goal).toMatchObject({ turnsUsed: 2, completionTurnId: expect.any(String) })
+    } finally { await observed.stop() }
+    const reference = session.reference
+    await session.close()
+    const reopened = await client.sessions.resume(reference)
+    expect(reopened.snapshot.goal).toMatchObject({ status: 'cleared', goal: { status: 'complete', turnsUsed: 2 } })
+    expect(await reopened.request('goal/clear', { requestId: 'clear-goal', sessionId: reopened.id })).toEqual({ goal: null, status: 'cleared' })
+  })
+}, 20000)
+
 test.each(['old-contract', 'code-mismatch', 'legacy', 'bad-stdout'])('incompatible or malformed %s fails before session creation', async scenario => {
   const fixture = await startFake(scenario)
   try {
