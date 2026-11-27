@@ -23,7 +23,8 @@ jobs:
           node-version: '22.20.0'
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: '1.4.5'
+          # Bun 1.4.2 crashes in the Windows Hermes gateway test.
+          bun-version: ${{ runner.os == 'Windows' && '1.4.5' || '1.4.2' }}
       - run: bun install --frozen-lockfile
       - run: bun run generate:check
       - run: bun run protocol:check
